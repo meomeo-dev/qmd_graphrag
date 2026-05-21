@@ -1,39 +1,93 @@
 date: 2026-05-21
-title: 统一检索面 Type DD 规划
-status: proposed
+title: 统一检索面 Type DD 规范
+status: accepted
 scope: qmd_graphrag
+document_role: normative_contract
+implementation_status_policy: >-
+  This document defines required contracts and acceptance gates. It does not
+  assert that every referenced module is present in code.
 
-principles:
+normative_principles:
   - qmd_corpus_is_whole_set
-  - graphrag_corpus_is_enhanced_subset
-  - graph_ingest_must_register_qmd_corpus
-  - no_secret_in_config_or_vault_state
+  - graphrag_corpus_is_graph_enhanced_subset
+  - graph_ingest_registers_qmd_corpus
+  - graph_vault_is_portable_persistence_unit
+  - project_config_is_provider_source_of_truth
+  - no_secret_value_in_config_or_vault_state
   - no_untyped_cross_bus_payload
+  - formatter_is_presentation_only
 
-identity:
+contract_artifacts:
+  corpus:
+    path: src/contracts/corpus.ts
+    exports:
+      - SourceDocumentSchema
+      - CorpusDocumentSchema
+      - CorpusChunkSchema
+      - DocumentIdentityMapSchema
+  qmd_query:
+    path: src/contracts/qmd-query.ts
+    exports:
+      - QmdQueryRequestSchema
+      - QmdRetrievalCandidateSchema
+      - QmdSearchResultSchema
+  graph_enhancement:
+    path: src/contracts/graph-enhancement.ts
+    exports:
+      - GraphEnhancementRequestSchema
+      - GraphEnhancementStateSchema
+      - GraphCapabilitySchema
+  unified_query:
+    path: src/contracts/unified-query.ts
+    exports:
+      - UnifiedQueryRequestSchema
+      - QueryRouteDecisionSchema
+      - CandidateRouteDecisionSchema
+      - EvidenceRefSchema
+      - UnifiedAnswerSchema
+      - GraphCapabilityErrorSchema
+      - TypedQueryErrorSchema
+  provider:
+    path: src/contracts/provider.ts
+    exports:
+      - OpenAIResponsesProviderConfigSchema
+      - OpenAIResponsesStreamEventSchema
+      - OpenAIStructuredOutputSchemaSchema
+      - ProviderCostAccountingSchema
+
+identity_model:
   source_id:
     description: Stable identity of the original source payload.
-    producer: future.ingest.source_registry
-    fields:
-      - sourceHash
+    producer: src/ingest/source-registry.ts#registerSourceDocument
+    canonical_derivation: sourceHash
+    locator_fields:
       - sourceName
       - sourceRelativePath
+    invariant: Path fields do not participate in canonical identity.
   document_id:
     description: qmd document identity inside the whole-corpus index.
-    producer: src/store.ts#insertDocument
+    producer: src/corpus/registry.ts#registerCorpusDocument
+    mirror_producer: src/store.ts#insertDocument
     fields:
       - collection
-      - path
+      - relativePath
       - contentHash
   book_id:
     description: Book-level GraphRAG processing identity.
     producer: src/job-state/fingerprint.ts#buildBookIdFromSourceHash
+    canonical_derivation: sourceHash
+    display_fields:
+      - bookDisplaySlug
+    invariant: Same source payload produces the same bookId across devices.
+  content_hash:
+    description: Stable identity of normalized text content.
+    producer: src/corpus/normalizer.ts#hashNormalizedContent
     fields:
-      - sourceSlug
-      - sourceHashPrefix
+      - normalizedText
+      - normalizationPolicyVersion
   chunk_id:
     description: qmd chunk identity for retrieval evidence.
-    producer: future.contracts.corpus#CorpusChunkSchema
+    producer: src/corpus/chunker.ts#registerCorpusChunks
     fields:
       - contentHash
       - chunkStrategy
@@ -41,52 +95,64 @@ identity:
       - pos
   graph_text_unit_id:
     description: GraphRAG text unit identity.
-    producer: GraphRAG output#text_units.parquet
+    producer: vendor/graphrag#text_units.parquet
     fields:
       - graphRagTextUnitId
 
-buses:
+deduplication:
+  high_cost_key:
+    fields:
+      - sourceHash
+      - contentHash
+      - stageFingerprint
+      - providerFingerprint
+  rule: Locator changes do not invalidate high-cost artifacts.
+
+typed_buses:
   corpus_bus:
     role: Whole-corpus ingestion and document identity.
-    types:
+    invariant: Every graph-enhanced source is registered on this bus first.
+    payloads:
       - name: source_document
-        schema: future.src/contracts/corpus.ts#SourceDocumentSchema
-        storage: file_or_sqlite
+        schema: src/contracts/corpus.ts#SourceDocumentSchema
+        storage: graph_vault/catalog/sources.yaml
       - name: corpus_document
-        schema: future.src/contracts/corpus.ts#CorpusDocumentSchema
-        storage: sqlite
+        schema: src/contracts/corpus.ts#CorpusDocumentSchema
+        storage: .qmd/index.sqlite
       - name: corpus_chunk
-        schema: future.src/contracts/corpus.ts#CorpusChunkSchema
-        storage: sqlite
+        schema: src/contracts/corpus.ts#CorpusChunkSchema
+        storage: .qmd/index.sqlite
       - name: document_identity_map
-        schema: future.src/contracts/corpus.ts#DocumentIdentityMapSchema
-        storage: file_or_sqlite
+        schema: src/contracts/corpus.ts#DocumentIdentityMapSchema
+        storage: graph_vault/catalog/document-identity-map.yaml
 
   qmd_retrieval_bus:
     role: Fast whole-corpus lexical, vector, expansion, and rerank retrieval.
-    types:
+    invariant: Formatter strings are not consumed by downstream retrieval logic.
+    payloads:
       - name: qmd_query_request
-        schema: future.src/contracts/qmd-query.ts#QmdQueryRequestSchema
+        schema: src/contracts/qmd-query.ts#QmdQueryRequestSchema
         storage: transient
       - name: qmd_retrieval_candidate
-        schema: future.src/contracts/qmd-query.ts#QmdRetrievalCandidateSchema
+        schema: src/contracts/qmd-query.ts#QmdRetrievalCandidateSchema
         storage: transient
       - name: qmd_search_result
-        schema: future.src/contracts/qmd-query.ts#QmdSearchResultSchema
+        schema: src/contracts/qmd-query.ts#QmdSearchResultSchema
         storage: transient
 
   graph_enhancement_bus:
-    role: High-cost graph enrichment for selected corpus subset.
-    types:
+    role: High-cost graph enrichment for selected corpus documents.
+    invariant: GraphRAG consumes qmd corpus identity, not anonymous files.
+    payloads:
       - name: graph_enhancement_request
-        schema: future.src/contracts/graph-enhancement.ts#GraphEnhancementRequestSchema
+        schema: src/contracts/graph-enhancement.ts#GraphEnhancementRequestSchema
         storage: transient
       - name: graph_enhancement_state
-        schema: future.src/contracts/graph-enhancement.ts#GraphEnhancementStateSchema
-        storage: file
+        schema: src/contracts/graph-enhancement.ts#GraphEnhancementStateSchema
+        storage: graph_vault/books/<book_id>/job.yaml
       - name: graph_capability
-        schema: future.src/contracts/graph-enhancement.ts#GraphCapabilitySchema
-        storage: file_or_sqlite
+        schema: src/contracts/graph-enhancement.ts#GraphCapabilitySchema
+        storage: graph_vault/catalog/graph-capabilities.yaml
       - name: graphrag_query_request
         schema: src/contracts/graphrag.ts#GraphRagQueryRequestSchema
         storage: transient
@@ -96,23 +162,56 @@ buses:
 
   unified_answer_bus:
     role: User-facing typed query route and answer surface.
-    types:
+    invariant: All user-visible evidence is expressed as EvidenceRef.
+    payloads:
       - name: unified_query_request
-        schema: future.src/contracts/unified-query.ts#UnifiedQueryRequestSchema
+        schema: src/contracts/unified-query.ts#UnifiedQueryRequestSchema
         storage: transient
       - name: query_route_decision
-        schema: future.src/contracts/unified-query.ts#QueryRouteDecisionSchema
-        storage: transient
+        schema: src/contracts/unified-query.ts#QueryRouteDecisionSchema
+        storage: transient_or_query_log
       - name: evidence_ref
-        schema: future.src/contracts/unified-query.ts#EvidenceRefSchema
-        storage: transient
+        schema: src/contracts/unified-query.ts#EvidenceRefSchema
+        storage: transient_or_query_log
       - name: unified_answer
-        schema: future.src/contracts/unified-query.ts#UnifiedAnswerSchema
-        storage: transient_or_cache
+        schema: src/contracts/unified-query.ts#UnifiedAnswerSchema
+        storage: transient_or_query_log
+      - name: typed_query_error
+        schema: src/contracts/unified-query.ts#TypedQueryErrorSchema
+        storage: transient_or_query_log
+
+  provider_bus:
+    role: Typed provider boundary for OpenAI Responses API and Jina services.
+    payloads:
+      - name: openai_responses_provider_config
+        schema: src/contracts/provider.ts#OpenAIResponsesProviderConfigSchema
+        storage: .qmd/index.yml
+      - name: openai_responses_stream_event
+        schema: src/contracts/provider.ts#OpenAIResponsesStreamEventSchema
+        storage: transient
+      - name: openai_structured_output_schema
+        schema: src/contracts/provider.ts#OpenAIStructuredOutputSchemaSchema
+        storage: transient
+      - name: jina_embedding_request
+        schema: src/contracts/jina.ts#JinaEmbeddingRequestSchema
+        storage: transient
+      - name: jina_embedding_response
+        schema: src/contracts/jina.ts#JinaEmbeddingResponseSchema
+        storage: transient
+      - name: jina_rerank_request
+        schema: src/contracts/jina.ts#JinaRerankRequestSchema
+        storage: transient
+      - name: jina_rerank_response
+        schema: src/contracts/jina.ts#JinaRerankResponseSchema
+        storage: transient
 
 config_projection:
   qmd_project_config:
     path: .qmd/index.yml
+    priority:
+      - explicit_config_argument
+      - nearest_project_qmd_config
+      - configured_global_qmd_index
     owns:
       - collections
       - models
@@ -123,15 +222,40 @@ config_projection:
   graphrag_runtime_config:
     path: graph_vault/settings.yaml
     owns:
-      - GraphRAG runtime provider projection
+      - GraphRAG provider projection
       - GraphRAG storage projection
-    source_of_truth: qmd_project_config_after_stage_1
+    source_of_truth: .qmd/index.yml
+    drift_control:
+      - managed_header
+      - source_fingerprint
+      - reject_on_fingerprint_mismatch
     secret_policy: env_placeholder_only
+  runtime_env:
+    required_names:
+      - OPENAI_API_KEY
+      - OPENAI_BASE_URL
+      - JINA_API_KEY
+    persistence_rule: Values are never persisted in catalog, checkpoint, or query logs.
+
+provider_contracts:
+  openai_responses:
+    endpoint: /responses
+    stream: true
+    strict_structured_output: true
+    object_schema_rule: additionalProperties_false_required
+    version_prefix_rule: no_forced_v1_prefix
+  jina:
+    roles:
+      - embedding_provider
+      - rerank_provider
+    required_env:
+      - JINA_API_KEY
 
 query_routes:
   qmd:
     corpus_scope: whole
     cost: low_to_medium
+    entrypoint: qmd query
     strengths:
       - lexical_search
       - vector_search
@@ -140,52 +264,208 @@ query_routes:
     limitations:
       - no_native_graph_reasoning
   graphrag:
-    corpus_scope: enhanced_subset
+    corpus_scope: graph_enhanced_subset
     cost: medium_to_high
+    entrypoint: qmd query --graphrag
     strengths:
       - graph_local_search
       - graph_global_search
       - drift_search
       - community_report_grounding
     limitations:
-      - only_query_ready_documents
+      - only_graph_query_capable_documents
   auto:
-    corpus_scope: whole_then_enhanced_subset
-    status: future
-    rule: qmd_recall_first_then_optional_graph_upgrade
+    corpus_scope: whole_then_graph_enhanced_subset
+    cost: route_decision_dependent
+    entrypoint: qmd query --mode auto
+    rule: qmd_recall_first_then_typed_graph_upgrade
+    upgrade_requirements:
+      - graph_synthesis_intent
+      - graph_coverage_threshold_satisfied
+      - cost_policy_allows_upgrade
 
-implementation_stages:
-  - id: stage_1_config
-    goal: Add qmd config fields for providers, graphrag, and query routing.
-    outputs:
-      - src/collections.ts config type extension
-      - docs/config example
-      - CLI reads graph-vault/python/method defaults from config
-  - id: stage_2_qmd_contracts
-    goal: Add zod contracts for qmd native retrieval payloads.
-    outputs:
-      - src/contracts/qmd-query.ts
-      - catalog/data-bus.catalog.yaml qmd retrieval entries
-  - id: stage_3_unified_ingest
-    goal: GraphRAG book ingest also registers normalized markdown in qmd corpus.
-    outputs:
-      - document_identity_map artifact
-      - qmd collection/document registration
-  - id: stage_4_unified_answer
-    goal: Normalize qmd and GraphRAG query results under a shared answer shape.
-    outputs:
-      - src/contracts/unified-query.ts
-      - qmd query --json emits typed route/evidence metadata
-  - id: stage_5_auto_route
-    goal: Support qmd-first auto upgrade to GraphRAG for graph-ready candidates.
-    outputs:
-      - QueryRouteDecision records
-      - configurable default_route
+route_decision_primitives:
+  intent_class_values:
+    - lookup
+    - source_location
+    - chunk_retrieval
+    - single_document_summary
+    - graph_synthesis
+    - multi_hop_reasoning
+  graph_coverage_formula: graphReadyCandidateCount / totalCandidateCount
+  cost_class_values:
+    - low
+    - medium
+    - high
+  refusal_reason_values:
+    - no_graph_ready_candidate
+    - coverage_below_threshold
+    - intent_not_graph_synthesis
+    - cost_policy_exceeded
+    - capability_missing
+    - provider_unavailable
 
-open_questions:
-  - Whether qmd local SQLite should store graph capability metadata directly or
-    read it from graph_vault catalog at query time.
-  - Whether normalized book markdown should live only under graph_vault/input
-    or be copied into a dedicated qmd corpus directory.
-  - Whether GraphRAG `contextData` should be normalized eagerly into
-    EvidenceRef or lazily preserved as provider-specific detail.
+route_contracts:
+  graph_capability_error:
+    schema: src/contracts/unified-query.ts#GraphCapabilityErrorSchema
+    rule: >-
+      `--graphrag` against a non-graph-ready source returns a typed capability
+      error and does not silently fall back to plain qmd retrieval.
+  query_route_decision:
+    schema: src/contracts/unified-query.ts#QueryRouteDecisionSchema
+    required_fields:
+      - requestedRoute
+      - selectedRoute
+      - reasonCode
+      - intentClass
+      - costClass
+      - maxCostClass
+      - graphCoverage
+      - candidateDistribution
+      - selectedSourceIds
+      - selectedDocumentIds
+      - selectedBookIds
+      - candidateEvidenceIds
+      - graphCapabilityIds
+      - candidateDecisions
+      - refusalReasons
+  candidate_route_decision:
+    schema: src/contracts/unified-query.ts#CandidateRouteDecisionSchema
+    required_fields:
+      - candidateId
+      - sourceId
+      - documentId
+      - bookId
+      - isGraphReady
+      - retrievalScore
+      - rerankScore
+      - selected
+      - selectionReason
+      - refusalReason
+  typed_query_error:
+    schema: src/contracts/unified-query.ts#TypedQueryErrorSchema
+    required_fields:
+      - route
+      - stage
+      - provider
+      - capability
+      - code
+      - retryable
+      - redactedMessage
+  evidence_ref:
+    schema: src/contracts/unified-query.ts#EvidenceRefSchema
+    required_fields:
+      - sourceId
+      - documentId
+      - contentHash
+      - chunkId
+      - bookId
+      - graphTextUnitId
+      - artifactId
+      - locator
+
+state_and_recovery:
+  processing_unit: source_document
+  graph_business_unit: book_id
+  recovery_unit: book_id_plus_processing_stage
+  cache_unit: normalized_provider_request_hash
+  commit_rule: >-
+    A processing stage is committed only after required artifact manifests
+    pass schema validation and vault-relative paths resolve from graph_vault.
+  canonical_readiness:
+    source: validated_checkpoint_plus_validated_manifest
+    mirrors:
+      - graph_capability
+      - qmd_sqlite_capability_mirror
+  restore_from_vault:
+    inputs:
+      - graph_vault/input
+      - graph_vault/catalog/sources.yaml
+      - graph_vault/catalog/document-identity-map.yaml
+      - graph_vault/catalog/graph-capabilities.yaml
+      - validated_artifact_manifest
+    outputs:
+      - .qmd/index.sqlite
+      - qmd_capability_mirror
+  invalidation:
+    source_hash_change: invalidates_all_downstream_artifacts
+    normalized_content_hash_change: invalidates_chunks_and_graph_artifacts
+    prompt_fingerprint_change: invalidates_prompt_dependent_artifacts
+    model_fingerprint_change: invalidates_model_dependent_artifacts
+    provider_config_change: invalidates_provider_dependent_artifacts
+  kind_specific_validators:
+    - parquet_content_hash
+    - lancedb_required_tables
+    - lancedb_row_count
+    - graphrag_output_manifest
+    - vault_relative_path_resolution
+  batch_isolation:
+    rule: Single-book failure does not roll back committed documents or capabilities for other books.
+
+cost_accounting:
+  schema: src/contracts/provider.ts#ProviderCostAccountingSchema
+  required_fields:
+    - sourceId
+    - documentId
+    - bookId
+    - contentHash
+    - stage
+    - provider
+    - model
+    - requestCount
+    - tokenCount
+    - embeddingCount
+    - cacheHit
+    - runId
+    - artifactIds
+
+security_contract:
+  redaction_before_persistence: true
+  forbidden_persistent_values:
+    - secret_values
+    - provider_authorization_headers
+    - raw_provider_error_payloads
+    - host_absolute_paths_as_identity
+  covered_payloads:
+    - catalog
+    - artifact_manifest
+    - checkpoint
+    - query_log
+    - query_response
+    - stdout_tail
+    - stderr_tail
+    - error_summary
+
+design_decisions:
+  graph_capability_storage:
+    canonical: validated_checkpoint_plus_validated_manifest
+    catalog_role: Rebuildable capability projection for route decisions.
+    qmd_sqlite_role: Query-accelerating mirror rebuilt from the canonical catalog.
+  normalized_book_materialization:
+    canonical: graph_vault/input
+    qmd_collection_role: qmd registers graph_vault/input as a normal collection.
+  graphrag_context_normalization:
+    answer_contract: GraphRAG evidence is normalized into EvidenceRef.
+    provider_detail: Provider-specific contextData remains typed JSON detail.
+  vendor_boundary:
+    rule: >-
+      GraphRAG vendor code remains an upstream-aligned dependency. qmd_graphrag
+      routing, configuration, and Type DD contracts live outside vendor code.
+    controls:
+      - version_pin
+      - adapter_layer_only
+      - no_business_route_logic_in_vendor
+      - upgrade_smoke_test
+
+acceptance_requirements:
+  - Graph-enhanced sources are searchable by plain qmd query.
+  - GraphRAG query reads only sources with graph_query capability.
+  - Auto route emits QueryRouteDecision for every graph upgrade or refusal.
+  - Every cross-runtime request and response has a zod schema.
+  - EvidenceRef resolves to source, document, chunk, or graph text unit identity.
+  - graph_vault remains portable across host paths and devices.
+  - Provider secrets resolve only through environment variable names.
+  - CLI and MCP query entries share the same typed route service.
+  - Responses API uses stream mode and strict structured output schemas.
+  - Jina embedding and rerank payloads are both on the provider bus.
+  - Cost accounting resolves provider, model, run, and artifact lineage.
