@@ -1,58 +1,60 @@
-# QMD - Query Markup Documents
+# qmd_graphrag
 
-An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
+`qmd_graphrag` 是基于 [`tobi/qmd`](https://github.com/tobi/qmd) fork 的二次开发仓库，
+目标是在保留 `qmd` 本地混合检索能力的前提下，引入：
 
-QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
+- `GraphRAG` 的图构建与 `local / global / drift` 查询能力。
+- `DSPy` 的离线 query prompt 优化能力。
+- Type DD 驱动的数据总线（typed data bus），以 schema / model 作为上下游契约。
 
-![QMD Architecture](assets/qmd-architecture.png)
+当前仓库状态：
 
-You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
+- 已建立 GitHub fork：`meomeo-dev/qmd_graphrag`
+- 已完成本地基础仓库创建与 upstream/origin 关系整理
+- 已补充 Type DD 契约层：`src/contracts/`
+- 已补充 Python sidecar bridge：`python/qmd_graphrag/bridge.py`
+- 已补充 GraphRAG / DSPy integration scaffold：`src/integrations/`
+- 已补充 producer / consumer catalog：`catalog/data-bus.catalog.yaml`
+
+## 核心判断（Key Finding）
+
+`qmd` 本身没有 `GraphRAG` 的原生实现。它具备的是：
+
+- BM25 / vector / rerank 混合检索
+- `lex` / `vec` / `hyde` 结构化查询扩写
+- TypeScript SDK / CLI / MCP 能力
+
+因此本项目不采用“把 GraphRAG 逻辑散装塞进 qmd 内核”的方式，而是采用：
+
+- `qmd` 继续作为 TypeScript 主运行时（main runtime）
+- `GraphRAG` 与 `DSPy` 通过 Python bridge 接入
+- 所有跨边界数据必须先经过 schema 校验
+
+架构说明见：
+
+- [docs/architecture/graphrag-integration.md](docs/architecture/graphrag-integration.md)
+- [catalog/data-bus.catalog.yaml](catalog/data-bus.catalog.yaml)
 
 ## Quick Start
 
 ```sh
-# Install globally (Node or Bun)
-npm install -g @tobilu/qmd
-# or
-bun install -g @tobilu/qmd
-
-# Or run directly
-npx @tobilu/qmd ...
-bunx @tobilu/qmd ...
-
-# Create collections for your notes, docs, and meeting transcripts
-qmd collection add ~/notes --name notes
-qmd collection add ~/Documents/meetings --name meetings
-qmd collection add ~/work/docs --name docs
-
-# Add context to help with search results, each piece of context will be returned when matching sub documents are returned. This works as a tree. This is the key feature of QMD as it allows LLMs to make much better contextual choices when selecting documents. Don't sleep on it!
-qmd context add qmd://notes "Personal notes and ideas"
-qmd context add qmd://meetings "Meeting transcripts and notes"
-qmd context add qmd://docs "Work documentation"
-
-# Generate embeddings for semantic search
-qmd embed
-
-# Search across everything
-qmd search "project timeline"           # Fast keyword search
-qmd vsearch "how to deploy"             # Semantic search
-qmd query "quarterly planning process"  # Hybrid + reranking (best quality)
-
-# Get a specific document
-qmd get "meetings/2024-01-15.md"
-
-# Get a document by docid (shown in search results)
-qmd get "#abc123"
-
-# Get multiple documents by glob pattern
-qmd multi-get "journals/2025-05*.md"
-
-# Search within a specific collection
-qmd search "API" -c notes
-
-# Export all matches for an agent
-qmd search "API" --all --files --min-score 0.3
+npm install
+npm run test:types
+node ./node_modules/vitest/vitest.mjs run test/integrations/contracts.test.ts
 ```
+
+目前新增部分是“可验证的 typed scaffold”，还不是完整可生产运行的
+GraphRAG product integration。下一阶段工作会集中在：
+
+1. 增加 CLI / MCP 的 GraphRAG 命令入口。
+2. 建立 GraphRAG root/config/bootstrap 脚手架。
+3. 将 DSPy 产出的优化 prompt 接入 `qmd` 的 query expansion 路径。
+4. 建立端到端评测（evaluation）与回归测试。
+
+![QMD Architecture](assets/qmd-architecture.png)
+
+你仍然可以参考原始 `qmd` 的大部分使用方式与 SDK 设计，以下内容保留自上游，
+后续会逐步按 `qmd_graphrag` 的新边界进行重写。
 
 ### Using with AI Agents
 

@@ -1,0 +1,110 @@
+version: 1
+
+types:
+  - name: query_expansion_item
+    schema: src/contracts/common.ts#QueryExpansionItemSchema
+    producers:
+      - src/llm.ts#expandQuery
+      - src/integrations/dspy.ts#optimizeQueryPrompt
+    consumers:
+      - src/store.ts#structuredSearch
+      - src/store.ts#hybridQuery
+    storage: transient
+
+  - name: graphrag_query_request
+    schema: src/contracts/graphrag.ts#GraphRagQueryRequestSchema
+    producers:
+      - src/integrations/graphrag.ts#runGraphRagQuery
+      - src/runtime.ts#createQmdGraphRagRuntime
+    consumers:
+      - python/qmd_graphrag/bridge.py#_run_graphrag_query
+    storage: transient
+
+  - name: graphrag_query_response
+    schema: src/contracts/graphrag.ts#GraphRagQueryResponseSchema
+    producers:
+      - python/qmd_graphrag/bridge.py#_run_graphrag_query
+    consumers:
+      - src/integrations/graphrag.ts#runGraphRagQuery
+      - future.cli.graphrag.query
+      - future.mcp.graphrag.query
+    storage: transient
+
+  - name: graphrag_index_request
+    schema: src/contracts/graphrag.ts#GraphRagIndexRequestSchema
+    producers:
+      - src/integrations/graphrag.ts#runGraphRagIndex
+      - src/runtime.ts#createQmdGraphRagRuntime
+    consumers:
+      - python/qmd_graphrag/bridge.py#_run_graphrag_index
+    storage: transient
+
+  - name: graphrag_index_response
+    schema: src/contracts/graphrag.ts#GraphRagIndexResponseSchema
+    producers:
+      - python/qmd_graphrag/bridge.py#_run_graphrag_index
+    consumers:
+      - src/integrations/graphrag.ts#runGraphRagIndex
+      - future.cli.graphrag.index
+    storage: transient
+
+  - name: dspy_query_prompt_optimization_request
+    schema: src/contracts/dspy.ts#DspyQueryPromptOptimizationRequestSchema
+    producers:
+      - src/integrations/dspy.ts#optimizeQueryPrompt
+      - src/runtime.ts#createQmdGraphRagRuntime
+    consumers:
+      - python/qmd_graphrag/bridge.py#_run_dspy_optimize_query_prompt
+    storage: transient
+
+  - name: optimized_query_prompt_artifact
+    schema: src/contracts/dspy.ts#DspyQueryPromptOptimizationResponseSchema
+    producers:
+      - python/qmd_graphrag/bridge.py#_run_dspy_optimize_query_prompt
+    consumers:
+      - future.prompt_registry.query_expansion
+      - future.eval.query_expansion
+    storage: file
+
+buses:
+  - name: online_retrieval_bus
+    description: Typed request and response bus for GraphRAG query execution.
+    payloads:
+      - graphrag_query_request
+      - graphrag_query_response
+
+  - name: offline_prompt_optimization_bus
+    description: Typed request and artifact bus for DSPy-based query prompt optimization.
+    payloads:
+      - dspy_query_prompt_optimization_request
+      - optimized_query_prompt_artifact
+
+dependencies:
+  - name: qmd
+    purpose: local lexical, vector, and rerank retrieval backbone
+    rationale: existing TypeScript retrieval core and CLI/MCP surface
+    alternatives:
+      - bespoke TypeScript retrieval stack
+    exit_conditions:
+      - if retrieval core is fully replaced by a new typed engine
+
+  - name: GraphRAG
+    purpose: graph extraction, community reports, local/global/drift query engine
+    rationale: qmd does not contain graph-native indexing or graph query orchestration
+    alternatives:
+      - custom knowledge graph pipeline
+      - another graph retrieval framework
+    boundary: python sidecar bridge
+    exit_conditions:
+      - if equivalent graph indexing and query quality exists natively in TypeScript
+
+  - name: DSPy
+    purpose: prompt compilation and query expansion optimization
+    rationale: optimize prompts offline instead of embedding prompt search in online runtime
+    alternatives:
+      - manual prompt tuning
+      - custom evolutionary prompt optimizer
+    boundary: offline optimizer bridge
+    exit_conditions:
+      - if query expansion prompt optimization is replaced by another typed optimizer
+

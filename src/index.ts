@@ -80,6 +80,27 @@ import {
   type NamedCollection,
   type ContextMap,
 } from "./collections.js";
+import { createQmdGraphRagRuntime, type QmdGraphRagRuntime } from "./runtime.js";
+import type {
+  GraphRagIndexMethod,
+  GraphRagIndexRequest,
+  GraphRagIndexResponse,
+  GraphRagQueryRequest,
+  GraphRagQueryResponse,
+  GraphRagSearchMethod,
+} from "./contracts/graphrag.js";
+import type {
+  DspyAutoMode,
+  DspyGeneratedExpansionRecord,
+  DspyOptimizer,
+  DspyQueryPromptOptimizationRequest,
+  DspyQueryPromptOptimizationResponse,
+} from "./contracts/dspy.js";
+import type {
+  BridgeEnvironment,
+  QueryExpansionItem,
+  QueryKind,
+} from "./contracts/common.js";
 
 // Re-export types for SDK consumers
 export type {
@@ -103,6 +124,20 @@ export type {
   CollectionConfig,
   NamedCollection,
   ContextMap,
+  GraphRagIndexMethod,
+  GraphRagIndexRequest,
+  GraphRagIndexResponse,
+  GraphRagQueryRequest,
+  GraphRagQueryResponse,
+  GraphRagSearchMethod,
+  DspyAutoMode,
+  DspyGeneratedExpansionRecord,
+  DspyOptimizer,
+  DspyQueryPromptOptimizationRequest,
+  DspyQueryPromptOptimizationResponse,
+  BridgeEnvironment,
+  QueryExpansionItem,
+  QueryKind,
 };
 
 // Re-export the internal Store type for advanced consumers
@@ -111,6 +146,36 @@ export type { InternalStore };
 // Re-export utility functions and types used by frontends
 export { extractSnippet, addLineNumbers, DEFAULT_MULTI_GET_MAX_BYTES };
 export type { ChunkStrategy } from "./store.js";
+export { createQmdGraphRagRuntime };
+export type { QmdGraphRagRuntime };
+export {
+  SchemaVersion,
+  JsonPrimitiveSchema,
+  JsonValueSchema,
+  QueryKindSchema,
+  QueryExpansionItemSchema,
+  BridgeEnvironmentSchema,
+} from "./contracts/common.js";
+export {
+  GraphRagSearchMethodSchema,
+  GraphRagIndexMethodSchema,
+  GraphRagQueryRequestSchema,
+  GraphRagWorkflowResultSchema,
+  GraphRagIndexRequestSchema,
+  GraphRagQueryResponseSchema,
+  GraphRagIndexResponseSchema,
+  GraphRagQueryEnvelopeSchema,
+  GraphRagIndexEnvelopeSchema,
+} from "./contracts/graphrag.js";
+export {
+  DspyOptimizerSchema,
+  DspyAutoModeSchema,
+  DspyQueryPromptOptimizationRequestSchema,
+  DspyGeneratedExpansionRecordSchema,
+  DspyQueryPromptOptimizationResponseSchema,
+  DspyOptimizationEnvelopeSchema,
+} from "./contracts/dspy.js";
+export { DataBusEnvelopeSchema } from "./contracts/bus.js";
 
 // Re-export getDefaultDbPath for CLI/MCP that need the default database location
 export { getDefaultDbPath } from "./store.js";

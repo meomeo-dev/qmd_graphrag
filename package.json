@@ -1,7 +1,7 @@
 {
-  "name": "@tobilu/qmd",
+  "name": "qmd_graphrag",
   "version": "2.5.1",
-  "description": "Query Markup Documents - On-device hybrid search for markdown files with BM25, vector search, and LLM reranking",
+  "description": "A typed QMD fork with GraphRAG and DSPy integration scaffolding",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -12,11 +12,15 @@
     }
   },
   "bin": {
+    "qmd-graphrag": "bin/qmd",
     "qmd": "bin/qmd"
   },
   "files": [
     "bin/",
+    "catalog/",
     "dist/",
+    "docs/architecture/",
+    "python/",
     "skills/",
     "scripts/build.mjs",
     "scripts/check-package-grammars.mjs",
@@ -49,11 +53,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tobi/qmd.git"
+    "url": "git+https://github.com/meomeo-dev/qmd_graphrag.git"
   },
-  "homepage": "https://github.com/tobi/qmd#readme",
+  "homepage": "https://github.com/meomeo-dev/qmd_graphrag#readme",
   "bugs": {
-    "url": "https://github.com/tobi/qmd/issues"
+    "url": "https://github.com/meomeo-dev/qmd_graphrag/issues"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
