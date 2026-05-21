@@ -1,5 +1,13 @@
 version: 1
 
+notes:
+  - >-
+    Current catalog is a transition-state bus. qmd native retrieval and
+    GraphRAG query are typed separately today. The target whole-corpus qmd plus
+    enhanced-subset GraphRAG design is documented in
+    docs/architecture/unified-retrieval-plane.md and
+    docs/architecture/unified-retrieval-plane.type-dd.yaml.
+
 types:
   - name: query_expansion_item
     schema: src/contracts/common.ts#QueryExpansionItemSchema

@@ -1,0 +1,191 @@
+date: 2026-05-21
+title: 统一检索面 Type DD 规划
+status: proposed
+scope: qmd_graphrag
+
+principles:
+  - qmd_corpus_is_whole_set
+  - graphrag_corpus_is_enhanced_subset
+  - graph_ingest_must_register_qmd_corpus
+  - no_secret_in_config_or_vault_state
+  - no_untyped_cross_bus_payload
+
+identity:
+  source_id:
+    description: Stable identity of the original source payload.
+    producer: future.ingest.source_registry
+    fields:
+      - sourceHash
+      - sourceName
+      - sourceRelativePath
+  document_id:
+    description: qmd document identity inside the whole-corpus index.
+    producer: src/store.ts#insertDocument
+    fields:
+      - collection
+      - path
+      - contentHash
+  book_id:
+    description: Book-level GraphRAG processing identity.
+    producer: src/job-state/fingerprint.ts#buildBookIdFromSourceHash
+    fields:
+      - sourceSlug
+      - sourceHashPrefix
+  chunk_id:
+    description: qmd chunk identity for retrieval evidence.
+    producer: future.contracts.corpus#CorpusChunkSchema
+    fields:
+      - contentHash
+      - chunkStrategy
+      - seq
+      - pos
+  graph_text_unit_id:
+    description: GraphRAG text unit identity.
+    producer: GraphRAG output#text_units.parquet
+    fields:
+      - graphRagTextUnitId
+
+buses:
+  corpus_bus:
+    role: Whole-corpus ingestion and document identity.
+    types:
+      - name: source_document
+        schema: future.src/contracts/corpus.ts#SourceDocumentSchema
+        storage: file_or_sqlite
+      - name: corpus_document
+        schema: future.src/contracts/corpus.ts#CorpusDocumentSchema
+        storage: sqlite
+      - name: corpus_chunk
+        schema: future.src/contracts/corpus.ts#CorpusChunkSchema
+        storage: sqlite
+      - name: document_identity_map
+        schema: future.src/contracts/corpus.ts#DocumentIdentityMapSchema
+        storage: file_or_sqlite
+
+  qmd_retrieval_bus:
+    role: Fast whole-corpus lexical, vector, expansion, and rerank retrieval.
+    types:
+      - name: qmd_query_request
+        schema: future.src/contracts/qmd-query.ts#QmdQueryRequestSchema
+        storage: transient
+      - name: qmd_retrieval_candidate
+        schema: future.src/contracts/qmd-query.ts#QmdRetrievalCandidateSchema
+        storage: transient
+      - name: qmd_search_result
+        schema: future.src/contracts/qmd-query.ts#QmdSearchResultSchema
+        storage: transient
+
+  graph_enhancement_bus:
+    role: High-cost graph enrichment for selected corpus subset.
+    types:
+      - name: graph_enhancement_request
+        schema: future.src/contracts/graph-enhancement.ts#GraphEnhancementRequestSchema
+        storage: transient
+      - name: graph_enhancement_state
+        schema: future.src/contracts/graph-enhancement.ts#GraphEnhancementStateSchema
+        storage: file
+      - name: graph_capability
+        schema: future.src/contracts/graph-enhancement.ts#GraphCapabilitySchema
+        storage: file_or_sqlite
+      - name: graphrag_query_request
+        schema: src/contracts/graphrag.ts#GraphRagQueryRequestSchema
+        storage: transient
+      - name: graphrag_query_response
+        schema: src/contracts/graphrag.ts#GraphRagQueryResponseSchema
+        storage: transient
+
+  unified_answer_bus:
+    role: User-facing typed query route and answer surface.
+    types:
+      - name: unified_query_request
+        schema: future.src/contracts/unified-query.ts#UnifiedQueryRequestSchema
+        storage: transient
+      - name: query_route_decision
+        schema: future.src/contracts/unified-query.ts#QueryRouteDecisionSchema
+        storage: transient
+      - name: evidence_ref
+        schema: future.src/contracts/unified-query.ts#EvidenceRefSchema
+        storage: transient
+      - name: unified_answer
+        schema: future.src/contracts/unified-query.ts#UnifiedAnswerSchema
+        storage: transient_or_cache
+
+config_projection:
+  qmd_project_config:
+    path: .qmd/index.yml
+    owns:
+      - collections
+      - models
+      - providers
+      - graphrag
+      - query
+    secret_policy: env_name_only
+  graphrag_runtime_config:
+    path: graph_vault/settings.yaml
+    owns:
+      - GraphRAG runtime provider projection
+      - GraphRAG storage projection
+    source_of_truth: qmd_project_config_after_stage_1
+    secret_policy: env_placeholder_only
+
+query_routes:
+  qmd:
+    corpus_scope: whole
+    cost: low_to_medium
+    strengths:
+      - lexical_search
+      - vector_search
+      - rerank
+      - source_location
+    limitations:
+      - no_native_graph_reasoning
+  graphrag:
+    corpus_scope: enhanced_subset
+    cost: medium_to_high
+    strengths:
+      - graph_local_search
+      - graph_global_search
+      - drift_search
+      - community_report_grounding
+    limitations:
+      - only_query_ready_documents
+  auto:
+    corpus_scope: whole_then_enhanced_subset
+    status: future
+    rule: qmd_recall_first_then_optional_graph_upgrade
+
+implementation_stages:
+  - id: stage_1_config
+    goal: Add qmd config fields for providers, graphrag, and query routing.
+    outputs:
+      - src/collections.ts config type extension
+      - docs/config example
+      - CLI reads graph-vault/python/method defaults from config
+  - id: stage_2_qmd_contracts
+    goal: Add zod contracts for qmd native retrieval payloads.
+    outputs:
+      - src/contracts/qmd-query.ts
+      - catalog/data-bus.catalog.yaml qmd retrieval entries
+  - id: stage_3_unified_ingest
+    goal: GraphRAG book ingest also registers normalized markdown in qmd corpus.
+    outputs:
+      - document_identity_map artifact
+      - qmd collection/document registration
+  - id: stage_4_unified_answer
+    goal: Normalize qmd and GraphRAG query results under a shared answer shape.
+    outputs:
+      - src/contracts/unified-query.ts
+      - qmd query --json emits typed route/evidence metadata
+  - id: stage_5_auto_route
+    goal: Support qmd-first auto upgrade to GraphRAG for graph-ready candidates.
+    outputs:
+      - QueryRouteDecision records
+      - configurable default_route
+
+open_questions:
+  - Whether qmd local SQLite should store graph capability metadata directly or
+    read it from graph_vault catalog at query time.
+  - Whether normalized book markdown should live only under graph_vault/input
+    or be copied into a dedicated qmd corpus directory.
+  - Whether GraphRAG `contextData` should be normalized eagerly into
+    EvidenceRef or lazily preserved as provider-specific detail.
