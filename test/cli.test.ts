@@ -238,6 +238,7 @@ describe("CLI Help", () => {
     expect(stdout).toContain("Usage:");
     expect(stdout).toContain("qmd collection add");
     expect(stdout).toContain("qmd search");
+    expect(stdout).toContain("qmd query --graphrag");
     expect(stdout).toContain("--no-gpu");
     expect(stdout).toContain("qmd skill show/install");
   });

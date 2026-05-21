@@ -14,6 +14,7 @@ types:
   - name: graphrag_query_request
     schema: src/contracts/graphrag.ts#GraphRagQueryRequestSchema
     producers:
+      - src/cli/qmd.ts#graphRagQuerySearch
       - src/integrations/graphrag.ts#runGraphRagQuery
       - src/runtime.ts#createQmdGraphRagRuntime
     consumers:
@@ -25,8 +26,8 @@ types:
     producers:
       - python/qmd_graphrag/bridge.py#_run_graphrag_query
     consumers:
+      - src/cli/qmd.ts#graphRagQuerySearch
       - src/integrations/graphrag.ts#runGraphRagQuery
-      - future.cli.graphrag.query
       - future.mcp.graphrag.query
     storage: transient
 

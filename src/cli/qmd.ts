@@ -110,6 +110,8 @@ import {
   type CollectionConfig,
   type ModelsConfig,
 } from "../collections.js";
+import { createQmdGraphRagRuntime } from "../runtime.js";
+import { GraphRagSearchMethodSchema } from "../contracts/graphrag.js";
 
 // NOTE: enableProductionMode() is intentionally NOT called at module scope here.
 // Importing this module for its exports (e.g. buildEditorUri, termLink from
@@ -2683,6 +2685,57 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
 }
 
+async function graphRagQuerySearch(
+  query: string,
+  opts: OutputOptions,
+  values: Record<string, unknown>,
+): Promise<void> {
+  const graphVault = pathResolve(
+    getPwd(),
+    String(values["graph-vault"] || "graph_vault"),
+  );
+  const method = GraphRagSearchMethodSchema.parse(
+    String(values["query-method"] || "local"),
+  );
+  const responseType = String(values["response-type"] || "multiple paragraphs");
+  const communityLevel = values["community-level"] == null
+    ? undefined
+    : parseInt(String(values["community-level"]), 10);
+  if (
+    communityLevel !== undefined &&
+    (!Number.isInteger(communityLevel) || communityLevel <= 0)
+  ) {
+    throw new Error("--community-level must be a positive integer");
+  }
+
+  if (!existsSync(graphVault)) {
+    throw new Error(`GraphRAG vault not found: ${graphVault}`);
+  }
+
+  const runtime = createQmdGraphRagRuntime();
+  const response = await runtime.graphQuery({
+    rootDir: graphVault,
+    method,
+    query,
+    responseType,
+    communityLevel,
+    verbose: false,
+    environment: {
+      pythonBin: values["python-bin"]
+        ? pathResolve(getPwd(), String(values["python-bin"]))
+        : undefined,
+      workingDirectory: getPwd(),
+    },
+  });
+
+  if (opts.format === "json") {
+    console.log(JSON.stringify(response, null, 2));
+    return;
+  }
+
+  console.log(response.responseText);
+}
+
 // Parse CLI arguments using util.parseArgs
 function parseCLI() {
   const { values, positionals } = parseArgs({
@@ -2731,6 +2784,12 @@ function parseCLI() {
       "candidate-limit": { type: "string", short: "C" },
       "no-rerank": { type: "boolean", default: false },
       "no-gpu": { type: "boolean", default: false },
+      graphrag: { type: "boolean", default: false },
+      "graph-vault": { type: "string" },
+      "query-method": { type: "string" },
+      "response-type": { type: "string" },
+      "community-level": { type: "string" },
+      "python-bin": { type: "string" },
       intent: { type: "string" },
       // Chunking options
       "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
@@ -3219,6 +3278,7 @@ function showHelp(): void {
   console.log("");
   console.log("Primary commands:");
   console.log("  qmd query <query>             - Hybrid search with auto expansion + reranking (recommended)");
+  console.log("  qmd query --graphrag <query>  - GraphRAG answer from graph_vault");
   console.log("  qmd query 'lex:..\\nvec:...'   - Structured query document (you provide lex/vec/hyde lines)");
   console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM)");
   console.log("  qmd vsearch <query>           - Vector similarity only");
@@ -3304,6 +3364,12 @@ function showHelp(): void {
   console.log("");
   console.log("Embed/query options:");
   console.log("  --chunk-strategy <auto|regex> - Chunking mode (default: regex; auto uses AST for code files)");
+  console.log("  --graphrag                    - Use GraphRAG query over graph_vault instead of QMD local index");
+  console.log("  --graph-vault <path>          - GraphRAG vault root (default ./graph_vault)");
+  console.log("  --query-method <method>       - GraphRAG method: local, global, drift, or basic");
+  console.log("  --response-type <text>        - GraphRAG response type (default multiple paragraphs)");
+  console.log("  --community-level <n>         - GraphRAG community level override");
+  console.log("  --python-bin <path>           - Python executable for GraphRAG bridge");
   console.log("");
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");
@@ -4281,7 +4347,11 @@ if (isMain) {
         console.error("Usage: qmd query [options] <query>");
         process.exit(1);
       }
-      await querySearch(cli.query, cli.opts);
+      if (cli.values.graphrag) {
+        await graphRagQuerySearch(cli.query, cli.opts, cli.values);
+      } else {
+        await querySearch(cli.query, cli.opts);
+      }
       break;
 
     case "bench": {
