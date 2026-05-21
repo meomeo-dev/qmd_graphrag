@@ -1,0 +1,358 @@
+date: 2026-05-21
+title: 原始需求实现审计基准
+status: active
+scope: qmd_graphrag
+
+purpose: >-
+  将原始需求拆解为可复核、可复审的检查标准，用于确认当前实现是否满足
+  `qmd_graphrag` 二次开发目标、Type DD 约束、GraphRAG 集成、DSPy 查询优化、
+  Jina 向量能力、Responses API 流式调用、成本控制、恢复语义和
+  `graph_vault` 可迁移性。
+
+audit_protocol:
+  evidence_rule: >-
+    每条标准必须给出本地文件、测试、运行命令或运行产物作为证据。不得以
+    主观判断替代证据。
+  status_values:
+    - pass
+    - fail
+    - partial
+    - not_applicable
+  remediation_rule: >-
+    任一标准为 `fail` 或影响可运行性的 `partial` 时，必须先提出修正决策，
+    实施后重新审计受影响标准，直到通过或记录明确的延期决策。
+  confidentiality_rule: >-
+    审计不得读取或输出 `.env` 密钥值。不得把源 EPUB 正文、缓存正文或
+    专有内容复制到外部服务。证据应引用路径、schema、命令和摘要。
+
+criteria:
+  - id: C01
+    group: repository_foundation
+    requirement: 项目必须以 `qmd` 为基础仓库进行二次开发。
+    pass_standard: >-
+      git 历史或代码结构能够证明当前仓库保留 `qmd` 基础能力，并在此基础上
+      增加 `qmd_graphrag` 能力。
+    evidence_targets:
+      - git log
+      - package metadata
+      - src/index.ts
+
+  - id: C02
+    group: repository_foundation
+    requirement: 项目名称和开发边界应体现 `qmd_graphrag`。
+    pass_standard: >-
+      包名、桥接模块、文档或配置中存在明确的 `qmd_graphrag` 命名边界。
+    evidence_targets:
+      - package.json
+      - python/qmd_graphrag/
+      - docs/architecture/
+
+  - id: C03
+    group: graphrag_integration
+    requirement: 必须检查 `qmd` 原生是否存在 GraphRAG 实现。
+    pass_standard: >-
+      架构文档记录了检查结论；若无原生实现，应说明采用集成而非重复造轮子。
+    evidence_targets:
+      - docs/architecture/graphrag-integration.md
+      - docs/records/graphrag/
+
+  - id: C04
+    group: graphrag_integration
+    requirement: 若 `qmd` 无 GraphRAG，应能继承或接入 Microsoft GraphRAG。
+    pass_standard: >-
+      仓库内存在可维护的 GraphRAG 依赖入口，且 bridge 默认能解析该依赖。
+    evidence_targets:
+      - .gitmodules
+      - vendor/graphrag
+      - python/qmd_graphrag/bridge.py
+
+  - id: C05
+    group: upstream_maintainability
+    requirement: GraphRAG 二开应降低与上游更新的冲突。
+    pass_standard: >-
+      本地能力优先放在 adapter、bridge 或 provider 层，不直接大面积修改
+      上游 GraphRAG 源码。
+    evidence_targets:
+      - vendor/graphrag git status
+      - python/qmd_graphrag/
+      - docs/records/graphrag/
+
+  - id: C06
+    group: typed_contracts
+    requirement: 全过程必须基于 Type DD 驱动。
+    pass_standard: >-
+      关键请求、响应、状态和 artifact 均有 schema 或 model，且导出给消费方。
+    evidence_targets:
+      - src/contracts/
+      - src/index.ts
+      - test/integrations/contracts.test.ts
+
+  - id: C07
+    group: typed_contracts
+    requirement: 数据总线必须能定位生产者和消费者。
+    pass_standard: >-
+      catalog 中登记关键数据类型、schema、producer、consumer 和存储边界。
+    evidence_targets:
+      - catalog/data-bus.catalog.yaml
+
+  - id: C08
+    group: typed_contracts
+    requirement: 禁止自由拼接跨模块输入输出。
+    pass_standard: >-
+      TypeScript 到 Python bridge 的请求和响应经过 zod schema 校验，Python
+      返回值结构稳定。
+    evidence_targets:
+      - src/integrations/python-bridge.ts
+      - src/contracts/graphrag.ts
+      - python/qmd_graphrag/bridge.py
+
+  - id: C09
+    group: dspy_query_optimization
+    requirement: 查询提示词指令优化依赖 DSPy。
+    pass_standard: >-
+      存在 DSPy 相关 contract、catalog 或 bridge 规划，能表达 query prompt
+      optimization 请求和响应。
+    evidence_targets:
+      - src/contracts/dspy.ts
+      - catalog/data-bus.catalog.yaml
+      - docs/architecture/graphrag-integration.md
+
+  - id: C10
+    group: dspy_query_optimization
+    requirement: DSPy 优化结果必须进入 typed bus。
+    pass_standard: >-
+      优化请求、生成记录、响应 artifact 均有 schema，并在 catalog 中登记。
+    evidence_targets:
+      - src/contracts/dspy.ts
+      - catalog/data-bus.catalog.yaml
+
+  - id: C11
+    group: jina_embedding
+    requirement: 使用 Jina 作为 embedding API。
+    pass_standard: >-
+      GraphRAG 配置模板或实际配置支持通过 Jina 生成 embedding，并使用
+      `JINA_API_KEY` 环境变量。
+    evidence_targets:
+      - configs/graphrag/
+      - graph_vault/settings.yaml
+      - catalog/data-bus.catalog.yaml
+
+  - id: C12
+    group: jina_rerank
+    requirement: 使用 Jina 作为 rerank API。
+    pass_standard: >-
+      qmd 或 GraphRAG 查询链路中存在 Jina rerank 的配置、adapter、contract
+      或明确未完成记录。
+    evidence_targets:
+      - src/
+      - configs/
+      - docs/records/
+
+  - id: C13
+    group: vector_store
+    requirement: 若用向量库，应能切换或使用 LanceDB。
+    pass_standard: >-
+      GraphRAG 配置和产物使用 LanceDB，且 embed stage 校验 LanceDB 完整表。
+    evidence_targets:
+      - configs/graphrag/settings.lancedb-jina.template.yaml
+      - graph_vault/output/lancedb
+      - src/job-state/graphrag-book.ts
+      - test/graphrag-book-state.test.ts
+
+  - id: C14
+    group: responses_api
+    requirement: completion 层应使用 OpenAI Responses API，而非 chat completions。
+    pass_standard: >-
+      自有 provider 调用 `responses` 接口，GraphRAG bridge 注册
+      `openai_responses` completion type。
+    evidence_targets:
+      - python/qmd_graphrag/graphrag_responses_completion.py
+      - python/qmd_graphrag/bridge.py
+      - graph_vault/settings.yaml
+
+  - id: C15
+    group: responses_api
+    requirement: Responses API endpoint 直接使用 `/responses`，不强制追加 `/v1`。
+    pass_standard: >-
+      provider 不把 base URL 固定拼接为 `/v1/responses`；endpoint 由 OpenAI
+      client 和 `OPENAI_BASE_URL` 组合处理。
+    evidence_targets:
+      - python/qmd_graphrag/graphrag_responses_completion.py
+      - docs/records/graphrag/2026-05-21-responses-api-streaming-transport.yaml
+
+  - id: C16
+    group: responses_api
+    requirement: Responses API 必须支持 stream 模式。
+    pass_standard: >-
+      provider 实现同步和异步 stream 收集/分块逻辑，并有测试覆盖。
+    evidence_targets:
+      - python/qmd_graphrag/graphrag_responses_completion.py
+      - test/python/test_graphrag_responses_completion.py
+
+  - id: C17
+    group: structured_output
+    requirement: 结构化输出必须满足 Responses API JSON schema 要求。
+    pass_standard: >-
+      provider 生成 strict json_schema，并为所有 object schema 补
+      `additionalProperties: false`。
+    evidence_targets:
+      - python/qmd_graphrag/graphrag_responses_completion.py
+      - test/python/test_graphrag_responses_completion.py
+
+  - id: C18
+    group: smoke_execution
+    requirement: 从提供的 EPUB 批次中至少分析一本作为冒烟。
+    pass_standard: >-
+      `graph_vault` 中存在单书 GraphRAG 输出、LanceDB 索引和 query_ready
+      状态；恢复脚本报告 ready。
+    evidence_targets:
+      - graph_vault/books/
+      - graph_vault/output/
+      - scripts/graphrag/resume-book-workspace.mjs
+
+  - id: C19
+    group: smoke_execution
+    requirement: 持久化仓库路径必须为 `graph_vault`。
+    pass_standard: >-
+      配置、状态、输出、cache、reports、sources 均以 `graph_vault` 为根。
+    evidence_targets:
+      - graph_vault/
+      - docs/design/job-state/book-job-state.md
+
+  - id: C20
+    group: smoke_execution
+    requirement: 冒烟应使用本地网关、`gpt-5.4` 和 medium reasoning。
+    pass_standard: >-
+      配置或运行记录能证明 completion model 使用 `gpt-5.4`，call args 包含
+      medium reasoning，密钥来自环境变量。
+    evidence_targets:
+      - graph_vault/settings.yaml
+      - configs/graphrag/
+      - docs/records/
+
+  - id: C21
+    group: cost_control
+    requirement: 处理不能默认每次从头重跑全部书。
+    pass_standard: >-
+      状态层定义最小单位，支持书级和 stage 级恢复，而不是 inbox 级重跑。
+    evidence_targets:
+      - docs/design/job-state/book-job-state.md
+      - src/contracts/book-job.ts
+      - src/job-state/repository.ts
+
+  - id: C22
+    group: cost_control
+    requirement: 最小业务单位应为书，恢复单位应更细化。
+    pass_standard: >-
+      BookJob 和 StageCheckpoint 分离，stage 顺序清晰，恢复计划能定位下一步。
+    evidence_targets:
+      - src/contracts/book-job.ts
+      - src/job-state/repository.ts
+      - test/book-job-state.test.ts
+
+  - id: C23
+    group: cost_control
+    requirement: 请求级成本应能通过 cache 或 fingerprint 去重。
+    pass_standard: >-
+      设计和实现至少记录 source、normalized content、config、prompt、model 或
+      stage fingerprint；GraphRAG cache 保留在 vault。
+    evidence_targets:
+      - docs/design/job-state/book-job-state.md
+      - src/job-state/fingerprint.ts
+      - src/job-state/graphrag-book.ts
+      - graph_vault/cache/
+
+  - id: C24
+    group: state_consistency
+    requirement: 状态管理必须覆盖成功、失败、中断和恢复。
+    pass_standard: >-
+      repository 支持 start、complete、fail stage，checkpoint 记录 attempt、
+      runId、errorSummary 和 artifactIds。
+    evidence_targets:
+      - src/job-state/repository.ts
+      - test/book-job-state.test.ts
+
+  - id: C25
+    group: state_consistency
+    requirement: 一致性边界应为 `bookId + stage`。
+    pass_standard: >-
+      文档和实现均按 bookId/stage 写入 checkpoint、artifact 和 run record。
+    evidence_targets:
+      - docs/design/job-state/book-job-state.md
+      - src/job-state/repository.ts
+
+  - id: C26
+    group: state_consistency
+    requirement: artifact 必须可追踪生产者和消费者。
+    pass_standard: >-
+      artifact manifest 包含 kind、path、contentHash、producerRunId，catalog
+      登记消费者。
+    evidence_targets:
+      - src/contracts/book-job.ts
+      - src/job-state/repository.ts
+      - catalog/data-bus.catalog.yaml
+
+  - id: C27
+    group: resume_recovery
+    requirement: 恢复计划必须检查 artifact 可达性，不只看 checkpoint。
+    pass_standard: >-
+      若 checkpoint 成功但 artifact 缺失，resume plan 返回 artifact_missing。
+    evidence_targets:
+      - src/job-state/repository.ts
+      - test/book-job-state.test.ts
+
+  - id: C28
+    group: graph_vault_portability
+    requirement: `graph_vault` 必须可从 A 设备拷贝到 B 设备后继续使用。
+    pass_standard: >-
+      状态、artifact、source、normalized input 和 LanceDB 路径为
+      vault-relative；运行时环境和 `.env` 不进入 vault 状态。
+    evidence_targets:
+      - docs/records/architecture/2026-05-21-portable-graph-vault.yaml
+      - graph_vault/books/
+      - graph_vault/catalog/
+      - graph_vault/sources/
+
+  - id: C29
+    group: graph_vault_portability
+    requirement: `bookId` 不能依赖宿主机绝对路径。
+    pass_standard: >-
+      `bookId` 由源文件名 slug 和 source hash 派生；带点号作者名不会被截断。
+    evidence_targets:
+      - src/job-state/fingerprint.ts
+      - src/job-state/graphrag-book.ts
+      - test/book-job-state.test.ts
+
+  - id: C30
+    group: graph_vault_portability
+    requirement: `source_epub` artifact 必须在 `graph_vault` 内部可达。
+    pass_standard: >-
+      ingest 阶段把 EPUB 复制到 `sources/<book_id>/source.epub`，manifest 中
+      只记录 vault-relative path，恢复脚本可不传原始 inbox 路径。
+    evidence_targets:
+      - src/job-state/graphrag-book.ts
+      - scripts/graphrag/resume-book-workspace.mjs
+      - graph_vault/sources/
+      - test/graphrag-book-state.test.ts
+
+agent_assignment:
+  agent_a:
+    criteria: [C01, C02, C03, C04, C05, C06, C07, C08, C09, C10]
+  agent_b:
+    criteria: [C11, C12, C13, C14, C15, C16, C17, C18, C19, C20]
+  agent_c:
+    criteria: [C21, C22, C23, C24, C25, C26, C27, C28, C29, C30]
+
+required_report_format:
+  per_criterion:
+    - id
+    - status
+    - evidence
+    - finding
+    - remediation_if_needed
+  summary:
+    - pass_count
+    - partial_count
+    - fail_count
+    - blocking_issues
+    - recommended_next_action

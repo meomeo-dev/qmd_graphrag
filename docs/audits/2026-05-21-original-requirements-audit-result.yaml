@@ -1,0 +1,127 @@
+date: 2026-05-21
+title: 原始需求实现审计结果
+status: passed
+scope: qmd_graphrag
+
+baseline:
+  path: docs/audits/2026-05-21-original-requirements-audit-baseline.yaml
+  criteria_count: 30
+
+summary:
+  pass_count: 30
+  partial_count: 0
+  fail_count: 0
+  blocking_issues: []
+  decision: >-
+    当前实现满足原始需求审计基准。无需继续补充修正或代码清理。
+
+initial_audit:
+  agent_a:
+    criteria: [C01, C02, C03, C04, C05, C06, C07, C08, C09, C10]
+    result:
+      pass: [C01, C02, C03, C04, C05, C06, C07, C08, C09]
+      partial: [C10]
+      fail: []
+    finding: >-
+      DSPy generated expansion record 已有 schema，但未作为独立数据类型登记到
+      data bus catalog。
+  agent_b:
+    criteria: [C11, C12, C13, C14, C15, C16, C17, C18, C19, C20]
+    result:
+      pass: [C11, C13, C14, C15, C16, C17, C18, C19, C20]
+      partial: []
+      fail: [C12]
+    finding: >-
+      Jina embedding 已满足，但 qmd rerank 默认仍为本地 GGUF，缺少 Jina rerank
+      API adapter、contract 和测试。
+  agent_c:
+    criteria: [C21, C22, C23, C24, C25, C26, C27, C28, C29, C30]
+    result:
+      pass: [C21, C22, C23, C24, C25, C26, C27, C28, C29, C30]
+      partial: []
+      fail: []
+    finding: >-
+      状态管理、恢复、成本控制和 graph_vault 可迁移性满足审计基准。
+
+remediation:
+  - issue: C10
+    action: >-
+      在 catalog/data-bus.catalog.yaml 中登记
+      dspy_generated_expansion_record，并纳入 offline_prompt_optimization_bus。
+    evidence:
+      - catalog/data-bus.catalog.yaml
+      - src/contracts/dspy.ts#DspyGeneratedExpansionRecordSchema
+  - issue: C12
+    action: >-
+      新增 Jina rerank Type DD contract，qmd rerank 默认切换为
+      jina:jina-reranker-v3，并通过 adapter 调用 Jina /v1/rerank。
+      保留 hf: 和本地路径 rerank 作为离线退出路径，避免破坏上游合并边界。
+    evidence:
+      - src/contracts/jina.ts
+      - src/llm.ts#LlamaCpp.rerankWithJina
+      - src/index.ts
+      - test/llm.test.ts
+      - test/integrations/contracts.test.ts
+      - docs/records/architecture/2026-05-21-jina-rerank-api-boundary.yaml
+
+reaudit:
+  agent_a:
+    criteria: [C01, C02, C03, C04, C05, C06, C07, C08, C09, C10]
+    status: pass
+    findings: []
+    note: >-
+      DSPy generated expansion record 已进入 catalog，并纳入
+      offline_prompt_optimization_bus。
+  agent_b:
+    criteria: [C11, C12, C13, C14, C15, C16, C17, C18, C19, C20]
+    status: pass
+    findings: []
+    note: >-
+      Jina embedding、Jina rerank、LanceDB、Responses API stream、strict
+      structured output 和 smoke 状态均满足基准。
+  agent_c:
+    criteria: [C21, C22, C23, C24, C25, C26, C27, C28, C29, C30]
+    status: pass
+    findings: []
+    note: >-
+      book 级业务单位、stage 级恢复、artifact 可达性校验和 graph_vault
+      可迁移性均满足基准。
+
+validation:
+  commands:
+    - command: node ./node_modules/typescript/bin/tsc -p tsconfig.build.json --noEmit
+      status: pass
+    - command: >-
+        CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose
+        --testTimeout 60000 test/llm.test.ts test/integrations/contracts.test.ts
+      status: pass
+      result: 2 files, 37 tests passed, 31 skipped
+    - command: >-
+        node ./node_modules/vitest/vitest.mjs run --reporter=verbose
+        --testTimeout 60000 test/book-job-state.test.ts
+        test/graphrag-book-state.test.ts test/integrations/contracts.test.ts
+      status: pass
+      result: 3 files, 17 tests passed
+    - command: >-
+        PYTHONPATH=python ./.venv-graphrag/bin/python
+        test/python/test_graphrag_responses_completion.py
+      status: pass
+      result: responses stream unit harness passed
+    - command: >-
+        node --import tsx scripts/graphrag/resume-book-workspace.mjs
+        --state-root ./graph_vault
+        --python-bin ./.venv-graphrag/bin/python
+        --working-directory /Users/jin/projects/qmd_graphrag
+      status: pass
+      result: ready, nextStage null, query_ready completed
+
+security:
+  - `.env` 未纳入审计输出，密钥值未读取或记录。
+  - graph_vault 状态和 artifact path 使用 vault-relative 边界。
+  - Jina adapter 只通过环境变量读取 JINA_API_KEY。
+
+final_decision:
+  status: accepted
+  next_action: >-
+    提交审计基准、审计结果、Jina rerank adapter、Type DD contract、catalog
+    和相关测试。

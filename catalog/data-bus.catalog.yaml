@@ -71,6 +71,37 @@ types:
       - future.eval.query_expansion
     storage: file
 
+  - name: dspy_generated_expansion_record
+    schema: src/contracts/dspy.ts#DspyGeneratedExpansionRecordSchema
+    producers:
+      - python/qmd_graphrag/bridge.py#_run_dspy_optimize_query_prompt
+      - finetune/experiments/gepa/dspy_gepa.py
+    consumers:
+      - src/contracts/dspy.ts#DspyGeneratedExpansionRecordSchema
+      - future.eval.query_expansion
+      - future.prompt_registry.query_expansion
+    storage: file
+    notes:
+      - emitted records are line-delimited JSON examples used to evaluate and
+        promote optimized query expansion prompts
+
+  - name: jina_rerank_request
+    schema: src/contracts/jina.ts#JinaRerankRequestSchema
+    producers:
+      - src/llm.ts#LlamaCpp.rerankWithJina
+    consumers:
+      - Jina API#POST /v1/rerank
+    storage: transient
+
+  - name: jina_rerank_response
+    schema: src/contracts/jina.ts#JinaRerankResponseSchema
+    producers:
+      - Jina API#POST /v1/rerank
+    consumers:
+      - src/llm.ts#LlamaCpp.rerankWithJina
+      - src/store.ts#rerank
+    storage: transient
+
   - name: book_job
     schema: src/contracts/book-job.ts#BookJobSchema
     producers:
@@ -134,6 +165,13 @@ buses:
     payloads:
       - dspy_query_prompt_optimization_request
       - optimized_query_prompt_artifact
+      - dspy_generated_expansion_record
+
+  - name: jina_rerank_bus
+    description: Typed request and response bus for Jina API reranking.
+    payloads:
+      - jina_rerank_request
+      - jina_rerank_response
 
   - name: book_processing_state_bus
     description: Typed persistence bus for per-book state, checkpoints, and artifacts.
@@ -174,13 +212,15 @@ dependencies:
       - if query expansion prompt optimization is replaced by another typed optimizer
 
   - name: Jina
-    purpose: embedding provider for GraphRAG indexing and graph-time retrieval
-    rationale: external high-quality embedding service routed through LiteLLM
+    purpose: embedding provider and rerank provider
+    rationale: external high-quality embedding and rerank service
     alternatives:
       - OpenAI embeddings
       - Azure OpenAI embeddings
       - local embedding models
-    boundary: GraphRAG -> graphrag-llm -> LiteLLM
+    boundary: >-
+      GraphRAG embedding -> graphrag-llm -> LiteLLM; qmd rerank ->
+      src/llm.ts#LlamaCpp.rerankWithJina -> Jina API
     required_env:
       - JINA_API_KEY
     exit_conditions:

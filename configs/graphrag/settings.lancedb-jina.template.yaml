@@ -1,6 +1,7 @@
 ### qmd_graphrag GraphRAG template
 ### Vector store: LanceDB
 ### Embedding provider: Jina via LiteLLM
+### Rerank provider: qmd local retrieval defaults to Jina via `jina:jina-reranker-v3`
 ###
 ### Usage:
 ### 1. Copy this file to your GraphRAG root as settings.yaml

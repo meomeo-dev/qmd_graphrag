@@ -12,6 +12,7 @@ import {
   LlamaCpp,
   getDefaultLlamaCpp,
   disposeDefaultLlamaCpp,
+  DEFAULT_RERANK_MODEL_URI,
   resolveLlamaGpuMode,
   setNodeLlamaCppModuleForTest,
   withNativeStdoutRedirectedToStderr,
@@ -110,6 +111,16 @@ describe("LlamaCpp.modelExists", () => {
 
     expect(result.exists).toBe(true);
     expect(result.name).toBe("hf:org/repo/model.gguf");
+  });
+
+  test("returns exists:true for Jina rerank model URIs", async () => {
+    const llm = getDefaultLlamaCpp();
+    const result = await llm.modelExists("jina:jina-reranker-v3");
+
+    expect(result).toEqual({
+      name: "jina:jina-reranker-v3",
+      exists: true,
+    });
   });
 
   test("returns exists:false for non-existent local paths", async () => {
@@ -435,7 +446,7 @@ describe("LlamaCpp expand context size config", () => {
 
 describe("LlamaCpp model resolution (config > env > default)", () => {
   const HARDCODED_EMBED = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
-  const HARDCODED_RERANK = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
+  const HARDCODED_RERANK = "jina:jina-reranker-v3";
   const HARDCODED_GENERATE = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 
   test("uses hardcoded default when no config or env is set", () => {
@@ -505,7 +516,9 @@ describe("LlamaCpp embedding truncation", () => {
 
 describe("LlamaCpp rerank deduping", () => {
   test("deduplicates identical document texts before scoring", async () => {
-    const llm = new LlamaCpp({}) as any;
+    const llm = new LlamaCpp({
+      rerankModel: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf",
+    }) as any;
     llm._ciMode = false; // allow unit test even in CI (mocked, no real models)
     const rankAll = vi.fn(async (_query: string, docs: string[]) =>
       docs.map((doc) => doc === "shared chunk" ? 0.9 : 0.2)
@@ -532,6 +545,76 @@ describe("LlamaCpp rerank deduping", () => {
     expect(scoreByFile.get("a.md")).toBe(0.9);
     expect(scoreByFile.get("b.md")).toBe(0.9);
     expect(scoreByFile.get("c.md")).toBe(0.2);
+  });
+});
+
+describe("LlamaCpp Jina rerank", () => {
+  test("uses Jina API and maps result indexes back to file paths", async () => {
+    const previousApiKey = process.env.JINA_API_KEY;
+    const previousFetch = globalThis.fetch;
+    process.env.JINA_API_KEY = "test-key";
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body));
+      expect(request).toEqual({
+        model: "jina-reranker-v3",
+        query: "auth setup",
+        documents: ["weather forecast", "configure AUTH_SECRET"],
+        return_documents: false,
+      });
+      return new Response(JSON.stringify({
+        model: "jina-reranker-v3",
+        results: [
+          { index: 1, relevance_score: 0.92 },
+          { index: 0, relevance_score: 0.12 },
+        ],
+      }));
+    });
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    try {
+      const llm = new LlamaCpp() as any;
+      llm._ciMode = false; // mocked API call; no local model or real service is used
+      const result = await llm.rerank("auth setup", [
+        { file: "weather.md", text: "weather forecast" },
+        { file: "auth.md", text: "configure AUTH_SECRET" },
+      ]);
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://api.jina.ai/v1/rerank",
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({
+            Authorization: "Bearer test-key",
+          }),
+        }),
+      );
+      expect(result).toEqual({
+        model: DEFAULT_RERANK_MODEL_URI,
+        results: [
+          { file: "auth.md", score: 0.92, index: 1 },
+          { file: "weather.md", score: 0.12, index: 0 },
+        ],
+      });
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousApiKey === undefined) delete process.env.JINA_API_KEY;
+      else process.env.JINA_API_KEY = previousApiKey;
+    }
+  });
+
+  test("requires JINA_API_KEY for Jina rerank models", async () => {
+    const previousApiKey = process.env.JINA_API_KEY;
+    delete process.env.JINA_API_KEY;
+    try {
+      const llm = new LlamaCpp() as any;
+      llm._ciMode = false; // exercise Jina adapter validation under CI
+      await expect(
+        llm.rerank("query", [{ file: "doc.md", text: "content" }]),
+      ).rejects.toThrow("JINA_API_KEY is required");
+    } finally {
+      if (previousApiKey === undefined) delete process.env.JINA_API_KEY;
+      else process.env.JINA_API_KEY = previousApiKey;
+    }
   });
 });
 
@@ -689,7 +772,9 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       // The fix uses a promise guard to ensure only one context creation runs at a time.
       // We verify this by instrumenting createEmbeddingContext to count invocations.
       
-      const freshLlm = new LlamaCpp({});
+      const freshLlm = new LlamaCpp({
+        rerankModel: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf",
+      });
       let contextCreateCount = 0;
       
       // Instrument the model's createEmbeddingContext to count calls

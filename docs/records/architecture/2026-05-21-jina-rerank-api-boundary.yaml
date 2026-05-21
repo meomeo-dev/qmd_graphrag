@@ -1,0 +1,50 @@
+date: 2026-05-21
+title: Jina Rerank API 边界决策
+status: accepted
+scope: qmd_graphrag
+
+problem:
+  summary: >-
+    原始需求要求使用 Jina 作为 embedding 和 rerank API。当前 GraphRAG
+    embedding 已通过 LiteLLM 使用 Jina，但 qmd 本地检索 rerank 仍默认使用
+    本地 GGUF reranker，缺少 Jina rerank API adapter 和 Type DD 边界。
+
+decision:
+  default_rerank_provider:
+    value: Jina
+    model: jina-reranker-v3
+    model_uri: jina:jina-reranker-v3
+    rationale: >-
+      默认 rerank 应满足原始需求的 API 服务边界。`jina:` 前缀显式标识
+      外部 Jina rerank provider，避免与 `hf:` 本地模型混淆。
+  local_fallback:
+    rule: >-
+      仍保留 `hf:`、本地路径等非 `jina:` rerank model，作为离线或退出路径。
+      用户可通过 `models.rerank` 或 `QMD_RERANK_MODEL` 切换。
+  api_boundary:
+    endpoint: https://api.jina.ai/v1/rerank
+    env:
+      - JINA_API_KEY
+      - JINA_API_BASE
+    request_contract: src/contracts/jina.ts#JinaRerankRequestSchema
+    response_contract: src/contracts/jina.ts#JinaRerankResponseSchema
+    notes:
+      - `JINA_API_BASE` 可用于私有部署或测试 mock；默认使用官方 API base。
+      - adapter 只发送 query 和候选文档文本，不发送本地路径之外的密钥信息。
+  score_mapping:
+    rule: >-
+      Jina 返回的 `results[].index` 映射回原始候选文档，`relevance_score`
+      映射为 qmd 的 rerank score。缺失或越界 index 视为上游响应错误。
+
+invariants:
+  - `JINA_API_KEY` 不写入配置文件、catalog、状态文件或运行产物。
+  - `jina:` rerank 不触发 node-llama-cpp rerank model 加载。
+  - 非 `jina:` rerank 路径保持现有本地 GGUF 行为。
+  - Jina request/response 必须经过 zod schema 校验。
+
+validation:
+  required:
+    - model resolver 默认返回 `jina:jina-reranker-v3`。
+    - Jina rerank adapter 能把 API response 映射回原始文件路径和 index。
+    - 缺少 `JINA_API_KEY` 时给出明确错误。
+    - data bus catalog 登记 Jina rerank request/response。

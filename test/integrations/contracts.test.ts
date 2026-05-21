@@ -5,6 +5,7 @@ import {
   GraphRagIndexRequestSchema,
   GraphRagQueryRequestSchema,
 } from "../../src/contracts/graphrag.js";
+import { JinaRerankRequestSchema } from "../../src/contracts/jina.js";
 
 describe("GraphRAG contracts", () => {
   test("accepts a local query request", () => {
@@ -45,5 +46,19 @@ describe("DSPy contracts", () => {
 
     expect(parsed.optimizer).toBe("gepa");
     expect(parsed.savePromptPath).toContain("best_prompt");
+  });
+});
+
+describe("Jina contracts", () => {
+  test("accepts a rerank request", () => {
+    const parsed = JinaRerankRequestSchema.parse({
+      model: "jina-reranker-v3",
+      query: "how to configure authentication",
+      documents: ["weather report", "set AUTH_SECRET"],
+      return_documents: false,
+    });
+
+    expect(parsed.model).toBe("jina-reranker-v3");
+    expect(parsed.documents).toHaveLength(2);
   });
 });

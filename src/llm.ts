@@ -1,7 +1,7 @@
 /**
  * llm.ts - LLM abstraction layer for QMD using node-llama-cpp
  *
- * Provides embeddings, text generation, and reranking using local GGUF models.
+ * Provides embeddings, text generation, and reranking using local or API models.
  */
 
 import type {
@@ -10,6 +10,10 @@ import type {
   LlamaEmbeddingContext,
   Token as LlamaToken,
 } from "node-llama-cpp";
+import {
+  JinaRerankRequestSchema,
+  JinaRerankResponseSchema,
+} from "./contracts/jina.js";
 
 type StdoutChunk = string | Uint8Array;
 type WriteCallback = (err?: Error | null) => void;
@@ -246,11 +250,13 @@ export type RerankDocument = {
 // Model Configuration
 // =============================================================================
 
-// HuggingFace model URIs for node-llama-cpp
+// HuggingFace model URIs for node-llama-cpp and API model URIs.
 // Format: hf:<user>/<repo>/<file>
 // Override via QMD_EMBED_MODEL env var (e.g. hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf)
 const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
-const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
+const DEFAULT_RERANK_MODEL = "jina:jina-reranker-v3";
+const JINA_RERANK_PREFIX = "jina:";
+const DEFAULT_JINA_API_BASE = "https://api.jina.ai";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 
@@ -280,6 +286,26 @@ export function resolveGenerateModel(config?: ModelResolutionConfig): string {
 
 export function resolveRerankModel(config?: ModelResolutionConfig): string {
   return config?.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
+}
+
+export function isJinaRerankModel(model: string): boolean {
+  return model.startsWith(JINA_RERANK_PREFIX);
+}
+
+function resolveJinaRerankModelName(model: string): string {
+  return isJinaRerankModel(model) ? model.slice(JINA_RERANK_PREFIX.length) : model;
+}
+
+function resolveJinaApiBase(): string {
+  return (process.env.JINA_API_BASE || DEFAULT_JINA_API_BASE).replace(/\/+$/, "");
+}
+
+function resolveJinaApiKey(): string {
+  const apiKey = process.env.JINA_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error("JINA_API_KEY is required for Jina rerank models");
+  }
+  return apiKey;
 }
 
 export function resolveModels(config?: ModelResolutionConfig): Required<ModelResolutionConfig> {
@@ -462,6 +488,16 @@ export async function pullModels(
 
   const results: PullResult[] = [];
   for (const model of models) {
+    if (isJinaRerankModel(model)) {
+      results.push({
+        model,
+        path: "jina-api",
+        sizeBytes: 0,
+        refreshed: false,
+      });
+      continue;
+    }
+
     let refreshed = false;
     const hfRef = parseHfUri(model);
     const filename = model.split("/").pop();
@@ -1407,6 +1443,10 @@ export class LlamaCpp implements LLM {
   }
 
   async modelExists(modelUri: string): Promise<ModelInfo> {
+    if (isJinaRerankModel(modelUri)) {
+      return { name: modelUri, exists: true };
+    }
+
     // For HuggingFace URIs, we assume they exist
     // For local paths, check if file exists
     if (modelUri.startsWith("hf:")) {
@@ -1527,6 +1567,11 @@ export class LlamaCpp implements LLM {
     options: RerankOptions = {}
   ): Promise<RerankResult> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    const modelName = options.model ?? this.rerankModelUri;
+    if (isJinaRerankModel(modelName)) {
+      return this.rerankWithJina(query, documents, modelName);
+    }
+
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1613,6 +1658,59 @@ export class LlamaCpp implements LLM {
     return {
       results,
       model: this.rerankModelUri,
+    };
+  }
+
+  private async rerankWithJina(
+    query: string,
+    documents: RerankDocument[],
+    model: string,
+  ): Promise<RerankResult> {
+    if (documents.length === 0) {
+      return {
+        results: [],
+        model,
+      };
+    }
+
+    const jinaModel = resolveJinaRerankModelName(model);
+    const request = JinaRerankRequestSchema.parse({
+      model: jinaModel,
+      query,
+      documents: documents.map((doc) => doc.text),
+      return_documents: false,
+    });
+    const response = await fetch(`${resolveJinaApiBase()}/v1/rerank`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${resolveJinaApiKey()}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(request),
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      const detail = body ? `: ${body.slice(0, 300)}` : "";
+      throw new Error(`Jina rerank request failed (${response.status})${detail}`);
+    }
+
+    const payload = JinaRerankResponseSchema.parse(await response.json());
+    const results = payload.results.map((item) => {
+      const document = documents[item.index];
+      if (document == null) {
+        throw new Error(`Jina rerank returned out-of-range index: ${item.index}`);
+      }
+      return {
+        file: document.file,
+        score: item.relevance_score,
+        index: item.index,
+      };
+    });
+
+    return {
+      results,
+      model,
     };
   }
 

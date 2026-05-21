@@ -135,10 +135,13 @@
 
 `Jina` 可以作为 embedding provider 使用，但语义上应区分：
 
-- `Jina` 在这里是向量服务（embedding service）。
+- `Jina` 在这里同时作为向量服务（embedding service）和重排服务
+  （rerank service）。
 - 它不是 `GraphRAG` 自己的独立 provider adapter。
-- 实际路径是：
+- GraphRAG embedding 实际路径是：
   `GraphRAG -> graphrag-llm -> LiteLLM -> Jina`
+- qmd rerank 实际路径是：
+  `qmd -> src/llm.ts#LlamaCpp.rerankWithJina -> Jina /v1/rerank`
 
 当前建议：
 
@@ -146,6 +149,9 @@
   使用 `OpenAI` / `Azure OpenAI` / 其他已验证 completion provider。
 - embedding model:
   使用 `Jina`。
+- rerank model:
+  默认使用 `jina:jina-reranker-v3`。如需离线运行，可通过
+  `models.rerank` 或 `QMD_RERANK_MODEL` 切换到 `hf:` 本地 GGUF reranker。
 
 原因：
 

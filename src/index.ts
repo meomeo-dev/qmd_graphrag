@@ -103,6 +103,12 @@ import type {
   QueryKind,
 } from "./contracts/common.js";
 import type {
+  JinaRerankDocument,
+  JinaRerankRequest,
+  JinaRerankResponse,
+  JinaRerankResult,
+} from "./contracts/jina.js";
+import type {
   BookArtifactKind,
   BookArtifactManifest,
   BookJob,
@@ -163,6 +169,10 @@ export type {
   DspyQueryPromptOptimizationRequest,
   DspyQueryPromptOptimizationResponse,
   BridgeEnvironment,
+  JinaRerankDocument,
+  JinaRerankRequest,
+  JinaRerankResponse,
+  JinaRerankResult,
   QueryExpansionItem,
   QueryKind,
   BookArtifactKind,
@@ -193,6 +203,12 @@ export {
   QueryExpansionItemSchema,
   BridgeEnvironmentSchema,
 } from "./contracts/common.js";
+export {
+  JinaRerankDocumentSchema,
+  JinaRerankRequestSchema,
+  JinaRerankResponseSchema,
+  JinaRerankResultSchema,
+} from "./contracts/jina.js";
 export {
   BookStageSchema,
   BookJobStatusSchema,
@@ -250,6 +266,9 @@ export type {
   GraphRagBookWorkspaceState,
   SyncGraphRagBookWorkspaceInput,
 } from "./job-state/graphrag-book.js";
+export {
+  isJinaRerankModel,
+} from "./llm.js";
 export {
   buildBookId,
   buildBookIdFromSourceHash,
