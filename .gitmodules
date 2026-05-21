@@ -1,0 +1,3 @@
+[submodule "vendor/graphrag"]
+	path = vendor/graphrag
+	url = https://github.com/microsoft/graphrag.git

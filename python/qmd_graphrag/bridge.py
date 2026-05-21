@@ -13,6 +13,10 @@ from typing import Any
 
 SCHEMA_VERSION = "1.0.0"
 REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_GRAPHRAG_REPO = REPO_ROOT / "vendor" / "graphrag"
+
+if str(REPO_ROOT / "python") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "python"))
 
 
 def _emit_error(message: str) -> int:
@@ -30,11 +34,14 @@ def _read_request() -> dict[str, Any]:
     return obj
 
 
-def _add_monorepo_package_paths(repo_path: str | None) -> None:
-    if not repo_path:
-        return
+def _resolve_repo_path(repo_path: str | None, default_path: Path) -> Path:
+    root = Path(repo_path).resolve() if repo_path else default_path.resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"missing repository path: {root}")
+    return root
 
-    root = Path(repo_path).resolve()
+
+def _add_monorepo_package_paths(root: Path) -> None:
     packages_dir = root / "packages"
     if not packages_dir.exists():
         sys.path.insert(0, str(root))
@@ -71,9 +78,88 @@ def _summarize_result(value: Any) -> str | None:
     return text[:400]
 
 
+def _write_text_if_missing(path: Path, content: str) -> None:
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8", errors="strict")
+
+
+def _ensure_graphrag_prompt_assets(root_dir: Path) -> None:
+    from graphrag.prompts.index.community_report import COMMUNITY_REPORT_PROMPT
+    from graphrag.prompts.index.community_report_text_units import (
+        COMMUNITY_REPORT_TEXT_PROMPT,
+    )
+    from graphrag.prompts.index.extract_claims import EXTRACT_CLAIMS_PROMPT
+    from graphrag.prompts.index.extract_graph import GRAPH_EXTRACTION_PROMPT
+    from graphrag.prompts.index.summarize_descriptions import SUMMARIZE_PROMPT
+    from graphrag.prompts.query.basic_search_system_prompt import (
+        BASIC_SEARCH_SYSTEM_PROMPT,
+    )
+    from graphrag.prompts.query.drift_search_system_prompt import (
+        DRIFT_LOCAL_SYSTEM_PROMPT,
+        DRIFT_REDUCE_PROMPT,
+    )
+    from graphrag.prompts.query.global_search_knowledge_system_prompt import (
+        GENERAL_KNOWLEDGE_INSTRUCTION,
+    )
+    from graphrag.prompts.query.global_search_map_system_prompt import (
+        MAP_SYSTEM_PROMPT,
+    )
+    from graphrag.prompts.query.global_search_reduce_system_prompt import (
+        REDUCE_SYSTEM_PROMPT,
+    )
+    from graphrag.prompts.query.local_search_system_prompt import (
+        LOCAL_SEARCH_SYSTEM_PROMPT,
+    )
+    from graphrag.prompts.query.question_gen_system_prompt import (
+        QUESTION_SYSTEM_PROMPT,
+    )
+
+    prompts_dir = root_dir / "prompts"
+    prompts = {
+        "extract_graph.txt": GRAPH_EXTRACTION_PROMPT,
+        "summarize_descriptions.txt": SUMMARIZE_PROMPT,
+        "extract_claims.txt": EXTRACT_CLAIMS_PROMPT,
+        "community_report_graph.txt": COMMUNITY_REPORT_PROMPT,
+        "community_report_text.txt": COMMUNITY_REPORT_TEXT_PROMPT,
+        "drift_search_system_prompt.txt": DRIFT_LOCAL_SYSTEM_PROMPT,
+        "drift_search_reduce_prompt.txt": DRIFT_REDUCE_PROMPT,
+        "drift_reduce_prompt.txt": DRIFT_REDUCE_PROMPT,
+        "global_search_map_system_prompt.txt": MAP_SYSTEM_PROMPT,
+        "global_search_reduce_system_prompt.txt": REDUCE_SYSTEM_PROMPT,
+        "global_search_knowledge_system_prompt.txt": GENERAL_KNOWLEDGE_INSTRUCTION,
+        "local_search_system_prompt.txt": LOCAL_SEARCH_SYSTEM_PROMPT,
+        "basic_search_system_prompt.txt": BASIC_SEARCH_SYSTEM_PROMPT,
+        "question_gen_system_prompt.txt": QUESTION_SYSTEM_PROMPT,
+    }
+
+    for name, content in prompts.items():
+        _write_text_if_missing(prompts_dir / name, content)
+
+
+def _register_qmd_completion_providers() -> None:
+    from graphrag_llm.completion import register_completion
+
+    from qmd_graphrag.graphrag_responses_completion import (
+        OpenAIResponsesCompletion,
+    )
+
+    register_completion(
+        completion_type="openai_responses",
+        completion_initializer=OpenAIResponsesCompletion,
+        scope="singleton",
+    )
+
+
 async def _run_graphrag_query(request: dict[str, Any]) -> dict[str, Any]:
     environment = request.get("environment") or {}
-    _add_monorepo_package_paths(environment.get("graphragRepoPath"))
+    graphrag_repo = _resolve_repo_path(
+        environment.get("graphragRepoPath"),
+        DEFAULT_GRAPHRAG_REPO,
+    )
+    _add_monorepo_package_paths(graphrag_repo)
+    _register_qmd_completion_providers()
 
     from graphrag.cli.query import (  # type: ignore
         _resolve_output_files,
@@ -91,6 +177,8 @@ async def _run_graphrag_query(request: dict[str, Any]) -> dict[str, Any]:
         request.get("dynamicCommunitySelection", False)
     )
     verbose = bool(request.get("verbose", False))
+
+    _ensure_graphrag_prompt_assets(root_dir)
 
     cli_overrides: dict[str, Any] = {}
     if data_dir:
@@ -190,16 +278,32 @@ async def _run_graphrag_query(request: dict[str, Any]) -> dict[str, Any]:
 
 async def _run_graphrag_index(request: dict[str, Any]) -> dict[str, Any]:
     environment = request.get("environment") or {}
-    _add_monorepo_package_paths(environment.get("graphragRepoPath"))
+    graphrag_repo = _resolve_repo_path(
+        environment.get("graphragRepoPath"),
+        DEFAULT_GRAPHRAG_REPO,
+    )
+    _add_monorepo_package_paths(graphrag_repo)
+    _register_qmd_completion_providers()
 
     import graphrag.api as api  # type: ignore
     from graphrag.config.load_config import load_config  # type: ignore
+    from graphrag.index.validate_config import validate_config_names  # type: ignore
 
     root_dir = Path(request["rootDir"]).resolve()
     method = request["method"]
     verbose = bool(request.get("verbose", False))
+    skip_validation = bool(request.get("skipValidation", False))
+    workflows = request.get("workflows")
 
-    config = load_config(root_dir=root_dir)
+    _ensure_graphrag_prompt_assets(root_dir)
+
+    cli_overrides: dict[str, Any] = {}
+    if workflows:
+        cli_overrides["workflows"] = workflows
+
+    config = load_config(root_dir=root_dir, cli_overrides=cli_overrides)
+    if not skip_validation:
+        validate_config_names(config)
     outputs = await api.build_index(
         config=config,
         method=method,
@@ -215,15 +319,19 @@ async def _run_graphrag_index(request: dict[str, Any]) -> dict[str, Any]:
         else:
             state_keys = []
 
-        response_outputs.append(
-            {
-                "workflow": str(output.workflow),
-                "hasError": output.error is not None,
-                "errorMessage": str(output.error) if output.error else None,
-                "resultSummary": _summarize_result(output.result),
-                "stateKeys": state_keys,
-            }
-        )
+        response_output = {
+            "workflow": str(output.workflow),
+            "hasError": output.error is not None,
+            "stateKeys": state_keys,
+        }
+        if output.error:
+            response_output["errorMessage"] = str(output.error)
+
+        result_summary = _summarize_result(output.result)
+        if result_summary is not None:
+            response_output["resultSummary"] = result_summary
+
+        response_outputs.append(response_output)
 
     return {
         "schemaVersion": SCHEMA_VERSION,

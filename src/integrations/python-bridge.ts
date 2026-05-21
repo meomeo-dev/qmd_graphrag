@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 
 import type { ZodType } from "zod";
 
@@ -16,9 +17,11 @@ export async function callPythonBridge<TRequest, TResponse>(
   options: PythonBridgeCallOptions<TRequest, TResponse>,
 ): Promise<TResponse> {
   const scriptPath = resolveProjectPath("python/qmd_graphrag/bridge.py");
+  const bundledPython = resolveProjectPath(".venv-graphrag/bin/python");
   const pythonBin =
     options.pythonBin ||
     process.env.QMD_GRAPHRAG_PYTHON ||
+    (existsSync(bundledPython) ? bundledPython : undefined) ||
     process.env.PYTHON ||
     "python3";
 

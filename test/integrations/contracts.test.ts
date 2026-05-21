@@ -24,9 +24,13 @@ describe("GraphRAG contracts", () => {
     const parsed = GraphRagIndexRequestSchema.parse({
       rootDir: "/tmp/graphrag-root",
       method: "standard",
+      skipValidation: true,
+      workflows: ["generate_text_embeddings"],
     });
 
     expect(parsed.method).toBe("standard");
+    expect(parsed.skipValidation).toBe(true);
+    expect(parsed.workflows).toEqual(["generate_text_embeddings"]);
   });
 });
 

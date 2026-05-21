@@ -1,0 +1,65 @@
+date: 2026-05-21
+title: Embedding 恢复与 LanceDB 完整性校验决策
+status: accepted
+scope: qmd_graphrag
+
+problem:
+  summary: >-
+    smoke 在 `generate_text_embeddings` 阶段失败。Jina embedding 请求成功，
+    但 LanceDB 写入时 PyArrow 报告 fixed-size list 长度不匹配。失败后
+    `output/lancedb` 已存在半成品目录，旧状态层可能把该目录误判为
+    `embed` 已完成。
+  observed:
+    - `jina-embeddings-v3` 在当前链路返回 1024 维向量。
+    - GraphRAG 默认 `vector_size` 是 3072。
+    - 当前续跑使用 `skipValidation: true`，不会触发 GraphRAG 自带的
+      embedding 维度探测与同步。
+    - 失败后只生成了部分 LanceDB table，不满足查询所需三类 embedding。
+
+decision:
+  vector_size:
+    value: 1024
+    rationale: >-
+      在使用 Jina `jina-embeddings-v3` 且跳过 GraphRAG validation 时，
+      必须在 `vector_store.vector_size` 显式固定维度，避免 LanceDB schema
+      使用上游默认 3072。
+  workflow_resume:
+    rule: >-
+      GraphRAG index request 支持 typed `workflows` 覆盖。若恢复点是
+      `embed`，只执行 `generate_text_embeddings`；若恢复点是
+      `community_report`，执行 `create_community_reports_text` 和
+      `generate_text_embeddings`。
+    rationale: >-
+      stage 是成本恢复单位。已成功的 community report 不应因 embedding
+      失败而被重复调用。
+  artifact_validation:
+    rule: >-
+      `lancedb_index` 只有在 `entity_description.lance`、
+      `community_full_content.lance`、`text_unit_text.lance` 三张表均存在，
+      且每张表包含 data `.lance` 文件与 `_versions` manifest 时才记录。
+    rationale: >-
+      目录存在不等于向量索引可查询。状态层必须校验可消费的最小完整产物。
+  fingerprint_boundary:
+    rule: >-
+      `modelFingerprint` 保留全局审计用途；stage fingerprint 只吸收本 stage
+      实际消费的模型、prompt 与配置。`vector_store` 只影响 `embed` 与
+      `query_ready`。
+    rationale: >-
+      embedding 或向量库配置变化不应使 `graph_extract` / `community_report`
+      失效，避免扩大重跑成本。
+
+implications:
+  positive:
+    - embedding 失败后可以从 `embed` 单独恢复。
+    - 半成品 LanceDB 目录不会污染 query-ready 判定。
+    - 向量维度和 provider 变更只影响真正消费该配置的阶段。
+  negative:
+    - Jina 模型变更时需要同步维护 `vector_store.vector_size`，或重新启用
+      validation 探测。
+    - 未来新增 embedding table 时需要更新完整性校验表清单。
+
+validation:
+  planned:
+    - TypeScript contract test validates typed workflow override.
+    - Book state test validates partial LanceDB is not treated as complete.
+    - Smoke rerun starts at `embed` and writes all LanceDB tables before query.

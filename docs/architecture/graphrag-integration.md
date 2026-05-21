@@ -27,6 +27,13 @@
 - Python sidecar:
   `GraphRAG` 与 `DSPy` 通过受控 bridge 接入。
 
+当前进一步约束如下：
+
+- `GraphRAG` 不作为仓库外部平级目录依赖长期存在。
+- `GraphRAG` 应收编为 `qmd_graphrag` 仓内子模块（submodule / 子模块）。
+- Python bridge 默认优先解析仓内 `GraphRAG` 子模块路径。
+- 上游同步通过子模块升级完成，本地 patch 维持最小边界。
+
 桥接原则如下：
 
 - 所有跨运行时请求必须先经过 `zod schema` 校验。
@@ -88,3 +95,95 @@
 - Python 依赖升级不会直接污染 TypeScript 核心。
 - 未来若要替换 `GraphRAG` 或 `DSPy`，退出路径清晰。
 
+## 当前已验证事实（Validated Facts）
+
+- `qmd` 当前没有原生 `GraphRAG` 实现。
+- `GraphRAG` 当前原生支持 `LanceDB`。
+- `Jina` 可以通过 `LiteLLM` 路径作为 embedding provider 使用。
+- 上游 `graphrag-llm` 默认 completion 实现仍走
+  `litellm.completion(...)` / `litellm.acompletion(...)`，即
+  `chat completions` 路径。
+- 本仓库已新增独立 `openai_responses` completion provider，并通过
+  `python/qmd_graphrag/graphrag_responses_completion.py` 接入
+  `OpenAI Responses API`。
+- 当前本地网关上的 `POST /responses` 已验证可用，且 endpoint 直接使用
+  `/responses`，不需要强制追加 `/v1/responses`。
+- 当前单书冒烟的主要剩余风险不是 provider 可用性，而是 community report
+  阶段对网关稳定性较敏感，可能出现 `429` 或 `502`，因此需要更保守的并发、
+  retry 和阶段级恢复。
+
+## 向量层选择（Vector Layer Choice）
+
+`GraphRAG` 官方当前原生支持 `LanceDB`，并且默认向量库类型就是
+`lancedb`。因此本仓库把 `LanceDB` 视为图检索侧（GraphRAG side）的首选
+向量库，不需要额外自研 vector adapter。
+
+建议边界如下：
+
+- `qmd` 侧：
+  继续使用其现有本地向量检索实现。
+- `GraphRAG` 侧：
+  使用 `LanceDB` 承载 entity / report / text unit 的向量索引。
+
+这样做的原因：
+
+- 避免在当前阶段把两套检索引擎的存储层过早耦合。
+- `GraphRAG` 对 `LanceDB` 已有现成实现与配置路径。
+- 未来若需要统一存储层，再通过 typed bus 做跨引擎编排。
+
+## 向量服务选择（Embedding Provider Choice）
+
+`Jina` 可以作为 embedding provider 使用，但语义上应区分：
+
+- `Jina` 在这里是向量服务（embedding service）。
+- 它不是 `GraphRAG` 自己的独立 provider adapter。
+- 实际路径是：
+  `GraphRAG -> graphrag-llm -> LiteLLM -> Jina`
+
+当前建议：
+
+- completion LLM:
+  使用 `OpenAI` / `Azure OpenAI` / 其他已验证 completion provider。
+- embedding model:
+  使用 `Jina`。
+
+原因：
+
+- `GraphRAG` 的 query / indexing 多个阶段仍然需要 completion LLM。
+- `Jina` 更适合作为 embedding 或 rerank provider，而不是直接承担全部
+  `GraphRAG` 推理职责。
+
+## 配置建议（Recommended Configuration）
+
+模板文件：
+
+- `configs/graphrag/settings.lancedb-jina.template.yaml`
+
+建议把它复制到实际 GraphRAG root，并与同目录 `.env` 配合使用：
+
+- `JINA_API_KEY`
+- `OPENAI_API_KEY` 或其他 completion provider 对应 key
+
+注意：
+
+- `GraphRAG` 的配置加载器会自动读取 `settings.yaml` 同目录的 `.env`。
+- 模板中的 `${JINA_API_KEY}` 会在加载时被替换。
+- 这意味着你当前保存在 `/Users/jin/projects/qmd_graphrag/.env` 中的
+  `JINA_API_KEY` 可以复用，但前提是后续 GraphRAG root 与 `.env`
+  的实际落点保持一致，或在运行前显式导出到进程环境。
+
+## 当前开发顺序（Current Delivery Order）
+
+当前按以下顺序推进：
+
+1. 将 `GraphRAG` 收编为仓内子模块，并让 bridge 默认使用仓内副本。
+2. 在自有 Python 层新增独立 `Responses API` provider，避免直接修改上游
+   completion 层。
+3. 补齐 `graph_vault/` 下的 prompts 与最小初始化资产。
+4. 跑通单本 EPUB 的 index 与 local query 冒烟。
+5. 在 `qmd_graphrag` 主仓库内增加书级状态层，提供
+   `book + stage` 恢复语义。
+
+对应决策记录见：
+
+- `docs/records/graphrag/2026-05-20-submodule-and-response-api-decision.yaml`

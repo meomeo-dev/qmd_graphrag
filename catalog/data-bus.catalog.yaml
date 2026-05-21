@@ -38,6 +38,11 @@ types:
     consumers:
       - python/qmd_graphrag/bridge.py#_run_graphrag_index
     storage: transient
+    notes:
+      - supports `skipValidation` to bypass GraphRAG preflight model checks when
+        the gateway cannot satisfy upstream connectivity validation semantics
+      - supports typed workflow overrides so recovery can rerun only the failed
+        GraphRAG workflow instead of replaying upstream high-cost stages
 
   - name: graphrag_index_response
     schema: src/contracts/graphrag.ts#GraphRagIndexResponseSchema
@@ -66,6 +71,57 @@ types:
       - future.eval.query_expansion
     storage: file
 
+  - name: book_job
+    schema: src/contracts/book-job.ts#BookJobSchema
+    producers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.registerBookSource
+      - src/job-state/repository.ts#FileBookJobStateRepository.upsertBookJob
+    consumers:
+      - future.batch_runner.book_scheduler
+      - future.cli.graphrag.book_status
+      - future.mcp.graphrag.book_status
+    storage: file
+
+  - name: book_stage_checkpoint
+    schema: src/contracts/book-job.ts#BookJobStageCheckpointSchema
+    producers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.startStage
+      - src/job-state/repository.ts#FileBookJobStateRepository.completeStage
+      - src/job-state/repository.ts#FileBookJobStateRepository.failStage
+    consumers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.getResumePlan
+      - future.batch_runner.book_scheduler
+    storage: file
+    notes:
+      - checkpoint success is valid only when required artifact manifests remain
+        present and their paths are reachable
+
+  - name: book_artifact_manifest
+    schema: src/contracts/book-job.ts#BookArtifactManifestSchema
+    producers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.recordArtifacts
+    consumers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.getResumePlan
+      - future.batch_runner.book_scheduler
+      - future.cli.graphrag.book_status
+      - future.query_router.book_workspace_locator
+    storage: file
+    notes:
+      - artifact identity excludes `producerRunId` to avoid duplicate entries
+        across bootstrap and resume synchronization
+
+  - name: book_resume_plan
+    schema: src/contracts/book-job.ts#BookResumePlanSchema
+    producers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.getResumePlan
+    consumers:
+      - future.batch_runner.book_scheduler
+      - future.cli.graphrag.resume
+    storage: transient
+    notes:
+      - stage state reason may be `artifact_missing` when checkpoint metadata
+        exists but required artifacts are missing from manifest or disk
+
 buses:
   - name: online_retrieval_bus
     description: Typed request and response bus for GraphRAG query execution.
@@ -78,6 +134,14 @@ buses:
     payloads:
       - dspy_query_prompt_optimization_request
       - optimized_query_prompt_artifact
+
+  - name: book_processing_state_bus
+    description: Typed persistence bus for per-book state, checkpoints, and artifacts.
+    payloads:
+      - book_job
+      - book_stage_checkpoint
+      - book_artifact_manifest
+      - book_resume_plan
 
 dependencies:
   - name: qmd
@@ -95,6 +159,7 @@ dependencies:
       - custom knowledge graph pipeline
       - another graph retrieval framework
     boundary: python sidecar bridge
+    preferred_vector_store: LanceDB
     exit_conditions:
       - if equivalent graph indexing and query quality exists natively in TypeScript
 
@@ -108,3 +173,15 @@ dependencies:
     exit_conditions:
       - if query expansion prompt optimization is replaced by another typed optimizer
 
+  - name: Jina
+    purpose: embedding provider for GraphRAG indexing and graph-time retrieval
+    rationale: external high-quality embedding service routed through LiteLLM
+    alternatives:
+      - OpenAI embeddings
+      - Azure OpenAI embeddings
+      - local embedding models
+    boundary: GraphRAG -> graphrag-llm -> LiteLLM
+    required_env:
+      - JINA_API_KEY
+    exit_conditions:
+      - if embedding quality, latency, or cost no longer fit the retrieval pipeline

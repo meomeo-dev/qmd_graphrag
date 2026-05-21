@@ -1,0 +1,46 @@
+date: 2026-05-21
+title: 阶段相关 Fingerprint 与仓内 Python 运行环境决策
+status: accepted
+scope: qmd_graphrag
+
+problem:
+  summary: >-
+    在引入书级状态层后，若直接对整个 `settings.yaml` 做哈希并作为
+    `graph_extract` 等 stage 的输入指纹，则像 `concurrent_requests`、
+    retry 等纯运行参数变化也会被误判为上游阶段失效，导致不必要重跑。
+  related_issue:
+    - 外部 `/Users/jin/projects/graphrag/.venv` 曾被实际运行链路隐式依赖，
+      不利于仓内复现与后续交付。
+
+decision:
+  summary: >-
+    Stage fingerprint 改为只吸收与该 stage 语义相关的配置与 prompt；
+    同时将仓库内 `.venv-graphrag` 设为 Python bridge 默认优先运行环境。
+  details:
+    - `ingest` / `normalize` 不再受 completion 并发等运行参数影响。
+    - `graph_extract` 只绑定图抽取相关 prompt、模型和相关配置。
+    - `community_report` 只绑定社区报告相关 prompt、模型和相关配置。
+    - `embed` 只绑定 embedding / vector store 相关配置。
+    - `query_ready` 只绑定查询相关 prompt 与模型配置。
+    - `src/integrations/python-bridge.ts` 默认优先解析
+      `.venv-graphrag/bin/python`。
+
+reasons:
+  - 运行参数变化不应触发高成本上游阶段重算。
+  - Type DD 下的 checkpoint 语义必须和真实成本边界一致。
+  - 仓内默认 Python 运行环境能降低外部依赖漂移和复现风险。
+
+implications:
+  positive:
+    - 调整并发、retry 或超时不会错误污染 `graph_extract` checkpoint。
+    - 单书恢复点更稳定，后续 20 本书批处理时成本可控。
+    - Bridge 默认走仓内 Python 环境，更接近可交付形态。
+  negative:
+    - 旧 bootstrap checkpoint 需要一次对齐到新 fingerprint 语义。
+    - 仍需持续维护仓内 Python 依赖安装说明与脚本。
+
+next_actions:
+  - action: 保留 `syncGraphRagBookWorkspace` 的 bootstrap 对齐逻辑。
+  - action: 使用 `scripts/graphrag/resume-book-workspace.mjs`
+      作为单书续跑入口。
+  - action: 后续补充本仓库 Python 环境初始化文档。

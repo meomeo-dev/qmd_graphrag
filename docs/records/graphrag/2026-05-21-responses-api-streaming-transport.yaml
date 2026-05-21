@@ -1,0 +1,63 @@
+date: 2026-05-21
+title: Responses API 流式传输适配决策
+status: accepted
+scope: qmd_graphrag
+
+problem:
+  summary: >-
+    本地 OpenAI 网关开始拒绝非流式 `/responses` 请求。GraphRAG 上游仍以
+    `LLMCompletionResponse` 作为普通 completion 的返回约定，并依赖该对象
+    做 cache、metrics 与 structured response 解析。
+  constraints:
+    - 只改造本仓库 `openai_responses` provider。
+    - 不修改上游 GraphRAG / graphrag-llm completion 层。
+    - Jina embedding 与其他非 `/responses` 服务不得被强制流式化。
+    - Endpoint 继续使用用户网关提供的 `/responses`，不拼接 `/v1`。
+
+decision:
+  summary: >-
+    `openai_responses` provider 对 `/responses` 统一使用 `stream=True` 传输。
+    当 GraphRAG 请求普通 completion 时，provider 内部消费 SSE 事件并组装
+    成 `LLMCompletionResponse`；当 GraphRAG 显式请求 `stream=True` 时，
+    provider 返回 chat-compatible chunk iterator。
+  event_handling:
+    text_delta: response.output_text.delta
+    text_done: response.output_text.done
+    complete: response.completed
+    failures:
+      - error
+      - response.failed
+      - response.incomplete
+  structured_output:
+    strategy: >-
+      使用 `text.format` 的 `json_schema` 或 `json_object` 配置保持
+      Responses API 结构化输出约束；provider 收集完整文本后，继续交给
+      `structure_completion_response` 解析为 GraphRAG 期望的 Pydantic model。
+    strict_schema: >-
+      GraphRAG 上游 Pydantic model 不一定声明 `extra='forbid'`，因此
+      `model_json_schema()` 生成的 object schema 可能缺少
+      `additionalProperties: false`。provider 在发送 Responses API 前递归
+      规范化所有 object schema，满足 strict structured output 的网关契约，
+      同时避免修改 vendor GraphRAG model。
+
+validation:
+  local:
+    - `py_compile` validates provider syntax
+    - unit harness validates sync and async SSE collection
+    - unit harness validates sync and async chat chunk conversion
+    - unit harness validates strict object schema normalization
+  gateway:
+    - minimal `/responses stream=True` request returned `OK`
+    - minimal structured `/responses stream=True` request returned JSON object
+    - minimal structured `/responses stream=True` request accepts strict schema
+
+implications:
+  positive:
+    - 满足网关只接受流式 `/responses` 的新约束。
+    - 保持 GraphRAG 普通 completion、cache 与 structured output 语义。
+    - 避免改动上游 completion 层，降低后续合并上游更新的冲突。
+  negative:
+    - 流式 completion 在 graphrag-llm middleware 中不缓存；普通 completion
+      仍由 provider 收集成完整 response 后进入现有 cache 路径。
+    - usage 依赖 `response.completed` 事件中的 response payload；若网关不返回
+      usage，则 token metrics 会回落为 0。

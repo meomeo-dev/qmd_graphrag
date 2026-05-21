@@ -1,0 +1,99 @@
+date: 2026-05-20
+title: 书级阶段检查点与作业状态决策
+status: accepted
+scope: qmd_graphrag
+
+problem:
+  summary: >-
+    现有 GraphRAG 流水线天然以 workflow 为执行主轴，但未直接提供
+    面向多书批处理的书级状态管理、阶段级恢复、成本边界和一致性语义。
+  concerns:
+    - 批量处理 20 本书时，不能接受从第一本重头跑到最后一本。
+    - 中断、网络抖动、429/502 等瞬时故障后，不能接受整本或整批重跑。
+    - LLM 成本控制要求明确最小重跑单位与 cache 复用边界。
+    - 未来需要回答“某本书的某阶段是谁生产的，谁消费的”。
+
+decision:
+  summary: >-
+    将 `一本书 + 一个阶段` 作为最小恢复单位，将 `单次 LLM 请求`
+    作为最小去重计费单位，并在 `qmd_graphrag` 主仓库中引入书级
+    Job State 层，而不是把恢复语义完全交给上游 GraphRAG workflow。
+  boundaries:
+    business_unit: 一本书
+    recovery_unit: 一本书的一个 stage
+    cache_unit: 一个已规范化的模型请求哈希
+  rejected_alternatives:
+    - alternative: 整个 inbox 作为单个 corpus 直接运行一个大 pipeline
+      reason: 成本不可控，恢复粒度过粗，无法局部重算
+    - alternative: 每次失败后直接重跑完整 fast pipeline
+      reason: 重复消耗 embedding 与 community report 成本
+    - alternative: 完全依赖 GraphRAG output/cache 目录隐式恢复
+      reason: 状态语义不足，缺少书级 manifest 与 stage 边界
+
+book_job_model:
+  primary_key:
+    - book_id
+  required_dimensions:
+    - source_hash
+    - normalized_content_hash
+    - config_fingerprint
+    - prompt_fingerprint
+    - model_fingerprint
+    - stage_status
+    - last_success_run_id
+  core_stages:
+    - ingest
+    - normalize
+    - graph_extract
+    - community_report
+    - embed
+    - query_ready
+
+consistency:
+  commit_boundary: book_id + stage
+  write_policy:
+    - stage 先写临时产物
+    - 校验完成后再提升为正式 artifact
+    - 失败时不得覆盖最近一次成功产物
+  invalidation_rules:
+    - source_hash 变化会使全部 stage 失效
+    - prompt_fingerprint 变化只使依赖该 prompt 的 stage 及其下游失效
+    - model_fingerprint 变化只使依赖该模型的 stage 及其下游失效
+    - config_fingerprint 变化按受影响 stage 失效
+
+recovery:
+  strategy:
+    - 读取 book manifest
+    - 找到最后一个 success stage
+    - 从下一个需要重算的 stage 继续
+  failure_policy:
+    - transient errors: 保留 stage 为 failed，可重试
+    - partial artifacts: 标记为 abandoned，不提升为 current
+    - cache reuse: 允许沿用同一 fingerprint 下的 LLM cache
+
+cost_control:
+  goals:
+    - 避免重复生成同一书的 graph/community report
+    - 避免因单个 429/502 导致整本书重算
+    - 避免因单书失败阻塞后续书的处理
+  controls:
+    - stage-level checkpoint
+    - request-level cache
+    - per-book artifact manifest
+    - per-run traceability
+
+storage_layout:
+  root: graph_vault
+  proposed_paths:
+    - graph_vault/books/<book_id>/source/
+    - graph_vault/books/<book_id>/artifacts/<stage>/
+    - graph_vault/books/<book_id>/cache/<stage>/
+    - graph_vault/books/<book_id>/runs/<run_id>/
+    - graph_vault/catalog/books.yaml
+    - graph_vault/catalog/runs.yaml
+
+next_actions:
+  - action: 定义 `BookJob`、`StageCheckpoint`、`ArtifactManifest` 的 typed schema
+  - action: 实现本地文件型 Job State 仓库
+  - action: 将 GraphRAG smoke 运行前后接入书级状态更新
+  - action: 逐步将 CLI / batch runner 改为按书调度

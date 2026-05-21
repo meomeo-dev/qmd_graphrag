@@ -21,6 +21,11 @@ export const GraphRagIndexMethodSchema = z.enum([
   "fast-update",
 ]);
 
+export const GraphRagWorkflowNameSchema = z.enum([
+  "create_community_reports_text",
+  "generate_text_embeddings",
+]);
+
 export const GraphRagQueryRequestSchema = z.object({
   rootDir: z.string().min(1),
   dataDir: z.string().min(1).optional(),
@@ -45,6 +50,8 @@ export const GraphRagIndexRequestSchema = z.object({
   rootDir: z.string().min(1),
   method: GraphRagIndexMethodSchema,
   verbose: z.boolean().optional(),
+  skipValidation: z.boolean().optional(),
+  workflows: z.array(GraphRagWorkflowNameSchema).nonempty().optional(),
   environment: BridgeEnvironmentSchema.optional(),
 });
 
@@ -73,9 +80,9 @@ export const GraphRagIndexEnvelopeSchema = buildEnvelopeSchema(
 
 export type GraphRagSearchMethod = z.infer<typeof GraphRagSearchMethodSchema>;
 export type GraphRagIndexMethod = z.infer<typeof GraphRagIndexMethodSchema>;
+export type GraphRagWorkflowName = z.infer<typeof GraphRagWorkflowNameSchema>;
 export type GraphRagQueryRequest = z.infer<typeof GraphRagQueryRequestSchema>;
 export type GraphRagQueryResponse = z.infer<typeof GraphRagQueryResponseSchema>;
 export type GraphRagIndexRequest = z.infer<typeof GraphRagIndexRequestSchema>;
 export type GraphRagIndexResponse = z.infer<typeof GraphRagIndexResponseSchema>;
 export type GraphRagWorkflowResult = z.infer<typeof GraphRagWorkflowResultSchema>;
-

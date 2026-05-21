@@ -88,6 +88,7 @@ import type {
   GraphRagQueryRequest,
   GraphRagQueryResponse,
   GraphRagSearchMethod,
+  GraphRagWorkflowName,
 } from "./contracts/graphrag.js";
 import type {
   DspyAutoMode,
@@ -101,6 +102,31 @@ import type {
   QueryExpansionItem,
   QueryKind,
 } from "./contracts/common.js";
+import type {
+  BookArtifactKind,
+  BookArtifactManifest,
+  BookJob,
+  BookJobRunRecord,
+  BookJobStageCheckpoint,
+  BookJobStatus,
+  BookResumePlan,
+  BookResumeStageState,
+  BookStage,
+  StageCheckpointStatus,
+} from "./contracts/book-job.js";
+import {
+  FileBookJobStateRepository,
+  type CompleteStageInput,
+  type FailStageInput,
+  type RecordArtifactInput,
+  type RegisterBookSourceInput,
+  type StageArtifactRequirementMap,
+  type StageFingerprintMap,
+  type StartStageInput,
+} from "./job-state/repository.js";
+import {
+  syncGraphRagBookWorkspace,
+} from "./job-state/graphrag-book.js";
 
 // Re-export types for SDK consumers
 export type {
@@ -130,6 +156,7 @@ export type {
   GraphRagQueryRequest,
   GraphRagQueryResponse,
   GraphRagSearchMethod,
+  GraphRagWorkflowName,
   DspyAutoMode,
   DspyGeneratedExpansionRecord,
   DspyOptimizer,
@@ -138,6 +165,16 @@ export type {
   BridgeEnvironment,
   QueryExpansionItem,
   QueryKind,
+  BookArtifactKind,
+  BookArtifactManifest,
+  BookJob,
+  BookJobRunRecord,
+  BookJobStageCheckpoint,
+  BookJobStatus,
+  BookResumePlan,
+  BookResumeStageState,
+  BookStage,
+  StageCheckpointStatus,
 };
 
 // Re-export the internal Store type for advanced consumers
@@ -157,8 +194,27 @@ export {
   BridgeEnvironmentSchema,
 } from "./contracts/common.js";
 export {
+  BookStageSchema,
+  BookJobStatusSchema,
+  StageCheckpointStatusSchema,
+  BookArtifactKindSchema,
+  BookJobSchema,
+  BookJobStageCheckpointSchema,
+  BookArtifactManifestSchema,
+  BookJobRunRecordSchema,
+  BookJobCatalogSchema,
+  BookJobCheckpointListSchema,
+  BookArtifactManifestListSchema,
+  BookJobRunCatalogEntrySchema,
+  BookJobRunCatalogSchema,
+  BookResumeStageStateSchema,
+  BookResumePlanSchema,
+  BookStageOrder,
+} from "./contracts/book-job.js";
+export {
   GraphRagSearchMethodSchema,
   GraphRagIndexMethodSchema,
+  GraphRagWorkflowNameSchema,
   GraphRagQueryRequestSchema,
   GraphRagWorkflowResultSchema,
   GraphRagIndexRequestSchema,
@@ -176,6 +232,34 @@ export {
   DspyOptimizationEnvelopeSchema,
 } from "./contracts/dspy.js";
 export { DataBusEnvelopeSchema } from "./contracts/bus.js";
+export {
+  FileBookJobStateRepository,
+  type CompleteStageInput,
+  type FailStageInput,
+  type RecordArtifactInput,
+  type RegisterBookSourceInput,
+  type StageArtifactRequirementMap,
+  type StageFingerprintMap,
+  type StartStageInput,
+} from "./job-state/repository.js";
+export {
+  syncGraphRagBookWorkspace,
+} from "./job-state/graphrag-book.js";
+export type {
+  GraphRagBookWorkspacePaths,
+  GraphRagBookWorkspaceState,
+  SyncGraphRagBookWorkspaceInput,
+} from "./job-state/graphrag-book.js";
+export {
+  buildBookId,
+  buildBookIdFromSourceHash,
+  createDeterministicHash,
+  createRunId,
+  hashFile,
+  hashText,
+  normalizeBookSlug,
+  toIsoTimestamp,
+} from "./job-state/fingerprint.js";
 
 // Re-export getDefaultDbPath for CLI/MCP that need the default database location
 export { getDefaultDbPath } from "./store.js";

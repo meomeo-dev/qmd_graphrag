@@ -1,0 +1,85 @@
+date: 2026-05-21
+title: graph_vault 可迁移性决策
+status: accepted
+scope: qmd_graphrag
+
+problem:
+  summary: >-
+    `graph_vault` 需要作为可搬迁的持久化仓库。从 A 设备拷贝到 B 设备后，
+    已完成的 GraphRAG 输出、LanceDB 索引、书级 checkpoint 和 artifact
+    manifest 应继续可用，不应依赖 A 设备的绝对路径。
+  current_risks:
+    - `BookJob.sourcePath` 记录宿主机绝对路径。
+    - `BookJob.metadata.normalizedPath` 和 `workspaceRoot` 记录宿主机绝对路径。
+    - `bookId` 由绝对 source path 派生，设备路径变化会让同一本书变成新书。
+    - `source_epub` artifact 可能指向 `../inbox`，只拷贝 `graph_vault` 时不可达。
+
+decision:
+  portable_unit:
+    path: graph_vault
+    rule: >-
+      `graph_vault` 是最小可迁移持久化单元。状态、源文件副本、规范化输入、
+      GraphRAG 输出、LanceDB、cache、reports 和 catalog 均应能在该目录内
+      自洽。
+  source_materialization:
+    rule: >-
+      首次同步书籍时将源 EPUB 复制进 `graph_vault/sources/<book_id>/`，
+      `source_epub` artifact 指向 vault-relative 路径。
+    rationale: >-
+      迁移后不能假设外部 `inbox` 仍存在。源文件副本是 ingest stage 的
+      可消费产物。
+  path_policy:
+    rule: >-
+      状态文件中的可消费路径使用 vault-relative path。`graph_vault`
+      内的 job、catalog、checkpoint、artifact 和 run record 不持久化
+      宿主机绝对路径。
+    forbidden:
+      - host absolute source path as canonical state
+      - host absolute normalized path as canonical state
+      - host absolute workspace root as canonical state
+      - host absolute path in portable job metadata
+  identity_policy:
+    rule: >-
+      `bookId` 由源文件内容哈希和源文件名 slug 派生，而不是由绝对路径派生。
+      同一本源文件在不同设备或不同父目录中应得到同一 `bookId`。
+    format: `<source_slug>-<source_hash_12>`
+  migration_policy:
+    rule: >-
+      同步时若发现旧的路径型 bookId 目录，应迁移到内容型 bookId 目录，
+      并重写 job、checkpoint、artifact 和 run record 中的 `bookId` 与
+      artifactId 引用。
+    compatibility: >-
+      旧状态可被一次性迁移；迁移后以内容型 bookId 为准。
+  runtime_policy:
+    rule: >-
+      跨设备迁移后，运行时 Python 环境、`.env`、`OPENAI_BASE_URL`、
+      `OPENAI_API_KEY` 和 `JINA_API_KEY` 由目标设备提供，不进入
+      `graph_vault`。
+
+invariants:
+  - `graph_vault/settings.yaml` 内部路径保持相对路径。
+  - artifact manifest 的 `path` 字段必须可由 `graph_vault` 根目录解析。
+  - `source_epub` artifact 必须指向 `sources/<book_id>/...`。
+  - `normalized_markdown` artifact 必须指向 `input/...`。
+  - `lancedb_index` artifact 必须指向 `output/lancedb`。
+  - `BookJob.sourcePath` 存储 canonical vault-relative source path。
+  - `BookJob.metadata` 不保存宿主机绝对路径；审计信息应使用 vault-relative
+    artifact 与 run record。
+
+validation:
+  required_tests:
+    - 同一源文件在不同父目录注册后得到相同 `bookId`。
+    - 注册后 source artifact 指向 vault 内部 `sources/<book_id>/`。
+    - `job.yaml` 和 catalog 不写入当前设备绝对 `sourcePath`。
+    - 已有旧路径型 bookId 可迁移到内容型 bookId。
+    - 恢复计划只依赖 vault-relative artifact 可达性。
+
+implications:
+  positive:
+    - `graph_vault` 可作为单目录备份、同步和迁移单元。
+    - 设备路径变化不会导致同一本书被重新建档。
+    - 失败恢复和 artifact 校验不依赖外部 inbox。
+  negative:
+    - vault 会保存源 EPUB 副本，占用额外空间。
+    - 如果同名不同内容源文件进入 vault，会形成不同 `bookId`。
+    - 若需要删除源副本，必须接受 ingest stage 不再完全自洽。
