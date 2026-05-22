@@ -115,14 +115,16 @@ route 为 `graphrag`，查询 graph-ready 子集。
 qmd query --mode auto <query>
 ```
 
-route 为 `auto`。执行顺序固定：
+route 为 `auto`。数据流顺序固定：
 
 1. qmd corpus 召回候选。
-2. 检查候选 evidence 是否具备 `graph_query` capability。
-3. 计算 graph coverage、intent class 和 cost class。
-4. 满足升级契约时调用 GraphRAG。
-5. 记录 `QueryRouteDecision`。
-6. 输出 `UnifiedAnswer`。
+2. 将 `QmdRetrievalCandidate` 映射到已验证 `GraphCapability`。
+3. `decideRoute()` 原子计算 graph coverage、intent class 和 cost class。
+4. `decideRoute()` 产出 `QueryRouteDecision`。
+5. `QueryRouteDecision.selectedRoute` 为 `graphrag` 时调用 GraphRAG。
+6. `buildUnifiedAnswer()` 将 route decision、答案和 evidence 归一化为
+   `UnifiedAnswer`。
+7. CLI/MCP formatter 输出 `UnifiedAnswer`。
 
 路由规则：
 
