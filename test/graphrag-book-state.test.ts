@@ -188,16 +188,64 @@ describe("syncGraphRagBookWorkspace", () => {
           hostPath: root,
         },
       });
-      const jobRaw = await readFile(
-        join(graphVault, "catalog", "books.yaml"),
+      expect(second.resumePlan.nextStage).toBe("graph_extract");
+      expect(second.resumePlan.staleStages).toContain("graph_extract");
+
+      for (const file of [
+        "documents.parquet",
+        "text_units.parquet",
+        "entities.parquet",
+        "relationships.parquet",
+        "communities.parquet",
+      ]) {
+        await writeFile(join(graphVault, "output", file), file, "utf8");
+      }
+      await writeFile(join(graphVault, "output", "context.json"), '{"records":[]}', "utf8");
+      await writeFile(join(graphVault, "output", "stats.json"), '{"workflows":{}}', "utf8");
+      const recovered = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        metadata: {
+          api_key: "sk-test-secret",
+          hostPath: root,
+        },
+      });
+      const jobRaw = await readFile(join(graphVault, "catalog", "books.yaml"), "utf8");
+      const artifacts = YAML.parse(await readFile(
+        join(graphVault, "books", recovered.job.bookId, "artifacts.yaml"),
         "utf8",
-      );
+      )) as { items: Array<{ stage: string; providerFingerprint?: string }> };
+      const checkpoints = YAML.parse(await readFile(
+        join(graphVault, "books", recovered.job.bookId, "checkpoints.yaml"),
+        "utf8",
+      )) as { items: Array<{ stage: string; providerFingerprint?: string }> };
+      const highCostStages = new Set([
+        "graph_extract",
+        "community_report",
+        "embed",
+        "query_ready",
+      ]);
 
       expect(second.job.providerFingerprint).not.toBe(first.job.providerFingerprint);
       expect(second.stageFingerprints.graph_extract)
         .not.toBe(first.stageFingerprints.graph_extract);
-      expect(second.resumePlan.nextStage).toBe("graph_extract");
-      expect(second.resumePlan.staleStages).toContain("graph_extract");
+      for (const item of artifacts.items.filter((artifact) =>
+        highCostStages.has(artifact.stage) &&
+        artifact.stageFingerprint === recovered.stageFingerprints[artifact.stage as keyof typeof recovered.stageFingerprints]
+      )) {
+        expect(item.providerFingerprint).toBe(recovered.job.providerFingerprint);
+      }
+      for (const item of checkpoints.items.filter((checkpoint) =>
+        highCostStages.has(checkpoint.stage) &&
+        checkpoint.inputFingerprint === recovered.stageFingerprints[checkpoint.stage as keyof typeof recovered.stageFingerprints]
+      )) {
+        expect(item.providerFingerprint).toBe(recovered.job.providerFingerprint);
+      }
+      expect(recovered.resumePlan.nextStage).toBe("community_report");
       expect(jobRaw).not.toContain("sk-test-secret");
       expect(jobRaw).not.toContain(root);
       expect(jobRaw).toContain("providerBoundaryFingerprint");

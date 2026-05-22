@@ -1008,7 +1008,7 @@ export async function syncGraphRagBookWorkspace(
     vaultSourcePath,
     bootstrapRunId,
     stageFingerprints,
-    settings.modelFingerprint,
+    settings.providerBoundaryFingerprint,
   );
   const recordedArtifacts = await repo.recordArtifacts(job.bookId, artifacts);
   const byStage = groupArtifactsByStage(recordedArtifacts);
