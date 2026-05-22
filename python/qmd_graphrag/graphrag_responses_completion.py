@@ -32,6 +32,14 @@ _RESPONSE_STREAM_FAILURE_EVENT_TYPES = {
     "response.incomplete",
 }
 
+# GraphRAG's completion middleware currently accepts OpenAI chat-shaped
+# `LLMCompletionResponse` objects. qmd_graphrag still calls only the OpenAI
+# Responses API; these constants are a private compatibility projection for the
+# upstream GraphRAG completion interface, not an invocation of Chat Completions.
+_GRAPHRAG_COMPLETION_RESPONSE_OBJECT = "chat.completion"
+_GRAPHRAG_COMPLETION_CHUNK_OBJECT = "chat.completion.chunk"
+_GRAPHRAG_COMPLETION_MIDDLEWARE_REQUEST_TYPE = "chat"
+
 
 def _normalize_api_base(api_base: str | None) -> str | None:
     if not api_base:
@@ -128,7 +136,10 @@ def _build_response_text_config(
         }
 
     if response_format_json_object:
-        return {"format": {"type": "json_object"}}
+        raise ValueError(
+            "response_format_json_object is not supported; use a strict "
+            "response_format model for Responses API structured output."
+        )
 
     return None
 
@@ -179,7 +190,7 @@ def _create_completion_response(
 
     return LLMCompletionResponse(
         id=response_id,
-        object="chat.completion",
+        object=_GRAPHRAG_COMPLETION_RESPONSE_OBJECT,
         created=created,
         model=model,
         choices=[choice],
@@ -198,7 +209,7 @@ def _create_completion_chunk(
 ) -> LLMCompletionChunk:
     return LLMCompletionChunk(
         id=response_id,
-        object="chat.completion.chunk",
+        object=_GRAPHRAG_COMPLETION_CHUNK_OBJECT,
         created=created,
         model=model,
         choices=[
@@ -397,6 +408,16 @@ async def _iter_response_chunks_async(
 
 def _translate_call_args(kwargs: dict[str, Any]) -> dict[str, Any]:
     translated: dict[str, Any] = {}
+    responses_endpoint = kwargs.pop("responses_endpoint", "/responses")
+    responses_stream = kwargs.pop("responses_stream", True)
+    strict_structured_output = kwargs.pop("strict_structured_output", True)
+
+    if responses_endpoint != "/responses":
+        raise ValueError("Responses API endpoint must be /responses")
+    if responses_stream is not True:
+        raise ValueError("Responses API stream transport must be enabled")
+    if strict_structured_output is not True:
+        raise ValueError("Responses API structured output must be strict")
 
     if "temperature" in kwargs:
         translated["temperature"] = kwargs["temperature"]
@@ -556,7 +577,7 @@ class OpenAIResponsesCompletion(LLMCompletion):
             model_config=self._model_config,
             model_fn=_base_completion,
             async_model_fn=_base_completion_async,
-            request_type="chat",
+            request_type=_GRAPHRAG_COMPLETION_MIDDLEWARE_REQUEST_TYPE,
             cache=cache,
             cache_key_creator=cache_key_creator,
             tokenizer=self._tokenizer,
@@ -575,11 +596,6 @@ class OpenAIResponsesCompletion(LLMCompletion):
             request_metrics = None
 
         response_format = kwargs.get("response_format")
-        is_streaming = kwargs.get("stream") or False
-        if response_format is not None and is_streaming:
-            raise ValueError(
-                "response_format is not supported for streaming completions."
-            )
 
         try:
             response = self._completion(
@@ -610,11 +626,6 @@ class OpenAIResponsesCompletion(LLMCompletion):
             request_metrics = None
 
         response_format = kwargs.get("response_format")
-        is_streaming = kwargs.get("stream") or False
-        if response_format is not None and is_streaming:
-            raise ValueError(
-                "response_format is not supported for streaming completions."
-            )
 
         try:
             response = await self._completion_async(

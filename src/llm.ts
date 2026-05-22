@@ -11,9 +11,25 @@ import type {
   Token as LlamaToken,
 } from "node-llama-cpp";
 import {
+  JinaEmbeddingRequestSchema,
+  JinaEmbeddingResponseSchema,
+  JinaProviderConfigSchema,
   JinaRerankRequestSchema,
   JinaRerankResponseSchema,
 } from "./contracts/jina.js";
+import { loadConfig, type CollectionConfig } from "./collections.js";
+import { ProviderRequestFingerprintSchema } from "./contracts/provider.js";
+import type { ProviderCostLineageMode } from "./contracts/provider.js";
+import { SchemaVersion } from "./contracts/common.js";
+import {
+  appendProviderCostAccounting,
+  buildProviderCostAccounting,
+} from "./provider/cost-accounting.js";
+import {
+  createDeterministicHash,
+  toIsoTimestamp,
+} from "./job-state/fingerprint.js";
+import { sanitizeVaultMetadata } from "./vault/metadata.js";
 
 type StdoutChunk = string | Uint8Array;
 type WriteCallback = (err?: Error | null) => void;
@@ -76,7 +92,18 @@ export async function withNativeStdoutRedirectedToStderr<T>(fn: () => Promise<T>
 
 import { homedir } from "os";
 import { join } from "path";
-import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
+import {
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+  closeSync,
+} from "fs";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -180,6 +207,7 @@ export type EmbedOptions = {
   model?: string;
   isQuery?: boolean;
   title?: string;
+  costLineage?: ProviderCostLineage;
 };
 
 /**
@@ -196,6 +224,7 @@ export type GenerateOptions = {
  */
 export type RerankOptions = {
   model?: string;
+  costLineage?: ProviderCostLineage;
 };
 
 /**
@@ -244,7 +273,77 @@ export type RerankDocument = {
   file: string;
   text: string;
   title?: string;
+  costLineage?: ProviderCostLineage;
 };
+
+export type ProviderCostLineage = {
+  sourceId?: string | null;
+  documentId?: string | null;
+  bookId?: string | null;
+  contentHash?: string | null;
+  lineageMode?: ProviderCostLineageMode;
+  artifactIds?: readonly string[];
+};
+
+function mergeProviderCostLineage(
+  lineages: readonly (ProviderCostLineage | null | undefined)[],
+): ProviderCostLineage | undefined {
+  const present = lineages.filter(
+    (lineage): lineage is ProviderCostLineage => lineage != null,
+  );
+  if (present.length === 0) return undefined;
+
+  const mergeScalar = (
+    key: Exclude<keyof ProviderCostLineage, "artifactIds" | "lineageMode">,
+  ): string | null => {
+    const values = new Set(
+      present
+        .map((lineage) => lineage[key])
+        .filter((value): value is string => typeof value === "string" && value.length > 0),
+    );
+    return values.size === 1 ? [...values][0]! : null;
+  };
+
+  const sourceId = mergeScalar("sourceId");
+  const documentId = mergeScalar("documentId");
+  const bookId = mergeScalar("bookId");
+  const contentHash = mergeScalar("contentHash");
+  const hasCorpusIdentity = present.some(
+    (lineage) =>
+      lineage.sourceId != null ||
+      lineage.documentId != null ||
+      lineage.bookId != null ||
+      lineage.contentHash != null,
+  );
+  const lineageMode = !hasCorpusIdentity
+    ? "transient_query"
+    : present.length === 1
+      ? (present[0]?.lineageMode ?? "corpus_artifact")
+      : "multi_document_query";
+
+  return {
+    sourceId,
+    documentId,
+    bookId,
+    contentHash,
+    lineageMode,
+    artifactIds: [
+      ...new Set(present.flatMap((lineage) => lineage.artifactIds ?? [])),
+    ],
+  };
+}
+
+function resolveProviderCostLineageMode(
+  lineage: ProviderCostLineage | undefined,
+): ProviderCostLineageMode {
+  if (lineage?.lineageMode) return lineage.lineageMode;
+  const hasCorpusIdentity =
+    lineage?.sourceId != null ||
+    lineage?.documentId != null ||
+    lineage?.bookId != null ||
+    lineage?.contentHash != null;
+  return hasCorpusIdentity ? "corpus_artifact" : "transient_query";
+}
 
 // =============================================================================
 // Model Configuration
@@ -255,6 +354,7 @@ export type RerankDocument = {
 // Override via QMD_EMBED_MODEL env var (e.g. hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf)
 const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "jina:jina-reranker-v3";
+const JINA_EMBED_PREFIX = "jina:";
 const JINA_RERANK_PREFIX = "jina:";
 const DEFAULT_JINA_API_BASE = "https://api.jina.ai";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
@@ -292,18 +392,79 @@ export function isJinaRerankModel(model: string): boolean {
   return model.startsWith(JINA_RERANK_PREFIX);
 }
 
+export function isJinaEmbeddingModel(model: string): boolean {
+  return model.startsWith(JINA_EMBED_PREFIX);
+}
+
+function resolveJinaEmbeddingModelName(model: string): string {
+  return isJinaEmbeddingModel(model) ? model.slice(JINA_EMBED_PREFIX.length) : model;
+}
+
 function resolveJinaRerankModelName(model: string): string {
   return isJinaRerankModel(model) ? model.slice(JINA_RERANK_PREFIX.length) : model;
 }
 
+function loadRuntimeConfig(): CollectionConfig {
+  try {
+    return loadConfig();
+  } catch {
+    return { collections: {} };
+  }
+}
+
+function envValue(envName: string | undefined, fallbackName: string): string | undefined {
+  const name = envName?.trim() || fallbackName;
+  return process.env[name]?.trim();
+}
+
+function resolveJinaProviderConfig(config: CollectionConfig = loadRuntimeConfig()) {
+  const provider = config.providers?.jina;
+  return JinaProviderConfigSchema.parse({
+    apiKeyEnv: provider?.api_key_env ?? "JINA_API_KEY",
+    baseUrlEnv: provider?.base_url_env ?? "JINA_API_BASE",
+    baseUrl: provider?.base_url ?? process.env.JINA_API_BASE ?? DEFAULT_JINA_API_BASE,
+    embeddingEndpoint: provider?.embedding_endpoint ?? "/v1/embeddings",
+    rerankEndpoint: provider?.rerank_endpoint ?? "/v1/rerank",
+  });
+}
+
 function resolveJinaApiBase(): string {
-  return (process.env.JINA_API_BASE || DEFAULT_JINA_API_BASE).replace(/\/+$/, "");
+  return resolveJinaProviderConfig().baseUrl.replace(/\/+$/, "");
+}
+
+function resolveJinaEmbeddingEndpoint(): string {
+  return resolveJinaProviderConfig().embeddingEndpoint;
+}
+
+function resolveJinaRerankEndpoint(): string {
+  return resolveJinaProviderConfig().rerankEndpoint;
+}
+
+export class JinaProviderConfigError extends Error {
+  readonly provider = "jina";
+  readonly code = "provider_unavailable";
+  readonly retryable = false;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "JinaProviderConfigError";
+  }
+}
+
+function readJinaUsageTokens(
+  usage: Record<string, unknown> | undefined,
+): number | null {
+  const raw = usage?.total_tokens ?? usage?.tokens;
+  return Number.isInteger(raw) && Number(raw) >= 0 ? Number(raw) : null;
 }
 
 function resolveJinaApiKey(): string {
-  const apiKey = process.env.JINA_API_KEY?.trim();
+  const config = resolveJinaProviderConfig();
+  const apiKey = envValue(config.apiKeyEnv, "JINA_API_KEY");
   if (!apiKey) {
-    throw new Error("JINA_API_KEY is required for Jina rerank models");
+    throw new JinaProviderConfigError(
+      `${config.apiKeyEnv} is required for Jina embedding and rerank models`,
+    );
   }
   return apiKey;
 }
@@ -1305,6 +1466,11 @@ export class LlamaCpp implements LLM {
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    const modelName = options.model ?? this.embedModelUri;
+    if (isJinaEmbeddingModel(modelName)) {
+      return (await this.embedBatchWithJina([text], modelName, options))[0] ?? null;
+    }
+
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1335,6 +1501,11 @@ export class LlamaCpp implements LLM {
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    const modelName = options.model ?? this.embedModelUri;
+    if (isJinaEmbeddingModel(modelName)) {
+      return this.embedBatchWithJina(texts, modelName, options);
+    }
+
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1398,6 +1569,147 @@ export class LlamaCpp implements LLM {
       console.error("Batch embedding error:", error);
       return texts.map(() => null);
     }
+  }
+
+  private async embedBatchWithJina(
+    texts: string[],
+    model: string,
+    options: EmbedOptions = {},
+  ): Promise<(EmbeddingResult | null)[]> {
+    if (texts.length === 0) return [];
+
+    const jinaModel = resolveJinaEmbeddingModelName(model);
+    const request = JinaEmbeddingRequestSchema.parse({
+      model: jinaModel,
+      input: texts,
+    });
+    const response = await fetch(
+      `${resolveJinaApiBase()}${resolveJinaEmbeddingEndpoint()}`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${resolveJinaApiKey()}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(request),
+      },
+    );
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      const detail = body ? `: ${body.slice(0, 300)}` : "";
+      throw new Error(`Jina embedding request failed (${response.status})${detail}`);
+    }
+
+    const payload = JinaEmbeddingResponseSchema.parse(await response.json());
+    const tokenCount = readJinaUsageTokens(payload.usage);
+    await this.recordProviderCost({
+      stage: "embed",
+      provider: "jina",
+      model: jinaModel,
+      requestCount: 1,
+      tokenCount,
+      tokenCountStatus: tokenCount == null ? "unknown" : "reported",
+      embeddingCount: texts.length,
+      embeddingCountStatus: "reported",
+      requestFingerprint: createDeterministicHash({
+        model: jinaModel,
+        input: texts,
+      }),
+      metadata: {
+        inputCount: texts.length,
+      },
+      costLineage: options.costLineage,
+    });
+    const byIndex = new Map(payload.data.map((item) => [item.index, item.embedding]));
+    return texts.map((_, index) => {
+      const embedding = byIndex.get(index);
+      return embedding ? { embedding, model } : null;
+    });
+  }
+
+  private async recordProviderCost(input: {
+    stage: string;
+    provider: string;
+    model: string;
+    requestCount: number;
+    tokenCount?: number | null;
+    tokenCountStatus?: "reported" | "estimated" | "unknown";
+    embeddingCount?: number;
+    embeddingCountStatus?: "reported" | "estimated" | "unknown";
+    requestFingerprint: string;
+    metadata?: Record<string, string | number | boolean | null>;
+    costLineage?: ProviderCostLineage;
+  }): Promise<void> {
+    const graphVault = process.env.QMD_GRAPH_VAULT?.trim();
+    if (!graphVault) return;
+    const requestArtifactId = createDeterministicHash([
+      "provider_request",
+      input.provider,
+      input.stage,
+      input.model,
+      input.requestFingerprint,
+    ]);
+    const requestArtifactPath = join(
+      graphVault,
+      "catalog",
+      "provider-requests",
+      `${requestArtifactId}.json`,
+    );
+    mkdirSync(join(graphVault, "catalog", "provider-requests"), {
+      recursive: true,
+    });
+    const metadata = sanitizeVaultMetadata(input.metadata);
+    const requestArtifact = ProviderRequestFingerprintSchema.parse({
+      schemaVersion: SchemaVersion,
+      artifactId: requestArtifactId,
+      kind: "provider_request_fingerprint",
+      provider: input.provider,
+      stage: input.stage,
+      model: input.model,
+      requestFingerprint: input.requestFingerprint,
+      createdAt: toIsoTimestamp(),
+      metadata: metadata ?? {},
+    });
+    writeFileSync(
+      requestArtifactPath,
+      JSON.stringify(requestArtifact, null, 2),
+      "utf8",
+    );
+    const lineageMode = resolveProviderCostLineageMode(input.costLineage);
+
+    const record = buildProviderCostAccounting({
+      sourceId: input.costLineage?.sourceId ?? null,
+      documentId: input.costLineage?.documentId ?? null,
+      bookId: input.costLineage?.bookId ?? null,
+      contentHash: input.costLineage?.contentHash ?? null,
+      lineageMode,
+      stage: input.stage,
+      provider: input.provider,
+      model: input.model,
+      requestCount: input.requestCount,
+      tokenCount: input.tokenCount ?? 0,
+      tokenCountStatus: input.tokenCountStatus ?? (
+        input.tokenCount == null ? "unknown" : "reported"
+      ),
+      embeddingCount: input.embeddingCount ?? 0,
+      embeddingCountStatus: input.embeddingCountStatus ?? (
+        input.embeddingCount == null ? "unknown" : "reported"
+      ),
+      cacheHit: false,
+      runId: process.env.QMD_RUN_ID || `${input.stage}-${Date.now()}`,
+      requestArtifactId,
+      artifactIds: [
+        requestArtifactId,
+        ...new Set(input.costLineage?.artifactIds ?? []),
+      ],
+      metadata: {
+        ...(input.metadata ?? {}),
+        requestArtifactPath:
+          `catalog/provider-requests/${requestArtifactId}.json`,
+      },
+    });
+    await appendProviderCostAccounting(graphVault, record);
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
@@ -1569,7 +1881,7 @@ export class LlamaCpp implements LLM {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     const modelName = options.model ?? this.rerankModelUri;
     if (isJinaRerankModel(modelName)) {
-      return this.rerankWithJina(query, documents, modelName);
+      return this.rerankWithJina(query, documents, modelName, options);
     }
 
     // Ping activity at start to keep models alive during this operation
@@ -1665,6 +1977,7 @@ export class LlamaCpp implements LLM {
     query: string,
     documents: RerankDocument[],
     model: string,
+    options: RerankOptions = {},
   ): Promise<RerankResult> {
     if (documents.length === 0) {
       return {
@@ -1680,14 +1993,17 @@ export class LlamaCpp implements LLM {
       documents: documents.map((doc) => doc.text),
       return_documents: false,
     });
-    const response = await fetch(`${resolveJinaApiBase()}/v1/rerank`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${resolveJinaApiKey()}`,
-        "Content-Type": "application/json",
+    const response = await fetch(
+      `${resolveJinaApiBase()}${resolveJinaRerankEndpoint()}`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${resolveJinaApiKey()}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(request),
       },
-      body: JSON.stringify(request),
-    });
+    );
 
     if (!response.ok) {
       const body = await response.text().catch(() => "");
@@ -1696,6 +2012,29 @@ export class LlamaCpp implements LLM {
     }
 
     const payload = JinaRerankResponseSchema.parse(await response.json());
+    const tokenCount = readJinaUsageTokens(payload.usage);
+    await this.recordProviderCost({
+      stage: "rerank",
+      provider: "jina",
+      model: jinaModel,
+      requestCount: 1,
+      tokenCount,
+      tokenCountStatus: tokenCount == null ? "unknown" : "reported",
+      embeddingCount: 0,
+      embeddingCountStatus: "reported",
+      requestFingerprint: createDeterministicHash({
+        model: jinaModel,
+        query,
+        documents: documents.map((doc) => doc.text),
+      }),
+      metadata: {
+        documentCount: documents.length,
+      },
+      costLineage: mergeProviderCostLineage([
+        options.costLineage,
+        ...documents.map((document) => document.costLineage),
+      ]),
+    });
     const results = payload.results.map((item) => {
       const document = documents[item.index];
       if (document == null) {

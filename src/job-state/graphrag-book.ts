@@ -1,5 +1,7 @@
-import { copyFile, mkdir, readdir, readFile, stat } from "node:fs/promises";
-import { basename, extname, join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { copyFile, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, extname, join, resolve } from "node:path";
 
 import YAML from "yaml";
 
@@ -10,6 +12,7 @@ import type {
   BookResumePlan,
   BookStage,
 } from "../contracts/book-job.js";
+import type { CollectionConfig } from "../collections.js";
 import type { JsonValue } from "../contracts/common.js";
 import {
   buildBookIdFromSourceHash,
@@ -17,12 +20,30 @@ import {
   createRunId,
   hashFile,
   hashText,
+  normalizeBookSlug,
 } from "./fingerprint.js";
+import {
+  chunkDocument,
+  createStore,
+  extractTitle,
+  hashContent,
+  insertContent,
+  insertDocument,
+  upsertStoreCollection,
+} from "../store.js";
+import {
+  hashDirectoryContents,
+  hashLanceDbDirectoryContents,
+  isCompleteLanceDbDirectory,
+} from "./artifact-validation.js";
 import {
   FileBookJobStateRepository,
   type StageArtifactRequirementMap,
   type StageFingerprintMap,
 } from "./repository.js";
+import { assertManagedGraphRagSettings } from "../graphrag/settings-projection.js";
+
+const GRAPHRAG_NORMALIZATION_POLICY_VERSION = "graphrag-normalized-markdown-v1";
 
 const GRAPH_EXTRACT_KINDS = [
   "graphrag_documents_parquet",
@@ -43,12 +64,6 @@ const GRAPH_RAG_STAGE_ARTIFACT_REQUIREMENTS: StageArtifactRequirementMap = {
   query_ready: ["graphrag_community_reports_parquet", "lancedb_index"],
 };
 
-const REQUIRED_LANCEDB_TABLES = [
-  "entity_description.lance",
-  "community_full_content.lance",
-  "text_unit_text.lance",
-] as const;
-
 export type GraphRagBookWorkspacePaths = {
   stateRootDir: string;
   sourcePath: string;
@@ -57,6 +72,8 @@ export type GraphRagBookWorkspacePaths = {
   settingsPath: string;
   promptsDir: string;
   outputDir: string;
+  qmdIndexPath?: string;
+  projectConfig?: CollectionConfig;
 };
 
 export type SyncGraphRagBookWorkspaceInput = GraphRagBookWorkspacePaths & {
@@ -72,40 +89,20 @@ export type GraphRagBookWorkspaceState = {
   bootstrapRunId: string;
 };
 
+export type GraphRagTextUnitIdentity = {
+  schemaVersion: "1.0.0";
+  bookId: string;
+  sourceId: string;
+  sourceHash: string;
+  documentId: string;
+  contentHash: string;
+  normalizedPath: string;
+  graphDocumentId: string;
+  graphTextUnitIds: string[];
+};
+
 function stripKnownBookExtension(path: string): string {
   return basename(path).replace(/\.(epub|md|markdown|txt)$/iu, "");
-}
-
-async function listFilesRecursive(rootDir: string): Promise<string[]> {
-  const entries = await readdir(rootDir, { withFileTypes: true });
-  const files: string[] = [];
-
-  for (const entry of entries) {
-    const entryPath = join(rootDir, entry.name);
-    if (entry.isDirectory()) {
-      files.push(...(await listFilesRecursive(entryPath)));
-      continue;
-    }
-    if (entry.isFile()) {
-      files.push(entryPath);
-    }
-  }
-
-  files.sort((left, right) => left.localeCompare(right));
-  return files;
-}
-
-async function hashDirectoryContents(rootDir: string): Promise<string> {
-  const files = await listFilesRecursive(rootDir);
-  const payload = await Promise.all(
-    files.map(async (path) => {
-      return {
-        path: path.slice(rootDir.length + 1),
-        hash: await hashFile(path),
-      };
-    }),
-  );
-  return createDeterministicHash(payload);
 }
 
 async function parseSettingsFingerprint(
@@ -218,13 +215,29 @@ async function artifactForFile(
   stage: BookStage,
   kind: Parameters<FileBookJobStateRepository["recordArtifacts"]>[1][number]["kind"],
   producerRunId: string,
+  stageFingerprint?: string,
+  providerFingerprint?: string,
 ) {
+  const contentHash = kind === "normalized_markdown"
+    ? await hashContent(
+        await readFile(path, "utf8"),
+        GRAPHRAG_NORMALIZATION_POLICY_VERSION,
+      )
+    : await hashFile(path);
+
   return {
     stage,
     kind,
     path,
-    contentHash: await hashFile(path),
+    contentHash,
     producerRunId,
+    metadata: {
+      ...(stageFingerprint ? { stageFingerprint } : {}),
+      ...(providerFingerprint ? { providerFingerprint } : {}),
+    },
+    stageFingerprint,
+    providerFingerprint,
+    normalizationPolicyVersion: GRAPHRAG_NORMALIZATION_POLICY_VERSION,
   };
 }
 
@@ -252,11 +265,26 @@ async function materializeSourceInVault(input: {
   return vaultSourcePath;
 }
 
+async function canonicalizeLegacyWorkspaceLayout(input: {
+  repo: FileBookJobStateRepository;
+  stateRootDir: string;
+  sourceIdentityPath: string;
+  sourceHash: string;
+  bookId: string;
+}): Promise<void> {
+  const legacyBookId = `${normalizeBookSlug(input.sourceIdentityPath)}-${
+    input.sourceHash.slice(0, 12)
+  }`;
+  await input.repo.remapBookIdentity(legacyBookId, input.bookId);
+}
+
 async function maybeArtifactForPath(
   path: string,
   stage: BookStage,
   kind: Parameters<FileBookJobStateRepository["recordArtifacts"]>[1][number]["kind"],
   producerRunId: string,
+  stageFingerprint?: string,
+  providerFingerprint?: string,
 ) {
   try {
     const entry = await stat(path);
@@ -267,7 +295,14 @@ async function maybeArtifactForPath(
     return null;
   }
 
-  return artifactForFile(path, stage, kind, producerRunId);
+  return artifactForFile(
+    path,
+    stage,
+    kind,
+    producerRunId,
+    stageFingerprint,
+    providerFingerprint,
+  );
 }
 
 async function maybeArtifactForDirectory(
@@ -275,6 +310,8 @@ async function maybeArtifactForDirectory(
   stage: BookStage,
   kind: Parameters<FileBookJobStateRepository["recordArtifacts"]>[1][number]["kind"],
   producerRunId: string,
+  stageFingerprint?: string,
+  providerFingerprint?: string,
 ) {
   try {
     const entry = await stat(path);
@@ -289,107 +326,391 @@ async function maybeArtifactForDirectory(
     stage,
     kind,
     path,
-    contentHash: await hashDirectoryContents(path),
+    contentHash: kind === "lancedb_index"
+      ? await hashLanceDbDirectoryContents(path)
+      : await hashDirectoryContents(path),
     producerRunId,
+    stageFingerprint,
+    providerFingerprint,
+    normalizationPolicyVersion: GRAPHRAG_NORMALIZATION_POLICY_VERSION,
+    metadata: {
+      ...(stageFingerprint ? { stageFingerprint } : {}),
+      ...(providerFingerprint ? { providerFingerprint } : {}),
+    },
   };
 }
 
-async function isCompleteLanceDbDirectory(path: string): Promise<boolean> {
+function normalizeIdList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item)).filter((item) => item.length > 0);
+  }
+  if (
+    typeof value === "object" &&
+    value != null &&
+    "length" in value &&
+    typeof (value as { length?: unknown }).length === "number"
+  ) {
+    return Array.from(value as ArrayLike<unknown>)
+      .map((item) => String(item))
+      .filter((item) => item.length > 0);
+  }
+  if (value == null) return [];
+  return [String(value)].filter((item) => item.length > 0);
+}
+
+function selectPythonBin(): string {
+  const bundledPython = resolve(process.cwd(), ".venv-graphrag", "bin", "python");
+  if (process.env.QMD_GRAPHRAG_PYTHON) return process.env.QMD_GRAPHRAG_PYTHON;
+  if (existsSync(bundledPython)) return bundledPython;
+  return process.env.PYTHON || "python3";
+}
+
+export async function readGraphTextUnitIdentity(input: {
+  bookId: string;
+  sourceId: string;
+  sourceHash: string;
+  documentId: string;
+  contentHash: string;
+  normalizedPath: string;
+  outputDir: string;
+}): Promise<GraphRagTextUnitIdentity | null> {
+  const documentsPath = join(input.outputDir, "documents.parquet");
+  const textUnitsPath = join(input.outputDir, "text_units.parquet");
   try {
-    const entry = await stat(path);
-    if (!entry.isDirectory()) {
-      return false;
-    }
+    await Promise.all([stat(documentsPath), stat(textUnitsPath)]);
   } catch {
-    return false;
+    return null;
   }
 
-  for (const tableName of REQUIRED_LANCEDB_TABLES) {
-    const tableDir = join(path, tableName);
+  const helper = [
+    "import json, sys",
+    "import pandas as pd",
+    "documents_path, text_units_path, document_id = sys.argv[1:4]",
+    "documents = pd.read_parquet(documents_path)",
+    "text_units = pd.read_parquet(text_units_path)",
+    "matched = documents.loc[documents['id'].astype(str) == str(document_id)]",
+    "if matched.empty and len(documents.index) == 1:",
+    "    matched = documents.iloc[[0]]",
+    "if matched.empty:",
+    "    print('null')",
+    "    raise SystemExit(0)",
+    "document = matched.iloc[0]",
+    "graph_document_id = str(document['id'])",
+    "ids = []",
+    "if 'text_unit_ids' in documents.columns:",
+    "    value = document.get('text_unit_ids')",
+    "    if hasattr(value, 'tolist'):",
+    "        value = value.tolist()",
+    "    if isinstance(value, (list, tuple, set)):",
+    "        ids.extend(str(item) for item in value if item is not None)",
+    "    elif value is not None:",
+    "        ids.append(str(value))",
+    "if 'document_id' in text_units.columns:",
+    "    filtered = text_units.loc[text_units['document_id'].astype(str) == graph_document_id]",
+    "    if 'id' in filtered.columns:",
+    "        ids.extend(str(item) for item in filtered['id'].tolist() if item is not None)",
+    "ids = sorted(set(item for item in ids if item))",
+    "print(json.dumps({'graphDocumentId': graph_document_id, 'graphTextUnitIds': ids}))",
+  ].join("\n");
+  const result = spawnSync(selectPythonBin(), [
+    "-c",
+    helper,
+    documentsPath,
+    textUnitsPath,
+    input.documentId,
+  ], {
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    throw new Error(
+      result.stderr.trim() || "failed to read GraphRAG text unit identity",
+    );
+  }
+  const parsed = JSON.parse(result.stdout.trim()) as null | {
+    graphDocumentId: unknown;
+    graphTextUnitIds: unknown;
+  };
+  if (parsed == null) return null;
+  const graphTextUnitIds = normalizeIdList(parsed.graphTextUnitIds);
+  if (typeof parsed.graphDocumentId !== "string" || graphTextUnitIds.length === 0) {
+    return null;
+  }
+  return {
+    schemaVersion: "1.0.0",
+    bookId: input.bookId,
+    sourceId: input.sourceId,
+    sourceHash: input.sourceHash,
+    documentId: input.documentId,
+    contentHash: input.contentHash,
+    normalizedPath: input.normalizedPath,
+    graphDocumentId: parsed.graphDocumentId,
+    graphTextUnitIds,
+  };
+}
+
+async function recordGraphTextUnitIdentityIfAvailable(input: {
+  repo: FileBookJobStateRepository;
+  job: BookJob;
+  normalizedPath: string;
+  outputDir: string;
+  required: boolean;
+}): Promise<void> {
+  let mapping: Awaited<ReturnType<typeof readGraphTextUnitIdentity>>;
+  try {
+    mapping = await readGraphTextUnitIdentity({
+      bookId: input.job.bookId,
+      sourceId: `sha256:${input.job.sourceHash}`,
+      sourceHash: input.job.sourceHash,
+      documentId: input.job.documentId,
+      contentHash: input.job.normalizedContentHash ?? input.job.sourceHash,
+      normalizedPath: input.normalizedPath,
+      outputDir: input.outputDir,
+    });
+  } catch (error) {
+    if (!input.required) return;
+    throw error;
+  }
+  if (mapping == null) {
+    if (!input.required) return;
+    throw new Error(
+      `GraphRAG document identity is missing for query_ready: ${input.job.documentId}`,
+    );
+  }
+  await input.repo.recordGraphTextUnitIdentity(mapping);
+  await writeFile(
+    join(input.outputDir, "qmd_graph_text_unit_identity.json"),
+    JSON.stringify(mapping, null, 2),
+    "utf8",
+  );
+}
+
+async function recordDocumentChunks(input: {
+  repo: FileBookJobStateRepository;
+  job: BookJob;
+  normalizedPath: string;
+}): Promise<void> {
+  let text: string;
+  try {
+    text = await readFile(input.normalizedPath, "utf8");
+  } catch {
+    return;
+  }
+
+  const chunks = chunkDocument(text);
+  const chunkIds = chunks.map((chunk, seq) =>
+    `chunk-${createDeterministicHash({
+      documentId: input.job.documentId,
+      contentHash: input.job.normalizedContentHash ?? input.job.sourceHash,
+      chunkStrategy: "qmd-default-v1",
+      seq,
+      pos: chunk.pos,
+      length: chunk.text.length,
+    }).slice(0, 12)}`,
+  );
+  await input.repo.recordDocumentChunks({
+    documentId: input.job.documentId,
+    contentHash: input.job.normalizedContentHash ?? input.job.sourceHash,
+    chunkIds,
+  });
+}
+
+async function registerQmdCorpusDocument(input: {
+  repo: FileBookJobStateRepository;
+  qmdIndexPath: string;
+  stateRootDir: string;
+  job: BookJob;
+  normalizedPath: string;
+}): Promise<void> {
+  const content = await readFile(input.normalizedPath, "utf8");
+  const contentHash = await hashContent(
+    content,
+    input.job.normalizationPolicyVersion,
+  );
+  if (contentHash !== input.job.normalizedContentHash) {
+    throw new Error(
+      `qmd corpus content hash differs from graph identity: ${input.job.documentId}`,
+    );
+  }
+
+  await mkdir(dirname(input.qmdIndexPath), { recursive: true });
+  const store = createStore(input.qmdIndexPath);
+  try {
+    upsertStoreCollection(store.db, "books", {
+      path: join(resolve(input.stateRootDir), "input"),
+      pattern: "**/*.md",
+      context: {
+        "/": "Normalized books available to qmd and GraphRAG.",
+      },
+    });
+    const now = new Date().toISOString();
+    const normalizedRelativePath = input.job.normalizedPath?.startsWith("input/")
+      ? input.job.normalizedPath.slice("input/".length)
+      : input.job.normalizedPath ?? basename(input.normalizedPath);
+    insertContent(store.db, contentHash, content, now);
+    insertDocument(
+      store.db,
+      "books",
+      normalizedRelativePath,
+      extractTitle(content, normalizedRelativePath),
+      contentHash,
+      now,
+      now,
+    );
+    await input.repo.recordQmdCorpusRegistration({
+      documentId: input.job.documentId,
+      contentHash,
+      collection: "books",
+      relativePath: normalizedRelativePath,
+    });
+  } finally {
+    store.close();
+  }
+}
+
+async function writeLanceDbRowCountSidecars(root: string): Promise<void> {
+  for (const tableName of [
+    "entity_description.lance",
+    "community_full_content.lance",
+    "text_unit_text.lance",
+  ]) {
+    const tableDir = join(root, tableName);
     try {
-      const [tableEntry, dataFiles, versionFiles] = await Promise.all([
-        stat(tableDir),
-        readdir(join(tableDir, "data")),
-        readdir(join(tableDir, "_versions")),
-      ]);
-      if (
-        !tableEntry.isDirectory() ||
-        !dataFiles.some((item) => item.endsWith(".lance")) ||
-        !versionFiles.some((item) => item.endsWith(".manifest"))
-      ) {
-        return false;
-      }
+      await stat(tableDir);
     } catch {
-      return false;
+      continue;
     }
+    const rowCount = await readLanceDbRowCount(tableDir);
+    if (rowCount == null) continue;
+    await writeFile(
+      join(tableDir, "qmd_row_count.json"),
+      JSON.stringify({ schemaVersion: "1.0.0", rowCount }, null, 2),
+      "utf8",
+    );
   }
+}
 
-  return true;
+async function readLanceDbRowCount(tableDir: string): Promise<number | null> {
+  const helper = [
+    "import json, sys",
+    "import lancedb",
+    "table_dir = sys.argv[1]",
+    "db_uri, table_name = table_dir.rsplit('/', 1)",
+    "db = lancedb.connect(db_uri)",
+    "names = [table_name[:-6] if table_name.endswith('.lance') else table_name, table_name]",
+    "table = None",
+    "for name in dict.fromkeys(names):",
+    "    try:",
+    "        table = db.open_table(name)",
+    "        break",
+    "    except Exception:",
+    "        pass",
+    "if table is None:",
+    "    raise ValueError(f'LanceDB table not found: {table_name}')",
+    "print(json.dumps({'rowCount': int(table.count_rows())}))",
+  ].join("\n");
+  const result = spawnSync(selectPythonBin(), ["-c", helper, tableDir], {
+    encoding: "utf8",
+  });
+  if (result.status !== 0) return null;
+  try {
+    const parsed = JSON.parse(result.stdout.trim()) as { rowCount?: unknown };
+    return typeof parsed.rowCount === "number" ? parsed.rowCount : null;
+  } catch {
+    return null;
+  }
 }
 
 async function collectWorkspaceArtifacts(
   paths: GraphRagBookWorkspacePaths,
   vaultSourcePath: string,
   producerRunId: string,
+  stageFingerprints: Record<BookStage, string>,
+  providerFingerprint: string,
 ) {
   const normalizedPath = resolve(paths.normalizedPath);
   const outputDir = resolve(paths.outputDir);
+  const stageRunId = (stage: BookStage) => `${producerRunId}-${stage}`;
 
   const artifacts = await Promise.all([
-    artifactForFile(vaultSourcePath, "ingest", "source_epub", producerRunId),
+    artifactForFile(
+      vaultSourcePath,
+      "ingest",
+      "source_epub",
+      stageRunId("ingest"),
+      stageFingerprints.ingest,
+      providerFingerprint,
+    ),
     maybeArtifactForPath(
       normalizedPath,
       "normalize",
       "normalized_markdown",
-      producerRunId,
+      stageRunId("normalize"),
+      stageFingerprints.normalize,
+      providerFingerprint,
     ),
     maybeArtifactForPath(
       join(outputDir, "documents.parquet"),
       "graph_extract",
       "graphrag_documents_parquet",
-      producerRunId,
+      stageRunId("graph_extract"),
+      stageFingerprints.graph_extract,
+      providerFingerprint,
     ),
     maybeArtifactForPath(
       join(outputDir, "text_units.parquet"),
       "graph_extract",
       "graphrag_text_units_parquet",
-      producerRunId,
+      stageRunId("graph_extract"),
+      stageFingerprints.graph_extract,
+      providerFingerprint,
     ),
     maybeArtifactForPath(
       join(outputDir, "entities.parquet"),
       "graph_extract",
       "graphrag_entities_parquet",
-      producerRunId,
+      stageRunId("graph_extract"),
+      stageFingerprints.graph_extract,
+      providerFingerprint,
     ),
     maybeArtifactForPath(
       join(outputDir, "relationships.parquet"),
       "graph_extract",
       "graphrag_relationships_parquet",
-      producerRunId,
+      stageRunId("graph_extract"),
+      stageFingerprints.graph_extract,
+      providerFingerprint,
     ),
     maybeArtifactForPath(
       join(outputDir, "communities.parquet"),
       "graph_extract",
       "graphrag_communities_parquet",
-      producerRunId,
+      stageRunId("graph_extract"),
+      stageFingerprints.graph_extract,
+      providerFingerprint,
     ),
     maybeArtifactForPath(
       join(outputDir, "context.json"),
       "graph_extract",
       "graphrag_context_json",
-      producerRunId,
+      stageRunId("graph_extract"),
+      stageFingerprints.graph_extract,
+      providerFingerprint,
     ),
     maybeArtifactForPath(
       join(outputDir, "stats.json"),
       "graph_extract",
       "graphrag_stats_json",
-      producerRunId,
+      stageRunId("graph_extract"),
+      stageFingerprints.graph_extract,
+      providerFingerprint,
     ),
     maybeArtifactForPath(
       join(outputDir, "community_reports.parquet"),
       "community_report",
       "graphrag_community_reports_parquet",
-      producerRunId,
+      stageRunId("community_report"),
+      stageFingerprints.community_report,
+      providerFingerprint,
     ),
     isCompleteLanceDbDirectory(join(outputDir, "lancedb")).then((isComplete) =>
       isComplete
@@ -397,7 +718,9 @@ async function collectWorkspaceArtifacts(
             join(outputDir, "lancedb"),
             "embed",
             "lancedb_index",
-            producerRunId,
+            stageRunId("embed"),
+            stageFingerprints.embed,
+            providerFingerprint,
           )
         : null,
     ),
@@ -405,7 +728,9 @@ async function collectWorkspaceArtifacts(
       join(resolve(paths.stateRootDir), "reports", "indexing-engine.log"),
       "graph_extract",
       "index_log",
-      producerRunId,
+      stageRunId("graph_extract"),
+      stageFingerprints.graph_extract,
+      providerFingerprint,
     ),
   ]);
 
@@ -465,14 +790,23 @@ async function bootstrapRecoveredStages(input: {
     if (isReusableSucceededCheckpoint) {
       return;
     }
+    const runId = `${input.bootstrapRunId}-${stage}`;
     await input.repo.completeStage({
       bookId: input.bookId,
       stage,
-      runId: input.bootstrapRunId,
+      runId,
       inputFingerprint: expectedFingerprint,
+      contentHash: input.artifacts.find((artifact) =>
+        artifactIds.includes(artifact.artifactId)
+      )?.contentHash,
+      stageFingerprint: input.stageFingerprints[stage],
+      providerFingerprint: input.artifacts.find((artifact) =>
+        artifactIds.includes(artifact.artifactId)
+      )?.providerFingerprint,
       artifactIds,
       metadata: {
         bootstrap: true,
+        bootstrapRootRunId: input.bootstrapRunId,
       },
     });
   };
@@ -510,13 +844,23 @@ export async function syncGraphRagBookWorkspace(
   const sourceIdentityPath = basename(input.sourceIdentityPath ?? sourcePath);
   const normalizedPath = resolve(input.normalizedPath);
   const bootstrapRunId = createRunId("bootstrap");
+  const settingsPath = resolve(input.settingsPath);
+
+  if (input.projectConfig != null) {
+    await assertManagedGraphRagSettings({
+      config: input.projectConfig,
+      settingsPath,
+    });
+  }
 
   const [sourceHash, normalizedContentHash, promptFingerprint, settings] =
     await Promise.all([
       hashFile(sourcePath),
-      hashFile(normalizedPath),
+      readFile(normalizedPath, "utf8").then((content) =>
+        hashContent(content, GRAPHRAG_NORMALIZATION_POLICY_VERSION)
+      ),
       hashDirectoryContents(resolve(input.promptsDir)),
-      parseSettingsFingerprint(resolve(input.settingsPath)),
+      parseSettingsFingerprint(settingsPath),
     ]);
 
   const promptFingerprintByStage: Record<BookStage, string> = {
@@ -558,30 +902,75 @@ export async function syncGraphRagBookWorkspace(
     stateRootDir: input.stateRootDir,
     bookId,
   });
+  await canonicalizeLegacyWorkspaceLayout({
+    repo,
+    stateRootDir: input.stateRootDir,
+    sourceIdentityPath,
+    sourceHash,
+    bookId,
+  });
 
   const job = await repo.registerBookSource({
     sourcePath,
     sourceIdentityPath,
     canonicalSourcePath: repo.relativePath(vaultSourcePath),
+    normalizedPath: repo.relativePath(normalizedPath),
     normalizedContentHash,
+    normalizationPolicyVersion: GRAPHRAG_NORMALIZATION_POLICY_VERSION,
     configFingerprint: settings.configFingerprint,
     promptFingerprint,
     modelFingerprint: settings.modelFingerprint,
+    stageFingerprints,
+    providerFingerprint: settings.modelFingerprint,
     metadata: {
       sourceIdentityPath,
       sourcePath: repo.relativePath(vaultSourcePath),
-      normalizedPath: repo.relativePath(normalizedPath),
       sourceName: stripKnownBookExtension(sourceIdentityPath),
       ...(input.metadata ?? {}),
     },
   });
 
+  await recordDocumentChunks({
+    repo,
+    job,
+    normalizedPath,
+  });
+  if (input.qmdIndexPath != null) {
+    await registerQmdCorpusDocument({
+      repo,
+      qmdIndexPath: input.qmdIndexPath,
+      stateRootDir: input.stateRootDir,
+      job,
+      normalizedPath,
+    });
+  }
+
+  await writeLanceDbRowCountSidecars(join(resolve(input.outputDir), "lancedb"));
+
   const artifacts = await collectWorkspaceArtifacts(
     input,
     vaultSourcePath,
     bootstrapRunId,
+    stageFingerprints,
+    settings.modelFingerprint,
   );
   const recordedArtifacts = await repo.recordArtifacts(job.bookId, artifacts);
+  const byStage = groupArtifactsByStage(recordedArtifacts);
+  const hasQueryReadyArtifacts = hasKinds(byStage.get("community_report") ?? [], [
+    "graphrag_community_reports_parquet",
+  ]) && hasKinds(byStage.get("embed") ?? [], ["lancedb_index"]);
+  if (hasQueryReadyArtifacts && input.qmdIndexPath == null) {
+    throw new Error(
+      "qmd corpus registration is required before publishing query_ready capability",
+    );
+  }
+  await recordGraphTextUnitIdentityIfAvailable({
+    repo,
+    job,
+    normalizedPath: repo.relativePath(normalizedPath),
+    outputDir: resolve(input.outputDir),
+    required: hasQueryReadyArtifacts,
+  });
 
   if (input.recordRecoveredStages !== false) {
     await bootstrapRecoveredStages({

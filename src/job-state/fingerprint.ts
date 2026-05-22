@@ -74,10 +74,24 @@ export function buildBookId(sourcePath: string): string {
 }
 
 export function buildBookIdFromSourceHash(
-  sourcePath: string,
+  _sourcePath: string,
   sourceHash: string,
 ): string {
-  return `${normalizeBookSlug(sourcePath)}-${sourceHash.slice(0, 12)}`;
+  return `book-${sourceHash.slice(0, 12)}`;
+}
+
+export function buildDocumentId(input: {
+  collection?: string;
+  relativePath?: string;
+  contentHash: string;
+  sourceId?: string;
+  normalizationPolicyVersion?: string;
+}): string {
+  return `doc-${createDeterministicHash({
+    sourceId: input.sourceId ?? null,
+    contentHash: input.contentHash,
+    normalizationPolicyVersion: input.normalizationPolicyVersion ?? null,
+  }).slice(0, 12)}`;
 }
 
 export function createRunId(stage: string, now: Date = new Date()): string {

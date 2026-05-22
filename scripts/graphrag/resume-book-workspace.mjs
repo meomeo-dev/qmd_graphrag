@@ -11,8 +11,15 @@ import {
   FileBookJobStateRepository,
   createQmdGraphRagRuntime,
   createRunId,
+  GraphRagWorkflowNameSchema,
+  loadGraphQueryCapabilities,
   syncGraphRagBookWorkspace,
+  writeManagedGraphRagSettings,
 } from "../../src/index.ts";
+import {
+  loadConfig,
+  setConfigSource,
+} from "../../src/collections.ts";
 
 function required(value, name) {
   if (!value) {
@@ -26,6 +33,8 @@ const { values } = parseArgs({
     "state-root": { type: "string" },
     "source-path": { type: "string" },
     "normalized-path": { type: "string" },
+    "qmd-index-path": { type: "string" },
+    config: { type: "string" },
     "python-bin": { type: "string" },
     "working-directory": { type: "string" },
     "query": { type: "string" },
@@ -45,12 +54,78 @@ const workingDirectory = resolve(values["working-directory"] ?? cwd());
 const pythonBin = values["python-bin"]
   ? resolve(values["python-bin"])
   : resolve(workingDirectory, ".venv-graphrag/bin/python");
+const qmdIndexPath = values["qmd-index-path"]
+  ? resolve(values["qmd-index-path"])
+  : resolve(workingDirectory, ".qmd/index.sqlite");
+const configPath = values.config
+  ? resolve(values.config)
+  : resolve(workingDirectory, ".qmd/index.yml");
 
 const runtime = createQmdGraphRagRuntime();
 const repo = new FileBookJobStateRepository(stateRoot);
 
 function printJson(payload) {
   console.log(JSON.stringify(payload, null, 2));
+}
+
+function stageWorkflows(stage) {
+  const workflowsByStage = {
+    graph_extract: [
+      "load_input_documents",
+      "create_base_text_units",
+      "create_final_documents",
+      "extract_graph",
+      "finalize_graph",
+      "extract_covariates",
+      "create_communities",
+      "create_final_text_units",
+    ],
+    community_report: [
+      "create_community_reports",
+      "create_community_reports_text",
+    ],
+    embed: ["generate_text_embeddings"],
+  };
+  const workflows = workflowsByStage[stage];
+  if (workflows == null) {
+    return null;
+  }
+  return workflows.map((workflow) => GraphRagWorkflowNameSchema.parse(workflow));
+}
+
+function indexScopeFromSync(sync) {
+  return {
+    bookId: sync.job.bookId,
+    sourceId: `sha256:${sync.job.sourceHash}`,
+    documentId: sync.job.documentId,
+    contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
+    artifactIds: [],
+  };
+}
+
+async function graphQueryScopeFromSync(sync) {
+  const sourceId = `sha256:${sync.job.sourceHash}`;
+  const capabilities = await loadGraphQueryCapabilities({
+    graphVault: stateRoot,
+    sourceIds: [sourceId],
+    documentIds: [sync.job.documentId],
+  });
+  const scoped = capabilities.filter((capability) =>
+    capability.bookId === sync.job.bookId
+  );
+  if (scoped.length === 0) {
+    throw new Error(
+      `no graph_query capability is ready for book ${sync.job.bookId}`,
+    );
+  }
+  return {
+    selectedBookIds: [...new Set(scoped.map((item) => item.bookId))],
+    graphCapabilityIds: [...new Set(scoped.map((item) => item.capabilityId))],
+    sourceIds: [...new Set(scoped.map((item) => item.sourceId))],
+    documentIds: [...new Set(scoped.map((item) => item.documentId))],
+    contentHashes: [...new Set(scoped.map((item) => item.contentHash))],
+    artifactIds: [...new Set(scoped.flatMap((item) => item.artifactIds))],
+  };
 }
 
 async function loadSingleBookDefaults() {
@@ -111,6 +186,12 @@ async function resolveWorkspaceInputs() {
 }
 
 async function run() {
+  setConfigSource({ configPath });
+  const projectConfig = loadConfig();
+  await writeManagedGraphRagSettings({
+    config: projectConfig,
+    graphVault: stateRoot,
+  });
   const { sourcePath, sourceIdentityPath, normalizedPath } =
     await resolveWorkspaceInputs();
   const sync = await syncGraphRagBookWorkspace({
@@ -121,6 +202,8 @@ async function run() {
     settingsPath: resolve(stateRoot, "settings.yaml"),
     promptsDir: resolve(stateRoot, "prompts"),
     outputDir: resolve(stateRoot, "output"),
+    qmdIndexPath,
+    projectConfig,
     metadata: {
       smoke: true,
     },
@@ -135,6 +218,7 @@ async function run() {
         method: values["query-method"],
         query: values.query,
         responseType: "multiple paragraphs",
+        capabilityScope: await graphQueryScopeFromSync(sync),
         verbose: values.verbose,
         environment: {
           pythonBin,
@@ -153,18 +237,55 @@ async function run() {
     return;
   }
 
-  if (!["community_report", "embed", "query_ready"].includes(nextStage)) {
+  if (nextStage === "query_ready") {
+    const refreshed = await syncGraphRagBookWorkspace({
+      stateRootDir: stateRoot,
+      sourcePath,
+      sourceIdentityPath,
+      normalizedPath,
+      settingsPath: resolve(stateRoot, "settings.yaml"),
+      promptsDir: resolve(stateRoot, "prompts"),
+      outputDir: resolve(stateRoot, "output"),
+      qmdIndexPath,
+      projectConfig,
+      metadata: {
+        smoke: true,
+      },
+    });
+
+    printJson({
+      status: refreshed.resumePlan.nextStage == null ? "ready" : "blocked",
+      bookId: sync.job.bookId,
+      startedStage: nextStage,
+      nextStage: refreshed.resumePlan.nextStage,
+      completedStages: refreshed.resumePlan.completedStages,
+      queryResult: null,
+    });
+    return;
+  }
+
+  if (nextStage === "ingest" || nextStage === "normalize") {
+    printJson({
+      status: "blocked",
+      bookId: sync.job.bookId,
+      startedStage: null,
+      nextStage,
+      completedStages: sync.resumePlan.completedStages,
+      queryResult: null,
+      reason: `${nextStage} is a qmd_graphrag workspace materialization stage; rerun with valid --source-path and --normalized-path before GraphRAG workflows`,
+    });
+    return;
+  }
+
+  const workflows = stageWorkflows(nextStage);
+  if (workflows == null) {
     throw new Error(
-      `resume script only supports post-graph-extract continuation, got nextStage=${nextStage}`,
+      `resume script cannot map nextStage=${nextStage} to GraphRAG workflows`,
     );
   }
 
   const runId = createRunId(nextStage);
   const inputFingerprint = sync.stageFingerprints[nextStage];
-  const workflows =
-    nextStage === "embed"
-      ? ["generate_text_embeddings"]
-      : ["create_community_reports_text", "generate_text_embeddings"];
 
   await repo.startStage({
     bookId: sync.job.bookId,
@@ -181,6 +302,7 @@ async function run() {
     const indexResult = await runtime.graphIndex({
       rootDir: stateRoot,
       method: "standard",
+      indexScope: indexScopeFromSync(sync),
       skipValidation: true,
       verbose: values.verbose,
       workflows,
@@ -198,6 +320,8 @@ async function run() {
       settingsPath: resolve(stateRoot, "settings.yaml"),
       promptsDir: resolve(stateRoot, "prompts"),
       outputDir: resolve(stateRoot, "output"),
+      qmdIndexPath,
+      projectConfig,
       metadata: {
         smoke: true,
       },
@@ -210,6 +334,7 @@ async function run() {
         method: values["query-method"],
         query: values.query,
         responseType: "multiple paragraphs",
+        capabilityScope: await graphQueryScopeFromSync(refreshed),
         verbose: values.verbose,
         environment: {
           pythonBin,
