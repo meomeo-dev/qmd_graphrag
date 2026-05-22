@@ -170,9 +170,9 @@ identity_model:
       - sourceRelativePath
     invariant: Path fields do not participate in canonical identity.
   document_id:
-    description: qmd document identity inside the whole-corpus index.
-    producer: src/store.ts#insertDocument
-    mirror_producer: src/store.ts#insertDocument
+    description: qmd document identity projected for whole-corpus retrieval.
+    producer: src/query/qmd-lineage.ts#projectQmdDocumentLineage
+    sqlite_row_source: src/store.ts#insertDocument
     fields:
       - sourceId
       - contentHash
@@ -195,8 +195,8 @@ identity_model:
       - normalizedText
       - normalizationPolicyVersion
   chunk_id:
-    description: qmd chunk identity for retrieval evidence.
-    producer: src/store.ts#chunkDocumentByTokens
+    description: qmd chunk identity projected for retrieval evidence.
+    producer: src/query/qmd-lineage.ts#buildQmdChunkLineageId
     graph_ingest_mirror_producer: src/job-state/graphrag-book.ts#syncGraphRagBookWorkspace
     fields:
       - contentHash
@@ -230,7 +230,10 @@ deduplication:
       - contentHash
       - stageFingerprint
       - providerFingerprint
-  rule: Locator changes do not invalidate high-cost artifacts.
+  rule: >-
+    Locator changes do not invalidate high-cost artifacts. providerFingerprint
+    represents the redacted provider request boundary and participates in
+    artifact deduplication and resume checks.
   excluded_fields:
     - artifactPath
     - artifactLocator
@@ -257,30 +260,6 @@ typed_buses:
           - src/job-state/repository.ts#FileBookJobStateRepository.registerBookSource
         consumers:
           - src/vault/restore.ts#restoreFromVault
-      - name: corpus_document
-        schema: src/contracts/corpus.ts#CorpusDocumentSchema
-        envelope: src/contracts/corpus.ts#CorpusDocumentEnvelopeSchema
-        storage: .qmd/index.sqlite
-        producers:
-          - src/store.ts#insertDocument
-        consumers:
-          - src/store.ts#structuredSearch
-          - src/store.ts#hybridQuery
-        runtime_note: >-
-          qmd SQLite stores corpus document rows. Unified routing consumes
-          qmd_retrieval_candidate projections, not raw corpus_document payloads.
-      - name: corpus_chunk
-        schema: src/contracts/corpus.ts#CorpusChunkSchema
-        envelope: src/contracts/corpus.ts#CorpusChunkEnvelopeSchema
-        storage: .qmd/index.sqlite
-        producers:
-          - src/store.ts#chunkDocumentByTokens
-        consumers:
-          - src/store.ts#structuredSearch
-          - src/store.ts#hybridQuery
-        runtime_note: >-
-          GraphRAG sync records chunkIds into document_identity_map but does
-          not produce corpus_chunk rows.
       - name: document_identity_map
         schema: src/contracts/corpus.ts#DocumentIdentityMapSchema
         envelope: src/contracts/corpus.ts#DocumentIdentityMapEnvelopeSchema
@@ -558,9 +537,10 @@ typed_buses:
           - src/cli/qmd.ts#exitWithError
           - src/mcp/server.ts#createMcpServer
         public_output_rule: >-
-          CLI and MCP expose GraphCapabilityError for missing graph_query
-          capability. TypedQueryError embeds the same payload for internal
-          catch and transport handling.
+          CLI and MCP expose TypedQueryError as the public top-level error.
+          GraphCapabilityError is embedded in
+          TypedQueryError.graphCapabilityError for missing graph_query
+          capability.
       - name: typed_query_error
         schema: src/contracts/unified-query.ts#TypedQueryErrorSchema
         envelope: src/contracts/unified-query.ts#TypedQueryErrorEnvelopeSchema
@@ -821,6 +801,29 @@ typed_buses:
           - src/vault/restore.ts#restoreFromVault
         consumers:
           - src/vault/restore.ts#restoreFromVault
+
+schema_declarations:
+  corpus_document:
+    schema: src/contracts/corpus.ts#CorpusDocumentSchema
+    envelope: src/contracts/corpus.ts#CorpusDocumentEnvelopeSchema
+    role: >-
+      Declares the stable qmd document projection shape. Current runtime
+      routing consumes qmd_retrieval_candidate payloads produced from qmd
+      SQLite rows by projectQmdDocumentLineage.
+    producer: src/query/qmd-lineage.ts#projectQmdDocumentLineage
+    consumer: src/query/qmd-candidates.ts#toQmdRetrievalCandidates
+    storage: .qmd/index.sqlite raw document rows
+    contract_level: schema_declaration
+  corpus_chunk:
+    schema: src/contracts/corpus.ts#CorpusChunkSchema
+    envelope: src/contracts/corpus.ts#CorpusChunkEnvelopeSchema
+    role: >-
+      Declares the stable qmd chunk projection shape. Current runtime routing
+      projects qmd chunk identity into qmd_retrieval_candidate evidence.
+    producer: src/query/qmd-lineage.ts#buildQmdChunkLineageId
+    consumer: src/query/qmd-candidates.ts#toQmdRetrievalCandidates
+    storage: .qmd/index.sqlite raw chunk rows
+    contract_level: schema_declaration
 
 config_projection:
   qmd_project_config:

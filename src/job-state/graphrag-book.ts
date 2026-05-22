@@ -110,6 +110,7 @@ async function parseSettingsFingerprint(
 ): Promise<{
   configFingerprint: string;
   modelFingerprint: string;
+  providerBoundaryFingerprint: string;
   stageConfigFingerprint: Record<BookStage, string>;
 }> {
   const raw = await readFile(settingsPath, "utf8");
@@ -117,6 +118,13 @@ async function parseSettingsFingerprint(
   const completionModels = parsed.completion_models;
   const embeddingModels = parsed.embedding_models;
   const vectorStore = parsed.vector_store;
+  const providerBoundary = createDeterministicHash({
+    version: "provider_request_boundary_v1",
+    completion_models: redactProviderBoundary(completionModels),
+    embedding_models: redactProviderBoundary(embeddingModels),
+    vector_store: redactProviderBoundary(vectorStore),
+    qmd_graphrag: redactProviderBoundary(parsed.qmd_graphrag),
+  });
 
   return {
     configFingerprint: hashText(raw),
@@ -124,6 +132,7 @@ async function parseSettingsFingerprint(
       completion_models: completionModels,
       embedding_models: embeddingModels,
     }),
+    providerBoundaryFingerprint: providerBoundary,
     stageConfigFingerprint: {
       ingest: createDeterministicHash({
         input: parsed.input,
@@ -165,6 +174,7 @@ function deriveStageFingerprints(input: {
   normalizedContentHash: string;
   promptFingerprintByStage: Record<BookStage, string>;
   stageConfigFingerprint: Record<BookStage, string>;
+  providerBoundaryFingerprint: string;
 }): Record<BookStage, string> {
   const ingest = createDeterministicHash([
     "ingest",
@@ -182,22 +192,26 @@ function deriveStageFingerprints(input: {
     normalize,
     input.stageConfigFingerprint.graph_extract,
     input.promptFingerprintByStage.graph_extract,
+    input.providerBoundaryFingerprint,
   ]);
   const communityReport = createDeterministicHash([
     "community_report",
     graphExtract,
     input.stageConfigFingerprint.community_report,
     input.promptFingerprintByStage.community_report,
+    input.providerBoundaryFingerprint,
   ]);
   const embed = createDeterministicHash([
     "embed",
     communityReport,
     input.stageConfigFingerprint.embed,
+    input.providerBoundaryFingerprint,
   ]);
   const queryReady = createDeterministicHash([
     "query_ready",
     embed,
     input.stageConfigFingerprint.query_ready,
+    input.providerBoundaryFingerprint,
   ]);
 
   return {
@@ -208,6 +222,46 @@ function deriveStageFingerprints(input: {
     embed,
     query_ready: queryReady,
   };
+}
+
+function isSensitiveProviderKey(key: string): boolean {
+  return /(^|[_-])(api[-_]?key|key|token|authorization|secret|password|credential)([_-]|$)/iu
+    .test(key) || key.toUpperCase().endsWith("_KEY");
+}
+
+function redactProviderBoundary(input: unknown): unknown {
+  if (input == null || typeof input === "boolean" || typeof input === "number") {
+    return input;
+  }
+  if (typeof input === "string") {
+    return input.startsWith("/") || /^[A-Za-z]:[\\/]/u.test(input)
+      ? "[redacted-path]"
+      : input;
+  }
+  if (Array.isArray(input)) {
+    return input.map((item) => redactProviderBoundary(item));
+  }
+  if (typeof input === "object") {
+    return Object.fromEntries(
+      Object.entries(input as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, value]) => [
+          key,
+          isSensitiveProviderKey(key)
+            ? redactProviderSecretValue(value)
+            : redactProviderBoundary(value),
+        ]),
+    );
+  }
+  return String(input);
+}
+
+function redactProviderSecretValue(value: unknown): unknown {
+  if (typeof value === "string") {
+    const placeholder = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/u.exec(value);
+    return placeholder == null ? "[redacted-secret]" : { env: placeholder[1] };
+  }
+  return "[redacted-secret]";
 }
 
 async function artifactForFile(
@@ -894,6 +948,7 @@ export async function syncGraphRagBookWorkspace(
     normalizedContentHash,
     promptFingerprintByStage,
     stageConfigFingerprint: settings.stageConfigFingerprint,
+    providerBoundaryFingerprint: settings.providerBoundaryFingerprint,
   });
   const bookId = buildBookIdFromSourceHash(sourceIdentityPath, sourceHash);
   const vaultSourcePath = await materializeSourceInVault({
@@ -921,11 +976,12 @@ export async function syncGraphRagBookWorkspace(
     promptFingerprint,
     modelFingerprint: settings.modelFingerprint,
     stageFingerprints,
-    providerFingerprint: settings.modelFingerprint,
+    providerFingerprint: settings.providerBoundaryFingerprint,
     metadata: {
       sourceIdentityPath,
       sourcePath: repo.relativePath(vaultSourcePath),
       sourceName: stripKnownBookExtension(sourceIdentityPath),
+      providerBoundaryFingerprint: settings.providerBoundaryFingerprint,
       ...(input.metadata ?? {}),
     },
   });

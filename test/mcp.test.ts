@@ -1329,7 +1329,7 @@ describe("MCP HTTP Transport", () => {
     expect(result.file).not.toBe("docs/readme.md");
   });
 
-  test("POST /mcp tools/call query returns typed GraphRAG capability error", async () => {
+  test("POST /mcp tools/call query returns typed GraphRAG query error", async () => {
     await mcpRequest({
       jsonrpc: "2.0", id: 1, method: "initialize",
       params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
@@ -1352,9 +1352,12 @@ describe("MCP HTTP Transport", () => {
 
       expect(status).toBe(200);
       expect(json.result.isError).toBe(true);
+      expect(json.result.structuredContent.error.schemaVersion).toBe(SchemaVersion);
+      expect(json.result.structuredContent.error.route).toBe("graphrag");
+      expect(json.result.structuredContent.error.stage).toBe("graph_capability");
       expect(json.result.structuredContent.error.capability).toBe("graph_query");
       expect(json.result.structuredContent.error.code).toBe("capability_missing");
-      expect(json.result.structuredContent.error.queriedScope)
+      expect(json.result.structuredContent.error.graphCapabilityError.queriedScope)
         .toBe("graph_enhanced_subset");
       expect(json.result.content[0].text).toContain("No graph_query capability");
     } finally {

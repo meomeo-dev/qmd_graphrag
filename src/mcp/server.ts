@@ -40,7 +40,6 @@ import type {
 import type { EvidenceRef, QueryStage } from "../contracts/unified-query.js";
 import {
   EvidenceRefSchema,
-  GraphCapabilityErrorSchema,
   QueryRouteDecisionSchema,
   TypedQueryErrorSchema,
 } from "../contracts/unified-query.js";
@@ -181,12 +180,11 @@ function primaryQueryForSearches(
 }
 
 function typedQueryErrorResult(error: TypedQueryErrorException) {
-  const publicError = error.payload.graphCapabilityError ?? error.payload;
   return {
-    content: [{ type: "text" as const, text: publicError.redactedMessage }],
+    content: [{ type: "text" as const, text: error.payload.redactedMessage }],
     isError: true,
     structuredContent: {
-      error: publicError,
+      error: error.payload,
     },
   };
 }
@@ -463,7 +461,7 @@ Intent-aware lex (C++ performance, not sports):
         answer: z.string().optional(),
         evidence: z.array(EvidenceRefSchema).optional(),
         routeDecision: QueryRouteDecisionSchema.optional(),
-        error: TypedQueryErrorSchema.or(GraphCapabilityErrorSchema).optional(),
+        error: TypedQueryErrorSchema.optional(),
       },
     },
     async ({

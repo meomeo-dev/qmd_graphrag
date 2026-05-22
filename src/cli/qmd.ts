@@ -4187,11 +4187,7 @@ function exitWithError(
   stage: QueryStage = "route",
 ): never {
   if (error instanceof TypedQueryErrorException) {
-    console.error(JSON.stringify(
-      error.payload.graphCapabilityError ?? error.payload,
-      null,
-      2,
-    ));
+    console.error(JSON.stringify(error.payload, null, 2));
     process.exit(code);
   } else {
     const message = error instanceof Error ? error.message : String(error);

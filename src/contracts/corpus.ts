@@ -15,8 +15,7 @@ export const VaultRelativePathSchema = z.string().min(1).refine(
 export const SourceLocatorSchema = z.object({
   path: VaultRelativePathSchema.optional(),
   relativePath: VaultRelativePathSchema.optional(),
-  uri: z.string().min(1).optional(),
-});
+}).strict();
 
 export const SourceDocumentSchema = z.object({
   schemaVersion: z.literal(SchemaVersion),

@@ -37,34 +37,31 @@ types:
   - name: corpus_document
     schema: src/contracts/corpus.ts#CorpusDocumentSchema
     envelope: src/contracts/corpus.ts#CorpusDocumentEnvelopeSchema
-    contract_level: required
+    contract_level: schema_declaration
     producers:
-      - src/store.ts#insertDocument
+      - src/query/qmd-lineage.ts#projectQmdDocumentLineage
     consumers:
-      - src/store.ts#structuredSearch
-      - src/store.ts#hybridQuery
+      - src/query/qmd-candidates.ts#toQmdRetrievalCandidates
     storage: .qmd/index.sqlite
     notes:
-      - qmd SQLite stores corpus document rows; unified routing consumes
+      - qmd SQLite stores raw document rows; unified routing consumes
         qmd_retrieval_candidate projections, not raw corpus_document payloads
-      - qmd-only query evidence derives stable qmd document ids from
-        sourceId, contentHash, and normalizationPolicyVersion
+      - CorpusDocumentSchema declares the stable projection shape; it is not
+        persisted as a standalone required bus payload
 
   - name: corpus_chunk
     schema: src/contracts/corpus.ts#CorpusChunkSchema
     envelope: src/contracts/corpus.ts#CorpusChunkEnvelopeSchema
-    contract_level: required
+    contract_level: schema_declaration
     producers:
-      - src/store.ts#chunkDocumentByTokens
+      - src/query/qmd-lineage.ts#buildQmdChunkLineageId
     consumers:
-      - src/store.ts#structuredSearch
-      - src/store.ts#hybridQuery
+      - src/query/qmd-candidates.ts#toQmdRetrievalCandidates
     storage: .qmd/index.sqlite
     notes:
-      - GraphRAG sync records chunkIds into document_identity_map but does not
-        produce corpus_chunk rows
-      - unified answer construction consumes qmd_retrieval_candidate payloads
-        whose chunkId is either graph-vault mapped or qmd SQLite projected
+      - qmd chunk ids are projected into qmd_retrieval_candidate evidence
+      - GraphRAG sync records chunkIds into document_identity_map when graph
+        identity is available, but does not produce corpus_chunk rows
 
   - name: document_identity_map
     schema: src/contracts/corpus.ts#DocumentIdentityMapSchema
@@ -425,9 +422,8 @@ types:
     storage: transient_or_query_log
     notes:
       - domain error for missing graph_query capability
-      - public CLI/MCP error output exposes GraphCapabilityError for missing
-        graph_query and keeps it embedded in TypedQueryError for internal
-        catch/transport handling
+      - public CLI/MCP error output exposes TypedQueryError as the top-level
+        error and embeds GraphCapabilityError for missing graph_query
 
   - name: openai_responses_provider_config
     schema: src/contracts/provider.ts#OpenAIResponsesProviderConfigSchema
@@ -759,6 +755,8 @@ types:
     storage: graph_vault/catalog/provider-requests/<artifact_id>.json
     notes:
       - stores redacted provider request fingerprints for cost lineage
+      - providerFingerprint in high-cost book state is the redacted provider
+        request boundary fingerprint used by artifact dedupe and resume checks
       - excludes secret values and raw provider request or response bodies
 
   - name: vault_restore_request
@@ -792,12 +790,10 @@ types:
 
 buses:
   - name: corpus_bus
-    description: Typed ingestion bus for whole-corpus source, document, and chunk identity.
+    description: Typed ingestion bus for whole-corpus source and identity maps.
     payloads:
       - source_document
       - source_document_catalog
-      - corpus_document
-      - corpus_chunk
       - document_identity_map
       - graph_text_unit_identity_map
       - document_identity_catalog

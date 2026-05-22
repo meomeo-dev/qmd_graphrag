@@ -127,6 +127,85 @@ describe("syncGraphRagBookWorkspace", () => {
     ).toThrow("strict");
   });
 
+  test("includes provider request boundary in high-cost recovery fingerprints", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+      await mkdir(join(graphVault, "output"), { recursive: true });
+
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+      await writeFile(join(graphVault, "prompts", "extract_graph.txt"), "prompt", "utf8");
+
+      await writeManagedGraphRagSettings({ config: projectConfig, graphVault });
+      const first = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        metadata: {
+          api_key: "sk-test-secret",
+          hostPath: root,
+        },
+      });
+      await new FileBookJobStateRepository(graphVault).completeStage({
+        bookId: first.job.bookId,
+        stage: "graph_extract",
+        runId: "run-extract-medium",
+        inputFingerprint: first.stageFingerprints.graph_extract,
+        providerFingerprint: first.job.providerFingerprint,
+      });
+
+      const changedConfig: CollectionConfig = {
+        ...projectConfig,
+        providers: {
+          ...projectConfig.providers,
+          openai: {
+            ...projectConfig.providers?.openai,
+            response_api: {
+              ...projectConfig.providers?.openai?.response_api,
+              reasoning_effort: "high",
+            },
+          },
+        },
+      };
+      await writeManagedGraphRagSettings({ config: changedConfig, graphVault });
+      const second = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        metadata: {
+          api_key: "sk-test-secret",
+          hostPath: root,
+        },
+      });
+      const jobRaw = await readFile(
+        join(graphVault, "catalog", "books.yaml"),
+        "utf8",
+      );
+
+      expect(second.job.providerFingerprint).not.toBe(first.job.providerFingerprint);
+      expect(second.stageFingerprints.graph_extract)
+        .not.toBe(first.stageFingerprints.graph_extract);
+      expect(second.resumePlan.nextStage).toBe("graph_extract");
+      expect(second.resumePlan.staleStages).toContain("graph_extract");
+      expect(jobRaw).not.toContain("sk-test-secret");
+      expect(jobRaw).not.toContain(root);
+      expect(jobRaw).toContain("providerBoundaryFingerprint");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("bootstraps recovered stages from a partial GraphRAG workspace", async () => {
     const root = await createWorkspace();
     try {

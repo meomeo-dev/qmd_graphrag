@@ -360,6 +360,13 @@ describe("Corpus and Graph Enhancement contracts", () => {
       sourceName: "book.epub",
       locator: { path: "../book.epub" },
     })).toThrow(/vault-relative/);
+    expect(() => SourceDocumentSchema.parse({
+      schemaVersion: SchemaVersion,
+      sourceId: "sha256:source",
+      sourceHash: "source",
+      sourceName: "book.epub",
+      locator: { uri: "file:///tmp/book.epub" },
+    })).toThrow();
     expect(() => GraphTextUnitIdentityMapSchema.parse({
       schemaVersion: SchemaVersion,
       bookId: "book-1",

@@ -428,6 +428,13 @@ describe("FileBookJobStateRepository", () => {
       sourceName: "book.epub",
       locator: { path: "../book.epub" },
     })).toThrow(/vault-relative/);
+    expect(() => SourceDocumentSchema.parse({
+      schemaVersion: SchemaVersion,
+      sourceId: "sha256:source",
+      sourceHash: "source",
+      sourceName: "book.epub",
+      locator: { uri: "file:///tmp/book.epub" },
+    })).toThrow();
     expect(() => DocumentIdentityMapSchema.parse({
       schemaVersion: SchemaVersion,
       sourceId: "sha256:source",

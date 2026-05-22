@@ -972,7 +972,7 @@ describe("CLI Unified Query Route", () => {
     expect(stdout).toContain("Score:");
   }, 20000);
 
-  test("qmd query --graphrag emits parseable typed capability error", async () => {
+  test("qmd query --graphrag emits a single typed query error", async () => {
     await mkdir(join(fixturesDir, "graph_vault"), { recursive: true });
     const { stderr, exitCode } = await runQmd(
       [
@@ -987,10 +987,18 @@ describe("CLI Unified Query Route", () => {
 
     expect(exitCode).toBe(1);
     const error = JSON.parse(stderr);
+    expect(error.schemaVersion).toBe(SchemaVersion);
     expect(error.route).toBe("graphrag");
+    expect(error.stage).toBe("graph_capability");
     expect(error.capability).toBe("graph_query");
     expect(error.code).toBe("capability_missing");
-    expect(error.queriedScope).toBe("graph_enhanced_subset");
+    expect(error.redactedMessage).toContain("No graph_query capability");
+    expect(error.graphCapabilityError).toMatchObject({
+      route: "graphrag",
+      capability: "graph_query",
+      code: "capability_missing",
+      queriedScope: "graph_enhanced_subset",
+    });
   }, 20000);
 });
 
