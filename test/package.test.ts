@@ -21,6 +21,8 @@ describe("package test task", () => {
     expect(testAllScript).toContain("Vitest suite under Node");
     expect(testAllScript).toContain("Bun test suite");
     expect(testAllScript).toContain("Package smoke");
+    expect(testAllScript).toContain("GraphRAG vendor subtree unchanged");
+    expect(testAllScript).toContain("vendor/graphrag");
 
     const packageSmokeScript = readFileSync(new URL("scripts/package-smoke.mjs", root), "utf8");
     expect(packageSmokeScript).toContain("scripts/build.mjs");

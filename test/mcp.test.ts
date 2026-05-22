@@ -12,13 +12,16 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mc
 import { z } from "zod";
 import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm";
 import { unlinkSync } from "node:fs";
-import { mkdtemp, writeFile, readdir, unlink, rmdir } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile, readdir, unlink, rmdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import YAML from "yaml";
 import type { CollectionConfig } from "../src/collections";
 import { setConfigIndexName } from "../src/collections";
 import { syncConfigToDb } from "../src/store";
+import { SchemaVersion } from "../src/contracts/common";
+import { hashLanceDbDirectoryContents } from "../src/job-state/artifact-validation";
+import { hashFile } from "../src/job-state/fingerprint";
 
 // =============================================================================
 // Test Database Setup
@@ -379,7 +382,9 @@ describe("MCP Server", () => {
       expect(bResult).toBeDefined();
     });
 
-    test("reranks documents with LLM", async () => {
+    test.skipIf(!process.env.JINA_API_KEY?.trim())(
+      "reranks documents with LLM",
+      async () => {
       const docs = [
         { file: "/test/docs/readme.md", text: "Project readme" },
         { file: "/test/docs/api.md", text: "API documentation" },
@@ -389,7 +394,9 @@ describe("MCP Server", () => {
       expect(reranked[0]!.score).toBeGreaterThan(0);
     });
 
-    test("full hybrid search pipeline", async () => {
+    test.skipIf(!process.env.JINA_API_KEY?.trim())(
+      "full hybrid search pipeline",
+      async () => {
       // Simulate full qmd_deep_search flow with type-routed queries
       const query = "meeting notes";
       const expanded = await expandQuery(query, DEFAULT_QUERY_MODEL, testDb);
@@ -899,11 +906,142 @@ describe("MCP Server", () => {
 import { startMcpHttpServer, type HttpServerHandle } from "../src/mcp/server";
 import { enableProductionMode } from "../src/store";
 
-describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
+async function writeHttpGraphVaultFixture(root: string): Promise<void> {
+  const bookId = "book-mcp";
+  const reportArtifactId = "artifact-mcp-report";
+  const lancedbArtifactId = "artifact-mcp-lancedb";
+  const lancedbPath = join(root, "books", bookId, "output", "lancedb");
+
+  await mkdir(join(root, "catalog"), { recursive: true });
+  await mkdir(join(root, "books", bookId, "output"), { recursive: true });
+  for (const tableName of [
+    "entity_description.lance",
+    "community_full_content.lance",
+    "text_unit_text.lance",
+  ]) {
+    const tableDir = join(lancedbPath, tableName);
+    await mkdir(join(tableDir, "data"), { recursive: true });
+    await mkdir(join(tableDir, "_versions"), { recursive: true });
+    await writeFile(join(tableDir, "data", "part-1.lance"), "rows", "utf8");
+    await writeFile(
+      join(tableDir, "_versions", "1.manifest"),
+      "part-1.lance",
+      "utf8",
+    );
+    await writeFile(
+      join(tableDir, "qmd_row_count.json"),
+      JSON.stringify({ schemaVersion: SchemaVersion, rowCount: 1 }),
+      "utf8",
+    );
+  }
+
+  const reportPath = join(root, "books", bookId, "output", "community_reports.parquet");
+  await writeFile(reportPath, "reports", "utf8");
+  const reportHash = await hashFile(reportPath);
+  const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
+
+  await writeFile(
+    join(root, "books", bookId, "checkpoints.yaml"),
+    `
+schemaVersion: ${SchemaVersion}
+items:
+  - schemaVersion: ${SchemaVersion}
+    bookId: ${bookId}
+    stage: query_ready
+    status: succeeded
+    attemptCount: 1
+    inputFingerprint: fp
+    contentHash: hash1
+    stageFingerprint: stage-query-ready
+    providerFingerprint: provider-openai-responses-jina
+    artifactIds:
+      - ${reportArtifactId}
+      - ${lancedbArtifactId}
+    finishedAt: 2026-05-21T00:00:00.000Z
+`,
+    "utf8",
+  );
+  await writeFile(
+    join(root, "books", bookId, "artifacts.yaml"),
+    `
+schemaVersion: ${SchemaVersion}
+items:
+  - schemaVersion: ${SchemaVersion}
+    artifactId: ${reportArtifactId}
+    bookId: ${bookId}
+    stage: community_report
+    kind: graphrag_community_reports_parquet
+    path: books/${bookId}/output/community_reports.parquet
+    contentHash: ${reportHash}
+    stageFingerprint: stage-community-report
+    providerFingerprint: provider-openai-responses-jina
+    producerRunId: run-1
+    createdAt: 2026-05-21T00:00:00.000Z
+  - schemaVersion: ${SchemaVersion}
+    artifactId: ${lancedbArtifactId}
+    bookId: ${bookId}
+    stage: embed
+    kind: lancedb_index
+    path: books/${bookId}/output/lancedb
+    contentHash: ${lancedbHash}
+    stageFingerprint: stage-embed
+    providerFingerprint: provider-openai-responses-jina
+    producerRunId: run-1
+    createdAt: 2026-05-21T00:00:00.000Z
+`,
+    "utf8",
+  );
+  await writeFile(
+    join(root, "catalog", "graph-capabilities.yaml"),
+    `
+schemaVersion: ${SchemaVersion}
+items:
+  - schemaVersion: ${SchemaVersion}
+    capabilityId: cap-mcp
+    kind: graph_query
+    bookId: ${bookId}
+    sourceId: source-mcp
+    documentId: hash1
+    contentHash: hash1
+    ready: true
+    readinessSource: validated_checkpoint_plus_validated_manifest
+    artifactIds:
+      - ${reportArtifactId}
+      - ${lancedbArtifactId}
+    createdAt: 2026-05-21T00:00:00.000Z
+`,
+    "utf8",
+  );
+  await writeFile(
+    join(root, "catalog", "document-identity-map.yaml"),
+    `
+schemaVersion: ${SchemaVersion}
+items:
+  - schemaVersion: ${SchemaVersion}
+    sourceId: source-mcp
+    sourceHash: source-mcp
+    canonicalBookId: ${bookId}
+    documentId: hash1
+    contentHash: hash1
+    normalizationPolicyVersion: graphrag-normalized-markdown-v1
+    normalizedPath: input/${bookId}.md
+    chunkIds: []
+    graphDocumentId: graph-doc-mcp
+    graphTextUnitIds:
+      - tu-mcp
+    metadata:
+      qmdCorpusRegistered: true
+`,
+    "utf8",
+  );
+}
+
+describe("MCP HTTP Transport", () => {
   let handle: HttpServerHandle;
   let baseUrl: string;
   let httpTestDbPath: string;
   let httpTestConfigDir: string;
+  let httpGraphVaultDir: string;
   // Stash original env to restore after tests
   const origIndexPath = process.env.INDEX_PATH;
   const origConfigDir = process.env.QMD_CONFIG_DIR;
@@ -947,12 +1085,40 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     const configPrefix = join(tmpdir(), `qmd-mcp-http-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     httpTestConfigDir = await mkdtemp(configPrefix);
     await writeFile(join(httpTestConfigDir, "index.yml"), YAML.stringify(httpTestConfig));
+    httpGraphVaultDir = await mkdtemp(join(tmpdir(), "qmd-mcp-http-graph-vault-"));
+    await writeHttpGraphVaultFixture(httpGraphVaultDir);
 
     // Point createStore() at our test DB
     process.env.INDEX_PATH = httpTestDbPath;
     process.env.QMD_CONFIG_DIR = httpTestConfigDir;
 
-    handle = await startMcpHttpServer(0, { quiet: true }); // OS-assigned ephemeral port
+    handle = await startMcpHttpServer(0, {
+      quiet: true,
+      services: {
+        queryGraphRag: async () => ({
+          schemaVersion: SchemaVersion,
+          method: "local",
+          responseText: "GraphRAG MCP answer from provider",
+          evidence: [{
+            evidenceId: "graph-evidence-1",
+            graphCapabilityId: "cap-mcp",
+            sourceId: "source-mcp",
+            documentId: "hash1",
+            bookId: "book-mcp",
+            contentHash: "hash1",
+            graphTextUnitId: "tu-mcp",
+            artifactId: "artifact-mcp-report",
+            locator: {
+              path: "graph/books/book-mcp/community-report.md",
+              lineStart: 7,
+            },
+            quote: "Graph-only projected evidence",
+            score: 0.93,
+            metadata: { title: "Graph Community Report" },
+          }],
+        }),
+      },
+    }); // OS-assigned ephemeral port
     baseUrl = `http://localhost:${handle.port}`;
   });
 
@@ -972,6 +1138,7 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
       for (const f of files) await unlink(join(httpTestConfigDir, f));
       await rmdir(httpTestConfigDir);
     } catch {}
+    await rm(httpGraphVaultDir, { recursive: true, force: true });
   });
 
   // ---------------------------------------------------------------------------
@@ -1068,13 +1235,24 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
 
     const { status, json } = await mcpRequest({
       jsonrpc: "2.0", id: 3, method: "tools/call",
-      params: { name: "query", arguments: { searches: [{ type: "lex", query: "readme" }] } },
+      params: {
+        name: "query",
+        arguments: {
+          searches: [{ type: "lex", query: "readme" }],
+          rerank: false,
+        },
+      },
     });
     expect(status).toBe(200);
     expect(json.result).toBeDefined();
     // Should have content array with text results
     expect(json.result.content.length).toBeGreaterThan(0);
     expect(json.result.content[0].type).toBe("text");
+    expect(json.result.structuredContent.routeDecision.requestedRoute).toBe("qmd");
+    expect(json.result.structuredContent.routeDecision.selectedRoute).toBe("qmd");
+    expect(json.result.structuredContent.answer).toContain("qmd retrieval");
+    expect(json.result.structuredContent.evidence.length).toBeGreaterThan(0);
+    expect(json.result.structuredContent.evidence[0].contentHash).toBeTruthy();
   });
 
   test("POST /mcp tools/call get returns document", async () => {
@@ -1116,5 +1294,111 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(hit).toBeDefined();
     expect(hit.line).toBe(301);
     expect(hit.snippet).toMatch(/^\d+: @@ -3\d\d,/);
+  });
+
+  test("POST /mcp tools/call query projects GraphRAG answer and evidence", async () => {
+    await mcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 6, method: "tools/call",
+      params: {
+        name: "query",
+        arguments: {
+          searches: [{ type: "lex", query: "readme" }],
+          route: "graphrag",
+          graphVault: httpGraphVaultDir,
+          graphMethod: "local",
+          rerank: false,
+        },
+      },
+    });
+
+    expect(status).toBe(200);
+    expect(json.result.content[0].text).toBe("GraphRAG MCP answer from provider");
+    expect(json.result.structuredContent.routeDecision.selectedRoute).toBe("graphrag");
+    expect(json.result.structuredContent.answer).toBe("GraphRAG MCP answer from provider");
+    expect(json.result.structuredContent.evidence[0].evidenceId).toBe("graph-evidence-1");
+
+    const [result] = json.result.structuredContent.results;
+    expect(result.file).toBe("graph/books/book-mcp/community-report.md");
+    expect(result.title).toBe("Graph Community Report");
+    expect(result.snippet).toContain("Graph-only projected evidence");
+    expect(result.file).not.toBe("docs/readme.md");
+  });
+
+  test("POST /mcp tools/call query returns typed GraphRAG capability error", async () => {
+    await mcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+
+    const emptyGraphVault = await mkdtemp(join(tmpdir(), "qmd-mcp-empty-graph-vault-"));
+    try {
+      const { status, json } = await mcpRequest({
+        jsonrpc: "2.0", id: 7, method: "tools/call",
+        params: {
+          name: "query",
+          arguments: {
+            searches: [{ type: "lex", query: "readme" }],
+            route: "graphrag",
+            graphVault: emptyGraphVault,
+            rerank: false,
+          },
+        },
+      });
+
+      expect(status).toBe(200);
+      expect(json.result.isError).toBe(true);
+      expect(json.result.structuredContent.error.capability).toBe("graph_query");
+      expect(json.result.structuredContent.error.code).toBe("capability_missing");
+      expect(json.result.structuredContent.error.queriedScope)
+        .toBe("graph_enhanced_subset");
+      expect(json.result.content[0].text).toContain("No graph_query capability");
+    } finally {
+      await rm(emptyGraphVault, { recursive: true, force: true });
+    }
+  });
+
+  test("POST /mcp tools/call query wraps generic retrieval failures as typed errors", async () => {
+    await mcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+
+    const invalidGraphVault = await mkdtemp(join(tmpdir(), "qmd-mcp-invalid-graph-vault-"));
+    try {
+      await mkdir(join(invalidGraphVault, "catalog"), { recursive: true });
+      await writeFile(
+        join(invalidGraphVault, "catalog", "document-identity-map.yaml"),
+        "items: [",
+        "utf8",
+      );
+
+      const { status, json } = await mcpRequest({
+        jsonrpc: "2.0", id: 8, method: "tools/call",
+        params: {
+          name: "query",
+          arguments: {
+            searches: [{ type: "lex", query: "readme" }],
+            route: "qmd",
+            graphVault: invalidGraphVault,
+            rerank: false,
+          },
+        },
+      });
+
+      expect(status).toBe(200);
+      expect(json.result.isError).toBe(true);
+      expect(json.result.structuredContent.error.schemaVersion)
+        .toBe(SchemaVersion);
+      expect(json.result.structuredContent.error.stage).toBe("qmd_retrieval");
+      expect(json.result.structuredContent.error.code).toBe("query_error");
+      expect(json.result.content[0].text).toContain("QMD query failed");
+    } finally {
+      await rm(invalidGraphVault, { recursive: true, force: true });
+    }
   });
 });

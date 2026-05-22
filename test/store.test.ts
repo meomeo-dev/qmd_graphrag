@@ -1130,6 +1130,27 @@ describe("Caching", () => {
     expect(key1).not.toBe(key2);
   });
 
+  test("getCacheKey is stable for equivalent provider request objects", () => {
+    const key1 = getCacheKey("rerank", {
+      model: "jina:jina-reranker-v3",
+      query: "architecture",
+      nested: {
+        limit: 10,
+        filters: ["book", "chapter"],
+      },
+    });
+    const key2 = getCacheKey("rerank", {
+      nested: {
+        filters: ["book", "chapter"],
+        limit: 10,
+      },
+      query: "architecture",
+      model: "jina:jina-reranker-v3",
+    });
+
+    expect(key1).toBe(key2);
+  });
+
   test("store cache operations work correctly", async () => {
     const store = await createTestStore();
 
@@ -3106,17 +3127,20 @@ describe("Embedding batching", () => {
 
   function createFakeEmbedLlm() {
     const embedBatchCalls: string[][] = [];
-    const embedCalls: { text: string; options?: { model?: string } }[] = [];
-    const embedBatchModelCalls: ({ model?: string } | undefined)[] = [];
+    const embedCalls: { text: string; options?: { model?: string; costLineage?: unknown } }[] = [];
+    const embedBatchModelCalls: ({ model?: string; costLineage?: unknown } | undefined)[] = [];
     return {
       embedBatchCalls,
       embedCalls,
       embedBatchModelCalls,
-      async embed(text: string, options?: { model?: string }) {
+      async embed(text: string, options?: { model?: string; costLineage?: unknown }) {
         embedCalls.push({ text, options });
         return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
       },
-      async embedBatch(texts: string[], options?: { model?: string }) {
+      async embedBatch(
+        texts: string[],
+        options?: { model?: string; costLineage?: unknown },
+      ) {
         embedBatchCalls.push([...texts]);
         embedBatchModelCalls.push(options);
         return texts.map((_text, index) => ({
@@ -3207,7 +3231,12 @@ describe("Embedding batching", () => {
 
       expect(result.chunksEmbedded).toBe(1);
       expect(fakeLlm.embedCalls[0]?.options?.model).toBe(model);
-      expect(fakeLlm.embedBatchModelCalls).toEqual([{ model }]);
+      expect(fakeLlm.embedBatchModelCalls[0]?.model).toBe(model);
+      expect(fakeLlm.embedBatchModelCalls[0]?.costLineage).toMatchObject({
+        contentHash: expect.any(String),
+        lineageMode: "corpus_artifact",
+        artifactIds: [expect.stringMatching(/^qmd-chunk:/)],
+      });
       expect(db.prepare(`SELECT DISTINCT model FROM content_vectors`).all()).toEqual([{ model }]);
     } finally {
       setDefaultLlamaCpp(null);
@@ -3231,7 +3260,11 @@ describe("Embedding batching", () => {
 
       expect(result.chunksEmbedded).toBe(1);
       expect(fakeLlm.embedCalls[0]?.options?.model).toBe(model);
-      expect(fakeLlm.embedBatchModelCalls).toEqual([{ model }]);
+      expect(fakeLlm.embedBatchModelCalls[0]?.model).toBe(model);
+      expect(fakeLlm.embedBatchModelCalls[0]?.costLineage).toMatchObject({
+        contentHash: expect.any(String),
+        lineageMode: "corpus_artifact",
+      });
       expect(db.prepare(`SELECT DISTINCT model FROM content_vectors`).all()).toEqual([{ model }]);
     } finally {
       setDefaultLlamaCpp(null);

@@ -15,6 +15,7 @@ import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
 import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qmd.ts";
 import { openDatabase } from "../src/db.ts";
+import { SchemaVersion } from "../src/contracts/common.ts";
 import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.ts";
 import { setConfigSource } from "../src/collections.ts";
 
@@ -42,7 +43,13 @@ function qmdRunnerArgs(args: string[]): { command: string; args: string[] } {
 // Helper to run qmd command with test database
 async function runQmd(
   args: string[],
-  options: { cwd?: string; env?: Record<string, string>; dbPath?: string; configDir?: string } = {}
+  options: {
+    cwd?: string;
+    env?: Record<string, string>;
+    dbPath?: string;
+    configDir?: string;
+    timeoutMs?: number;
+  } = {}
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const workingDir = options.cwd || fixturesDir;
   const dbPath = options.dbPath || testDbPath;
@@ -60,6 +67,13 @@ async function runQmd(
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  let killedForTimeout = false;
+  const timeout = setTimeout(() => {
+    killedForTimeout = true;
+    proc.kill("SIGTERM");
+    setTimeout(() => proc.kill("SIGKILL"), 2000).unref();
+  }, options.timeoutMs ?? 60000);
+  timeout.unref();
 
   const stdoutPromise = new Promise<string>((resolve, reject) => {
     let data = "";
@@ -77,8 +91,16 @@ async function runQmd(
     proc.once("error", reject);
     proc.on("close", (code) => resolve(code ?? 1));
   });
+  clearTimeout(timeout);
   const stdout = await stdoutPromise;
   const stderr = await stderrPromise;
+  if (killedForTimeout) {
+    return {
+      stdout,
+      stderr: `${stderr}\nqmd command timed out after ${options.timeoutMs ?? 60000}ms`.trim(),
+      exitCode: exitCode || 124,
+    };
+  }
 
   return { stdout, stderr, exitCode };
 }
@@ -239,6 +261,7 @@ describe("CLI Help", () => {
     expect(stdout).toContain("qmd collection add");
     expect(stdout).toContain("qmd search");
     expect(stdout).toContain("qmd query --graphrag");
+    expect(stdout).toContain("--mode <qmd|auto>");
     expect(stdout).toContain("--no-gpu");
     expect(stdout).toContain("qmd skill show/install");
   });
@@ -347,6 +370,14 @@ describe("CLI Embed", () => {
     const { stderr, exitCode } = await runQmd(["embed", "--max-docs-per-batch", "0"]);
     expect(exitCode).toBe(1);
     expect(stderr).toContain("maxDocsPerBatch");
+    const payload = JSON.parse(stderr);
+    expect(payload.schemaVersion).toBe(SchemaVersion);
+    expect(payload.route).toBe("qmd");
+    expect(payload.stage).toBe("route");
+    expect(payload.code).toBe("cli_error");
+    expect(payload.retryable).toBe(false);
+    expect(payload.redactedMessage).toContain("maxDocsPerBatch");
+    expect(payload.metadata.diagnosticHint).toContain("qmd doctor");
   });
 
   test("rejects invalid --max-batch-mb", async () => {
@@ -452,6 +483,9 @@ describe("CLI Init Command", () => {
     const configText = readFileSync(join(projectDir, ".qmd", "index.yml"), "utf-8");
     expect(configText).toContain("collections: {}");
     expect(configText).toContain("models:");
+    expect(configText).toContain("providers:");
+    expect(configText).toContain("graphrag:");
+    expect(configText).toContain("query:");
   });
 
   test("refuses to initialize in HOME", async () => {
@@ -531,6 +565,9 @@ describe("CLI Status Command", () => {
     expect(configText).toContain(DEFAULT_EMBED_MODEL_URI);
     expect(configText).toContain(DEFAULT_GENERATE_MODEL_URI);
     expect(configText).toContain(DEFAULT_RERANK_MODEL_URI);
+    expect(configText).toContain("providers:");
+    expect(configText).toContain("graphrag:");
+    expect(configText).toContain("query:");
   }, 20000);
 
   test("qmd doctor warns when no collections are configured", async () => {
@@ -803,6 +840,158 @@ describe("CLI Search Command", () => {
     expect(results[0].line).toBeGreaterThan(0);
     expect(results[0].body).toBeTypeOf("string");
   });
+});
+
+describe("CLI Unified Query Route", () => {
+  let localDbPath: string;
+  let localConfigDir: string;
+
+  beforeAll(async () => {
+    const env = await createIsolatedTestEnv("unified-query");
+    localDbPath = env.dbPath;
+    localConfigDir = env.configDir;
+    const addResult = await runQmd(
+      ["collection", "add", ".", "--name", "fixtures"],
+      { dbPath: localDbPath, configDir: localConfigDir },
+    );
+    if (addResult.exitCode !== 0) {
+      throw new Error(`Failed to add collection: ${addResult.stderr}`);
+    }
+  });
+
+  test("qmd query --mode auto --json emits UnifiedAnswer", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(
+      [
+        "query",
+        "--mode",
+        "auto",
+        "--json",
+        "--no-rerank",
+        "lex: Full-text search with BM25",
+      ],
+      { dbPath: localDbPath, configDir: localConfigDir },
+    );
+    expect(exitCode).toBe(0);
+    expect(stderr).not.toContain("Expanding query");
+
+    const answer = JSON.parse(stdout);
+    expect(answer.schemaVersion).toBe("1.0.0");
+    expect(answer.routeDecision.requestedRoute).toBe("auto");
+    expect(answer.routeDecision.selectedRoute).toBe("qmd");
+    expect(Array.isArray(answer.evidence)).toBe(true);
+  }, 20000);
+
+  test("qmd query --json emits UnifiedAnswer on the default qmd route", async () => {
+    const query = "lex: Full-text search with BM25";
+    const { stdout, exitCode } = await runQmd(
+      [
+        "query",
+        "--json",
+        "--no-rerank",
+        query,
+      ],
+      { dbPath: localDbPath, configDir: localConfigDir },
+    );
+    expect(exitCode).toBe(0);
+
+    const answer = JSON.parse(stdout);
+    expect(answer.schemaVersion).toBe("1.0.0");
+    expect(answer.query).toBe(query);
+    expect(answer.routeDecision.requestedRoute).toBe("qmd");
+    expect(answer.routeDecision.selectedRoute).toBe("qmd");
+    expect(Array.isArray(answer.evidence)).toBe(true);
+  }, 20000);
+
+  test("qmd query rejects graph-only default route in project config", async () => {
+    const env = await createIsolatedTestEnv("graph-default-route");
+    await writeFile(
+      join(env.configDir, "index.yml"),
+      "collections: {}\nquery:\n  default_route: graphrag\n",
+    );
+    const { stderr, exitCode } = await runQmd(
+      [
+        "query",
+        "--json",
+        "--no-rerank",
+        "lex: Full-text search with BM25",
+      ],
+      { dbPath: env.dbPath, configDir: env.configDir },
+    );
+
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("query.default_route must be qmd or auto");
+    expect(stderr).toContain("--graphrag");
+  }, 20000);
+
+  test("qmd query --mode auto preserves auto decision when graph upgrade is disabled", async () => {
+    const env = await createIsolatedTestEnv("auto-upgrade-disabled");
+    await writeFile(
+      join(env.configDir, "index.yml"),
+      "collections: {}\nquery:\n  allow_graph_upgrade: false\n",
+    );
+    const addResult = await runQmd(
+      ["collection", "add", ".", "--name", "fixtures"],
+      { dbPath: env.dbPath, configDir: env.configDir },
+    );
+    expect(addResult.exitCode).toBe(0);
+
+    const { stdout, exitCode } = await runQmd(
+      [
+        "query",
+        "--mode",
+        "auto",
+        "--json",
+        "--no-rerank",
+        "lex: Full-text search with BM25",
+      ],
+      { dbPath: env.dbPath, configDir: env.configDir },
+    );
+    expect(exitCode).toBe(0);
+
+    const answer = JSON.parse(stdout);
+    expect(answer.routeDecision.requestedRoute).toBe("auto");
+    expect(answer.routeDecision.selectedRoute).toBe("qmd");
+    expect(answer.routeDecision.refusalReasons).toContain(
+      "graph_upgrade_disabled",
+    );
+  }, 20000);
+
+  test("qmd query non-json output is projected from UnifiedAnswer evidence", async () => {
+    const { stdout, exitCode } = await runQmd(
+      [
+        "query",
+        "--no-rerank",
+        "lex: Full-text search with BM25",
+      ],
+      { dbPath: localDbPath, configDir: localConfigDir },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("qmd://fixtures/");
+    expect(stdout).toContain("Full-text search");
+    expect(stdout).toContain("Score:");
+  }, 20000);
+
+  test("qmd query --graphrag emits parseable typed capability error", async () => {
+    await mkdir(join(fixturesDir, "graph_vault"), { recursive: true });
+    const { stderr, exitCode } = await runQmd(
+      [
+        "query",
+        "--graphrag",
+        "--json",
+        "--no-rerank",
+        "lex: Full-text search with BM25",
+      ],
+      { dbPath: localDbPath, configDir: localConfigDir },
+    );
+
+    expect(exitCode).toBe(1);
+    const error = JSON.parse(stderr);
+    expect(error.route).toBe("graphrag");
+    expect(error.capability).toBe("graph_query");
+    expect(error.code).toBe("capability_missing");
+    expect(error.queriedScope).toBe("graph_enhanced_subset");
+  }, 20000);
 });
 
 describe("CLI Get Command", () => {
@@ -1849,6 +2038,33 @@ describe("mcp http daemon", () => {
     return 10000 + Math.floor(Math.random() * 50000);
   }
 
+  async function waitForPidExit(pid: number, timeoutMs = 5000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(pid, 0);
+      } catch {
+        return;
+      }
+      await sleep(100);
+    }
+    throw new Error(`Process ${pid} did not exit within ${timeoutMs}ms`);
+  }
+
+  async function terminatePid(pid: number): Promise<void> {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      return;
+    }
+    try {
+      await waitForPidExit(pid, 5000);
+    } catch {
+      try { process.kill(pid, "SIGKILL"); } catch { /* already dead */ }
+      await waitForPidExit(pid, 5000);
+    }
+  }
+
   beforeAll(async () => {
     daemonTestDir = await mkdtemp(join(tmpdir(), "qmd-daemon-test-"));
     daemonCacheDir = join(daemonTestDir, "cache");
@@ -1863,14 +2079,14 @@ describe("mcp http daemon", () => {
   afterAll(async () => {
     // Kill any leftover spawned processes
     for (const pid of spawnedPids) {
-      try { process.kill(pid, "SIGTERM"); } catch { /* already dead */ }
+      await terminatePid(pid);
     }
     // Also clean up via PID file if present
     try {
       const pf = pidPath();
       if (existsSync(pf)) {
         const pid = parseInt(readFileSync(pf, "utf-8").trim());
-        try { process.kill(pid, "SIGTERM"); } catch {}
+        await terminatePid(pid);
         unlinkSync(pf);
       }
     } catch {}
@@ -1953,10 +2169,12 @@ describe("mcp http daemon", () => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ searches: [{ type: "lex", query: "authentication" }], limit: 5, rerank: false }),
       });
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(410);
       const body = await res.json();
-      const files = body.results.map((r: { file: string }) => r.file);
-      expect(files.some((file: string) => file.includes("mcp-fixtures/notes/meeting.md"))).toBe(true);
+      expect(body.error.schemaVersion).toBe(SchemaVersion);
+      expect(body.error.code).toBe("endpoint_retired");
+      expect(body.error.redactedMessage).toContain("REST query endpoint retired");
+      expect(body.replacement).toContain("/mcp");
     } finally {
       const closed = new Promise(r => proc.once("close", r));
       proc.kill("SIGTERM");
@@ -1987,8 +2205,7 @@ describe("mcp http daemon", () => {
     expect(ready).toBe(true);
 
     // Clean up
-    process.kill(pid, "SIGTERM");
-    await sleep(500);
+    await terminatePid(pid);
     try { unlinkSync(pidPath()); } catch {}
   });
 
@@ -2051,8 +2268,7 @@ describe("mcp http daemon", () => {
     expect(stderr).toContain("Already running");
 
     // Clean up first daemon
-    process.kill(pid, "SIGTERM");
-    await sleep(500);
+    await terminatePid(pid);
     try { unlinkSync(pidPath()); } catch {}
   });
 
@@ -2074,8 +2290,7 @@ describe("mcp http daemon", () => {
     // Clean up
     const ready = await waitForServer(port);
     expect(ready).toBe(true);
-    process.kill(pid, "SIGTERM");
-    await sleep(500);
+    await terminatePid(pid);
     try { unlinkSync(pidPath()); } catch {}
   });
 });

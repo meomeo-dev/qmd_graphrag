@@ -8,6 +8,9 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -549,10 +552,113 @@ describe("LlamaCpp rerank deduping", () => {
 });
 
 describe("LlamaCpp Jina rerank", () => {
+  test("uses Jina API for embedding models", async () => {
+    const previousApiKey = process.env.JINA_API_KEY;
+    const previousGraphVault = process.env.QMD_GRAPH_VAULT;
+    const previousFetch = globalThis.fetch;
+    const graphVault = await mkdtemp(join(tmpdir(), "qmd-jina-cost-"));
+    process.env.JINA_API_KEY = "test-key";
+    process.env.QMD_GRAPH_VAULT = graphVault;
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body));
+      expect(request).toEqual({
+        model: "jina-embeddings-v3",
+        input: ["alpha", "beta"],
+      });
+      return new Response(JSON.stringify({
+        model: "jina-embeddings-v3",
+        data: [
+          { index: 0, embedding: [0.1, 0.2] },
+          { index: 1, embedding: [0.3, 0.4] },
+        ],
+        usage: {
+          total_tokens: 7,
+        },
+      }));
+    });
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    try {
+      const llm = new LlamaCpp({ embedModel: "jina:jina-embeddings-v3" }) as any;
+      llm._ciMode = false;
+      const result = await llm.embedBatch(["alpha", "beta"], {
+        costLineage: {
+          sourceId: "source-1",
+          documentId: "doc-1",
+          bookId: "book-1",
+          contentHash: "hash-1",
+          artifactIds: ["business-artifact-1"],
+        },
+      });
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://api.jina.ai/v1/embeddings",
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({
+            Authorization: "Bearer test-key",
+          }),
+        }),
+      );
+      expect(result).toEqual([
+        { embedding: [0.1, 0.2], model: "jina:jina-embeddings-v3" },
+        { embedding: [0.3, 0.4], model: "jina:jina-embeddings-v3" },
+      ]);
+      const ledger = await readFile(
+        join(graphVault, "catalog", "cost-accounting.jsonl"),
+        "utf8",
+      );
+      expect(ledger).toContain("\"provider\":\"jina\"");
+      expect(ledger).toContain("\"tokenCount\":7");
+      expect(ledger).toContain("\"tokenCountStatus\":\"reported\"");
+      expect(ledger).toContain("\"embeddingCount\":2");
+      expect(ledger).toContain("\"embeddingCountStatus\":\"reported\"");
+      expect(ledger).toContain("\"artifactIds\":[\"");
+      expect(ledger).toContain("\"requestArtifactPath\":");
+      const record = JSON.parse(ledger.trim()) as {
+        sourceId: string;
+        documentId: string;
+        bookId: string;
+        contentHash: string;
+        lineageMode: string;
+        requestArtifactId: string;
+        artifactIds: string[];
+      };
+      expect(record.sourceId).toBe("source-1");
+      expect(record.documentId).toBe("doc-1");
+      expect(record.bookId).toBe("book-1");
+      expect(record.contentHash).toBe("hash-1");
+      expect(record.lineageMode).toBe("corpus_artifact");
+      expect(record.requestArtifactId).toBe(record.artifactIds[0]);
+      expect(record.artifactIds).toContain("business-artifact-1");
+      const providerRequest = await readFile(
+        join(
+          graphVault,
+          "catalog",
+          "provider-requests",
+          `${record.artifactIds[0]}.json`,
+        ),
+        "utf8",
+      );
+      expect(providerRequest).toContain("\"kind\": \"provider_request_fingerprint\"");
+      expect(providerRequest).not.toContain("test-key");
+    } finally {
+      globalThis.fetch = previousFetch;
+      await rm(graphVault, { recursive: true, force: true });
+      if (previousApiKey === undefined) delete process.env.JINA_API_KEY;
+      else process.env.JINA_API_KEY = previousApiKey;
+      if (previousGraphVault === undefined) delete process.env.QMD_GRAPH_VAULT;
+      else process.env.QMD_GRAPH_VAULT = previousGraphVault;
+    }
+  });
+
   test("uses Jina API and maps result indexes back to file paths", async () => {
     const previousApiKey = process.env.JINA_API_KEY;
+    const previousGraphVault = process.env.QMD_GRAPH_VAULT;
     const previousFetch = globalThis.fetch;
+    const graphVault = await mkdtemp(join(tmpdir(), "qmd-jina-rerank-cost-"));
     process.env.JINA_API_KEY = "test-key";
+    process.env.QMD_GRAPH_VAULT = graphVault;
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const request = JSON.parse(String(init?.body));
       expect(request).toEqual({
@@ -575,9 +681,33 @@ describe("LlamaCpp Jina rerank", () => {
       const llm = new LlamaCpp() as any;
       llm._ciMode = false; // mocked API call; no local model or real service is used
       const result = await llm.rerank("auth setup", [
-        { file: "weather.md", text: "weather forecast" },
-        { file: "auth.md", text: "configure AUTH_SECRET" },
-      ]);
+        {
+          file: "weather.md",
+          text: "weather forecast",
+          costLineage: {
+            sourceId: "source-1",
+            documentId: "doc-1",
+            bookId: "book-1",
+            contentHash: "hash-1",
+            artifactIds: ["weather-artifact"],
+          },
+        },
+        {
+          file: "auth.md",
+          text: "configure AUTH_SECRET",
+          costLineage: {
+            sourceId: "source-1",
+            documentId: "doc-1",
+            bookId: "book-1",
+            contentHash: "hash-1",
+            artifactIds: ["auth-artifact"],
+          },
+        },
+      ], {
+        costLineage: {
+          artifactIds: ["query-artifact"],
+        },
+      });
 
       expect(fetchMock).toHaveBeenCalledWith(
         "https://api.jina.ai/v1/rerank",
@@ -595,10 +725,122 @@ describe("LlamaCpp Jina rerank", () => {
           { file: "weather.md", score: 0.12, index: 0 },
         ],
       });
+      const ledger = await readFile(
+        join(graphVault, "catalog", "cost-accounting.jsonl"),
+        "utf8",
+      );
+      expect(ledger).toContain("\"stage\":\"rerank\"");
+      expect(ledger).toContain("\"artifactIds\":[\"");
+      const record = JSON.parse(ledger.trim()) as {
+        sourceId: string;
+        documentId: string;
+        bookId: string;
+        contentHash: string;
+        lineageMode: string;
+        requestArtifactId: string;
+        artifactIds: string[];
+      };
+      expect(record.sourceId).toBe("source-1");
+      expect(record.documentId).toBe("doc-1");
+      expect(record.bookId).toBe("book-1");
+      expect(record.contentHash).toBe("hash-1");
+      expect(record.lineageMode).toBe("multi_document_query");
+      expect(record.requestArtifactId).toBe(record.artifactIds[0]);
+      expect(record.artifactIds).toEqual(
+        expect.arrayContaining([
+          "query-artifact",
+          "weather-artifact",
+          "auth-artifact",
+        ]),
+      );
+      const providerRequest = await readFile(
+        join(
+          graphVault,
+          "catalog",
+          "provider-requests",
+          `${record.artifactIds[0]}.json`,
+        ),
+        "utf8",
+      );
+      expect(providerRequest).not.toContain("test-key");
+      expect(providerRequest).not.toContain("AUTH_SECRET");
     } finally {
       globalThis.fetch = previousFetch;
+      await rm(graphVault, { recursive: true, force: true });
       if (previousApiKey === undefined) delete process.env.JINA_API_KEY;
       else process.env.JINA_API_KEY = previousApiKey;
+      if (previousGraphVault === undefined) delete process.env.QMD_GRAPH_VAULT;
+      else process.env.QMD_GRAPH_VAULT = previousGraphVault;
+    }
+  });
+
+  test("records direct Jina rerank of multiple corpus artifacts as multi-document", async () => {
+    const previousApiKey = process.env.JINA_API_KEY;
+    const previousGraphVault = process.env.QMD_GRAPH_VAULT;
+    const previousFetch = globalThis.fetch;
+    const graphVault = await mkdtemp(join(tmpdir(), "qmd-jina-rerank-merge-"));
+    process.env.JINA_API_KEY = "test-key";
+    process.env.QMD_GRAPH_VAULT = graphVault;
+    globalThis.fetch = vi.fn(async () =>
+      new Response(JSON.stringify({
+        model: "jina-reranker-v3",
+        usage: { total_tokens: 3 },
+        results: [
+          { index: 0, relevance_score: 0.7 },
+          { index: 1, relevance_score: 0.6 },
+        ],
+      }), { status: 200 }),
+    ) as unknown as typeof fetch;
+
+    try {
+      const llm = new LlamaCpp() as any;
+      llm._ciMode = false;
+      await llm.rerank("query", [
+        {
+          file: "a.md",
+          text: "alpha",
+          costLineage: {
+            documentId: "doc-a",
+            contentHash: "hash-a",
+            lineageMode: "corpus_artifact",
+            artifactIds: ["artifact-a"],
+          },
+        },
+        {
+          file: "b.md",
+          text: "beta",
+          costLineage: {
+            documentId: "doc-b",
+            contentHash: "hash-b",
+            lineageMode: "corpus_artifact",
+            artifactIds: ["artifact-b"],
+          },
+        },
+      ]);
+
+      const ledger = await readFile(
+        join(graphVault, "catalog", "cost-accounting.jsonl"),
+        "utf8",
+      );
+      const record = JSON.parse(ledger.trim()) as {
+        lineageMode: string;
+        artifactIds: string[];
+        documentId: string | null;
+        contentHash: string | null;
+      };
+      expect(record.lineageMode).toBe("multi_document_query");
+      expect(record.documentId).toBeNull();
+      expect(record.contentHash).toBeNull();
+      expect(record.artifactIds).toEqual(
+        expect.arrayContaining(["artifact-a", "artifact-b"]),
+      );
+    } finally {
+      globalThis.fetch = previousFetch;
+      await rm(graphVault, { recursive: true, force: true });
+      if (previousApiKey === undefined) delete process.env.JINA_API_KEY;
+      else process.env.JINA_API_KEY = previousApiKey;
+      if (previousGraphVault === undefined) delete process.env.QMD_GRAPH_VAULT;
+      else process.env.QMD_GRAPH_VAULT = previousGraphVault;
     }
   });
 
@@ -611,6 +853,13 @@ describe("LlamaCpp Jina rerank", () => {
       await expect(
         llm.rerank("query", [{ file: "doc.md", text: "content" }]),
       ).rejects.toThrow("JINA_API_KEY is required");
+      await expect(
+        llm.rerank("query", [{ file: "doc.md", text: "content" }]),
+      ).rejects.toMatchObject({
+        provider: "jina",
+        code: "provider_unavailable",
+        retryable: false,
+      });
     } finally {
       if (previousApiKey === undefined) delete process.env.JINA_API_KEY;
       else process.env.JINA_API_KEY = previousApiKey;
@@ -826,7 +1075,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     }, 60000);
   });
 
-  describe("rerank", () => {
+  describe.skipIf(!process.env.JINA_API_KEY)("rerank", () => {
     test("scores capital of France question correctly", async () => {
       const query = "What is the capital of France?";
       const documents: RerankDocument[] = [
@@ -1127,7 +1376,7 @@ describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
       });
     });
 
-    test("session rerank works correctly", async () => {
+    test.skipIf(!process.env.JINA_API_KEY)("session rerank works correctly", async () => {
       await withLLMSession(async (session) => {
         const documents: RerankDocument[] = [
           { file: "a.txt", text: "The capital of France is Paris." },
