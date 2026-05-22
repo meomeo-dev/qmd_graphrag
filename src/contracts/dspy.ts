@@ -47,6 +47,16 @@ export const DspyOptimizationEnvelopeSchema = buildEnvelopeSchema(
   DspyQueryPromptOptimizationRequestSchema,
 );
 
+export const DspyOptimizationResponseEnvelopeSchema = buildEnvelopeSchema(
+  "dspy.optimized_query_prompt_artifact",
+  DspyQueryPromptOptimizationResponseSchema,
+);
+
+export const DspyGeneratedExpansionRecordEnvelopeSchema = buildEnvelopeSchema(
+  "dspy.generated_expansion_record",
+  DspyGeneratedExpansionRecordSchema,
+);
+
 export type DspyOptimizer = z.infer<typeof DspyOptimizerSchema>;
 export type DspyAutoMode = z.infer<typeof DspyAutoModeSchema>;
 export type DspyQueryPromptOptimizationRequest = z.infer<
@@ -58,4 +68,3 @@ export type DspyQueryPromptOptimizationResponse = z.infer<
 export type DspyGeneratedExpansionRecord = z.infer<
   typeof DspyGeneratedExpansionRecordSchema
 >;
-

@@ -42,6 +42,54 @@ export interface ModelsConfig {
   generate?: string;
 }
 
+export interface OpenAIResponseApiConfig {
+  endpoint?: string;
+  stream?: boolean;
+  reasoning_effort?: "low" | "medium" | "high";
+  strict_structured_output?: boolean;
+}
+
+export interface OpenAIProviderConfig {
+  api_key_env?: string;
+  base_url_env?: string;
+  response_api?: OpenAIResponseApiConfig;
+}
+
+export interface JinaProviderConfig {
+  api_key_env?: string;
+  base_url?: string;
+  base_url_env?: string;
+  embedding_endpoint?: string;
+  rerank_endpoint?: string;
+  embedding_model?: string;
+  rerank_model?: string;
+}
+
+export interface ProvidersConfig {
+  openai?: OpenAIProviderConfig;
+  jina?: JinaProviderConfig;
+}
+
+export interface GraphRagConfig {
+  enabled?: boolean;
+  vault?: string;
+  python_bin?: string;
+  default_method?: "local" | "global" | "drift" | "basic";
+  default_response_type?: string;
+  enhanced_collections?: string[];
+}
+
+export interface QueryAutoRouteConfig {
+  graph_coverage_threshold?: number;
+  max_cost_class?: "low" | "medium" | "high";
+}
+
+export interface QueryConfig {
+  default_route?: "qmd" | "auto";
+  allow_graph_upgrade?: boolean;
+  auto_route?: QueryAutoRouteConfig;
+}
+
 /**
  * The complete configuration file structure
  */
@@ -51,6 +99,9 @@ export interface CollectionConfig {
   editor_uri_template?: string;               // Alias for editor_uri
   collections: Record<string, Collection>;    // Collection name -> config
   models?: ModelsConfig;
+  providers?: ProvidersConfig;
+  graphrag?: GraphRagConfig;
+  query?: QueryConfig;
 }
 
 /**

@@ -1,16 +1,137 @@
 import { z } from "zod";
 
-import { DspyOptimizationEnvelopeSchema } from "./dspy.js";
+import {
+  QueryExpansionItemEnvelopeSchema,
+} from "./common.js";
+import {
+  BookArtifactManifestListEnvelopeSchema,
+  BookArtifactManifestEnvelopeSchema,
+  BookJobCatalogEnvelopeSchema,
+  BookJobCheckpointListEnvelopeSchema,
+  BookJobEnvelopeSchema,
+  BookJobRunCatalogEnvelopeSchema,
+  BookJobRunRecordEnvelopeSchema,
+  BookJobStageCheckpointEnvelopeSchema,
+  BookResumePlanEnvelopeSchema,
+} from "./book-job.js";
+import {
+  CorpusChunkEnvelopeSchema,
+  CorpusDocumentEnvelopeSchema,
+  DocumentIdentityCatalogEnvelopeSchema,
+  DocumentIdentityMapEnvelopeSchema,
+  GraphTextUnitIdentityMapEnvelopeSchema,
+  SourceDocumentCatalogEnvelopeSchema,
+  SourceDocumentEnvelopeSchema,
+} from "./corpus.js";
+import {
+  DspyGeneratedExpansionRecordEnvelopeSchema,
+  DspyOptimizationEnvelopeSchema,
+  DspyOptimizationResponseEnvelopeSchema,
+} from "./dspy.js";
+import {
+  GraphCapabilityCatalogEnvelopeSchema,
+  GraphCapabilityEnvelopeSchema,
+  GraphEnhancementRequestEnvelopeSchema,
+  GraphEnhancementStateEnvelopeSchema,
+} from "./graph-enhancement.js";
 import {
   GraphRagIndexEnvelopeSchema,
+  GraphRagIndexResponseEnvelopeSchema,
+  GraphRagEvidenceEnvelopeSchema,
+  GraphRagProviderDetailEnvelopeSchema,
   GraphRagQueryEnvelopeSchema,
+  GraphRagQueryResponseEnvelopeSchema,
 } from "./graphrag.js";
+import {
+  JinaEmbeddingRequestEnvelopeSchema,
+  JinaEmbeddingResponseEnvelopeSchema,
+  JinaProviderConfigEnvelopeSchema,
+  JinaRerankRequestEnvelopeSchema,
+  JinaRerankResponseEnvelopeSchema,
+} from "./jina.js";
+import {
+  OpenAIResponsesProviderConfigEnvelopeSchema,
+  OpenAIResponsesRequestEnvelopeSchema,
+  OpenAIResponsesResponseEnvelopeSchema,
+  OpenAIResponsesStreamEventEnvelopeSchema,
+  OpenAIStructuredOutputSchemaEnvelopeSchema,
+  ProviderCostAccountingEnvelopeSchema,
+  ProviderRequestFingerprintEnvelopeSchema,
+} from "./provider.js";
+import {
+  QmdQueryRequestEnvelopeSchema,
+  QmdRetrievalCandidateEnvelopeSchema,
+  QmdSearchResultEnvelopeSchema,
+} from "./qmd-query.js";
+import {
+  CandidateRouteDecisionEnvelopeSchema,
+  EvidenceRefEnvelopeSchema,
+  GraphCapabilityErrorEnvelopeSchema,
+  QueryRouteDecisionEnvelopeSchema,
+  TypedQueryErrorEnvelopeSchema,
+  UnifiedAnswerEnvelopeSchema,
+  UnifiedQueryRequestEnvelopeSchema,
+} from "./unified-query.js";
+import {
+  VaultRestoreReportEnvelopeSchema,
+  VaultRestoreRequestEnvelopeSchema,
+} from "./vault.js";
 
 export const DataBusEnvelopeSchema = z.union([
+  SourceDocumentEnvelopeSchema,
+  SourceDocumentCatalogEnvelopeSchema,
+  CorpusDocumentEnvelopeSchema,
+  CorpusChunkEnvelopeSchema,
+  DocumentIdentityMapEnvelopeSchema,
+  GraphTextUnitIdentityMapEnvelopeSchema,
+  DocumentIdentityCatalogEnvelopeSchema,
+  QueryExpansionItemEnvelopeSchema,
+  QmdQueryRequestEnvelopeSchema,
+  QmdRetrievalCandidateEnvelopeSchema,
+  QmdSearchResultEnvelopeSchema,
+  GraphEnhancementRequestEnvelopeSchema,
+  GraphEnhancementStateEnvelopeSchema,
+  GraphCapabilityEnvelopeSchema,
   GraphRagQueryEnvelopeSchema,
+  GraphRagQueryResponseEnvelopeSchema,
+  GraphRagEvidenceEnvelopeSchema,
+  GraphRagProviderDetailEnvelopeSchema,
   GraphRagIndexEnvelopeSchema,
+  GraphRagIndexResponseEnvelopeSchema,
+  UnifiedQueryRequestEnvelopeSchema,
+  QueryRouteDecisionEnvelopeSchema,
+  CandidateRouteDecisionEnvelopeSchema,
+  EvidenceRefEnvelopeSchema,
+  UnifiedAnswerEnvelopeSchema,
+  GraphCapabilityErrorEnvelopeSchema,
+  TypedQueryErrorEnvelopeSchema,
+  OpenAIResponsesProviderConfigEnvelopeSchema,
+  OpenAIResponsesRequestEnvelopeSchema,
+  OpenAIResponsesResponseEnvelopeSchema,
+  OpenAIResponsesStreamEventEnvelopeSchema,
+  OpenAIStructuredOutputSchemaEnvelopeSchema,
+  ProviderRequestFingerprintEnvelopeSchema,
+  JinaProviderConfigEnvelopeSchema,
+  JinaEmbeddingRequestEnvelopeSchema,
+  JinaEmbeddingResponseEnvelopeSchema,
+  JinaRerankRequestEnvelopeSchema,
+  JinaRerankResponseEnvelopeSchema,
   DspyOptimizationEnvelopeSchema,
+  DspyOptimizationResponseEnvelopeSchema,
+  DspyGeneratedExpansionRecordEnvelopeSchema,
+  BookJobEnvelopeSchema,
+  BookJobCatalogEnvelopeSchema,
+  BookJobStageCheckpointEnvelopeSchema,
+  BookJobCheckpointListEnvelopeSchema,
+  BookArtifactManifestEnvelopeSchema,
+  BookArtifactManifestListEnvelopeSchema,
+  BookJobRunCatalogEnvelopeSchema,
+  BookJobRunRecordEnvelopeSchema,
+  BookResumePlanEnvelopeSchema,
+  ProviderCostAccountingEnvelopeSchema,
+  GraphCapabilityCatalogEnvelopeSchema,
+  VaultRestoreRequestEnvelopeSchema,
+  VaultRestoreReportEnvelopeSchema,
 ]);
 
 export type DataBusEnvelope = z.infer<typeof DataBusEnvelopeSchema>;
-

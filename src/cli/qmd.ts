@@ -112,6 +112,31 @@ import {
 } from "../collections.js";
 import { createQmdGraphRagRuntime } from "../runtime.js";
 import { GraphRagSearchMethodSchema } from "../contracts/graphrag.js";
+import { SchemaVersion } from "../contracts/common.js";
+import type { QmdSearchResult } from "../contracts/qmd-query.js";
+import type {
+  EvidenceRef,
+  QueryStage,
+  UnifiedAnswer,
+} from "../contracts/unified-query.js";
+import {
+  TypedQueryErrorException,
+  createTypedQueryError,
+  routeQuery,
+} from "../query/unified-router.js";
+import { QmdSearchResultSchema } from "../contracts/qmd-query.js";
+import {
+  loadDocumentIdentitiesFromGraphVault,
+  toQmdRetrievalCandidates,
+  type QmdCandidateInput,
+} from "../query/qmd-candidates.js";
+import {
+  loadGraphQueryCapabilities,
+  resolveCandidateGraphCapabilities,
+} from "../graphrag/capability-catalog.js";
+import {
+  writeManagedGraphRagSettingsSync,
+} from "../graphrag/settings-projection.js";
 
 // NOTE: enableProductionMode() is intentionally NOT called at module scope here.
 // Importing this module for its exports (e.g. buildEditorUri, termLink from
@@ -423,12 +448,9 @@ function initLocalIndex(): void {
   closeDb();
 
   if (!existsSync(configPath)) {
-    saveConfig({
-      collections: {},
-      models: resolveModels(),
-    });
+    ensureRuntimeConfigForCli();
   } else {
-    ensureModelsConfiguredForCli();
+    ensureRuntimeConfigForCli();
   }
 
   const localStore = createStore(dbPath);
@@ -436,6 +458,96 @@ function initLocalIndex(): void {
   localStore.close();
 
   console.log("ready to go with new local index");
+}
+
+function defaultProjectProvidersConfig(): CollectionConfig["providers"] {
+  return {
+    openai: {
+      api_key_env: "OPENAI_API_KEY",
+      base_url_env: "OPENAI_BASE_URL",
+      response_api: {
+        endpoint: "/responses",
+        stream: true,
+        reasoning_effort: "medium",
+        strict_structured_output: true,
+      },
+    },
+    jina: {
+      api_key_env: "JINA_API_KEY",
+      base_url_env: "JINA_API_BASE",
+      base_url: "https://api.jina.ai",
+      embedding_endpoint: "/v1/embeddings",
+      rerank_endpoint: "/v1/rerank",
+      embedding_model: "jina-embeddings-v3",
+      rerank_model: "jina-reranker-v3",
+    },
+  };
+}
+
+function ensureRuntimeConfigForCli(): CollectionConfig {
+  const config = loadConfig();
+  const configuredDefaultRoute = config.query?.default_route;
+  if (
+    configuredDefaultRoute != null &&
+    configuredDefaultRoute !== "qmd" &&
+    configuredDefaultRoute !== "auto"
+  ) {
+    throw new Error(
+      "query.default_route must be qmd or auto; use --graphrag for graph-only queries",
+    );
+  }
+  const models = resolveModels(config.models);
+  const next: CollectionConfig = {
+    ...config,
+    collections: config.collections ?? {},
+    models: {
+      ...(config.models ?? {}),
+      embed: models.embed,
+      generate: models.generate,
+      rerank: models.rerank,
+    },
+    providers: {
+      ...defaultProjectProvidersConfig(),
+      ...(config.providers ?? {}),
+      openai: {
+        ...defaultProjectProvidersConfig()?.openai,
+        ...(config.providers?.openai ?? {}),
+        response_api: {
+          ...defaultProjectProvidersConfig()?.openai?.response_api,
+          ...(config.providers?.openai?.response_api ?? {}),
+        },
+      },
+      jina: {
+        ...defaultProjectProvidersConfig()?.jina,
+        ...(config.providers?.jina ?? {}),
+      },
+    },
+    graphrag: {
+      enabled: true,
+      vault: "graph_vault",
+      default_method: "local",
+      default_response_type: "multiple paragraphs",
+      ...(config.graphrag ?? {}),
+    },
+    query: {
+      default_route: "qmd",
+      allow_graph_upgrade: true,
+      auto_route: {
+        graph_coverage_threshold: 0.7,
+        max_cost_class: "medium",
+        ...(config.query?.auto_route ?? {}),
+      },
+      ...(config.query ?? {}),
+    },
+  };
+  saveConfig(next);
+  if (next.graphrag?.enabled !== false) {
+    writeManagedGraphRagSettingsSync({
+      config: next,
+      graphVault: pathResolve(getPwd(), next.graphrag?.vault ?? "graph_vault"),
+    });
+  }
+  return next;
 }
 
 function isForceCpuEnabled(): boolean {
@@ -1841,21 +1953,7 @@ function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
 
 function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
   try {
-    const config = loadConfig();
-    const models = resolveModels(config.models);
-    const current = config.models ?? {};
-    if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
-      saveConfig({
-        ...config,
-        models: {
-          ...current,
-          embed: models.embed,
-          generate: models.generate,
-          rerank: models.rerank,
-        },
-      });
-    }
-    return models;
+    return resolveModels(ensureRuntimeConfigForCli().models);
   } catch {
     return resolveModels();
   }
@@ -2022,6 +2120,7 @@ type OutputOptions = {
   intent?: string;       // Domain intent for disambiguation
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
   chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
+  displayQuery?: string; // Presentation-only query string for snippets.
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -2323,6 +2422,64 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
   }
 }
 
+function evidenceMetadataString(
+  evidence: EvidenceRef,
+  key: string,
+): string | undefined {
+  const value = evidence.metadata?.[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function evidenceMetadataNumber(
+  evidence: EvidenceRef,
+  key: string,
+): number | undefined {
+  const value = evidence.metadata?.[key];
+  return typeof value === "number" ? value : undefined;
+}
+
+function outputRowsFromUnifiedAnswer(answer: UnifiedAnswer): OutputRow[] {
+  return answer.evidence.map((evidence) => {
+    const path = evidenceMetadataString(evidence, "path") ?? evidence.locator?.path
+      ?? evidence.evidenceId;
+    const title = evidenceMetadataString(evidence, "title") ?? path;
+    const fullText = evidenceMetadataString(evidence, "fullText") ?? evidence.quote ?? "";
+    return {
+      file: path,
+      displayPath: path,
+      title,
+      body: fullText,
+      chunkPos: evidenceMetadataNumber(evidence, "chunkPos"),
+      chunkLen: evidenceMetadataNumber(evidence, "chunkLen"),
+      score: evidence.score ?? 0,
+      context: evidenceMetadataString(evidence, "context") ?? null,
+      hash: evidence.contentHash ?? undefined,
+      docid: evidenceMetadataString(evidence, "docid") ?? evidence.documentId ?? undefined,
+      explain: undefined,
+    };
+  });
+}
+
+function outputUnifiedAnswer(answer: UnifiedAnswer, opts: OutputOptions): void {
+  if (opts.format === "json") {
+    console.log(JSON.stringify(answer, null, 2));
+    return;
+  }
+
+  if (answer.routeDecision.selectedRoute === "graphrag") {
+    console.log(answer.answerText);
+    return;
+  }
+
+  const rows = outputRowsFromUnifiedAnswer(answer);
+  if (rows.length === 0) {
+    printEmptySearchResults(opts.format);
+    return;
+  }
+
+  outputResults(rows, opts.displayQuery ?? answer.query, { ...opts, limit: rows.length });
+}
+
 // Resolve -c collection filter: supports single string, array, or undefined.
 // Returns validated collection names (exits on unknown collection).
 function resolveCollectionFilter(raw: string | string[] | undefined, useDefaults: boolean = false): string[] {
@@ -2445,6 +2602,91 @@ function parseStructuredQuery(query: string): ParsedStructuredQuery | null {
   return typed.length > 0 ? { searches: typed, intent } : null;
 }
 
+async function searchQmdForUnifiedRoute(
+  query: string,
+  opts: OutputOptions,
+  routeOptions: {
+    quietDiagnostics?: boolean;
+    graphVault?: string;
+  } = {},
+): Promise<{
+  results: Awaited<ReturnType<typeof hybridQuery>>;
+  qmdResult: QmdSearchResult;
+}> {
+  const store = getStore();
+  const collectionNames = resolveCollectionFilter(opts.collection, true);
+  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
+  if (!routeOptions.quietDiagnostics) {
+    checkIndexHealth(store.db);
+  }
+
+  const parsed = parseStructuredQuery(query);
+  const intent = opts.intent || parsed?.intent;
+  let results = parsed
+    ? await structuredSearch(store, parsed.searches, {
+        collections: singleCollection ? [singleCollection] : undefined,
+        limit: opts.all ? 500 : (opts.limit || 10),
+        minScore: opts.minScore || 0,
+        candidateLimit: opts.candidateLimit,
+        skipRerank: opts.skipRerank,
+        explain: !!opts.explain,
+        intent,
+        chunkStrategy: opts.chunkStrategy,
+      })
+    : await hybridQuery(store, query, {
+        collection: singleCollection,
+        limit: opts.all ? 500 : (opts.limit || 10),
+        minScore: opts.minScore || 0,
+        candidateLimit: opts.candidateLimit,
+        skipRerank: opts.skipRerank,
+        explain: !!opts.explain,
+        intent,
+        chunkStrategy: opts.chunkStrategy,
+      });
+
+  if (collectionNames.length > 1) {
+    results = results.filter(r => {
+      const prefixes = collectionNames.map(n => `qmd://${n}/`);
+      return prefixes.some(p => r.file.startsWith(p));
+    });
+  }
+
+  const identities = routeOptions.graphVault
+    ? await loadDocumentIdentitiesFromGraphVault(routeOptions.graphVault)
+    : [];
+
+  return {
+    results,
+    qmdResult: QmdSearchResultSchema.parse({
+      schemaVersion: SchemaVersion,
+      query,
+      results: toQmdRetrievalCandidates(results as readonly QmdCandidateInput[], {
+        identities,
+        fallbackCandidatePrefix: "qmd",
+      }),
+    }),
+  };
+}
+
+function outputHybridResults(
+  results: Awaited<ReturnType<typeof hybridQuery>>,
+  query: string,
+  opts: OutputOptions,
+): void {
+  outputResults(results.map(r => ({
+    file: r.file,
+    displayPath: r.displayPath,
+    title: r.title,
+    body: r.body,
+    chunkPos: r.bestChunkPos,
+    chunkLen: r.bestChunk.length,
+    score: r.score,
+    context: r.context,
+    docid: r.docid,
+    explain: r.explain,
+  })), query, { ...opts, limit: results.length });
+}
+
 function search(query: string, opts: OutputOptions): void {
   const db = getDb();
 
@@ -2548,26 +2790,11 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 }
 
 async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
-  const store = getStore();
-
-  // Validate collection filter (supports multiple -c flags)
-  // Use default collections if none specified
-  const collectionNames = resolveCollectionFilter(opts.collection, true);
-  const singleCollection = collectionNames.length === 1 ? collectionNames[0] : undefined;
-
-  checkIndexHealth(store.db);
-
-  // Check for structured query syntax (lex:/vec:/hyde:/intent: prefixes)
-  const parsed = parseStructuredQuery(query);
-  // Intent can come from --intent flag or from intent: line in query document
-  const intent = opts.intent || parsed?.intent;
-
   await withLLMSession(async () => {
-    let results;
-
+    const parsed = parseStructuredQuery(query);
+    const intent = opts.intent || parsed?.intent;
     if (parsed) {
       const structuredQueries = parsed.searches;
-      // Structured search — user provided their own query expansions
       const typeLabels = structuredQueries.map(s => s.type).join('+');
       process.stderr.write(`${c.dim}Structured search: ${structuredQueries.length} queries (${typeLabels})${c.reset}\n`);
       if (intent) {
@@ -2581,88 +2808,28 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         process.stderr.write(`${c.dim}├─ ${s.type}: ${preview}${c.reset}\n`);
       }
       process.stderr.write(`${c.dim}└─ Searching...${c.reset}\n`);
-
-      results = await structuredSearch(store, structuredQueries, {
-        collections: singleCollection ? [singleCollection] : undefined,
-        limit: opts.all ? 500 : (opts.limit || 10),
-        minScore: opts.minScore || 0,
-        candidateLimit: opts.candidateLimit,
-        skipRerank: opts.skipRerank,
-        explain: !!opts.explain,
-        intent,
-        chunkStrategy: opts.chunkStrategy,
-        hooks: {
-          onEmbedStart: (count) => {
-            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
-          },
-          onEmbedDone: (ms) => {
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-          },
-          onRerankStart: (chunkCount) => {
-            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
-            progress.indeterminate();
-          },
-          onRerankDone: (ms) => {
-            progress.clear();
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-          },
-        },
-      });
-    } else {
-      // Standard hybrid query with automatic expansion
-      results = await hybridQuery(store, query, {
-        collection: singleCollection,
-        limit: opts.all ? 500 : (opts.limit || 10),
-        minScore: opts.minScore || 0,
-        candidateLimit: opts.candidateLimit,
-        skipRerank: opts.skipRerank,
-        explain: !!opts.explain,
-        intent,
-        chunkStrategy: opts.chunkStrategy,
-        hooks: {
-          onStrongSignal: (score) => {
-            process.stderr.write(`${c.dim}Strong BM25 signal (${score.toFixed(2)}) — skipping expansion${c.reset}\n`);
-          },
-          onExpandStart: () => {
-            process.stderr.write(`${c.dim}Expanding query...${c.reset}`);
-          },
-          onExpand: (original, expanded, ms) => {
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-            logExpansionTree(original, expanded);
-            process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
-          },
-          onEmbedStart: (count) => {
-            process.stderr.write(`${c.dim}Embedding ${count} ${count === 1 ? 'query' : 'queries'}...${c.reset}`);
-          },
-          onEmbedDone: (ms) => {
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-          },
-          onRerankStart: (chunkCount) => {
-            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
-            progress.indeterminate();
-          },
-          onRerankDone: (ms) => {
-            progress.clear();
-            process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
-          },
-        },
-      });
     }
 
-    // Post-filter for multi-collection
-    if (collectionNames.length > 1) {
-      results = results.filter(r => {
-        const prefixes = collectionNames.map(n => `qmd://${n}/`);
-        return prefixes.some(p => r.file.startsWith(p));
-      });
-    }
+    const answer = await routeQuery({
+      schemaVersion: SchemaVersion,
+      query,
+      requestedRoute: "qmd",
+      collections: resolveCollectionFilter(opts.collection, true),
+      maxCostClass: "medium",
+    }, {
+      searchQmd: async () => {
+        const searchResult = await searchQmdForUnifiedRoute(
+          query,
+          opts,
+          {
+            quietDiagnostics: opts.format === "json",
+          },
+        );
+        return searchResult.qmdResult;
+      },
+    });
 
     closeDb();
-
-    if (results.length === 0) {
-      printEmptySearchResults(opts.format);
-      return;
-    }
 
     // Use first lex/vec query for output context, or original query
     const structuredQueries = parsed?.searches;
@@ -2670,19 +2837,70 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       ? (structuredQueries.find(s => s.type === 'lex')?.query || structuredQueries.find(s => s.type === 'vec')?.query || query)
       : query;
 
-    outputResults(results.map(r => ({
-      file: r.file,
-      displayPath: r.displayPath,
-      title: r.title,
-      body: r.body,
-      chunkPos: r.bestChunkPos,
-      chunkLen: r.bestChunk.length,
-      score: r.score,
-      context: r.context,
-      docid: r.docid,
-      explain: r.explain,
-    })), displayQuery, { ...opts, limit: results.length });
+    outputUnifiedAnswer(answer, { ...opts, displayQuery });
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
+}
+
+async function autoQuerySearch(query: string, opts: OutputOptions): Promise<void> {
+  await withLLMSession(async () => {
+    const config = ensureRuntimeConfigForCli();
+    const graphVault = pathResolve(
+      getPwd(),
+      config.graphrag?.vault ?? "graph_vault",
+    );
+    const method = GraphRagSearchMethodSchema.parse(
+      config.graphrag?.default_method ?? "local",
+    );
+    const responseType =
+      config.graphrag?.default_response_type ?? "multiple paragraphs";
+    const answer = await routeQuery({
+      schemaVersion: SchemaVersion,
+      query,
+      requestedRoute: "auto",
+      maxCostClass: config.query?.auto_route?.max_cost_class ?? "medium",
+      graphCoverageThreshold: config.query?.auto_route?.graph_coverage_threshold,
+      allowGraphUpgrade: config.query?.allow_graph_upgrade !== false,
+    }, {
+      searchQmd: async () => {
+        const searchResult = await searchQmdForUnifiedRoute(
+          query,
+          opts,
+          {
+            quietDiagnostics: opts.format === "json",
+            graphVault,
+          },
+        );
+        return searchResult.qmdResult;
+      },
+      resolveGraphCapabilities: async (candidates) =>
+        resolveCandidateGraphCapabilities({ graphVault, candidates }),
+      queryGraphRag: async (request, decision) => {
+        const runtime = createQmdGraphRagRuntime();
+        return runtime.graphQuery({
+          rootDir: graphVault,
+          method: GraphRagSearchMethodSchema.parse(request.method ?? method),
+          query: request.query,
+          responseType,
+          capabilityScope: {
+            selectedBookIds: decision.selectedBookIds,
+            graphCapabilityIds: decision.graphCapabilityIds,
+            sourceIds: decision.selectedSourceIds,
+            documentIds: decision.selectedDocumentIds,
+            contentHashes: decision.selectedContentHashes,
+            artifactIds: decision.graphArtifactIds,
+          },
+          verbose: false,
+          environment: {
+            workingDirectory: getPwd(),
+          },
+        });
+      },
+    });
+
+    closeDb();
+
+    outputUnifiedAnswer(answer, opts);
+  }, { maxDuration: 10 * 60 * 1000, name: 'autoQuerySearch' });
 }
 
 async function graphRagQuerySearch(
@@ -2690,14 +2908,19 @@ async function graphRagQuerySearch(
   opts: OutputOptions,
   values: Record<string, unknown>,
 ): Promise<void> {
+  const config = ensureRuntimeConfigForCli();
   const graphVault = pathResolve(
     getPwd(),
-    String(values["graph-vault"] || "graph_vault"),
+    String(values["graph-vault"] || config.graphrag?.vault || "graph_vault"),
   );
   const method = GraphRagSearchMethodSchema.parse(
-    String(values["query-method"] || "local"),
+    String(values["query-method"] || config.graphrag?.default_method || "local"),
   );
-  const responseType = String(values["response-type"] || "multiple paragraphs");
+  const responseType = String(
+    values["response-type"] ||
+    config.graphrag?.default_response_type ||
+    "multiple paragraphs",
+  );
   const communityLevel = values["community-level"] == null
     ? undefined
     : parseInt(String(values["community-level"]), 10);
@@ -2708,32 +2931,56 @@ async function graphRagQuerySearch(
     throw new Error("--community-level must be a positive integer");
   }
 
-  if (!existsSync(graphVault)) {
-    throw new Error(`GraphRAG vault not found: ${graphVault}`);
-  }
-
-  const runtime = createQmdGraphRagRuntime();
-  const response = await runtime.graphQuery({
-    rootDir: graphVault,
-    method,
+  const answer = await routeQuery({
+    schemaVersion: SchemaVersion,
     query,
-    responseType,
-    communityLevel,
-    verbose: false,
-    environment: {
-      pythonBin: values["python-bin"]
-        ? pathResolve(getPwd(), String(values["python-bin"]))
-        : undefined,
-      workingDirectory: getPwd(),
+    requestedRoute: "graphrag",
+    method,
+    maxCostClass: "medium",
+    graphCoverageThreshold: 0,
+  }, {
+    searchQmd: async () => (await searchQmdForUnifiedRoute(
+      query,
+      opts,
+      {
+        quietDiagnostics: true,
+        graphVault,
+      },
+    )).qmdResult,
+    resolveGraphScopeCapabilities: async () =>
+      loadGraphQueryCapabilities({ graphVault }),
+    resolveGraphCapabilities: async (candidates) =>
+      resolveCandidateGraphCapabilities({ graphVault, candidates }),
+    queryGraphRag: async (request, decision) => {
+      const runtime = createQmdGraphRagRuntime();
+      return runtime.graphQuery({
+        rootDir: graphVault,
+        method: GraphRagSearchMethodSchema.parse(request.method ?? method),
+        query: request.query,
+        responseType,
+        capabilityScope: {
+          selectedBookIds: decision.selectedBookIds,
+          graphCapabilityIds: decision.graphCapabilityIds,
+          sourceIds: decision.selectedSourceIds,
+          documentIds: decision.selectedDocumentIds,
+          contentHashes: decision.selectedContentHashes,
+          artifactIds: decision.graphArtifactIds,
+        },
+        communityLevel,
+        verbose: false,
+        environment: {
+          pythonBin: values["python-bin"]
+            ? pathResolve(getPwd(), String(values["python-bin"]))
+            : config.graphrag?.python_bin
+              ? pathResolve(getPwd(), config.graphrag.python_bin)
+              : undefined,
+          workingDirectory: getPwd(),
+        },
+      });
     },
   });
 
-  if (opts.format === "json") {
-    console.log(JSON.stringify(response, null, 2));
-    return;
-  }
-
-  console.log(response.responseText);
+  outputUnifiedAnswer(answer, opts);
 }
 
 // Parse CLI arguments using util.parseArgs
@@ -2786,6 +3033,7 @@ function parseCLI() {
       "no-gpu": { type: "boolean", default: false },
       graphrag: { type: "boolean", default: false },
       "graph-vault": { type: "string" },
+      mode: { type: "string" },
       "query-method": { type: "string" },
       "response-type": { type: "string" },
       "community-level": { type: "string" },
@@ -3277,8 +3525,8 @@ function showHelp(): void {
   console.log("  qmd <command> [options]");
   console.log("");
   console.log("Primary commands:");
-  console.log("  qmd query <query>             - Hybrid search with auto expansion + reranking (recommended)");
-  console.log("  qmd query --graphrag <query>  - GraphRAG answer from graph_vault");
+  console.log("  qmd query <query>             - Whole-corpus qmd search with expansion + reranking");
+  console.log("  qmd query --graphrag <query>  - Graph-enhanced qmd query for graph-ready sources");
   console.log("  qmd query 'lex:..\\nvec:...'   - Structured query document (you provide lex/vec/hyde lines)");
   console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM)");
   console.log("  qmd vsearch <query>           - Vector similarity only");
@@ -3364,7 +3612,8 @@ function showHelp(): void {
   console.log("");
   console.log("Embed/query options:");
   console.log("  --chunk-strategy <auto|regex> - Chunking mode (default: regex; auto uses AST for code files)");
-  console.log("  --graphrag                    - Use GraphRAG query over graph_vault instead of QMD local index");
+  console.log("  --mode <qmd|auto>             - Query route selector (default qmd)");
+  console.log("  --graphrag                    - Use qmd graph-enhanced query over graph_vault");
   console.log("  --graph-vault <path>          - GraphRAG vault root (default ./graph_vault)");
   console.log("  --query-method <method>       - GraphRAG method: local, global, drift, or basic");
   console.log("  --response-type <text>        - GraphRAG response type (default multiple paragraphs)");
@@ -3932,9 +4181,34 @@ function printDoctorHint(): void {
   console.error("If qmd still behaves unexpectedly, run 'qmd doctor' for diagnostics.");
 }
 
-function exitWithError(error: unknown, code = 1): never {
-  console.error(error instanceof Error ? error.message : String(error));
-  printDoctorHint();
+function exitWithError(
+  error: unknown,
+  code = 1,
+  stage: QueryStage = "route",
+): never {
+  if (error instanceof TypedQueryErrorException) {
+    console.error(JSON.stringify(
+      error.payload.graphCapabilityError ?? error.payload,
+      null,
+      2,
+    ));
+    process.exit(code);
+  } else {
+    const message = error instanceof Error ? error.message : String(error);
+    const redactedMessage =
+      sanitizeDiagnosticMessage(message) || "QMD command failed.";
+    const payload = createTypedQueryError({
+      route: "qmd",
+      stage,
+      code: "cli_error",
+      retryable: false,
+      redactedMessage,
+      metadata: {
+        diagnosticHint: "Run `qmd doctor` for diagnostics.",
+      },
+    });
+    console.error(JSON.stringify(payload, null, 2));
+  }
   process.exit(code);
 }
 
@@ -4347,10 +4621,33 @@ if (isMain) {
         console.error("Usage: qmd query [options] <query>");
         process.exit(1);
       }
-      if (cli.values.graphrag) {
-        await graphRagQuerySearch(cli.query, cli.opts, cli.values);
-      } else {
-        await querySearch(cli.query, cli.opts);
+      try {
+        if (cli.values.mode != null && !["qmd", "auto"].includes(String(cli.values.mode))) {
+          throw new TypedQueryErrorException(createTypedQueryError({
+            route: "auto",
+            stage: "route",
+            code: "invalid_query_mode",
+            retryable: false,
+            redactedMessage: "--mode must be qmd or auto.",
+          }));
+        }
+        if (cli.values.graphrag) {
+          await graphRagQuerySearch(cli.query, cli.opts, cli.values);
+        } else {
+          const config = ensureRuntimeConfigForCli();
+          const configuredRoute = config.query?.default_route ?? "qmd";
+          const explicitMode = cli.values.mode == null
+            ? null
+            : String(cli.values.mode);
+          const route = explicitMode ?? configuredRoute;
+          if (route === "auto") {
+            await autoQuerySearch(cli.query, cli.opts);
+          } else {
+            await querySearch(cli.query, cli.opts);
+          }
+        }
+      } catch (error) {
+        exitWithError(error);
       }
       break;
 

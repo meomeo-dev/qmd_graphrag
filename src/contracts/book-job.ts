@@ -1,6 +1,11 @@
 import { z } from "zod";
 
-import { JsonValueSchema, SchemaVersion } from "./common.js";
+import {
+  JsonValueSchema,
+  SchemaVersion,
+  buildEnvelopeSchema,
+} from "./common.js";
+import { VaultRelativePathSchema } from "./corpus.js";
 
 export const BookStageOrder = [
   "ingest",
@@ -12,6 +17,12 @@ export const BookStageOrder = [
 ] as const;
 
 export const BookStageSchema = z.enum(BookStageOrder);
+const HighCostBookStageSet = new Set<string>([
+  "graph_extract",
+  "community_report",
+  "embed",
+  "query_ready",
+]);
 
 export const BookJobStatusSchema = z.enum([
   "pending",
@@ -48,12 +59,17 @@ export const BookArtifactKindSchema = z.enum([
 export const BookJobSchema = z.object({
   schemaVersion: z.literal(SchemaVersion),
   bookId: z.string().min(1),
-  sourcePath: z.string().min(1),
+  documentId: z.string().min(1),
+  sourcePath: VaultRelativePathSchema,
   sourceHash: z.string().min(1),
   normalizedContentHash: z.string().min(1).optional(),
+  normalizedPath: VaultRelativePathSchema.optional(),
+  normalizationPolicyVersion: z.string().min(1).optional(),
   configFingerprint: z.string().min(1),
   promptFingerprint: z.string().min(1),
   modelFingerprint: z.string().min(1),
+  stageFingerprints: z.record(z.string(), z.string().min(1)).optional(),
+  providerFingerprint: z.string().min(1).optional(),
   currentStage: BookStageSchema.optional(),
   overallStatus: BookJobStatusSchema,
   lastSuccessRunId: z.string().min(1).optional(),
@@ -61,6 +77,31 @@ export const BookJobSchema = z.object({
   updatedAt: z.string().min(1),
   metadata: z.record(z.string(), JsonValueSchema).optional(),
 });
+
+function hasHighCostFingerprintFields(
+  value: {
+    stage: string;
+    contentHash?: string;
+    stageFingerprint?: string;
+    providerFingerprint?: string;
+  },
+  ctx: z.RefinementCtx,
+): void {
+  if (!HighCostBookStageSet.has(value.stage)) return;
+  for (const field of [
+    "contentHash",
+    "stageFingerprint",
+    "providerFingerprint",
+  ] as const) {
+    if (!value[field]) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `high-cost stage ${value.stage} requires ${field}`,
+        path: [field],
+      });
+    }
+  }
+}
 
 export const BookJobStageCheckpointSchema = z.object({
   schemaVersion: z.literal(SchemaVersion),
@@ -72,10 +113,13 @@ export const BookJobStageCheckpointSchema = z.object({
   startedAt: z.string().min(1).optional(),
   finishedAt: z.string().min(1).optional(),
   inputFingerprint: z.string().min(1),
+  contentHash: z.string().min(1).optional(),
+  stageFingerprint: z.string().min(1).optional(),
+  providerFingerprint: z.string().min(1).optional(),
   artifactIds: z.array(z.string().min(1)),
   errorSummary: z.string().min(1).optional(),
   metadata: z.record(z.string(), JsonValueSchema).optional(),
-});
+}).superRefine(hasHighCostFingerprintFields);
 
 export const BookArtifactManifestSchema = z.object({
   schemaVersion: z.literal(SchemaVersion),
@@ -83,12 +127,15 @@ export const BookArtifactManifestSchema = z.object({
   bookId: z.string().min(1),
   stage: BookStageSchema,
   kind: BookArtifactKindSchema,
-  path: z.string().min(1),
+  path: VaultRelativePathSchema,
   contentHash: z.string().min(1),
+  stageFingerprint: z.string().min(1).optional(),
+  providerFingerprint: z.string().min(1).optional(),
+  normalizationPolicyVersion: z.string().min(1).optional(),
   producerRunId: z.string().min(1),
   createdAt: z.string().min(1),
   metadata: z.record(z.string(), JsonValueSchema).optional(),
-});
+}).superRefine(hasHighCostFingerprintFields);
 
 export const BookJobRunRecordSchema = z.object({
   schemaVersion: z.literal(SchemaVersion),
@@ -162,6 +209,51 @@ export const BookResumePlanSchema = z.object({
   completedStages: z.array(BookStageSchema),
   stageStates: z.array(BookResumeStageStateSchema),
 });
+
+export const BookJobEnvelopeSchema = buildEnvelopeSchema(
+  "book.job",
+  BookJobSchema,
+);
+
+export const BookJobCatalogEnvelopeSchema = buildEnvelopeSchema(
+  "book.job_catalog",
+  BookJobCatalogSchema,
+);
+
+export const BookJobStageCheckpointEnvelopeSchema = buildEnvelopeSchema(
+  "book.stage_checkpoint",
+  BookJobStageCheckpointSchema,
+);
+
+export const BookJobCheckpointListEnvelopeSchema = buildEnvelopeSchema(
+  "book.stage_checkpoint_list",
+  BookJobCheckpointListSchema,
+);
+
+export const BookArtifactManifestEnvelopeSchema = buildEnvelopeSchema(
+  "book.artifact_manifest",
+  BookArtifactManifestSchema,
+);
+
+export const BookArtifactManifestListEnvelopeSchema = buildEnvelopeSchema(
+  "book.artifact_manifest_list",
+  BookArtifactManifestListSchema,
+);
+
+export const BookJobRunCatalogEnvelopeSchema = buildEnvelopeSchema(
+  "book.run_catalog",
+  BookJobRunCatalogSchema,
+);
+
+export const BookJobRunRecordEnvelopeSchema = buildEnvelopeSchema(
+  "book.run_record",
+  BookJobRunRecordSchema,
+);
+
+export const BookResumePlanEnvelopeSchema = buildEnvelopeSchema(
+  "book.resume_plan",
+  BookResumePlanSchema,
+);
 
 export type BookStage = z.infer<typeof BookStageSchema>;
 export type BookJobStatus = z.infer<typeof BookJobStatusSchema>;

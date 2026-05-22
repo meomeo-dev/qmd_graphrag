@@ -31,12 +31,19 @@ import {
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
+import type { ProviderCostLineage } from "./llm.js";
 import type {
   NamedCollection,
   Collection,
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import { createDeterministicHash } from "./job-state/fingerprint.js";
+import {
+  QMD_SQLITE_NORMALIZATION_POLICY_VERSION,
+  buildQmdChunkLineageId,
+  projectQmdDocumentLineage,
+} from "./query/qmd-lineage.js";
 
 // =============================================================================
 // Configuration
@@ -928,7 +935,7 @@ function initializeDatabase(db: Database): void {
     CREATE TRIGGER documents_ai AFTER INSERT ON documents
     WHEN new.active = 1
     BEGIN
-      INSERT INTO documents_fts(rowid, filepath, title, body)
+      INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
       SELECT
         new.id,
         new.collection || '/' || new.path,
@@ -949,11 +956,12 @@ function initializeDatabase(db: Database): void {
   db.exec(`
     CREATE TRIGGER documents_au AFTER UPDATE ON documents
     BEGIN
-      -- Delete from FTS if no longer active
-      DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
+      -- Replace the derived FTS row for every update, including qmd
+      -- graph_vault restore/resync paths that repeatedly upsert one document.
+      DELETE FROM documents_fts WHERE rowid = old.id;
 
       -- Update FTS if still/newly active
-      INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
+      INSERT INTO documents_fts(rowid, filepath, title, body)
       SELECT
         new.id,
         new.collection || '/' || new.path,
@@ -1219,7 +1227,13 @@ export type Store = {
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
-  rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => Promise<{ file: string; score: number }[]>;
+  rerank: (
+    query: string,
+    documents: RerankDocument[],
+    model?: string,
+    intent?: string,
+    costLineage?: ProviderCostLineage,
+  ) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
   findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentNotFound;
@@ -1242,7 +1256,12 @@ export type Store = {
   getActiveDocumentPaths: (collectionName: string) => string[];
 
   // Vector/embedding operations
-  getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
+  getHashesForEmbedding: () => {
+    hash: string;
+    body: string;
+    path: string;
+    collection: string;
+  }[];
   clearAllEmbeddings: () => void;
   insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string, totalChunks?: number, fingerprint?: string) => void;
 };
@@ -1415,6 +1434,7 @@ export type EmbedOptions = {
 type PendingEmbeddingDoc = {
   hash: string;
   path: string;
+  collection: string;
   bytes: number;
 };
 
@@ -1425,6 +1445,7 @@ type EmbeddingDoc = PendingEmbeddingDoc & {
 type ChunkItem = {
   hash: string;
   path: string;
+  collection: string;
   title: string;
   text: string;
   seq: number;
@@ -1502,7 +1523,8 @@ function getPendingEmbeddingDocs(db: Database, collection?: string, model: strin
   const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
-      SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
+      SELECT d.hash, MIN(d.path) as path, MIN(d.collection) as collection,
+             length(CAST(c.doc AS BLOB)) as bytes
       FROM documents d
       JOIN content c ON d.hash = c.hash
       LEFT JOIN (
@@ -1519,6 +1541,84 @@ function getPendingEmbeddingDocs(db: Database, collection?: string, model: strin
     `);
     return (collection ? stmt.all(model, fingerprint, collection) : stmt.all(model, fingerprint)) as PendingEmbeddingDoc[];
   });
+}
+
+function qmdEmbeddingCostLineage(chunk: ChunkItem): ProviderCostLineage {
+  return {
+    documentId: projectQmdDocumentLineage({
+      collection: chunk.collection,
+      path: chunk.path,
+      hash: chunk.hash,
+    }).documentId,
+    contentHash: chunk.hash,
+    lineageMode: "corpus_artifact",
+    artifactIds: [buildQmdChunkLineageId(chunk.hash, chunk.seq)],
+  };
+}
+
+function qmdRerankCostLineage(candidate: RankedResult): ProviderCostLineage {
+  const contentHash = candidate.hash ?? null;
+  if (contentHash == null) {
+    return {
+      lineageMode: "transient_query",
+      artifactIds: [],
+    };
+  }
+
+  return {
+    documentId: projectQmdDocumentLineage({
+      file: candidate.file,
+      displayPath: candidate.displayPath,
+      hash: contentHash,
+    }).documentId,
+    contentHash,
+    lineageMode: "corpus_artifact",
+    artifactIds: [],
+  };
+}
+
+function qmdRerankDocument(input: {
+  candidate: RankedResult;
+  text: string;
+  seq?: number | null;
+}): RerankDocument {
+  return {
+    file: input.candidate.file,
+    text: input.text,
+    title: input.candidate.title,
+    costLineage: {
+      ...qmdRerankCostLineage(input.candidate),
+      artifactIds: [
+        ...(input.candidate.hash == null || input.seq == null
+          ? []
+          : [buildQmdChunkLineageId(input.candidate.hash, input.seq)]),
+      ],
+    },
+  };
+}
+
+function mergeStoreProviderCostLineage(
+  lineages: readonly ProviderCostLineage[],
+): ProviderCostLineage {
+  const scalar = (
+    key: "documentId" | "contentHash",
+  ): string | null => {
+    const values = new Set(
+      lineages
+        .map((lineage) => lineage[key])
+        .filter((value): value is string => typeof value === "string" && value.length > 0),
+    );
+    return values.size === 1 ? [...values][0]! : null;
+  };
+
+  return {
+    documentId: scalar("documentId"),
+    contentHash: scalar("contentHash"),
+    lineageMode: lineages.length === 1 ? "corpus_artifact" : "multi_document_query",
+    artifactIds: [
+      ...new Set(lineages.flatMap((lineage) => lineage.artifactIds ?? [])),
+    ],
+  };
 }
 
 function buildEmbeddingBatches(
@@ -1642,7 +1742,10 @@ export async function generateEmbeddings(
     const tryEmbedChunk = async (chunk: ChunkItem): Promise<boolean> => {
       try {
         const text = formatDocForEmbedding(chunk.text, chunk.title, embedModelUri);
-        const result = await session.embed(text, { model });
+        const result = await session.embed(text, {
+          model,
+          costLineage: qmdEmbeddingCostLineage(chunk),
+        });
         if (!result) {
           recordFailure(chunk, "embedding returned no vector");
           return false;
@@ -1710,6 +1813,7 @@ export async function generateEmbeddings(
           batchChunks.push({
             hash: doc.hash,
             path: doc.path,
+            collection: doc.collection,
             title,
             text: chunks[seq]!.text,
             seq,
@@ -1733,7 +1837,10 @@ export async function generateEmbeddings(
       if (!vectorTableInitialized) {
         const firstChunk = batchChunks[0]!;
         const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title, embedModelUri);
-        const firstResult = await session.embed(firstText, { model });
+        const firstResult = await session.embed(firstText, {
+          model,
+          costLineage: qmdEmbeddingCostLineage(firstChunk),
+        });
         if (!firstResult) {
           throw new Error("Failed to get embedding dimensions from first chunk");
         }
@@ -1765,9 +1872,15 @@ export async function generateEmbeddings(
         const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
         const chunkBatch = batchChunks.slice(batchStart, batchEnd);
         const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, embedModelUri));
+        const batchLineage = mergeStoreProviderCostLineage(
+          chunkBatch.map(qmdEmbeddingCostLineage),
+        );
 
         try {
-          const embeddings = await session.embedBatch(texts, { model });
+          const embeddings = await session.embedBatch(texts, {
+            model,
+            costLineage: batchLineage,
+          });
           for (let i = 0; i < chunkBatch.length; i++) {
             const chunk = chunkBatch[i]!;
             const embedding = embeddings[i];
@@ -1891,7 +2004,21 @@ export function createStore(dbPath?: string): Store {
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, intent, store.llm),
-    rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model ?? store.llm?.rerankModelName ?? DEFAULT_RERANK_MODEL, db, intent, store.llm),
+    rerank: (
+      query: string,
+      documents: RerankDocument[],
+      model?: string,
+      intent?: string,
+      costLineage?: ProviderCostLineage,
+    ) => rerank(
+      query,
+      documents,
+      model ?? store.llm?.rerankModelName ?? DEFAULT_RERANK_MODEL,
+      db,
+      intent,
+      store.llm,
+      costLineage,
+    ),
 
     // Document retrieval
     findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
@@ -2027,6 +2154,7 @@ export type SearchResult = DocumentResult & {
   score: number;              // Relevance score (0-1)
   source: "fts" | "vec";      // Search source (full-text or vector)
   chunkPos?: number;          // Character position of matching chunk (for vector search)
+  chunkSeq?: number;          // Canonical qmd chunk sequence when known
 };
 
 /**
@@ -2037,6 +2165,8 @@ export type RankedResult = {
   displayPath: string;
   title: string;
   body: string;
+  hash?: string;
+  chunkSeq?: number | null;
   score: number;
 };
 
@@ -2235,10 +2365,10 @@ export function getIndexHealth(db: Database, model: string = DEFAULT_EMBED_MODEL
 // =============================================================================
 
 export function getCacheKey(url: string, body: object): string {
-  const hash = createHash("sha256");
-  hash.update(url);
-  hash.update(JSON.stringify(body));
-  return hash.digest("hex");
+  return createDeterministicHash({
+    body,
+    url,
+  });
 }
 
 export function getCachedResult(db: Database, cacheKey: string): string | null {
@@ -2362,9 +2492,15 @@ export function vacuumDatabase(db: Database): void {
 // Document helpers
 // =============================================================================
 
-export async function hashContent(content: string): Promise<string> {
+export async function hashContent(
+  content: string,
+  normalizationPolicyVersion = QMD_SQLITE_NORMALIZATION_POLICY_VERSION,
+): Promise<string> {
   const hash = createHash("sha256");
-  hash.update(content);
+  hash.update(JSON.stringify({
+    content,
+    normalizationPolicyVersion,
+  }));
   return hash.digest("hex");
 }
 
@@ -3419,10 +3555,17 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       d.title,
       content.doc as body,
       d.hash,
+      cv.seq,
       fm.bm25_score
     FROM fts_matches fm
     JOIN documents d ON d.id = fm.rowid
     JOIN content ON content.hash = d.hash
+    LEFT JOIN (
+      SELECT hash, MIN(seq) AS seq
+      FROM content_vectors
+      WHERE pos = 0
+      GROUP BY hash
+    ) cv ON cv.hash = d.hash
     WHERE d.active = 1
   `;
 
@@ -3435,7 +3578,15 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   sql += ` ORDER BY fm.bm25_score ASC LIMIT ?`;
   params.push(limit);
 
-  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
+  const rows = db.prepare(sql).all(...params) as {
+    filepath: string;
+    display_path: string;
+    title: string;
+    body: string;
+    hash: string;
+    seq: number | null;
+    bm25_score: number;
+  }[];
   return rows.map(row => {
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
     // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.
@@ -3456,6 +3607,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       context: getContextForFile(db, row.filepath),
       score,
       source: "fts" as const,
+      ...(row.seq != null ? { chunkSeq: row.seq } : {}),
     };
   });
 }
@@ -3495,6 +3647,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
     SELECT
       cv.hash || '_' || cv.seq as hash_seq,
       cv.hash,
+      cv.seq,
       cv.pos,
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
@@ -3513,7 +3666,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
   }
 
   const docRows = withLazyContentVectorMigration(db, () => db.prepare(docSql).all(...params) as {
-    hash_seq: string; hash: string; pos: number; filepath: string;
+    hash_seq: string; hash: string; seq: number; pos: number; filepath: string;
     display_path: string; title: string; body: string;
   }[]);
 
@@ -3546,6 +3699,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
         score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
         chunkPos: row.pos,
+        chunkSeq: row.seq,
       };
     });
 }
@@ -3567,10 +3721,14 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  * Get all unique content hashes that need embeddings (from active documents).
  * Returns hash, document body, and a sample path for display purposes.
  */
-export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBED_MODEL): { hash: string; body: string; path: string }[] {
+export function getHashesForEmbedding(
+  db: Database,
+  model: string = DEFAULT_EMBED_MODEL,
+): { hash: string; body: string; path: string; collection: string }[] {
   const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => db.prepare(`
-    SELECT d.hash, c.doc as body, MIN(d.path) as path
+    SELECT d.hash, c.doc as body, MIN(d.path) as path,
+           MIN(d.collection) as collection
     FROM documents d
     JOIN content c ON d.hash = c.hash
     LEFT JOIN (
@@ -3582,7 +3740,12 @@ export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBE
     WHERE d.active = 1
       AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
     GROUP BY d.hash
-  `).all(model, fingerprint) as { hash: string; body: string; path: string }[]);
+  `).all(model, fingerprint) as {
+    hash: string;
+    body: string;
+    path: string;
+    collection: string;
+  }[]);
 }
 
 /**
@@ -3755,7 +3918,15 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(
+  query: string,
+  documents: RerankDocument[],
+  model: string = DEFAULT_RERANK_MODEL,
+  db: Database,
+  intent?: string,
+  llmOverride?: LlamaCpp,
+  costLineage?: ProviderCostLineage,
+): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
 
@@ -3774,7 +3945,7 @@ export async function rerank(query: string, documents: { file: string; text: str
     if (cached !== null) {
       cachedResults.set(doc.text, parseFloat(cached));
     } else {
-      uncachedDocsByChunk.set(doc.text, { file: doc.file, text: doc.text });
+      uncachedDocsByChunk.set(doc.text, doc);
     }
   }
 
@@ -3782,7 +3953,10 @@ export async function rerank(query: string, documents: { file: string; text: str
   if (uncachedDocsByChunk.size > 0) {
     const llm = llmOverride ?? getDefaultLlamaCpp();
     const uncachedDocs = [...uncachedDocsByChunk.values()];
-    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
+    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, {
+      model,
+      costLineage,
+    });
 
     // Cache results by chunk text so identical chunks across files are scored once.
     const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
@@ -4453,9 +4627,11 @@ export interface HybridQueryResult {
   body: string;             // full document body (for snippet extraction)
   bestChunk: string;        // best chunk text
   bestChunkPos: number;     // char offset of best chunk in body
+  bestChunkSeq?: number | null; // canonical qmd chunk sequence for Type DD lineage
   score: number;            // blended score (full precision)
   context: string | null;   // user-set context
   docid: string;            // content hash prefix (6 chars)
+  hash?: string;            // full content hash for typed identity joins
   explain?: HybridQueryExplain;
 }
 
@@ -4542,7 +4718,8 @@ export async function hybridQuery(
     for (const r of initialFts) docidMap.set(r.filepath, r.docid);
     rankedLists.push(initialFts.map(r => ({
       file: r.filepath, displayPath: r.displayPath,
-      title: r.title, body: r.body || "", score: r.score,
+      title: r.title, body: r.body || "", hash: r.hash,
+      chunkSeq: r.chunkSeq, score: r.score,
     })));
     rankedListMeta.push({ source: "fts", queryType: "original", query });
   }
@@ -4561,7 +4738,8 @@ export async function hybridQuery(
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(ftsResults.map(r => ({
           file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
+          title: r.title, body: r.body || "", hash: r.hash,
+          chunkSeq: r.chunkSeq, score: r.score,
         })));
         rankedListMeta.push({ source: "fts", queryType: "lex", query: q.query });
       }
@@ -4601,7 +4779,8 @@ export async function hybridQuery(
         for (const r of vecResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(vecResults.map(r => ({
           file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
+          title: r.title, body: r.body || "", hash: r.hash,
+          chunkSeq: r.chunkSeq, score: r.score,
         })));
         rankedListMeta.push({
           source: "vec",
@@ -4625,7 +4804,10 @@ export async function hybridQuery(
   // Reranking full bodies is O(tokens) — the critical perf lesson that motivated this refactor.
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
-  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
+  const docChunkMap = new Map<string, {
+    chunks: { text: string; pos: number }[];
+    bestIdx: number;
+  }>();
 
   const chunkStrategy = options?.chunkStrategy;
   for (const cand of candidates) {
@@ -4657,6 +4839,7 @@ export async function hybridQuery(
         const bestIdx = chunkInfo?.bestIdx ?? 0;
         const bestChunk = chunkInfo?.chunks[bestIdx]?.text || cand.body || "";
         const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
+        const bestChunkSeq = cand.chunkSeq ?? null;
         const rrfRank = i + 1;
         const rrfScore = 1 / rrfRank;
         const trace = rrfTraceByFile?.get(cand.file);
@@ -4683,9 +4866,11 @@ export async function hybridQuery(
           body: cand.body,
           bestChunk,
           bestChunkPos,
+          bestChunkSeq,
           score: rrfScore,
           context: store.getContextForFile(cand.file),
           docid: docidMap.get(cand.file) || "",
+          hash: cand.hash,
           ...(explainData ? { explain: explainData } : {}),
         };
       })
@@ -4699,23 +4884,39 @@ export async function hybridQuery(
   }
 
   // Step 6: Rerank chunks (NOT full bodies)
-  const chunksToRerank: { file: string; text: string }[] = [];
+  const chunksToRerank: RerankDocument[] = [];
   for (const cand of candidates) {
     const chunkInfo = docChunkMap.get(cand.file);
     if (chunkInfo) {
-      chunksToRerank.push({ file: cand.file, text: chunkInfo.chunks[chunkInfo.bestIdx]!.text });
+      const chunk = chunkInfo.chunks[chunkInfo.bestIdx]!;
+      chunksToRerank.push(qmdRerankDocument({
+        candidate: cand,
+        text: chunk.text,
+        seq: cand.chunkSeq,
+      }));
     }
   }
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(
+    query,
+    chunksToRerank,
+    undefined,
+    intent,
+    mergeStoreProviderCostLineage(
+      chunksToRerank
+        .map((document) => document.costLineage)
+        .filter((lineage): lineage is ProviderCostLineage => lineage != null),
+    ),
+  );
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
   // Position-aware weights: top retrieval results get more protection from reranker disagreement
   const candidateMap = new Map(candidates.map(c => [c.file, {
-    displayPath: c.displayPath, title: c.title, body: c.body,
+    displayPath: c.displayPath, title: c.title, body: c.body, hash: c.hash,
+    chunkSeq: c.chunkSeq,
   }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
@@ -4733,6 +4934,7 @@ export async function hybridQuery(
     const bestIdx = chunkInfo?.bestIdx ?? 0;
     const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
     const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
+    const bestChunkSeq = candidate?.chunkSeq ?? null;
     const trace = rrfTraceByFile?.get(r.file);
     const explainData: HybridQueryExplain | undefined = explain ? {
       ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
@@ -4757,9 +4959,11 @@ export async function hybridQuery(
       body: candidate?.body || "",
       bestChunk,
       bestChunkPos,
+      bestChunkSeq,
       score: blendedScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
+      hash: candidate?.hash,
       ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);
@@ -4792,6 +4996,7 @@ export interface VectorSearchResult {
   score: number;
   context: string | null;
   docid: string;
+  hash?: string;
 }
 
 /**
@@ -4841,6 +5046,7 @@ export async function vectorSearchQuery(
           score: r.score,
           context: store.getContextForFile(r.filepath),
           docid: r.docid,
+          hash: r.hash,
         });
       }
     }
@@ -4947,7 +5153,8 @@ export async function structuredSearch(
           for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(ftsResults.map(r => ({
             file: r.filepath, displayPath: r.displayPath,
-            title: r.title, body: r.body || "", score: r.score,
+            title: r.title, body: r.body || "", hash: r.hash,
+            chunkSeq: r.chunkSeq, score: r.score,
           })));
           rankedListMeta.push({
             source: "fts",
@@ -4987,7 +5194,8 @@ export async function structuredSearch(
             for (const r of vecResults) docidMap.set(r.filepath, r.docid);
             rankedLists.push(vecResults.map(r => ({
               file: r.filepath, displayPath: r.displayPath,
-              title: r.title, body: r.body || "", score: r.score,
+              title: r.title, body: r.body || "", hash: r.hash,
+              chunkSeq: r.chunkSeq, score: r.score,
             })));
             rankedListMeta.push({
               source: "vec",
@@ -5019,7 +5227,10 @@ export async function structuredSearch(
     || searches[0]?.query || "";
   const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
-  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
+  const docChunkMap = new Map<string, {
+    chunks: { text: string; pos: number }[];
+    bestIdx: number;
+  }>();
   const ssChunkStrategy = options?.chunkStrategy;
 
   for (const cand of candidates) {
@@ -5051,6 +5262,7 @@ export async function structuredSearch(
         const bestIdx = chunkInfo?.bestIdx ?? 0;
         const bestChunk = chunkInfo?.chunks[bestIdx]?.text || cand.body || "";
         const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
+        const bestChunkSeq = cand.chunkSeq ?? null;
         const rrfRank = i + 1;
         const rrfScore = 1 / rrfRank;
         const trace = rrfTraceByFile?.get(cand.file);
@@ -5077,9 +5289,11 @@ export async function structuredSearch(
           body: cand.body,
           bestChunk,
           bestChunkPos,
+          bestChunkSeq,
           score: rrfScore,
           context: store.getContextForFile(cand.file),
           docid: docidMap.get(cand.file) || "",
+          hash: cand.hash,
           ...(explainData ? { explain: explainData } : {}),
         };
       })
@@ -5093,22 +5307,38 @@ export async function structuredSearch(
   }
 
   // Step 5: Rerank chunks
-  const chunksToRerank: { file: string; text: string }[] = [];
+  const chunksToRerank: RerankDocument[] = [];
   for (const cand of candidates) {
     const chunkInfo = docChunkMap.get(cand.file);
     if (chunkInfo) {
-      chunksToRerank.push({ file: cand.file, text: chunkInfo.chunks[chunkInfo.bestIdx]!.text });
+      const chunk = chunkInfo.chunks[chunkInfo.bestIdx]!;
+      chunksToRerank.push(qmdRerankDocument({
+        candidate: cand,
+        text: chunk.text,
+        seq: cand.chunkSeq,
+      }));
     }
   }
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(
+    primaryQuery,
+    chunksToRerank,
+    undefined,
+    intent,
+    mergeStoreProviderCostLineage(
+      chunksToRerank
+        .map((document) => document.costLineage)
+        .filter((lineage): lineage is ProviderCostLineage => lineage != null),
+    ),
+  );
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score
   const candidateMap = new Map(candidates.map(c => [c.file, {
-    displayPath: c.displayPath, title: c.title, body: c.body,
+    displayPath: c.displayPath, title: c.title, body: c.body, hash: c.hash,
+    chunkSeq: c.chunkSeq,
   }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
@@ -5126,6 +5356,7 @@ export async function structuredSearch(
     const bestIdx = chunkInfo?.bestIdx ?? 0;
     const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
     const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
+    const bestChunkSeq = candidate?.chunkSeq ?? null;
     const trace = rrfTraceByFile?.get(r.file);
     const explainData: HybridQueryExplain | undefined = explain ? {
       ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
@@ -5150,9 +5381,11 @@ export async function structuredSearch(
       body: candidate?.body || "",
       bestChunk,
       bestChunkPos,
+      bestChunkSeq,
       score: blendedScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
+      hash: candidate?.hash,
       ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);

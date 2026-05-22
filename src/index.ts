@@ -87,6 +87,8 @@ import type {
   GraphRagIndexResponse,
   GraphRagQueryRequest,
   GraphRagQueryResponse,
+  GraphRagCapabilityScope,
+  GraphRagEvidence,
   GraphRagSearchMethod,
   GraphRagWorkflowName,
 } from "./contracts/graphrag.js";
@@ -103,11 +105,74 @@ import type {
   QueryKind,
 } from "./contracts/common.js";
 import type {
+  DataBusEnvelope,
+} from "./contracts/bus.js";
+import type {
+  VaultRestoreReport,
+  VaultRestoreRequest,
+} from "./contracts/vault.js";
+import type {
+  JinaEmbeddingItem,
+  JinaEmbeddingRequest,
+  JinaEmbeddingResponse,
   JinaRerankDocument,
   JinaRerankRequest,
   JinaRerankResponse,
   JinaRerankResult,
 } from "./contracts/jina.js";
+import type {
+  CorpusChunk,
+  CorpusDocument,
+  DocumentIdentityCatalog,
+  DocumentIdentityMap,
+  GraphTextUnitIdentityMap,
+  SourceDocument,
+  SourceDocumentCatalog,
+  SourceLocator,
+} from "./contracts/corpus.js";
+import type {
+  QmdQueryRequest,
+  QmdQuerySearch,
+  QmdRetrievalCandidate,
+  QmdSearchResult,
+} from "./contracts/qmd-query.js";
+import type {
+  GraphCapability,
+  GraphCapabilityCatalog,
+  GraphCapabilityKind,
+  GraphEnhancementRequest,
+  GraphEnhancementState,
+  GraphEnhancementStatus,
+} from "./contracts/graph-enhancement.js";
+import type {
+  CandidateDistribution,
+  CandidateRouteDecision,
+  EvidenceLocator,
+  EvidenceRef,
+  GraphCapabilityError,
+  QueryCostClass,
+  QueryIntentClass,
+  QueryRoute,
+  QueryRouteDecision,
+  QueryStage,
+  RouteRefusalReason,
+  RouteDecisionStatus,
+  SelectedQueryRoute,
+  TypedQueryError,
+  UnifiedAnswer,
+  UnifiedQueryRequest,
+} from "./contracts/unified-query.js";
+import type {
+  OpenAIResponsesProviderConfig,
+  OpenAIResponsesReasoning,
+  OpenAIResponsesRequest,
+  OpenAIResponsesResponse,
+  OpenAIResponsesStreamEvent,
+  OpenAIStructuredOutputSchema,
+  ProviderCostAccounting,
+  ProviderRequestFingerprint,
+  StrictJsonSchemaNode,
+} from "./contracts/provider.js";
 import type {
   BookArtifactKind,
   BookArtifactManifest,
@@ -122,6 +187,7 @@ import type {
 } from "./contracts/book-job.js";
 import {
   FileBookJobStateRepository,
+  type BuildGraphEnhancementRequestInput,
   type CompleteStageInput,
   type FailStageInput,
   type RecordArtifactInput,
@@ -133,6 +199,13 @@ import {
 import {
   syncGraphRagBookWorkspace,
 } from "./job-state/graphrag-book.js";
+import type {
+  BuildUnifiedAnswerInput,
+} from "./query/unified-answer.js";
+import type {
+  DecideRouteInput,
+  RouteQueryServices,
+} from "./query/unified-router.js";
 
 // Re-export types for SDK consumers
 export type {
@@ -161,6 +234,8 @@ export type {
   GraphRagIndexResponse,
   GraphRagQueryRequest,
   GraphRagQueryResponse,
+  GraphRagCapabilityScope,
+  GraphRagEvidence,
   GraphRagSearchMethod,
   GraphRagWorkflowName,
   DspyAutoMode,
@@ -169,12 +244,63 @@ export type {
   DspyQueryPromptOptimizationRequest,
   DspyQueryPromptOptimizationResponse,
   BridgeEnvironment,
+  JinaEmbeddingItem,
+  JinaEmbeddingRequest,
+  JinaEmbeddingResponse,
   JinaRerankDocument,
   JinaRerankRequest,
   JinaRerankResponse,
   JinaRerankResult,
+  SourceLocator,
+  SourceDocument,
+  SourceDocumentCatalog,
+  CorpusDocument,
+  CorpusChunk,
+  DocumentIdentityMap,
+  DocumentIdentityCatalog,
+  QmdQuerySearch,
+  QmdQueryRequest,
+  QmdRetrievalCandidate,
+  QmdSearchResult,
+  GraphCapabilityKind,
+  GraphEnhancementStatus,
+  GraphEnhancementRequest,
+  GraphEnhancementState,
+  GraphCapability,
+  GraphCapabilityCatalog,
+  QueryRoute,
+  SelectedQueryRoute,
+  RouteDecisionStatus,
+  QueryIntentClass,
+  QueryCostClass,
+  RouteRefusalReason,
+  UnifiedQueryRequest,
+  CandidateDistribution,
+  CandidateRouteDecision,
+  QueryRouteDecision,
+  EvidenceLocator,
+  EvidenceRef,
+  UnifiedAnswer,
+  QueryStage,
+  GraphCapabilityError,
+  TypedQueryError,
+  OpenAIResponsesProviderConfig,
+  OpenAIResponsesReasoning,
+  OpenAIResponsesRequest,
+  OpenAIResponsesResponse,
+  StrictJsonSchemaNode,
+  OpenAIStructuredOutputSchema,
+  OpenAIResponsesStreamEvent,
+  ProviderCostAccounting,
+  ProviderRequestFingerprint,
+  BuildUnifiedAnswerInput,
+  DecideRouteInput,
+  RouteQueryServices,
+  DataBusEnvelope,
   QueryExpansionItem,
   QueryKind,
+  VaultRestoreRequest,
+  VaultRestoreReport,
   BookArtifactKind,
   BookArtifactManifest,
   BookJob,
@@ -201,12 +327,101 @@ export {
   JsonValueSchema,
   QueryKindSchema,
   QueryExpansionItemSchema,
+  QueryExpansionItemEnvelopeSchema,
   BridgeEnvironmentSchema,
 } from "./contracts/common.js";
 export {
+  SourceLocatorSchema,
+  SourceDocumentSchema,
+  SourceDocumentEnvelopeSchema,
+  SourceDocumentCatalogSchema,
+  SourceDocumentCatalogEnvelopeSchema,
+  CorpusDocumentSchema,
+  CorpusDocumentEnvelopeSchema,
+  CorpusChunkSchema,
+  CorpusChunkEnvelopeSchema,
+  DocumentIdentityMapSchema,
+  DocumentIdentityMapEnvelopeSchema,
+  DocumentIdentityCatalogSchema,
+  DocumentIdentityCatalogEnvelopeSchema,
+  GraphTextUnitIdentityMapSchema,
+  GraphTextUnitIdentityMapEnvelopeSchema,
+} from "./contracts/corpus.js";
+export {
+  QmdQuerySearchSchema,
+  QmdQueryRequestSchema,
+  QmdQueryRequestEnvelopeSchema,
+  QmdRetrievalCandidateSchema,
+  QmdRetrievalCandidateEnvelopeSchema,
+  QmdSearchResultSchema,
+  QmdSearchResultEnvelopeSchema,
+} from "./contracts/qmd-query.js";
+export {
+  GraphCapabilityKindSchema,
+  GraphEnhancementStatusSchema,
+  GraphEnhancementRequestSchema,
+  GraphEnhancementRequestEnvelopeSchema,
+  GraphEnhancementStateSchema,
+  GraphEnhancementStateEnvelopeSchema,
+  GraphCapabilitySchema,
+  GraphCapabilityCatalogSchema,
+  GraphCapabilityEnvelopeSchema,
+  GraphCapabilityCatalogEnvelopeSchema,
+} from "./contracts/graph-enhancement.js";
+export {
+  QueryRouteSchema,
+  SelectedQueryRouteSchema,
+  RouteDecisionStatusSchema,
+  QueryIntentClassSchema,
+  QueryCostClassSchema,
+  RouteRefusalReasonSchema,
+  UnifiedQueryRequestSchema,
+  UnifiedQueryRequestEnvelopeSchema,
+  CandidateDistributionSchema,
+  CandidateRouteDecisionSchema,
+  QueryRouteDecisionSchema,
+  QueryRouteDecisionEnvelopeSchema,
+  CandidateRouteDecisionEnvelopeSchema,
+  EvidenceLocatorSchema,
+  EvidenceRefSchema,
+  EvidenceRefEnvelopeSchema,
+  UnifiedAnswerSchema,
+  UnifiedAnswerEnvelopeSchema,
+  QueryStageSchema,
+  GraphCapabilityErrorSchema,
+  GraphCapabilityErrorEnvelopeSchema,
+  TypedQueryErrorSchema,
+  TypedQueryErrorEnvelopeSchema,
+} from "./contracts/unified-query.js";
+export {
+  OpenAIResponsesProviderConfigSchema,
+  OpenAIResponsesProviderConfigEnvelopeSchema,
+  OpenAIResponsesReasoningSchema,
+  OpenAIResponsesRequestSchema,
+  OpenAIResponsesRequestEnvelopeSchema,
+  OpenAIResponsesResponseSchema,
+  OpenAIResponsesResponseEnvelopeSchema,
+  StrictJsonSchemaNodeSchema,
+  OpenAIStructuredOutputSchemaSchema,
+  OpenAIStructuredOutputSchemaEnvelopeSchema,
+  OpenAIResponsesStreamEventSchema,
+  OpenAIResponsesStreamEventEnvelopeSchema,
+  ProviderCostAccountingSchema,
+  ProviderCostAccountingEnvelopeSchema,
+  ProviderRequestFingerprintSchema,
+  ProviderRequestFingerprintEnvelopeSchema,
+} from "./contracts/provider.js";
+export {
+  JinaEmbeddingRequestSchema,
+  JinaEmbeddingRequestEnvelopeSchema,
+  JinaEmbeddingItemSchema,
+  JinaEmbeddingResponseSchema,
+  JinaEmbeddingResponseEnvelopeSchema,
   JinaRerankDocumentSchema,
   JinaRerankRequestSchema,
+  JinaRerankRequestEnvelopeSchema,
   JinaRerankResponseSchema,
+  JinaRerankResponseEnvelopeSchema,
   JinaRerankResultSchema,
 } from "./contracts/jina.js";
 export {
@@ -215,29 +430,44 @@ export {
   StageCheckpointStatusSchema,
   BookArtifactKindSchema,
   BookJobSchema,
+  BookJobEnvelopeSchema,
+  BookJobCatalogEnvelopeSchema,
   BookJobStageCheckpointSchema,
+  BookJobStageCheckpointEnvelopeSchema,
+  BookJobCheckpointListEnvelopeSchema,
   BookArtifactManifestSchema,
+  BookArtifactManifestEnvelopeSchema,
+  BookArtifactManifestListEnvelopeSchema,
   BookJobRunRecordSchema,
   BookJobCatalogSchema,
   BookJobCheckpointListSchema,
   BookArtifactManifestListSchema,
   BookJobRunCatalogEntrySchema,
   BookJobRunCatalogSchema,
+  BookJobRunCatalogEnvelopeSchema,
   BookResumeStageStateSchema,
   BookResumePlanSchema,
+  BookResumePlanEnvelopeSchema,
   BookStageOrder,
 } from "./contracts/book-job.js";
 export {
   GraphRagSearchMethodSchema,
+  GraphRagCapabilityScopeSchema,
   GraphRagIndexMethodSchema,
   GraphRagWorkflowNameSchema,
   GraphRagQueryRequestSchema,
   GraphRagWorkflowResultSchema,
   GraphRagIndexRequestSchema,
+  GraphRagEvidenceSchema,
+  GraphRagEvidenceEnvelopeSchema,
   GraphRagQueryResponseSchema,
   GraphRagIndexResponseSchema,
+  GraphRagProviderDetailSchema,
+  GraphRagProviderDetailEnvelopeSchema,
   GraphRagQueryEnvelopeSchema,
+  GraphRagQueryResponseEnvelopeSchema,
   GraphRagIndexEnvelopeSchema,
+  GraphRagIndexResponseEnvelopeSchema,
 } from "./contracts/graphrag.js";
 export {
   DspyOptimizerSchema,
@@ -246,10 +476,34 @@ export {
   DspyGeneratedExpansionRecordSchema,
   DspyQueryPromptOptimizationResponseSchema,
   DspyOptimizationEnvelopeSchema,
+  DspyOptimizationResponseEnvelopeSchema,
+  DspyGeneratedExpansionRecordEnvelopeSchema,
 } from "./contracts/dspy.js";
 export { DataBusEnvelopeSchema } from "./contracts/bus.js";
 export {
+  VaultRestoreRequestSchema,
+  VaultRestoreRequestEnvelopeSchema,
+  VaultRestoreReportSchema,
+  VaultRestoreReportEnvelopeSchema,
+} from "./contracts/vault.js";
+export {
+  buildEvidenceRefsFromQmdResults,
+  buildEvidenceRefsFromGraphRagResponse,
+  buildUnifiedAnswer,
+} from "./query/unified-answer.js";
+export {
+  DEFAULT_GRAPH_COVERAGE_THRESHOLD,
+  DEFAULT_MAX_COST_CLASS,
+  TypedQueryErrorException,
+  buildGraphCapabilityError,
+  classifyQueryIntent,
+  createTypedQueryError,
+  decideRoute,
+  routeQuery,
+} from "./query/unified-router.js";
+export {
   FileBookJobStateRepository,
+  type BuildGraphEnhancementRequestInput,
   type CompleteStageInput,
   type FailStageInput,
   type RecordArtifactInput,
@@ -259,11 +513,33 @@ export {
   type StartStageInput,
 } from "./job-state/repository.js";
 export {
+  readGraphTextUnitIdentity,
   syncGraphRagBookWorkspace,
 } from "./job-state/graphrag-book.js";
+export {
+  loadGraphCapabilities,
+  loadGraphQueryCapabilities,
+  recordGraphCapability,
+  resolveCandidateGraphCapabilities,
+} from "./graphrag/capability-catalog.js";
+export {
+  assertManagedGraphRagSettings,
+  buildGraphRagRuntimeSettingsProjection,
+  graphRagProjectConfigFingerprint,
+  writeManagedGraphRagSettings,
+  writeManagedGraphRagSettingsSync,
+} from "./graphrag/settings-projection.js";
+export {
+  buildProviderCostAccounting,
+  appendProviderCostAccounting,
+} from "./provider/cost-accounting.js";
+export {
+  restoreFromVault,
+} from "./vault/restore.js";
 export type {
   GraphRagBookWorkspacePaths,
   GraphRagBookWorkspaceState,
+  GraphRagTextUnitIdentity,
   SyncGraphRagBookWorkspaceInput,
 } from "./job-state/graphrag-book.js";
 export {

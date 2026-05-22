@@ -53,3 +53,7 @@ export function buildEnvelopeSchema<const TKind extends string, TPayload extends
   });
 }
 
+export const QueryExpansionItemEnvelopeSchema = buildEnvelopeSchema(
+  "qmd.query_expansion.item",
+  QueryExpansionItemSchema,
+);

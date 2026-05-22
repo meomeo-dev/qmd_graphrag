@@ -24,11 +24,36 @@ import {
   extractSnippet,
   addLineNumbers,
   getDefaultDbPath,
+  SchemaVersion,
+  createTypedQueryError,
+  routeQuery,
   DEFAULT_MULTI_GET_MAX_BYTES,
+  TypedQueryErrorException,
   type QMDStore,
   type ExpandedQuery,
   type IndexStatus,
 } from "../index.js";
+import type {
+  GraphRagQueryRequest,
+  GraphRagQueryResponse,
+} from "../contracts/graphrag.js";
+import type { EvidenceRef, QueryStage } from "../contracts/unified-query.js";
+import {
+  EvidenceRefSchema,
+  GraphCapabilityErrorSchema,
+  QueryRouteDecisionSchema,
+  TypedQueryErrorSchema,
+} from "../contracts/unified-query.js";
+import {
+  loadGraphQueryCapabilities,
+  resolveCandidateGraphCapabilities,
+} from "../graphrag/capability-catalog.js";
+import {
+  loadDocumentIdentitiesFromGraphVault,
+  toQmdRetrievalCandidates,
+  type QmdCandidateInput,
+} from "../query/qmd-candidates.js";
+import { runGraphRagQuery } from "../integrations/graphrag.js";
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
 
@@ -86,6 +111,56 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
   return lines.join('\n');
 }
 
+function evidenceMetadataString(
+  evidence: EvidenceRef,
+  key: string,
+): string | undefined {
+  const value = evidence.metadata?.[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function evidenceMetadataNumber(
+  evidence: EvidenceRef,
+  key: string,
+): number | undefined {
+  const value = evidence.metadata?.[key];
+  return typeof value === "number" ? value : undefined;
+}
+
+function evidenceRefsToSearchResults(
+  evidence: EvidenceRef[],
+  query: string,
+): SearchResultItem[] {
+  return evidence.map((item) => {
+    const docid = evidenceMetadataString(item, "docid")
+      ?? item.documentId
+      ?? item.evidenceId;
+    const file = evidenceMetadataString(item, "path")
+      ?? item.locator?.path
+      ?? item.evidenceId;
+    const line = item.locator?.lineStart
+      ?? evidenceMetadataNumber(item, "line")
+      ?? 1;
+    const fullText = evidenceMetadataString(item, "fullText");
+    const chunkPos = evidenceMetadataNumber(item, "chunkPos");
+    const chunkLen = evidenceMetadataNumber(item, "chunkLen");
+    const snippetInfo = fullText != null
+      ? extractSnippet(fullText, query, 300, chunkPos, chunkLen)
+      : null;
+    const snippetLine = snippetInfo?.line ?? line;
+    const snippet = snippetInfo?.snippet ?? item.quote ?? "";
+    return {
+      docid: docid.startsWith("#") ? docid : `#${docid}`,
+      file,
+      title: evidenceMetadataString(item, "title") ?? file,
+      score: Math.round((item.score ?? 0) * 100) / 100,
+      context: evidenceMetadataString(item, "context") ?? null,
+      line: snippetLine,
+      snippet: addLineNumbers(snippet, snippetLine),
+    };
+  });
+}
+
 function getPackageVersion(): string {
   try {
     const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "../../package.json");
@@ -96,9 +171,57 @@ function getPackageVersion(): string {
   }
 }
 
+function primaryQueryForSearches(
+  searches: Array<{ type: string; query: string }>,
+): string {
+  return searches.find(s => s.type === "lex")?.query
+    || searches.find(s => s.type === "vec")?.query
+    || searches[0]?.query
+    || "";
+}
+
+function typedQueryErrorResult(error: TypedQueryErrorException) {
+  const publicError = error.payload.graphCapabilityError ?? error.payload;
+  return {
+    content: [{ type: "text" as const, text: publicError.redactedMessage }],
+    isError: true,
+    structuredContent: {
+      error: publicError,
+    },
+  };
+}
+
+function genericTypedQueryErrorResult(
+  error: unknown,
+  stage: QueryStage = "qmd_retrieval",
+) {
+  return typedQueryErrorResult(new TypedQueryErrorException(createTypedQueryError({
+    route: "qmd",
+    stage,
+    code: "query_error",
+    retryable: false,
+    redactedMessage: "QMD query failed before returning a typed answer.",
+    metadata: {
+      errorName: error instanceof Error ? error.name : typeof error,
+    },
+  })));
+}
+
 // =============================================================================
 // MCP Server
 // =============================================================================
+
+export type McpGraphRagQueryProvider = (
+  request: GraphRagQueryRequest,
+) => Promise<GraphRagQueryResponse>;
+
+export type McpRuntimeServices = {
+  queryGraphRag: McpGraphRagQueryProvider;
+};
+
+const DEFAULT_MCP_RUNTIME_SERVICES: McpRuntimeServices = {
+  queryGraphRag: runGraphRagQuery,
+};
 
 /**
  * Build dynamic server instructions from actual index state.
@@ -168,7 +291,10 @@ async function buildInstructions(store: QMDStore): Promise<string> {
  * Create an MCP server with all QMD tools, resources, and prompts registered.
  * Shared by both stdio and HTTP transports.
  */
-async function createMcpServer(store: QMDStore): Promise<McpServer> {
+async function createMcpServer(
+  store: QMDStore,
+  services: McpRuntimeServices,
+): Promise<McpServer> {
   const server = new McpServer(
     { name: "qmd", version: getPackageVersion() },
     { instructions: await buildInstructions(store) },
@@ -308,6 +434,15 @@ Intent-aware lex (C++ performance, not sports):
           "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
         ),
         collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
+        route: z.enum(["qmd", "auto", "graphrag"]).optional().default("qmd").describe(
+          "Retrieval route: qmd for whole-corpus search, auto for typed graph upgrade, graphrag for graph-ready subset only."
+        ),
+        graphVault: z.string().optional().describe(
+          "graph_vault path used to resolve graph capabilities for auto/graphrag routes."
+        ),
+        graphMethod: z.enum(["local", "global", "drift", "basic"]).optional().default("local").describe(
+          "GraphRAG query method when route resolves to graphrag."
+        ),
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
@@ -315,8 +450,34 @@ Intent-aware lex (C++ performance, not sports):
           "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
         ),
       },
+      outputSchema: {
+        results: z.array(z.object({
+          docid: z.string(),
+          file: z.string(),
+          title: z.string(),
+          score: z.number(),
+          context: z.string().nullable(),
+          line: z.number(),
+          snippet: z.string(),
+        })).optional(),
+        answer: z.string().optional(),
+        evidence: z.array(EvidenceRefSchema).optional(),
+        routeDecision: QueryRouteDecisionSchema.optional(),
+        error: TypedQueryErrorSchema.or(GraphCapabilityErrorSchema).optional(),
+      },
     },
-    async ({ searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
+    async ({
+      searches,
+      limit,
+      minScore,
+      candidateLimit,
+      collections,
+      route,
+      graphVault,
+      graphMethod,
+      intent,
+      rerank,
+    }) => {
       // Map to internal format
       const queries: ExpandedQuery[] = searches.map(s => ({
         type: s.type,
@@ -326,37 +487,86 @@ Intent-aware lex (C++ performance, not sports):
       // Use default collections if none specified
       const effectiveCollections = collections ?? defaultCollectionNames;
 
-      const results = await store.search({
-        queries,
-        collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
-        limit,
-        minScore,
-        candidateLimit,
-        rerank,
-        intent,
+      const answer = await routeQuery({
+        schemaVersion: SchemaVersion,
+        query: primaryQueryForSearches(searches),
+        requestedRoute: route,
+        collections: effectiveCollections,
+        maxCostClass: "medium",
+      }, {
+        searchQmd: async () => {
+          const results = await store.search({
+            queries,
+            collections: effectiveCollections.length > 0
+              ? effectiveCollections
+              : undefined,
+            limit,
+            minScore,
+            candidateLimit,
+            rerank,
+            intent,
+          });
+          const identities = graphVault
+            ? await loadDocumentIdentitiesFromGraphVault(graphVault)
+            : [];
+          return {
+            schemaVersion: SchemaVersion,
+            query: primaryQueryForSearches(searches),
+            results: toQmdRetrievalCandidates(
+              results as readonly QmdCandidateInput[],
+              {
+                identities,
+                fallbackCandidatePrefix: "mcp",
+              },
+            ),
+          };
+        },
+        resolveGraphCapabilities: graphVault
+          ? async (candidates) =>
+              resolveCandidateGraphCapabilities({ graphVault, candidates })
+          : undefined,
+        resolveGraphScopeCapabilities: graphVault
+          ? async () => loadGraphQueryCapabilities({ graphVault })
+          : undefined,
+        queryGraphRag: graphVault
+          ? async (request, decision) => services.queryGraphRag({
+              rootDir: graphVault,
+              method: graphMethod,
+              query: request.query,
+              responseType: "multiple paragraphs",
+              capabilityScope: {
+                selectedBookIds: decision.selectedBookIds,
+                graphCapabilityIds: decision.graphCapabilityIds,
+                sourceIds: decision.selectedSourceIds,
+                documentIds: decision.selectedDocumentIds,
+                contentHashes: decision.selectedContentHashes,
+                artifactIds: decision.graphArtifactIds,
+              },
+            })
+          : undefined,
+      }).catch((error: unknown) => {
+        if (error instanceof TypedQueryErrorException) {
+          return typedQueryErrorResult(error);
+        }
+        return genericTypedQueryErrorResult(error);
       });
 
-      // Use first lex or vec query for snippet extraction
-      const primaryQuery = searches.find(s => s.type === 'lex')?.query
-        || searches.find(s => s.type === 'vec')?.query
-        || searches[0]?.query || "";
+      if ("isError" in answer) return answer;
 
-      const filtered: SearchResultItem[] = results.map(r => {
-        const { line, snippet } = extractSnippet(r.body, primaryQuery, 300, r.bestChunkPos, r.bestChunk.length, intent);
-        return {
-          docid: `#${r.docid}`,
-          file: r.displayPath,
-          title: r.title,
-          score: Math.round(r.score * 100) / 100,
-          context: r.context,
-          line,
-          snippet: addLineNumbers(snippet, line),
-        };
-      });
+      const primaryQuery = primaryQueryForSearches(searches);
+      const filtered = evidenceRefsToSearchResults(answer.evidence, primaryQuery);
+      const text = answer.routeDecision.selectedRoute === "graphrag"
+        ? answer.answerText
+        : formatSearchSummary(filtered, primaryQuery);
 
       return {
-        content: [{ type: "text", text: formatSearchSummary(filtered, primaryQuery) }],
-        structuredContent: { results: filtered },
+        content: [{ type: "text", text }],
+        structuredContent: {
+          results: filtered,
+          answer: answer.answerText,
+          evidence: answer.evidence,
+          routeDecision: answer.routeDecision,
+        },
       };
     }
   );
@@ -543,6 +753,7 @@ Intent-aware lex (C++ performance, not sports):
 
 export type McpStartupOptions = {
   dbPath?: string;
+  services?: Partial<McpRuntimeServices>;
 };
 
 export async function startMcpServer(options: McpStartupOptions = {}): Promise<void> {
@@ -557,7 +768,8 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
     dbPath: options.dbPath ?? getDefaultDbPath(),
     ...(existsSync(configPath) ? { configPath } : {}),
   });
-  const server = await createMcpServer(store);
+  const services = { ...DEFAULT_MCP_RUNTIME_SERVICES, ...options.services };
+  const server = await createMcpServer(store, services);
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
@@ -592,6 +804,7 @@ export async function startMcpHttpServer(
 
   // Pre-fetch default collection names for REST endpoint
   const defaultCollectionNames = await store.getDefaultCollectionNames();
+  const services = { ...DEFAULT_MCP_RUNTIME_SERVICES, ...options.services };
 
   // Session map: each client gets its own McpServer + Transport pair (MCP spec requirement).
   // The store is shared — it's stateless SQLite, safe for concurrent access.
@@ -606,7 +819,7 @@ export async function startMcpHttpServer(
         log(`${ts()} New session ${sessionId} (${sessions.size} active)`);
       },
     });
-    const server = await createMcpServer(store);
+    const server = await createMcpServer(store, services);
     await server.connect(transport);
 
     transport.onclose = () => {
@@ -633,11 +846,6 @@ export async function startMcpHttpServer(
       arguments?: Record<string, unknown>;
     };
   };
-  type RestSearchInput = {
-    type?: unknown;
-    query?: unknown;
-  };
-
   /** Extract a human-readable label from a JSON-RPC body */
   function describeRequest(body: JsonRpcLikeBody): string {
     const method = typeof body.method === "string" ? body.method : "unknown";
@@ -660,6 +868,24 @@ export async function startMcpHttpServer(
     if (!quiet) console.error(msg);
   }
 
+  function writeTypedHttpError(
+    res: ServerResponse,
+    status: number,
+    code: string,
+    redactedMessage: string,
+    extra: Record<string, unknown> = {},
+  ): void {
+    const payload = createTypedQueryError({
+      route: "qmd",
+      stage: "route",
+      code,
+      retryable: false,
+      redactedMessage,
+    });
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: payload, ...extra }));
+  }
+
   // Helper to collect request body
   async function collectBody(req: IncomingMessage): Promise<string> {
     const chunks: Buffer[] = [];
@@ -680,60 +906,12 @@ export async function startMcpHttpServer(
         return;
       }
 
-      // REST endpoint: POST /search — structured search without MCP protocol
-      // REST endpoint: POST /query (alias: /search) — structured search without MCP protocol
+      // REST query aliases are retired to keep one typed retrieval contract.
       if ((pathname === "/query" || pathname === "/search") && nodeReq.method === "POST") {
-        const rawBody = await collectBody(nodeReq);
-        const params = JSON.parse(rawBody) as Record<string, unknown>;
-
-        // Validate required fields
-        if (!params.searches || !Array.isArray(params.searches)) {
-          nodeRes.writeHead(400, { "Content-Type": "application/json" });
-          nodeRes.end(JSON.stringify({ error: "Missing required field: searches (array)" }));
-          return;
-        }
-
-        // Map to internal format
-        const searches = params.searches as RestSearchInput[];
-        const queries: ExpandedQuery[] = searches.map((s) => ({
-          type: s.type as 'lex' | 'vec' | 'hyde',
-          query: String(s.query || ""),
-        }));
-
-        // Use default collections if none specified
-        const effectiveCollections = Array.isArray(params.collections) ? params.collections.map(String) : defaultCollectionNames;
-
-        const results = await store.search({
-          queries,
-          collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
-          limit: typeof params.limit === "number" ? params.limit : 10,
-          minScore: typeof params.minScore === "number" ? params.minScore : 0,
-          candidateLimit: typeof params.candidateLimit === "number" ? params.candidateLimit : undefined,
-          intent: typeof params.intent === "string" ? params.intent : undefined,
-          rerank: typeof params.rerank === "boolean" ? params.rerank : undefined,
+        writeTypedHttpError(nodeRes, 410, "endpoint_retired", "REST query endpoint retired.", {
+          replacement: "/mcp tools/call query",
         });
-
-        // Use first lex or vec query for snippet extraction
-        const primaryQuery = searches.find((s) => s.type === 'lex')?.query
-          || searches.find((s) => s.type === 'vec')?.query
-          || searches[0]?.query || "";
-
-        const formatted = results.map(r => {
-          const { line, snippet } = extractSnippet(r.body, String(primaryQuery), 300, r.bestChunkPos, r.bestChunk.length, typeof params.intent === "string" ? params.intent : undefined);
-          return {
-            docid: `#${r.docid}`,
-            file: r.displayPath,
-            title: r.title,
-            score: Math.round(r.score * 100) / 100,
-            context: r.context,
-            line,
-            snippet: addLineNumbers(snippet, line),
-          };
-        });
-
-        nodeRes.writeHead(200, { "Content-Type": "application/json" });
-        nodeRes.end(JSON.stringify({ results: formatted }));
-        log(`${ts()} POST /query ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
+        log(`${ts()} ${nodeReq.method} ${pathname} retired (${Date.now() - reqStart}ms)`);
         return;
       }
 
@@ -821,12 +999,15 @@ export async function startMcpHttpServer(
         return;
       }
 
-      nodeRes.writeHead(404);
-      nodeRes.end("Not Found");
+      writeTypedHttpError(nodeRes, 404, "endpoint_not_found", "MCP HTTP endpoint not found.");
     } catch (err) {
       console.error("HTTP handler error:", err);
-      nodeRes.writeHead(500);
-      nodeRes.end("Internal Server Error");
+      writeTypedHttpError(
+        nodeRes,
+        500,
+        "http_handler_error",
+        "MCP HTTP handler failed before returning a typed response.",
+      );
     }
   });
 
