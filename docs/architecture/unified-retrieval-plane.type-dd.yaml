@@ -200,9 +200,7 @@ identity_model:
     graph_ingest_mirror_producer: src/job-state/graphrag-book.ts#syncGraphRagBookWorkspace
     fields:
       - contentHash
-      - chunkStrategy
       - seq
-      - pos
   graph_text_unit_id:
     description: GraphRAG text unit identity.
     producer: src/job-state/graphrag-book.ts#syncGraphRagBookWorkspace
