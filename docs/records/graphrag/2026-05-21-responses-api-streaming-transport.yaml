@@ -13,13 +13,17 @@ problem:
     - 不修改上游 GraphRAG / graphrag-llm completion 层。
     - Jina embedding 与其他非 `/responses` 服务不得被强制流式化。
     - Endpoint 继续使用用户网关提供的 `/responses`，不拼接 `/v1`。
+    - Responses provider 的 chat-shaped completion 对象只存在于
+      graphrag-llm provider 适配边界，用于满足上游 `LLMCompletion`
+      interface；网络请求不得调用 Chat Completions API。
 
 decision:
   summary: >-
     `openai_responses` provider 对 `/responses` 统一使用 `stream=True` 传输。
     当 GraphRAG 请求普通 completion 时，provider 内部消费 SSE 事件并组装
     成 `LLMCompletionResponse`；当 GraphRAG 显式请求 `stream=True` 时，
-    provider 返回 chat-compatible chunk iterator。
+    provider 返回 chat-compatible chunk iterator。该投影是上游接口兼容层，
+    不是 Chat Completions API 调用。
   event_handling:
     text_delta: response.output_text.delta
     text_done: response.output_text.done
@@ -30,9 +34,10 @@ decision:
       - response.incomplete
   structured_output:
     strategy: >-
-      使用 `text.format` 的 `json_schema` 或 `json_object` 配置保持
-      Responses API 结构化输出约束；provider 收集完整文本后，继续交给
+      使用 `text.format` 的 strict `json_schema` 配置保持 Responses API
+      结构化输出约束；provider 收集完整文本后，继续交给
       `structure_completion_response` 解析为 GraphRAG 期望的 Pydantic model。
+      `json_object` 不作为降级路径。
     strict_schema: >-
       GraphRAG 上游 Pydantic model 不一定声明 `extra='forbid'`，因此
       `model_json_schema()` 生成的 object schema 可能缺少
@@ -55,7 +60,7 @@ implications:
   positive:
     - 满足网关只接受流式 `/responses` 的新约束。
     - 保持 GraphRAG 普通 completion、cache 与 structured output 语义。
-    - 避免改动上游 completion 层，降低后续合并上游更新的冲突。
+    - 避免改动上游 completion 层，降低合并上游更新的冲突。
   negative:
     - 流式 completion 在 graphrag-llm middleware 中不缓存；普通 completion
       仍由 provider 收集成完整 response 后进入现有 cache 路径。

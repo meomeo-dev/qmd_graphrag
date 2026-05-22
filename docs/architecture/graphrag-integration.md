@@ -93,7 +93,7 @@
 
 - 主仓库保留 `qmd` 的本地检索稳定性。
 - Python 依赖升级不会直接污染 TypeScript 核心。
-- 未来若要替换 `GraphRAG` 或 `DSPy`，退出路径清晰。
+- 替换 `GraphRAG` 或 `DSPy` 时，退出路径清晰。
 
 ## 当前已验证事实（Validated Facts）
 
@@ -129,7 +129,7 @@
 
 - 避免在当前阶段把两套检索引擎的存储层过早耦合。
 - `GraphRAG` 对 `LanceDB` 已有现成实现与配置路径。
-- 未来若需要统一存储层，再通过 typed bus 做跨引擎编排。
+- 统一存储层通过 typed bus 做跨引擎编排。
 
 ## 向量服务选择（Embedding Provider Choice）
 
@@ -174,22 +174,25 @@
 
 - `GraphRAG` 的配置加载器会自动读取 `settings.yaml` 同目录的 `.env`。
 - 模板中的 `${JINA_API_KEY}` 会在加载时被替换。
-- 这意味着你当前保存在 `/Users/jin/projects/qmd_graphrag/.env` 中的
-  `JINA_API_KEY` 可以复用，但前提是后续 GraphRAG root 与 `.env`
-  的实际落点保持一致，或在运行前显式导出到进程环境。
+- `JINA_API_KEY` 可复用；GraphRAG root 与 `.env` 的实际落点必须保持一致，
+  或在运行前显式导出到进程环境。
 
-## 当前开发顺序（Current Delivery Order）
+## 集成约束（Integration Constraints）
 
-当前按以下顺序推进：
+`GraphRAG` 作为仓内受控依赖（controlled in-repository dependency）由
+`vendor/graphrag` 提供。qmd_graphrag 的自有适配层承载 `Responses API`、
+Jina、LanceDB、状态恢复和 Type DD 数据总线契约；上游 completion 层保持
+可合并边界（mergeable boundary），避免二开逻辑散落到上游实现。
 
-1. 将 `GraphRAG` 收编为仓内子模块，并让 bridge 默认使用仓内副本。
-2. 在自有 Python 层新增独立 `Responses API` provider，避免直接修改上游
-   completion 层。
-3. 补齐 `graph_vault/` 下的 prompts 与最小初始化资产。
-4. 跑通单本 EPUB 的 index 与 local query 冒烟。
-5. 在 `qmd_graphrag` 主仓库内增加书级状态层，提供
-   `book + stage` 恢复语义。
+`graph_vault` 是 GraphRAG 持久化仓库（persistent vault）。所有可迁移路径
+使用 vault-relative locator；`settings.yaml` 是 `.qmd/index.yml` 的受管投影
+（managed projection），由 `qmd_graphrag.managed_by` 与
+`source_fingerprint` 校验漂移。
 
-对应决策记录见：
+查询入口保持统一：`qmd` 覆盖全集检索，GraphRAG 能力通过
+`GraphCapability` 暴露为增强子集。`qmd --graphrag` 只能消费已验证的
+`query_ready` capability scope，不能从候选文本或路径自由拼接身份。
+
+对应决策记录：
 
 - `docs/records/graphrag/2026-05-20-submodule-and-response-api-decision.yaml`

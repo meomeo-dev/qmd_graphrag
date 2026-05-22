@@ -9,8 +9,8 @@ problem:
     `graph_extract` 等 stage 的输入指纹，则像 `concurrent_requests`、
     retry 等纯运行参数变化也会被误判为上游阶段失效，导致不必要重跑。
   related_issue:
-    - 外部 `/Users/jin/projects/graphrag/.venv` 曾被实际运行链路隐式依赖，
-      不利于仓内复现与后续交付。
+    - 平级外部 GraphRAG Python 环境曾被实际运行链路隐式依赖，不利于
+      仓内复现与交付。
 
 decision:
   summary: >-
@@ -33,14 +33,14 @@ reasons:
 implications:
   positive:
     - 调整并发、retry 或超时不会错误污染 `graph_extract` checkpoint。
-    - 单书恢复点更稳定，后续 20 本书批处理时成本可控。
+    - 单书恢复点更稳定，20 本书批处理时成本可控。
     - Bridge 默认走仓内 Python 环境，更接近可交付形态。
   negative:
     - 旧 bootstrap checkpoint 需要一次对齐到新 fingerprint 语义。
-    - 仍需持续维护仓内 Python 依赖安装说明与脚本。
+    - 仓内 Python 依赖安装说明与脚本必须与 bridge 运行要求同步维护。
 
-next_actions:
-  - action: 保留 `syncGraphRagBookWorkspace` 的 bootstrap 对齐逻辑。
-  - action: 使用 `scripts/graphrag/resume-book-workspace.mjs`
+operational_rules:
+  - rule: 保留 `syncGraphRagBookWorkspace` 的 bootstrap 对齐逻辑。
+  - rule: 使用 `scripts/graphrag/resume-book-workspace.mjs`
       作为单书续跑入口。
-  - action: 后续补充本仓库 Python 环境初始化文档。
+  - rule: 本仓库 Python 环境初始化文档与运行脚本保持同步。

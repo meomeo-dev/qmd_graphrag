@@ -14,14 +14,13 @@ context:
   constraints:
     - 跨运行时数据必须受 schema / model 约束，遵循 Type DD。
     - 避免自由拼接 prompt、context、response 跨边界流动。
-    - 后续二开需要可持续维护，并能合并 GraphRAG 上游更新。
+    - 二开边界必须支持持续维护，并能合并 GraphRAG 上游更新。
   environment:
-    qmd_repo: /Users/jin/projects/qmd_graphrag
-    smoke_input_dir: /Users/jin/projects/qmd_graphrag/inbox/软件工程与系统设计经典著作指南
-    graph_vault_dir: /Users/jin/projects/qmd_graphrag/graph_vault
+    qmd_repo: <repo-root>
+    smoke_input_dir: <repo-root>/inbox/<sample-epub-batch>
+    graph_vault_dir: <repo-root>/graph_vault
     selected_epub: >-
-      /Users/jin/projects/qmd_graphrag/inbox/软件工程与系统设计经典著作指南/
-      A Philosophy of Software Design (John K. Ousterhout).epub
+      <repo-root>/inbox/<sample-epub-batch>/<sample-epub>
 
 validated_facts:
   - id: qmd_has_no_native_graphrag
@@ -36,68 +35,56 @@ validated_facts:
       embedding provider 使用。
   - id: current_graphrag_completion_path
     fact: >-
-      当前 `graphrag-llm` 的 `LiteLLMCompletion` 实现调用
+      `graphrag-llm` 的 `LiteLLMCompletion` 实现调用
       `litellm.completion(...)` 与 `litellm.acompletion(...)`，属于
       `chat completions` 路径，不是 `OpenAI Responses API`。
     evidence:
-      file: /Users/jin/projects/qmd_graphrag/vendor/graphrag/packages/graphrag-llm/graphrag_llm/completion/lite_llm_completion.py
+      file: vendor/graphrag/packages/graphrag-llm/graphrag_llm/completion/lite_llm_completion.py
   - id: gateway_responses_available_on_root_path
     fact: >-
-      当前本地网关 `POST /responses` 可用，不要求 `POST /v1/responses`。
+      本地网关 `POST /responses` 可用，不要求 `POST /v1/responses`。
   - id: qmd_custom_responses_provider_available
     fact: >-
       本仓库已新增独立 `openai_responses` completion provider，并通过
       bridge 注册到 GraphRAG runtime，不修改上游 `LiteLLMCompletion`。
     evidence:
-      file: /Users/jin/projects/qmd_graphrag/python/qmd_graphrag/graphrag_responses_completion.py
+      file: python/qmd_graphrag/graphrag_responses_completion.py
   - id: gateway_concurrency_sensitive
     fact: >-
-      当前网关对 GraphRAG 社区报告阶段的默认并发较敏感，默认
+      网关对 GraphRAG 社区报告阶段的默认并发较敏感，默认
       `concurrent_requests=25` 会触发 `429 Concurrency limit exceeded for user`。
   - id: smoke_failure_not_due_to_responses_only
     fact: >-
       本轮索引失败的主要剩余问题不是 completion provider 不可用，而是
       community report 阶段会受 `429` / `502` 等网关波动影响。
     evidence:
-      file: /Users/jin/projects/qmd_graphrag/graph_vault/reports/indexing-engine.log
+      file: graph_vault/reports/indexing-engine.log
 
 decision:
   summary: >-
-    将 `GraphRAG` 作为 `qmd_graphrag` 仓内子模块接入，并以仓内二开版本
-    作为后续唯一维护入口；completion 层不改写上游 `LiteLLMCompletion`，
+    将 `GraphRAG` 作为 `qmd_graphrag` 仓内受控依赖接入，并以仓内二开版本
+    作为唯一维护入口；completion 层不改写上游 `LiteLLMCompletion`，
     而是在我们自有 Python 侧新增独立 `OpenAI Responses API` provider，
     并通过配置切换到该 provider。
   details:
-    - 不再把 `/Users/jin/projects/graphrag` 这种平级外部仓库视为运行时依赖。
+    - 不把平级外部仓库视为运行时依赖。
     - 主仓库通过 typed bridge 调用仓内子模块暴露的 GraphRAG 能力。
     - GraphRAG 的上游更新通过子模块 fast-forward 或显式升级提交合并。
     - 我们的二开改动尽量收敛在最小 patch 面，避免无边界 fork 漂移。
-    - 不修改上游 `LiteLLMCompletion` 的行为，减少未来同步冲突。
+    - 不修改上游 `LiteLLMCompletion` 的行为，减少上游同步冲突。
 
 reasons:
-  - 外部平级仓库不可追踪，不利于团队复现、CI 和后续交付。
-  - 用户明确要求后续以我们自己的二开 GraphRAG 持续维护。
+  - 外部平级仓库不可追踪，不利于团队复现、CI 和交付。
+  - 用户明确要求以我们自己的二开 GraphRAG 持续维护。
   - `Responses API` 已验证可通，且 base URL 不应强制追加 `/v1`。
   - 子模块模式可把上游同步与本地 patch 分层管理，维护成本最低。
 
 implications:
   positive:
     - GraphRAG 依赖版本、补丁与运行入口可以固定在本仓库。
-    - 后续可以在子模块内添加 `Responses API` 适配，而不污染 `qmd`
+    - `Responses API` 适配位于自有 Python provider，而不污染 `qmd`
       核心检索逻辑。
     - Type DD 的桥接契约继续保持不变，调用侧不依赖底层实现细节。
   negative:
     - 需要管理子模块更新流程与仓内环境初始化。
-    - 若未来切换到 `Responses API`，仍需在二开 GraphRAG 内新增适配代码。
-
-next_actions:
-  - action: 将 `GraphRAG` 加入 `qmd_graphrag` 的子模块目录。
-  - action: 调整 Python bridge，默认优先解析仓内子模块路径。
-  - action: 补齐 `graph_vault/prompts/*.txt`，重新跑通单书索引。
-  - action: 新增独立 `Responses API` provider 并切换 GraphRAG completion。
-  - action: 将 GraphRAG completion 并发降到网关可承受范围，并补充 retry。
-  - action: 索引完成后执行 `local` 查询冒烟。
-
-not_now:
-  - 在在线查询热路径内引入 DSPy 优化。
-  - 统一 `qmd` 与 GraphRAG 的底层向量存储实现。
+    - 自有 provider 必须随上游 GraphRAG 更新做兼容性验证。

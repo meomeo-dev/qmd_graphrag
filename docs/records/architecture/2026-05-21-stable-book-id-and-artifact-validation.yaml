@@ -5,61 +5,74 @@ scope: qmd_graphrag
 
 problem:
   summary: >-
-    书级状态层最初把源文件内容哈希纳入 `bookId`，导致同一路径的书籍内容
-    变化时会产生新的状态目录。这违反了 `book_id` 作为稳定身份、
-    `source_hash` 作为失效维度的边界。同时，恢复计划只检查 checkpoint
-    状态与 fingerprint，未验证 checkpoint 引用的 artifact 是否仍可访问。
+    书级状态层以宿主机路径派生 `bookId` 会让同一源内容在不同设备形成
+    不同状态目录，破坏 `graph_vault` 可迁移性和高成本阶段去重。
+    恢复计划只检查 checkpoint 状态与 fingerprint 时，不能发现 checkpoint
+    引用的 artifact 被删除、移动或原地篡改。
   risks:
-    - 同一本书内容更新后被误识别为新书，历史 checkpoint 与 run trace 分裂。
+    - 同一源内容在不同设备被误识别为不同书，历史 checkpoint 与 run trace
+      分裂。
     - artifact 被删除或移动后，stage 仍可能显示为 `succeeded`。
     - bootstrap 同步可能重复写入相同 artifact，扩大 manifest 噪音。
 
 decision:
   summary: >-
-    `bookId` 改为由规范化源路径派生；`sourceHash` 保留为 stage fingerprint
-    的失效输入。恢复计划必须同时满足 checkpoint 状态、input fingerprint、
-    artifact manifest 记录和 artifact 路径可达性。
+    `bookId` 改为由 `sourceHash` 派生；源路径只作为 locator 和 alias。
+    `sourceHash` 同时作为 source identity 和 stage fingerprint 的失效输入。
+    恢复计划必须同时满足 checkpoint 状态、input fingerprint、
+    artifact manifest 记录、vault-relative path containment、artifact 内容哈希
+    复验和 kind-specific validator。
   identity_rules:
     book_id:
-      source: canonical_source_path
-      purpose: 稳定书籍身份
+      source: source_file_content_hash
+      purpose: 跨设备稳定书籍身份
     source_hash:
       source: source_file_content
-      purpose: stage invalidation dimension
+      purpose: source identity and stage invalidation dimension
     artifact_id:
       source:
         - book_id
         - stage
         - kind
-        - relative_path
         - content_hash
+        - sanitized_metadata
       excluded:
+        - relative_path
         - producer_run_id
   resume_rules:
     - succeeded checkpoint 缺失必需 artifact 时视为不可满足。
     - checkpoint 引用的 artifactId 在 manifest 中不存在时视为不可满足。
     - manifest 中 artifact 路径不可访问时视为不可满足。
-    - `query_ready` 必须同时绑定 community report 与 LanceDB index。
+    - manifest 中 artifact 内容哈希与当前文件或目录内容不一致时视为不可满足。
+    - LanceDB artifact 必须包含必需表、非空 data fragment 和 manifest 引用。
+    - GraphRAG JSON artifact 必须是可解析 JSON object。
+    - `query_ready` checkpoint 必须同时引用已验证的 community report 与
+      LanceDB index artifact；artifact stage 保持真实 producer stage。
 
 legacy_migration:
   rule: >-
-    若检测到旧版内容哈希尾缀的 book directory，且稳定路径派生的目录尚未
-    存在，则迁移旧目录并重写其中的 `bookId` 引用。
+    若检测到旧版路径派生或截断书名派生的 book directory，且 sourceHash
+    派生目录尚未存在，则迁移旧目录并重写其中的 `bookId` 引用。
   purpose: >-
     保留本次 smoke 已经产生的 checkpoint、artifact manifest 和 run trace，
     避免因状态模型修正造成无意义重跑。
 
 implications:
   positive:
-    - 同一本书的状态目录随内容更新保持稳定。
-    - 内容变化通过 fingerprint 触发 stage 失效，而不是制造新书。
+    - 相同源内容在不同设备共享同一状态目录。
+    - 路径变化不触发高成本阶段重跑。
     - artifact 丢失可以被恢复计划直接发现。
+    - artifact 原地篡改可以被内容哈希复验直接发现。
   negative:
     - 状态仓库需要维护一次 legacy id 迁移逻辑。
-    - 恢复计划读取 artifact manifest 后还需要访问文件系统验证路径。
+    - 恢复计划读取 artifact manifest 后还需要访问文件系统验证路径、
+      内容哈希和 kind-specific artifact 结构。
 
 validation:
   tests:
-    - book identity remains stable after source content changes
+    - identical source content keeps book identity stable across device paths
     - repeated bootstrap records one stable artifact manifest entry
     - missing checkpoint artifacts make the stage unsatisfied
+    - content-hash mismatch makes the stage unsatisfied
+    - partial LanceDB does not mark embed complete
+    - single-book failure does not roll back another book capability

@@ -111,7 +111,7 @@ validation:
         node --import tsx scripts/graphrag/resume-book-workspace.mjs
         --state-root ./graph_vault
         --python-bin ./.venv-graphrag/bin/python
-        --working-directory /Users/jin/projects/qmd_graphrag
+        --working-directory <repo-root>
       status: pass
       result: ready, nextStage null, query_ready completed
 

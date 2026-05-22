@@ -7,14 +7,14 @@
 - `DSPy` 的离线 query prompt 优化能力。
 - Type DD 驱动的数据总线（typed data bus），以 schema / model 作为上下游契约。
 
-当前仓库状态：
+仓库能力边界：
 
 - 已建立 GitHub fork：`meomeo-dev/qmd_graphrag`
-- 已完成本地基础仓库创建与 upstream/origin 关系整理
-- 已补充 Type DD 契约层：`src/contracts/`
-- 已补充 Python sidecar bridge：`python/qmd_graphrag/bridge.py`
-- 已补充 GraphRAG / DSPy integration scaffold：`src/integrations/`
-- 已补充 producer / consumer catalog：`catalog/data-bus.catalog.yaml`
+- 保留 upstream/origin 关系，便于持续合并上游 `qmd` 更新。
+- Type DD 契约层位于 `src/contracts/`。
+- Python sidecar bridge 位于 `python/qmd_graphrag/bridge.py`。
+- GraphRAG / DSPy integration 位于 `src/integrations/`。
+- producer / consumer catalog 位于 `catalog/data-bus.catalog.yaml`。
 
 ## 核心判断（Key Finding）
 
@@ -43,18 +43,38 @@ npm run test:types
 node ./node_modules/vitest/vitest.mjs run test/integrations/contracts.test.ts
 ```
 
-目前新增部分是“可验证的 typed scaffold”，还不是完整可生产运行的
-GraphRAG product integration。下一阶段工作会集中在：
+准生产使用要求：
 
-1. 增加 CLI / MCP 的 GraphRAG 命令入口。
-2. 建立 GraphRAG root/config/bootstrap 脚手架。
-3. 将 DSPy 产出的优化 prompt 接入 `qmd` 的 query expansion 路径。
-4. 建立端到端评测（evaluation）与回归测试。
+1. `qmd` 是全集检索入口；`--graphrag` 是图增强子集查询入口。
+2. GraphRAG 入库必须先注册 qmd corpus，再发布 graph query capability。
+3. OpenAI 生成请求只走 Responses API `/responses`，并使用 stream 模式。
+4. Jina 作为 embedding 与 rerank provider。
+5. `graph_vault` 是可迁移持久化单元，不能持久化本机绝对路径或密钥值。
+
+### 统一检索路由（Unified Retrieval Route）
+
+`qmd query` 是全集入口（whole-corpus entrypoint）。它查询 qmd corpus
+中的所有已入库文本，包括已完成 GraphRAG 增强的书或文档。它适合原文定位、
+文件查找、chunk 召回、低成本快速检索，以及不确定是否需要图增强时的默认查询。
+
+`qmd query --graphrag` 是显式图增强入口（explicit graph-enhanced
+entrypoint）。它只查询具备 `graph_query` capability 的子集，适合全书总结、
+概念关系、跨章节综合和多跳推理。查询对象未 graph-ready 时，命令返回 typed
+capability error，不退回普通 qmd 结果。
+
+`qmd query --mode auto` 是统一路由入口（auto routing entrypoint）。它先执行
+qmd 全集召回，再依据 `intent`、graph-ready coverage、cost class 和
+`allowGraphUpgrade` 决定是否升级到 GraphRAG。路由决策输出
+`QueryRouteDecision`，用于审计为什么选择 qmd 或 GraphRAG。
+
+配置项 `query.default_route` 只允许 `qmd` 或 `auto`。`graphrag` 不能作为无旗标
+默认路由；GraphRAG 必须通过 `--graphrag` 显式选择，或由 `--mode auto` 在满足
+typed route decision 契约时选择。
 
 ![QMD Architecture](assets/qmd-architecture.png)
 
-你仍然可以参考原始 `qmd` 的大部分使用方式与 SDK 设计，以下内容保留自上游，
-后续会逐步按 `qmd_graphrag` 的新边界进行重写。
+你仍然可以参考原始 `qmd` 的大部分使用方式与 SDK 设计。以下内容保留自上游，
+并受 `qmd_graphrag` 的 Type DD 与 provider 配置边界约束。
 
 ### Using with AI Agents
 

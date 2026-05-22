@@ -317,7 +317,8 @@ criteria:
     group: graph_vault_portability
     requirement: `bookId` 不能依赖宿主机绝对路径。
     pass_standard: >-
-      `bookId` 由源文件名 slug 和 source hash 派生；带点号作者名不会被截断。
+      `bookId = book-<first_12_hex_chars_of_source_hash>`；源文件名只作为
+      display slug、alias 或 locator，不进入 canonical identity。
     evidence_targets:
       - src/job-state/fingerprint.ts
       - src/job-state/graphrag-book.ts

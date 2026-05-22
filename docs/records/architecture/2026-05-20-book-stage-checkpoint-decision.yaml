@@ -11,7 +11,7 @@ problem:
     - 批量处理 20 本书时，不能接受从第一本重头跑到最后一本。
     - 中断、网络抖动、429/502 等瞬时故障后，不能接受整本或整批重跑。
     - LLM 成本控制要求明确最小重跑单位与 cache 复用边界。
-    - 未来需要回答“某本书的某阶段是谁生产的，谁消费的”。
+    - 需要回答“某本书的某阶段是谁生产的，谁消费的”。
 
 decision:
   summary: >-
@@ -75,7 +75,7 @@ cost_control:
   goals:
     - 避免重复生成同一书的 graph/community report
     - 避免因单个 429/502 导致整本书重算
-    - 避免因单书失败阻塞后续书的处理
+    - 避免因单书失败阻塞其他书的处理
   controls:
     - stage-level checkpoint
     - request-level cache

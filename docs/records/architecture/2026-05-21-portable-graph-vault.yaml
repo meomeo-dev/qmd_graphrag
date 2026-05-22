@@ -11,7 +11,8 @@ problem:
   current_risks:
     - `BookJob.sourcePath` 记录宿主机绝对路径。
     - `BookJob.metadata.normalizedPath` 和 `workspaceRoot` 记录宿主机绝对路径。
-    - `bookId` 由绝对 source path 派生，设备路径变化会让同一本书变成新书。
+    - `bookId` 依赖宿主机 locator 时，设备迁移或重命名会让同一
+      内容变成新书。
     - `source_epub` artifact 可能指向 `../inbox`，只拷贝 `graph_vault` 时不可达。
 
 decision:
@@ -40,16 +41,30 @@ decision:
       - host absolute path in portable job metadata
   identity_policy:
     rule: >-
-      `bookId` 由源文件内容哈希和源文件名 slug 派生，而不是由绝对路径派生。
-      同一本源文件在不同设备或不同父目录中应得到同一 `bookId`。
-    format: `<source_slug>-<source_hash_12>`
+      `bookId` 由源文件内容哈希派生，而不是由绝对路径或源文件名派生。
+      同一源内容在不同设备、不同父目录或不同文件名下应得到同一 `bookId`。
+      源文件名只作为 display slug、alias 或 locator，不进入 canonical identity。
+    format: `book-<first_12_hex_chars_of_source_hash>`
+    source_id_format: `sha256:<source_hash>`
   migration_policy:
     rule: >-
-      同步时若发现旧的路径型 bookId 目录，应迁移到内容型 bookId 目录，
-      并重写 job、checkpoint、artifact 和 run record 中的 `bookId` 与
-      artifactId 引用。
+      同步时若发现旧的路径型、源文件名型或截断书名型 bookId 目录，应迁移到
+      sourceHash 型 bookId 目录，并重写 job、checkpoint、artifact 和 run record
+      中的 `bookId` 与 artifactId 引用。
     compatibility: >-
-      旧状态可被一次性迁移；迁移后以内容型 bookId 为准。
+      旧状态可被一次性迁移；迁移后以 sourceHash 型 bookId 为准。
+    active_directory_rule: >-
+      `graph_vault/books` 和 `graph_vault/sources` 的 active 区只保留
+      canonical `book-<sourceHash>` 目录。同一 `sourceHash` 的 legacy
+      目录合并后移动到 `graph_vault/archive/legacy-books` 或
+      `graph_vault/archive/legacy-sources`，不保留在 active 区。
+    discovery_rule: >-
+      迁移发现不能只依赖 `catalog/books.yaml`。当 catalog 已 canonical
+      但 active 区仍残留同 `sourceHash` legacy 目录时，repository 必须扫描
+      legacy `job.yaml` 并合并。
+    artifact_identity_rule: >-
+      `artifactId` 由 `bookId + stage + kind + contentHash + stageFingerprint +
+      providerFingerprint` 派生，不包含 artifact path、runId 或设备 locator。
   runtime_policy:
     rule: >-
       跨设备迁移后，运行时 Python 环境、`.env`、`OPENAI_BASE_URL`、
@@ -62,24 +77,43 @@ invariants:
   - `source_epub` artifact 必须指向 `sources/<book_id>/...`。
   - `normalized_markdown` artifact 必须指向 `input/...`。
   - `lancedb_index` artifact 必须指向 `output/lancedb`。
+  - LanceDB 表目录使用 `<table>.lance`，行数读取使用去掉 `.lance` 后缀的
+    表名，并写入 `<table>.lance/qmd_row_count.json`。
+  - `lancedb_index` validator 必须校验 required table、非空 data fragment
+    与正行数 sidecar。LanceDB manifest 不作为通过条件。
+  - `lancedb_index` canonical content hash 必须只覆盖 required table 的
+    `data/*.lance` fragment 与 `qmd_row_count.json` sidecar，不覆盖
+    `_versions/**` 等 vendor 易变文件。
+  - restore audit 报告必须区分 `documentsPortable` 与
+    `capabilitiesPortable`。`portable` 仅在两者都为 true 时为 true。
+  - `capabilitiesPortable` 必须验证 book catalog、checkpoint、artifact
+    manifest 与 capability 来源材料。
   - `BookJob.sourcePath` 存储 canonical vault-relative source path。
   - `BookJob.metadata` 不保存宿主机绝对路径；审计信息应使用 vault-relative
     artifact 与 run record。
+  - active `books/` 下不得同时存在同一 `sourceHash` 的 canonical 与 legacy
+    book 目录。
+  - active `sources/` 下不得同时存在同一 `sourceHash` 的 canonical 与 legacy
+    source 目录。
 
 validation:
   required_tests:
     - 同一源文件在不同父目录注册后得到相同 `bookId`。
+    - 同一源内容在不同文件名下得到相同 `bookId`。
     - 注册后 source artifact 指向 vault 内部 `sources/<book_id>/`。
     - `job.yaml` 和 catalog 不写入当前设备绝对 `sourcePath`。
     - 已有旧路径型 bookId 可迁移到内容型 bookId。
+    - catalog 已 canonical 但 active 区残留同源 legacy 目录时仍可迁移。
+    - 迁移后 active `books/` 和 `sources/` 不保留同源 legacy 目录。
+    - GraphRAG 生成的 `<table>.lance` 目录可写出正行数 sidecar。
     - 恢复计划只依赖 vault-relative artifact 可达性。
 
 implications:
   positive:
     - `graph_vault` 可作为单目录备份、同步和迁移单元。
-    - 设备路径变化不会导致同一本书被重新建档。
+    - 设备路径或文件名变化不会导致同一源内容被重新建档。
     - 失败恢复和 artifact 校验不依赖外部 inbox。
   negative:
     - vault 会保存源 EPUB 副本，占用额外空间。
-    - 如果同名不同内容源文件进入 vault，会形成不同 `bookId`。
+    - 如果不同内容源文件进入 vault，会形成不同 `bookId`。
     - 若需要删除源副本，必须接受 ingest stage 不再完全自洽。

@@ -110,8 +110,13 @@
 
 `lancedb_index` 不是“目录存在”即可满足。当前 GraphRAG 查询至少依赖
 `entity_description.lance`、`community_full_content.lance` 和
-`text_unit_text.lance` 三张 LanceDB 表。只有三张表均包含 data 文件与版本
-manifest 时，`embed` 才能提升为成功产物。
+`text_unit_text.lance` 三张 LanceDB 表。只有三张表均包含非空 data 文件与
+正行数 sidecar 时，`embed` 才能提升为成功产物。
+
+每张 LanceDB 表还必须有正行数 sidecar（positive row-count sidecar）。
+同步层从 LanceDB 读取表行数并写入 `<table>.lance/qmd_row_count.json`。
+validator 必须拒绝缺少该 sidecar 或 `rowCount <= 0` 的表。LanceDB
+manifest 内容不是 qmd_graphrag 的稳定契约，不作为通过条件。
 
 ## 一致性策略
 
@@ -151,9 +156,11 @@ manifest 时，`embed` 才能提升为成功产物。
 - 必需 artifact 在 manifest 或磁盘中缺失：对应 stage 失效。
 - 半成品 LanceDB 目录不得满足 `lancedb_index` 需求。
 
-`bookId` 是稳定身份，来源于源文件名 slug 和源文件内容哈希，不来源于宿主机
-绝对路径。这样 `graph_vault` 从 A 设备拷贝到 B 设备后，同一本源文件仍然
-映射到同一个状态目录。若同一路径的书籍内容变化，会形成新的 `bookId`。
+`bookId` 是稳定身份，格式为
+`book-<first_12_hex_chars_of_source_hash>`，只由源文件内容哈希派生，
+不来源于宿主机绝对路径或源文件名。这样 `graph_vault` 从 A 设备拷贝到
+B 设备后，同一本源文件仍然映射到同一个状态目录。若同一路径的书籍内容
+变化，会形成新的 `bookId`。
 
 为了保证 `graph_vault` 可迁移，源 EPUB 在 ingest 阶段需要物化到
 `graph_vault/sources/<book_id>/`。`BookJob.sourcePath` 和
@@ -161,9 +168,10 @@ manifest 时，`embed` 才能提升为成功产物。
 宿主机绝对路径；审计和追踪应基于 vault-relative artifact、run record 和
 内容哈希（content hash）。
 
-`artifactId` 由 `bookId + stage + kind + relativePath + contentHash` 派生，
-不包含 `producerRunId`。因此同一产物被 bootstrap 或恢复同步多次发现时，
-manifest 不会因为运行 ID 变化而重复膨胀。
+`artifactId` 由 `bookId + stage + kind + contentHash + stageFingerprint +
+providerFingerprint` 派生，不包含 `producerRunId`、artifact path 或 run
+locator。因此同一高成本产物被 bootstrap 或恢复同步多次发现时，manifest
+不会因为运行 ID 或设备路径变化而重复膨胀。
 
 ## 成本控制
 
@@ -231,3 +239,9 @@ graph_vault/
 - `lancedb_index` artifact 指向 `output/lancedb`。
 - 状态判断只读取 vault-relative artifact，不读取原始 inbox。
 - `BookJob.metadata` 不保存原始设备上的绝对路径。
+- `books/` 与 `sources/` 的 active 区只保留 canonical `book-<sourceHash>`
+  目录。
+- 同一 `sourceHash` 的 legacy book 目录必须合并到 canonical 目录；合并后旧
+  目录移动到 `archive/legacy-books/` 或 `archive/legacy-sources/`。
+- legacy 合并必须重写 job、checkpoint、artifact、run record、run catalog
+  与 typed catalog 中的 `bookId` 和 artifact 引用。

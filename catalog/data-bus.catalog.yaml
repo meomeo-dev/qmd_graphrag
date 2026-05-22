@@ -4,7 +4,7 @@ notes:
   - >-
     This catalog is the authoritative typed data-bus contract inventory for
     qmd_graphrag. It defines required payloads, schemas, producers, consumers,
-    and storage boundaries. It does not assert implementation status.
+    and storage boundaries.
   - >-
     qmd owns the whole-corpus retrieval plane. GraphRAG owns the graph-enhanced
     subset. Shared payloads use schemas and declared producer/consumer
@@ -13,62 +13,113 @@ notes:
 types:
   - name: source_document
     schema: src/contracts/corpus.ts#SourceDocumentSchema
+    envelope: src/contracts/corpus.ts#SourceDocumentEnvelopeSchema
     contract_level: required
     producers:
-      - src/ingest/source-registry.ts#registerSourceDocument
       - src/job-state/repository.ts#FileBookJobStateRepository.registerBookSource
     consumers:
-      - src/corpus/registry.ts#registerCorpusDocument
-      - src/graphrag/book-ingest.ts#createGraphEnhancementRequest
       - src/vault/restore.ts#restoreFromVault
     storage: graph_vault/catalog/sources.yaml
     notes:
       - canonical identity derives from sourceHash
       - source path fields are locators and do not participate in identity
 
-  - name: corpus_document
-    schema: src/contracts/corpus.ts#CorpusDocumentSchema
+  - name: source_document_catalog
+    schema: src/contracts/corpus.ts#SourceDocumentCatalogSchema
+    envelope: src/contracts/corpus.ts#SourceDocumentCatalogEnvelopeSchema
     contract_level: required
     producers:
-      - src/corpus/registry.ts#registerCorpusDocument
+      - src/job-state/repository.ts#FileBookJobStateRepository.registerBookSource
+    consumers:
+      - src/vault/restore.ts#restoreFromVault
+    storage: graph_vault/catalog/sources.yaml
+
+  - name: corpus_document
+    schema: src/contracts/corpus.ts#CorpusDocumentSchema
+    envelope: src/contracts/corpus.ts#CorpusDocumentEnvelopeSchema
+    contract_level: required
+    producers:
       - src/store.ts#insertDocument
     consumers:
-      - src/corpus/chunker.ts#registerCorpusChunks
       - src/store.ts#structuredSearch
       - src/store.ts#hybridQuery
-      - src/query/unified-router.ts#routeQuery
     storage: .qmd/index.sqlite
+    notes:
+      - qmd SQLite stores corpus document rows; unified routing consumes
+        qmd_retrieval_candidate projections, not raw corpus_document payloads
+      - qmd-only query evidence derives stable qmd document ids from
+        sourceId, contentHash, and normalizationPolicyVersion
 
   - name: corpus_chunk
     schema: src/contracts/corpus.ts#CorpusChunkSchema
+    envelope: src/contracts/corpus.ts#CorpusChunkEnvelopeSchema
     contract_level: required
     producers:
-      - src/corpus/chunker.ts#registerCorpusChunks
+      - src/store.ts#chunkDocumentByTokens
     consumers:
       - src/store.ts#structuredSearch
       - src/store.ts#hybridQuery
-      - src/query/unified-answer.ts#buildEvidenceRefs
     storage: .qmd/index.sqlite
+    notes:
+      - GraphRAG sync records chunkIds into document_identity_map but does not
+        produce corpus_chunk rows
+      - unified answer construction consumes qmd_retrieval_candidate payloads
+        whose chunkId is either graph-vault mapped or qmd SQLite projected
 
   - name: document_identity_map
     schema: src/contracts/corpus.ts#DocumentIdentityMapSchema
+    envelope: src/contracts/corpus.ts#DocumentIdentityMapEnvelopeSchema
     contract_level: required
     producers:
-      - src/corpus/registry.ts#recordDocumentIdentityMap
+      - src/job-state/repository.ts#FileBookJobStateRepository.registerBookSource
+      - src/job-state/repository.ts#FileBookJobStateRepository.recordDocumentChunks
+      - src/job-state/repository.ts#FileBookJobStateRepository.recordQmdCorpusRegistration
+      - src/job-state/repository.ts#FileBookJobStateRepository.recordGraphTextUnitIdentity
     consumers:
-      - src/graphrag/book-ingest.ts#createGraphEnhancementRequest
-      - src/query/unified-answer.ts#buildEvidenceRefs
-      - src/job-state/repository.ts#FileBookJobStateRepository.getResumePlan
+      - src/graphrag/capability-catalog.ts#loadGraphCapabilities
+      - src/query/qmd-candidates.ts#loadDocumentIdentitiesFromGraphVault
+      - src/job-state/repository.ts#FileBookJobStateRepository.validateQueryReadyGraphIdentity
       - src/vault/restore.ts#restoreFromVault
     storage: graph_vault/catalog/document-identity-map.yaml
     notes:
       - stores normalizationPolicyVersion with contentHash lineage
+      - qmdCorpusRegistered gates query_ready capability publication
+      - persists graphDocumentId and graphTextUnitIds when GraphRAG output is
+        available
+
+  - name: document_identity_catalog
+    schema: src/contracts/corpus.ts#DocumentIdentityCatalogSchema
+    envelope: src/contracts/corpus.ts#DocumentIdentityCatalogEnvelopeSchema
+    contract_level: required
+    producers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.registerBookSource
+    consumers:
+      - src/graphrag/capability-catalog.ts#loadGraphCapabilities
+      - src/vault/restore.ts#restoreFromVault
+    storage: graph_vault/catalog/document-identity-map.yaml
+
+  - name: graph_text_unit_identity_map
+    schema: src/contracts/corpus.ts#GraphTextUnitIdentityMapSchema
+    envelope: src/contracts/corpus.ts#GraphTextUnitIdentityMapEnvelopeSchema
+    contract_level: required
+    producers:
+      - src/job-state/graphrag-book.ts#syncGraphRagBookWorkspace
+    consumers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.recordGraphTextUnitIdentity
+      - python/qmd_graphrag/bridge.py#_filter_graphrag_frames_for_scope
+    storage: graph_vault/catalog/document-identity-map.yaml
+    notes:
+      - binds sourceId, sourceHash, documentId, and contentHash to GraphRAG
+        graphDocumentId and graphTextUnitIds
+      - GraphRAG documents.parquet and text_units.parquet are source tables
+        read by the producer; they are not Type DD bus producers
 
   - name: query_expansion_item
     schema: src/contracts/common.ts#QueryExpansionItemSchema
+    envelope: src/contracts/common.ts#QueryExpansionItemEnvelopeSchema
     contract_level: required
     producers:
-      - src/llm.ts#expandQuery
+      - src/llm.ts#LlamaCpp.expandQuery
       - src/integrations/dspy.ts#optimizeQueryPrompt
     consumers:
       - src/store.ts#structuredSearch
@@ -77,20 +128,28 @@ types:
 
   - name: qmd_query_request
     schema: src/contracts/qmd-query.ts#QmdQueryRequestSchema
+    envelope: src/contracts/qmd-query.ts#QmdQueryRequestEnvelopeSchema
     contract_level: required
     producers:
       - src/cli/qmd.ts#querySearch
-      - src/mcp/server.ts#query
+      - src/mcp/server.ts#createMcpServer
     consumers:
+      - src/query/qmd-candidates.ts#toQmdRetrievalCandidates
       - src/query/unified-router.ts#routeQuery
     storage: transient
+    notes:
+      - direct qmd whole-corpus retrieval intent contract
+      - unified_query_request is the user-facing route contract for qmd,
+        graphrag, and auto routes
+      - qmd_retrieval_candidate is the downstream candidate contract consumed by
+        the unified router
 
   - name: qmd_retrieval_candidate
     schema: src/contracts/qmd-query.ts#QmdRetrievalCandidateSchema
+    envelope: src/contracts/qmd-query.ts#QmdRetrievalCandidateEnvelopeSchema
     contract_level: required
     producers:
-      - src/store.ts#structuredSearch
-      - src/store.ts#hybridQuery
+      - src/query/qmd-candidates.ts#toQmdRetrievalCandidates
     consumers:
       - src/query/unified-router.ts#decideRoute
       - src/query/unified-answer.ts#buildUnifiedAnswer
@@ -98,42 +157,53 @@ types:
 
   - name: qmd_search_result
     schema: src/contracts/qmd-query.ts#QmdSearchResultSchema
+    envelope: src/contracts/qmd-query.ts#QmdSearchResultEnvelopeSchema
     contract_level: required
     producers:
-      - src/query/qmd-search.ts#searchWholeCorpus
+      - src/cli/qmd.ts#searchQmdForUnifiedRoute
+      - src/mcp/server.ts#createMcpServer
     consumers:
-      - src/cli/formatter.ts#formatSearchResults
+      - src/cli/qmd.ts#querySearch
+      - src/cli/qmd.ts#autoQuerySearch
       - src/query/unified-answer.ts#buildUnifiedAnswer
     storage: transient
 
   - name: graph_enhancement_request
     schema: src/contracts/graph-enhancement.ts#GraphEnhancementRequestSchema
+    envelope: src/contracts/graph-enhancement.ts#GraphEnhancementRequestEnvelopeSchema
     contract_level: required
     producers:
-      - src/graphrag/book-ingest.ts#createGraphEnhancementRequest
+      - src/job-state/repository.ts#FileBookJobStateRepository.buildGraphEnhancementRequest
     consumers:
       - src/integrations/graphrag.ts#runGraphRagIndex
       - python/qmd_graphrag/bridge.py#_run_graphrag_index
     storage: transient
+    notes:
+      - normalizedInputPath is vault-relative and rejects absolute,
+        traversal, and URI-like paths
 
   - name: graph_enhancement_state
     schema: src/contracts/graph-enhancement.ts#GraphEnhancementStateSchema
+    envelope: src/contracts/graph-enhancement.ts#GraphEnhancementStateEnvelopeSchema
     contract_level: required
     producers:
-      - src/job-state/repository.ts#FileBookJobStateRepository.completeStage
-      - src/job-state/repository.ts#FileBookJobStateRepository.failStage
+      - src/job-state/repository.ts#FileBookJobStateRepository.getGraphEnhancementState
     consumers:
-      - src/query/unified-router.ts#loadGraphCapability
-      - src/job-state/repository.ts#FileBookJobStateRepository.getResumePlan
-    storage: graph_vault/books/<book_id>/job.yaml
+      - test/book-job-state.test.ts#FileBookJobStateRepository graph enhancement state tests
+      - src/graphrag/capability-catalog.ts#loadGraphCapabilities
+    storage: graph_vault/books/<book_id>/job.yaml plus checkpoints and artifacts
     notes:
       - query-ready status is derived from validated checkpoint and validated manifest
+      - this projection is for typed inspection and audit; runtime capability
+        loading reads book state, checkpoints, artifacts, and identity catalogs
 
   - name: graph_capability
     schema: src/contracts/graph-enhancement.ts#GraphCapabilitySchema
+    envelope: src/contracts/graph-enhancement.ts#GraphCapabilityEnvelopeSchema
     contract_level: required
     producers:
       - src/graphrag/capability-catalog.ts#recordGraphCapability
+      - src/graphrag/capability-catalog.ts#loadGraphCapabilities
     consumers:
       - src/query/unified-router.ts#decideRoute
       - src/cli/qmd.ts#graphRagQuerySearch
@@ -141,20 +211,44 @@ types:
     storage: graph_vault/catalog/graph-capabilities.yaml
     notes:
       - rebuildable projection derived from validated checkpoint and manifest
+      - explicit catalog is written by recordGraphCapability and can be
+        rebuilt from query-ready book state
+      - book-state derived capability is authoritative for matching
+        bookId/kind/method
+
+  - name: graph_capability_catalog
+    schema: src/contracts/graph-enhancement.ts#GraphCapabilityCatalogSchema
+    envelope: src/contracts/graph-enhancement.ts#GraphCapabilityCatalogEnvelopeSchema
+    contract_level: required
+    producers:
+      - src/graphrag/capability-catalog.ts#recordGraphCapability
+    consumers:
+      - src/graphrag/capability-catalog.ts#loadGraphCapabilities
+      - src/vault/restore.ts#restoreFromVault
+    storage: graph_vault/catalog/graph-capabilities.yaml
+    notes:
+      - catalog entries are accepted only when corresponding query-ready
+        checkpoint artifact manifests validate
+      - artifact stage remains producer stage and is not rewritten to
+        query_ready
+      - explicit catalog supplements absent capability semantic keys and does
+        not overwrite derived book-state capabilities
 
   - name: graphrag_query_request
     schema: src/contracts/graphrag.ts#GraphRagQueryRequestSchema
+    envelope: src/contracts/graphrag.ts#GraphRagQueryEnvelopeSchema
     contract_level: required
     producers:
       - src/cli/qmd.ts#graphRagQuerySearch
-      - src/integrations/graphrag.ts#runGraphRagQuery
-      - src/runtime.ts#createQmdGraphRagRuntime
+      - src/mcp/server.ts#createMcpServer
     consumers:
+      - src/integrations/graphrag.ts#runGraphRagQuery
       - python/qmd_graphrag/bridge.py#_run_graphrag_query
     storage: transient
 
   - name: graphrag_query_response
     schema: src/contracts/graphrag.ts#GraphRagQueryResponseSchema
+    envelope: src/contracts/graphrag.ts#GraphRagQueryResponseEnvelopeSchema
     contract_level: required
     producers:
       - python/qmd_graphrag/bridge.py#_run_graphrag_query
@@ -162,19 +256,48 @@ types:
       - src/cli/qmd.ts#graphRagQuerySearch
       - src/integrations/graphrag.ts#runGraphRagQuery
       - src/query/unified-answer.ts#buildUnifiedAnswer
-      - src/mcp/graphrag.ts#queryGraphEnhancedCorpus
     storage: transient
     notes:
       - responseText is provider output and is not an evidence contract
-      - GraphRAG contextData must be normalized into EvidenceRef before user output
+      - GraphRAG evidence must be normalized into EvidenceRef before user output
+      - providerDetail is typed provider metadata and is not an evidence contract
+
+  - name: graphrag_provider_detail
+    schema: src/contracts/graphrag.ts#GraphRagProviderDetailSchema
+    envelope: src/contracts/graphrag.ts#GraphRagProviderDetailEnvelopeSchema
+    contract_level: required
+    producers:
+      - python/qmd_graphrag/bridge.py#_run_graphrag_query
+    consumers:
+      - src/query/unified-answer.ts#buildUnifiedAnswer
+    storage: transient
+    notes:
+      - carries provider and method only
+      - raw provider context tables remain internal bridge state and do not
+        cross the Type DD data bus
+
+  - name: graphrag_evidence
+    schema: src/contracts/graphrag.ts#GraphRagEvidenceSchema
+    envelope: src/contracts/graphrag.ts#GraphRagEvidenceEnvelopeSchema
+    contract_level: required
+    producers:
+      - python/qmd_graphrag/bridge.py#_run_graphrag_query
+    consumers:
+      - src/query/unified-answer.ts#buildEvidenceRefsFromGraphRagResponse
+      - src/integrations/graphrag.ts#evidenceCostLineage
+    storage: transient
+    notes:
+      - carries graphCapabilityId as first-class lineage for GraphRAG evidence
+      - required lineage includes bookId, graphTextUnitId, and artifactId
 
   - name: graphrag_index_request
     schema: src/contracts/graphrag.ts#GraphRagIndexRequestSchema
+    envelope: src/contracts/graphrag.ts#GraphRagIndexEnvelopeSchema
     contract_level: required
     producers:
-      - src/integrations/graphrag.ts#runGraphRagIndex
-      - src/runtime.ts#createQmdGraphRagRuntime
+      - scripts/graphrag/resume-book-workspace.mjs
     consumers:
+      - src/integrations/graphrag.ts#runGraphRagIndex
       - python/qmd_graphrag/bridge.py#_run_graphrag_index
     storage: transient
     notes:
@@ -182,48 +305,61 @@ types:
         from GraphRAG upstream validation semantics
       - supports typed workflow overrides so recovery replays only the failed
         GraphRAG workflow
+      - indexScope carries current book/source/document/content lineage for
+        provider cost accounting and prevents full-vault capability aggregation
 
   - name: graphrag_index_response
     schema: src/contracts/graphrag.ts#GraphRagIndexResponseSchema
+    envelope: src/contracts/graphrag.ts#GraphRagIndexResponseEnvelopeSchema
     contract_level: required
     producers:
       - python/qmd_graphrag/bridge.py#_run_graphrag_index
     consumers:
       - src/integrations/graphrag.ts#runGraphRagIndex
-      - src/cli/graphrag-index.ts#indexGraphEnhancedCorpus
     storage: transient
 
   - name: unified_query_request
     schema: src/contracts/unified-query.ts#UnifiedQueryRequestSchema
+    envelope: src/contracts/unified-query.ts#UnifiedQueryRequestEnvelopeSchema
     contract_level: required
     producers:
       - src/cli/qmd.ts#querySearch
-      - src/mcp/server.ts#query
+      - src/mcp/server.ts#createMcpServer
     consumers:
       - src/query/unified-router.ts#routeQuery
     storage: transient
 
   - name: query_route_decision
     schema: src/contracts/unified-query.ts#QueryRouteDecisionSchema
+    envelope: src/contracts/unified-query.ts#QueryRouteDecisionEnvelopeSchema
     contract_level: required
     producers:
       - src/query/unified-router.ts#decideRoute
     consumers:
       - src/query/unified-answer.ts#buildUnifiedAnswer
-      - src/cli/formatter.ts#formatSearchResults
+      - src/cli/qmd.ts#querySearch
+      - src/cli/qmd.ts#autoQuerySearch
+      - src/cli/qmd.ts#graphRagQuerySearch
     storage: transient_or_query_log
     notes:
       - records intent class, graph coverage, cost class, selected identities,
         graph capability ids, and refusal reasons
+      - graphrag scope identity is derived from selected GraphCapability
+        records rather than partial qmd candidate identity
+      - explicit graphrag requests without capability keep selectedRoute
+        graphrag and set status refused; they do not encode qmd fallback
 
   - name: candidate_route_decision
     schema: src/contracts/unified-query.ts#CandidateRouteDecisionSchema
+    envelope: src/contracts/unified-query.ts#CandidateRouteDecisionEnvelopeSchema
     contract_level: required
     producers:
       - src/query/unified-router.ts#decideRoute
     consumers:
       - src/query/unified-answer.ts#buildUnifiedAnswer
-      - src/cli/formatter.ts#formatSearchResults
+      - src/cli/qmd.ts#querySearch
+      - src/cli/qmd.ts#autoQuerySearch
+      - src/cli/qmd.ts#graphRagQuerySearch
     storage: transient_or_query_log
     notes:
       - records per-candidate graph readiness, scores, selection status,
@@ -231,130 +367,203 @@ types:
 
   - name: evidence_ref
     schema: src/contracts/unified-query.ts#EvidenceRefSchema
+    envelope: src/contracts/unified-query.ts#EvidenceRefEnvelopeSchema
     contract_level: required
     producers:
-      - src/query/unified-answer.ts#buildEvidenceRefs
+      - src/query/unified-answer.ts#buildEvidenceRefsFromQmdResults
+      - src/query/unified-answer.ts#buildEvidenceRefsFromGraphRagResponse
     consumers:
       - src/query/unified-answer.ts#buildUnifiedAnswer
-      - src/cli/formatter.ts#formatSearchResults
-      - src/mcp/server.ts#query
+      - src/cli/qmd.ts#querySearch
+      - src/cli/qmd.ts#autoQuerySearch
+      - src/cli/qmd.ts#graphRagQuerySearch
+      - src/mcp/server.ts#createMcpServer
     storage: transient_or_query_log
     notes:
+      - graphCapabilityId is null for qmd-only evidence and populated for
+        GraphRAG evidence
       - resolves user-facing evidence to source, document, chunk, artifact, or
         GraphRAG text unit identity
 
   - name: unified_answer
     schema: src/contracts/unified-query.ts#UnifiedAnswerSchema
+    envelope: src/contracts/unified-query.ts#UnifiedAnswerEnvelopeSchema
     contract_level: required
     producers:
       - src/query/unified-answer.ts#buildUnifiedAnswer
     consumers:
-      - src/cli/formatter.ts#formatSearchResults
-      - src/mcp/server.ts#query
+      - src/cli/qmd.ts#querySearch
+      - src/cli/qmd.ts#autoQuerySearch
+      - src/cli/qmd.ts#graphRagQuerySearch
+      - src/mcp/server.ts#createMcpServer
     storage: transient_or_query_log
 
   - name: typed_query_error
     schema: src/contracts/unified-query.ts#TypedQueryErrorSchema
+    envelope: src/contracts/unified-query.ts#TypedQueryErrorEnvelopeSchema
     contract_level: required
     producers:
       - src/query/unified-router.ts#routeQuery
-      - src/query/unified-answer.ts#buildUnifiedAnswer
-      - src/integrations/graphrag.ts#runGraphRagQuery
     consumers:
-      - src/cli/formatter.ts#formatSearchResults
-      - src/mcp/server.ts#query
+      - src/cli/qmd.ts#exitWithError
+      - src/mcp/server.ts#createMcpServer
     storage: transient_or_query_log
     notes:
-      - carries route, stage, provider, capability, code, retryable, and
-        redactedMessage
+      - carries schemaVersion, route, stage, provider, capability, code,
+        retryable, and redactedMessage
+
+  - name: graph_capability_error
+    schema: src/contracts/unified-query.ts#GraphCapabilityErrorSchema
+    envelope: src/contracts/unified-query.ts#GraphCapabilityErrorEnvelopeSchema
+    contract_level: required
+    producers:
+      - src/query/unified-router.ts#buildGraphCapabilityError
+    consumers:
+      - src/query/unified-router.ts#routeQuery
+      - src/cli/qmd.ts#exitWithError
+      - src/mcp/server.ts#createMcpServer
+    storage: transient_or_query_log
+    notes:
+      - domain error for missing graph_query capability
+      - public CLI/MCP error output exposes GraphCapabilityError for missing
+        graph_query and keeps it embedded in TypedQueryError for internal
+        catch/transport handling
 
   - name: openai_responses_provider_config
     schema: src/contracts/provider.ts#OpenAIResponsesProviderConfigSchema
+    envelope: src/contracts/provider.ts#OpenAIResponsesProviderConfigEnvelopeSchema
     contract_level: required
     producers:
-      - src/config/project-config.ts#loadProjectConfig
+      - .qmd/index.yml#providers.openai
     consumers:
+      - src/cli/qmd.ts#ensureRuntimeConfigForCli
       - python/qmd_graphrag/graphrag_responses_completion.py
-      - src/integrations/openai-responses.ts#createResponsesClient
     storage: .qmd/index.yml
     notes:
       - endpoint is `/responses`
       - stream mode is required
       - base URL is not force-prefixed with `/v1`
+      - qmd project config owns env names and endpoint intent; GraphRAG runtime
+        settings receive the projected provider values
+
+  - name: openai_responses_request
+    schema: src/contracts/provider.ts#OpenAIResponsesRequestSchema
+    envelope: src/contracts/provider.ts#OpenAIResponsesRequestEnvelopeSchema
+    contract_level: required
+    producers:
+      - python/qmd_graphrag/graphrag_responses_completion.py
+    consumers:
+      - OpenAI Responses API#POST /responses
+    storage: transient
+
+  - name: openai_responses_response
+    schema: src/contracts/provider.ts#OpenAIResponsesResponseSchema
+    envelope: src/contracts/provider.ts#OpenAIResponsesResponseEnvelopeSchema
+    contract_level: required
+    producers:
+      - OpenAI Responses API#POST /responses
+    consumers:
+      - python/qmd_graphrag/graphrag_responses_completion.py
+    storage: transient
 
   - name: openai_responses_stream_event
     schema: src/contracts/provider.ts#OpenAIResponsesStreamEventSchema
+    envelope: src/contracts/provider.ts#OpenAIResponsesStreamEventEnvelopeSchema
     contract_level: required
     producers:
-      - src/integrations/openai-responses.ts#streamResponses
       - python/qmd_graphrag/graphrag_responses_completion.py
     consumers:
-      - src/integrations/openai-responses.ts#collectResponsesStream
       - python/qmd_graphrag/graphrag_responses_completion.py
     storage: transient
 
   - name: openai_structured_output_schema
     schema: src/contracts/provider.ts#OpenAIStructuredOutputSchemaSchema
+    envelope: src/contracts/provider.ts#OpenAIStructuredOutputSchemaEnvelopeSchema
     contract_level: required
     producers:
-      - src/integrations/openai-responses.ts#buildStrictStructuredOutputSchema
       - python/qmd_graphrag/graphrag_responses_completion.py
     consumers:
       - OpenAI Responses API#text.format.schema
     storage: transient
     notes:
-      - every object schema sets additionalProperties to false
+      - zod schema files validate payload shape and are not runtime producers
+      - plain completion requests omit text.format and still require
+        stream=true
+      - every OpenAI Responses structured output JSON schema object node sets
+        additionalProperties to false
+      - Responses provider projection carries responses_endpoint=/responses,
+        responses_stream=true, and strict_structured_output=true into
+        GraphRAG runtime settings
 
   - name: jina_embedding_request
     schema: src/contracts/jina.ts#JinaEmbeddingRequestSchema
+    envelope: src/contracts/jina.ts#JinaEmbeddingRequestEnvelopeSchema
     contract_level: required
     producers:
       - src/llm.ts#LlamaCpp.embedBatchWithJina
-      - python/qmd_graphrag/bridge.py#_run_graphrag_index
     consumers:
       - Jina API#POST /v1/embeddings
     storage: transient
 
+  - name: jina_provider_config
+    schema: src/contracts/jina.ts#JinaProviderConfigSchema
+    envelope: src/contracts/jina.ts#JinaProviderConfigEnvelopeSchema
+    contract_level: required
+    producers:
+      - src/llm.ts#resolveJinaApiBase
+      - src/llm.ts#resolveJinaApiKey
+    consumers:
+      - src/llm.ts#LlamaCpp.embedBatchWithJina
+      - src/llm.ts#LlamaCpp.rerankWithJina
+    storage: transient
+    notes:
+      - stores environment variable names and endpoints, never secret values
+
   - name: jina_embedding_response
     schema: src/contracts/jina.ts#JinaEmbeddingResponseSchema
+    envelope: src/contracts/jina.ts#JinaEmbeddingResponseEnvelopeSchema
     contract_level: required
     producers:
       - Jina API#POST /v1/embeddings
     consumers:
       - src/llm.ts#LlamaCpp.embedBatchWithJina
-      - python/qmd_graphrag/bridge.py#_run_graphrag_index
       - src/store.ts#insertEmbedding
     storage: transient
 
   - name: dspy_query_prompt_optimization_request
     schema: src/contracts/dspy.ts#DspyQueryPromptOptimizationRequestSchema
+    envelope: src/contracts/dspy.ts#DspyOptimizationEnvelopeSchema
     contract_level: required
     producers:
       - src/integrations/dspy.ts#optimizeQueryPrompt
-      - src/runtime.ts#createQmdGraphRagRuntime
+      - src/llm.ts#LlamaCpp.expandQuery
     consumers:
+      - src/integrations/dspy.ts#optimizeQueryPrompt
       - python/qmd_graphrag/bridge.py#_run_dspy_optimize_query_prompt
     storage: transient
+    notes:
+      - request envelopes carry optimization inputs across the TypeScript to
+        Python bridge boundary
 
   - name: optimized_query_prompt_artifact
     schema: src/contracts/dspy.ts#DspyQueryPromptOptimizationResponseSchema
+    envelope: src/contracts/dspy.ts#DspyOptimizationResponseEnvelopeSchema
     contract_level: required
     producers:
       - python/qmd_graphrag/bridge.py#_run_dspy_optimize_query_prompt
     consumers:
-      - src/prompt-registry/query-expansion.ts#promoteOptimizedPrompt
       - finetune/experiments/gepa/dspy_gepa.py
     storage: file
 
   - name: dspy_generated_expansion_record
     schema: src/contracts/dspy.ts#DspyGeneratedExpansionRecordSchema
+    envelope: src/contracts/dspy.ts#DspyGeneratedExpansionRecordEnvelopeSchema
     contract_level: required
     producers:
       - python/qmd_graphrag/bridge.py#_run_dspy_optimize_query_prompt
       - finetune/experiments/gepa/dspy_gepa.py
     consumers:
-      - src/contracts/dspy.ts#DspyGeneratedExpansionRecordSchema
-      - src/prompt-registry/query-expansion.ts#evaluateOptimizedPrompt
+      - finetune/experiments/gepa/dspy_gepa.py
     storage: file
     notes:
       - emitted records are line-delimited JSON examples for optimized query
@@ -362,6 +571,7 @@ types:
 
   - name: jina_rerank_request
     schema: src/contracts/jina.ts#JinaRerankRequestSchema
+    envelope: src/contracts/jina.ts#JinaRerankRequestEnvelopeSchema
     contract_level: required
     producers:
       - src/llm.ts#LlamaCpp.rerankWithJina
@@ -371,6 +581,7 @@ types:
 
   - name: jina_rerank_response
     schema: src/contracts/jina.ts#JinaRerankResponseSchema
+    envelope: src/contracts/jina.ts#JinaRerankResponseEnvelopeSchema
     contract_level: required
     producers:
       - Jina API#POST /v1/rerank
@@ -381,6 +592,7 @@ types:
 
   - name: book_job
     schema: src/contracts/book-job.ts#BookJobSchema
+    envelope: src/contracts/book-job.ts#BookJobEnvelopeSchema
     contract_level: required
     producers:
       - src/job-state/repository.ts#FileBookJobStateRepository.registerBookSource
@@ -388,11 +600,22 @@ types:
     consumers:
       - src/job-state/graphrag-book.ts#syncGraphRagBookWorkspace
       - src/job-state/repository.ts#FileBookJobStateRepository.getResumePlan
-      - src/cli/graphrag-status.ts#showBookStatus
     storage: file
+
+  - name: book_job_catalog
+    schema: src/contracts/book-job.ts#BookJobCatalogSchema
+    envelope: src/contracts/book-job.ts#BookJobCatalogEnvelopeSchema
+    contract_level: required
+    producers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.upsertBookJob
+    consumers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.getResumePlan
+      - src/graphrag/capability-catalog.ts#loadGraphCapabilities
+    storage: graph_vault/catalog/books.yaml
 
   - name: book_stage_checkpoint
     schema: src/contracts/book-job.ts#BookJobStageCheckpointSchema
+    envelope: src/contracts/book-job.ts#BookJobStageCheckpointEnvelopeSchema
     contract_level: required
     producers:
       - src/job-state/repository.ts#FileBookJobStateRepository.startStage
@@ -406,77 +629,178 @@ types:
       - checkpoint success is valid only when required artifact manifests remain
         present and their paths resolve from graph_vault
 
+  - name: book_stage_checkpoint_list
+    schema: src/contracts/book-job.ts#BookJobCheckpointListSchema
+    envelope: src/contracts/book-job.ts#BookJobCheckpointListEnvelopeSchema
+    contract_level: required
+    producers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.startStage
+      - src/job-state/repository.ts#FileBookJobStateRepository.completeStage
+      - src/job-state/repository.ts#FileBookJobStateRepository.failStage
+    consumers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.getResumePlan
+      - src/graphrag/capability-catalog.ts#loadGraphCapabilities
+    storage: graph_vault/books/<book_id>/checkpoints.yaml
+
   - name: book_artifact_manifest
     schema: src/contracts/book-job.ts#BookArtifactManifestSchema
+    envelope: src/contracts/book-job.ts#BookArtifactManifestEnvelopeSchema
     contract_level: required
     producers:
       - src/job-state/repository.ts#FileBookJobStateRepository.recordArtifacts
     consumers:
       - src/job-state/repository.ts#FileBookJobStateRepository.getResumePlan
       - src/job-state/graphrag-book.ts#syncGraphRagBookWorkspace
-      - src/query/unified-router.ts#locateGraphWorkspace
       - src/vault/restore.ts#restoreFromVault
     storage: file
     notes:
       - artifact identity excludes `producerRunId` to avoid duplicate entries
         across bootstrap and resume synchronization
       - stores artifact hash and normalization policy lineage when applicable
+      - "`lancedb_index` artifact hash covers required table `data/*.lance`
+        fragments and `qmd_row_count.json`; `_versions/**` and other
+        vendor-volatile files do not participate in canonical hash"
+
+  - name: book_artifact_manifest_list
+    schema: src/contracts/book-job.ts#BookArtifactManifestListSchema
+    envelope: src/contracts/book-job.ts#BookArtifactManifestListEnvelopeSchema
+    contract_level: required
+    producers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.recordArtifacts
+    consumers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.getResumePlan
+      - src/graphrag/capability-catalog.ts#loadGraphCapabilities
+      - src/vault/restore.ts#restoreFromVault
+    storage: graph_vault/books/<book_id>/artifacts.yaml
 
   - name: book_resume_plan
     schema: src/contracts/book-job.ts#BookResumePlanSchema
+    envelope: src/contracts/book-job.ts#BookResumePlanEnvelopeSchema
     contract_level: required
     producers:
       - src/job-state/repository.ts#FileBookJobStateRepository.getResumePlan
     consumers:
       - src/job-state/graphrag-book.ts#syncGraphRagBookWorkspace
-      - src/cli/graphrag-resume.ts#resumeBookWorkspace
     storage: transient
     notes:
       - stage state reason may be `artifact_missing` when checkpoint metadata
         exists but required artifacts are missing from manifest or disk
 
+  - name: book_run_catalog
+    schema: src/contracts/book-job.ts#BookJobRunCatalogSchema
+    envelope: src/contracts/book-job.ts#BookJobRunCatalogEnvelopeSchema
+    contract_level: required
+    producers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.appendRunRecord
+    consumers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.listRunRecords
+    storage: graph_vault/catalog/runs.yaml
+
+  - name: book_run_record
+    schema: src/contracts/book-job.ts#BookJobRunRecordSchema
+    envelope: src/contracts/book-job.ts#BookJobRunRecordEnvelopeSchema
+    contract_level: required
+    producers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.appendRunRecord
+    consumers:
+      - src/job-state/repository.ts#FileBookJobStateRepository.listRunRecords
+    storage: graph_vault/books/<book_id>/runs/<run_id>.yaml
+
   - name: provider_cost_accounting
     schema: src/contracts/provider.ts#ProviderCostAccountingSchema
+    envelope: src/contracts/provider.ts#ProviderCostAccountingEnvelopeSchema
     contract_level: required
     producers:
       - src/integrations/graphrag.ts#runGraphRagIndex
-      - src/integrations/openai-responses.ts#collectUsage
+      - src/integrations/graphrag.ts#runGraphRagQuery
       - src/llm.ts#LlamaCpp.embedBatchWithJina
       - src/llm.ts#LlamaCpp.rerankWithJina
     consumers:
-      - src/job-state/repository.ts#recordCostAccounting
-      - src/audit/cost-report.ts#summarizeProviderCost
+      - src/provider/cost-accounting.ts#appendProviderCostAccounting
     storage: graph_vault/catalog/cost-accounting.jsonl
     notes:
       - records provider, model, run, token, embedding, cache, and artifact lineage
+      - requestArtifactId is a first-class field and must be present in
+        artifactIds
+      - lineageMode declares whether the record is corpus_artifact,
+        graph_artifact, multi_document_query, or transient_query
+      - artifactIds must include the redacted provider request fingerprint
+        artifact for GraphRAG, Jina embedding, and Jina rerank calls
+      - tokenCountStatus and embeddingCountStatus distinguish reported,
+        estimated, and unknown counts; unknown counts use numeric 0 only as an
+        aggregation-neutral value
+      - qmd Jina embedding and rerank records are request-level records; source
+        and book identities are nullable for qmd-only corpus calls, while
+        document and content identities are projected from qmd SQLite when the
+        request is tied to corpus content
+      - records without corpus identity are valid only with lineageMode
+        transient_query
+      - qmd Jina request-level records always reference a redacted provider
+        request artifact under graph_vault/catalog/provider-requests
+      - OpenAI Responses stream events are internal to the GraphRAG Python
+        provider adapter; the cost ledger records GraphRAG index/query as
+        aggregate adapter calls with provider `graphrag`
+      - GraphRAG aggregate records carry redacted request fingerprints and
+        business artifact lineage; they do not claim direct OpenAI token usage
+        unless GraphRAG exposes provider-specific usage detail
+      - GraphRAG-side Jina embedding is recorded through the GraphRAG adapter
+        unless the GraphRAG runtime exposes provider-specific usage detail
+
+  - name: provider_request_fingerprint
+    schema: src/contracts/provider.ts#ProviderRequestFingerprintSchema
+    envelope: src/contracts/provider.ts#ProviderRequestFingerprintEnvelopeSchema
+    contract_level: required
+    producers:
+      - src/llm.ts#LlamaCpp.recordProviderCost
+      - src/integrations/graphrag.ts#writeGraphRagProviderRequestArtifact
+    consumers:
+      - src/integrations/graphrag.ts#recordGraphRagCost
+      - src/llm.ts#LlamaCpp.recordProviderCost
+    storage: graph_vault/catalog/provider-requests/<artifact_id>.json
+    notes:
+      - stores redacted provider request fingerprints for cost lineage
+      - excludes secret values and raw provider request or response bodies
 
   - name: vault_restore_request
     schema: src/contracts/vault.ts#VaultRestoreRequestSchema
+    envelope: src/contracts/vault.ts#VaultRestoreRequestEnvelopeSchema
     contract_level: required
     producers:
-      - src/cli/vault-restore.ts#restoreFromVaultCommand
+      - src/vault/restore.ts#restoreFromVault
+      - test/integrations/contracts.test.ts#Data bus contracts
     consumers:
       - src/vault/restore.ts#restoreFromVault
     storage: transient
+    notes:
+      - restore request envelopes define the portable graph_vault restore
+        boundary
 
   - name: vault_restore_report
     schema: src/contracts/vault.ts#VaultRestoreReportSchema
+    envelope: src/contracts/vault.ts#VaultRestoreReportEnvelopeSchema
     contract_level: required
     producers:
       - src/vault/restore.ts#restoreFromVault
     consumers:
-      - src/cli/vault-restore.ts#restoreFromVaultCommand
-      - src/audit/vault-portability.ts#auditVaultPortability
-    storage: transient_or_report
+      - src/vault/restore.ts#restoreFromVault
+    storage: graph_vault/catalog/restore-audits.jsonl
+    notes:
+      - portable is true only when documentsPortable and capabilitiesPortable
+        are both true
+      - capabilitiesPortable requires book catalog, checkpoints, artifacts, and
+        validated capability source material for graph-enhanced identities
 
 buses:
   - name: corpus_bus
     description: Typed ingestion bus for whole-corpus source, document, and chunk identity.
     payloads:
       - source_document
+      - source_document_catalog
       - corpus_document
       - corpus_chunk
       - document_identity_map
+      - graph_text_unit_identity_map
+      - document_identity_catalog
 
   - name: qmd_retrieval_bus
     description: Typed whole-corpus lexical, vector, expansion, and rerank bus.
@@ -485,6 +809,7 @@ buses:
       - qmd_retrieval_candidate
       - qmd_search_result
       - query_expansion_item
+      - unified_query_request
 
   - name: graph_enhancement_bus
     description: Typed graph-enhanced subset ingestion, state, and query bus.
@@ -492,10 +817,13 @@ buses:
       - graph_enhancement_request
       - graph_enhancement_state
       - graph_capability
+      - graph_capability_catalog
       - graphrag_index_request
       - graphrag_index_response
       - graphrag_query_request
       - graphrag_query_response
+      - graphrag_provider_detail
+      - graphrag_evidence
 
   - name: unified_answer_bus
     description: Typed user-facing route, evidence, and answer bus.
@@ -505,18 +833,23 @@ buses:
       - candidate_route_decision
       - evidence_ref
       - unified_answer
+      - graph_capability_error
       - typed_query_error
 
   - name: provider_bus
     description: Typed provider bus for OpenAI Responses API and Jina services.
     payloads:
       - openai_responses_provider_config
+      - openai_responses_request
+      - openai_responses_response
       - openai_responses_stream_event
       - openai_structured_output_schema
       - jina_embedding_request
+      - jina_provider_config
       - jina_embedding_response
       - jina_rerank_request
       - jina_rerank_response
+      - provider_request_fingerprint
 
   - name: offline_prompt_optimization_bus
     description: Typed DSPy query prompt optimization bus.
@@ -529,9 +862,14 @@ buses:
     description: Typed persistence bus for per-book state, checkpoints, and artifacts.
     payloads:
       - book_job
+      - book_job_catalog
       - book_stage_checkpoint
+      - book_stage_checkpoint_list
       - book_artifact_manifest
+      - book_artifact_manifest_list
       - book_resume_plan
+      - book_run_catalog
+      - book_run_record
       - provider_cost_accounting
 
   - name: vault_portability_bus
@@ -566,6 +904,7 @@ dependencies:
       - adapter_layer_only
       - no_business_route_logic_in_vendor
       - upgrade_smoke_test
+      - lancedb_canonical_hash_excludes_vendor_versions
     exit_conditions:
       - if equivalent graph indexing and query quality exists natively in TypeScript
 

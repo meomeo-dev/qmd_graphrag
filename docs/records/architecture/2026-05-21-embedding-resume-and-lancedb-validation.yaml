@@ -36,7 +36,8 @@ decision:
     rule: >-
       `lancedb_index` 只有在 `entity_description.lance`、
       `community_full_content.lance`、`text_unit_text.lance` 三张表均存在，
-      且每张表包含 data `.lance` 文件与 `_versions` manifest 时才记录。
+      且每张表包含非空 data `.lance` 文件与正行数 `qmd_row_count.json`
+      sidecar 时才记录。`_versions` manifest 不参与通过条件。
     rationale: >-
       目录存在不等于向量索引可查询。状态层必须校验可消费的最小完整产物。
   fingerprint_boundary:
@@ -56,7 +57,7 @@ implications:
   negative:
     - Jina 模型变更时需要同步维护 `vector_store.vector_size`，或重新启用
       validation 探测。
-    - 未来新增 embedding table 时需要更新完整性校验表清单。
+    - embedding table 清单变化时必须同步更新完整性校验表清单。
 
 validation:
   planned:
