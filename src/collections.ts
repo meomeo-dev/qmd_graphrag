@@ -84,10 +84,18 @@ export interface QueryAutoRouteConfig {
   max_cost_class?: "low" | "medium" | "high";
 }
 
+export interface QueryExpansionPolicyConfig {
+  provider?: "builtin" | "dspy";
+  policy_ref?: string;
+  failure_policy?: "fallback_to_builtin_expander" | "strict_refuse";
+  strict_schema?: boolean;
+}
+
 export interface QueryConfig {
   default_route?: "qmd" | "auto";
   allow_graph_upgrade?: boolean;
   auto_route?: QueryAutoRouteConfig;
+  expansion_policy?: QueryExpansionPolicyConfig;
 }
 
 /**

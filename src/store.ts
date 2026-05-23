@@ -38,6 +38,12 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import { DspyQueryExpansionStrictRefusalError } from "./dspy/errors.js";
+import { buildDspyRuntimeFingerprints } from "./dspy/fingerprints.js";
+import { DspyPolicyStore } from "./dspy/policy-store.js";
+import { QueryExpansionFailurePolicySchema } from "./contracts/dspy.js";
+import type { QueryExpansionFailurePolicy } from "./contracts/dspy.js";
+import { SchemaVersion } from "./contracts/common.js";
 import { createDeterministicHash } from "./job-state/fingerprint.js";
 import {
   QMD_SQLITE_NORMALIZATION_POLICY_VERSION,
@@ -988,6 +994,23 @@ type StoreCollectionRow = {
   context: string | null;
 };
 
+type StoreRuntimeConfig = {
+  graphVault?: string;
+  queryExpansionPolicyProvider?: "builtin" | "dspy";
+  queryExpansionPolicyRef?: string;
+  queryExpansionFailurePolicy?: QueryExpansionFailurePolicy;
+  dspyFingerprints?: {
+    modelFingerprint: string;
+    providerFingerprint: string;
+    retrievalConfigFingerprint: string;
+    corpusSnapshotFingerprint: string;
+    indexSnapshotFingerprint: string;
+    retrieverFingerprint: string;
+    rerankerFingerprint: string;
+    schemaFingerprint: string;
+  };
+};
+
 function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
   return {
     name: row.name,
@@ -1108,6 +1131,63 @@ export function setStoreGlobalContext(db: Database, value: string | undefined): 
   }
 }
 
+function setStoreConfigValue(db: Database, key: string, value: unknown): void {
+  if (value === undefined) {
+    db.prepare(`DELETE FROM store_config WHERE key = ?`).run(key);
+    return;
+  }
+  db.prepare(`
+    INSERT INTO store_config (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(key, JSON.stringify(value));
+}
+
+function getStoreConfigValue<T>(db: Database, key: string): T | undefined {
+  const row = db.prepare(`SELECT value FROM store_config WHERE key = ?`).get(key) as
+    | { value: string | null }
+    | null
+    | undefined;
+  if (!row?.value) return undefined;
+  return JSON.parse(row.value) as T;
+}
+
+function queryExpansionFailurePolicyFromConfig(
+  config: CollectionConfig,
+): QueryExpansionFailurePolicy {
+  const expansion = config.query?.expansion_policy;
+  const defaultAction =
+    expansion?.failure_policy ?? "fallback_to_builtin_expander";
+  return QueryExpansionFailurePolicySchema.parse({
+    schemaVersion: SchemaVersion,
+    defaultAction,
+    reasonActions: {},
+    strictSchema: expansion?.strict_schema ?? true,
+  });
+}
+
+function getStoreRuntimeConfig(db: Database): StoreRuntimeConfig {
+  return getStoreConfigValue<StoreRuntimeConfig>(db, "runtime_config") ?? {};
+}
+
+function currentDspyFingerprints(_model: string, db: Database): {
+  modelFingerprint: string;
+  providerFingerprint: string;
+  retrievalConfigFingerprint: string;
+  corpusSnapshotFingerprint: string;
+  indexSnapshotFingerprint: string;
+  retrieverFingerprint: string;
+  rerankerFingerprint: string;
+  schemaFingerprint: string;
+} {
+  const configured = getStoreRuntimeConfig(db).dspyFingerprints;
+  if (configured) return configured;
+  return buildDspyRuntimeFingerprints({ collections: {} }, {
+    generateModel: DEFAULT_QUERY_MODEL,
+    embedModel: DEFAULT_EMBED_MODEL,
+    rerankModel: DEFAULT_RERANK_MODEL,
+  });
+}
+
 /**
  * Sync external config (YAML/inline) into SQLite store_collections.
  * External config always wins. Skips sync if config hash hasn't changed.
@@ -1116,9 +1196,22 @@ export function syncConfigToDb(db: Database, config: CollectionConfig): void {
   // Check config hash — skip sync if unchanged
   const configJson = JSON.stringify(config);
   const hash = createHash('sha256').update(configJson).digest('hex');
+  const fingerprints = buildDspyRuntimeFingerprints(config, {
+    generateModel: DEFAULT_QUERY_MODEL,
+    embedModel: DEFAULT_EMBED_MODEL,
+    rerankModel: DEFAULT_RERANK_MODEL,
+  });
+  const runtimeConfig = {
+    graphVault: config.graphrag?.vault,
+    queryExpansionPolicyProvider: config.query?.expansion_policy?.provider ?? "builtin",
+    queryExpansionPolicyRef: config.query?.expansion_policy?.policy_ref,
+    queryExpansionFailurePolicy: queryExpansionFailurePolicyFromConfig(config),
+    dspyFingerprints: fingerprints,
+  } satisfies StoreRuntimeConfig;
 
   const existingHash = db.prepare(`SELECT value FROM store_config WHERE key = 'config_hash'`).get() as { value: string } | null | undefined;
   if (existingHash != null && existingHash.value === hash) {
+    setStoreConfigValue(db, "runtime_config", runtimeConfig);
     return; // Config unchanged, skip sync
   }
 
@@ -1143,6 +1236,8 @@ export function syncConfigToDb(db: Database, config: CollectionConfig): void {
   } else {
     setStoreGlobalContext(db, undefined);
   }
+
+  setStoreConfigValue(db, "runtime_config", runtimeConfig);
 
   // Save config hash
   db.prepare(`INSERT INTO store_config (key, value) VALUES ('config_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(hash);
@@ -3878,6 +3973,41 @@ function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<stri
 // =============================================================================
 
 export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+  const runtimeConfig = getStoreRuntimeConfig(db);
+  if (
+    runtimeConfig.queryExpansionPolicyProvider === "dspy" &&
+    runtimeConfig.graphVault
+  ) {
+    const failurePolicy = runtimeConfig.queryExpansionFailurePolicy
+      ?? DspyPolicyStore.defaultFailurePolicy();
+    if (failurePolicy.strictSchema !== true) {
+      throw new Error("DSPy query expansion requires strict_schema=true");
+    }
+    const policyStore = new DspyPolicyStore({
+      graphVault: runtimeConfig.graphVault,
+      pointerPath: runtimeConfig.queryExpansionPolicyRef,
+      failurePolicy,
+      actor: "qmd-query",
+    });
+    const dspyResult = policyStore.expandQuery(
+      query,
+      intent,
+      currentDspyFingerprints(model, db),
+    );
+    if (dspyResult.status === "expanded") {
+      const expanded = dspyResult.expansions
+        .filter((item) => item.text !== query)
+        .map((item) => ({ type: item.type, query: item.text }));
+      if (expanded.length > 0) return expanded;
+    }
+    if (dspyResult.status === "strict_refuse") {
+      throw new DspyQueryExpansionStrictRefusalError(
+        dspyResult.reason,
+        `DSPy query expansion failed (${dspyResult.reason}): ${dspyResult.message}`,
+      );
+    }
+  }
+
   // Check cache first — stored as JSON preserving types
   const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);

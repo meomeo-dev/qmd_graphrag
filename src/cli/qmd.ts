@@ -113,6 +113,19 @@ import {
 import { createQmdGraphRagRuntime } from "../runtime.js";
 import { GraphRagSearchMethodSchema } from "../contracts/graphrag.js";
 import { SchemaVersion } from "../contracts/common.js";
+import {
+  buildDspyRuntimeFingerprints,
+  dspyProviderEnvRefs,
+} from "../dspy/fingerprints.js";
+import { DspyPolicyStore } from "../dspy/policy-store.js";
+import type { DspyArtifactWriteResult } from "../dspy/policy-store.js";
+import {
+  DspyGeneratedExpansionRecordSchema,
+  DspyOptimizationArtifactSchema,
+  DspyEvaluationReportSchema,
+  DspyPromotionDecisionSchema,
+  QueryExpansionFailurePolicySchema,
+} from "../contracts/dspy.js";
 import type { QmdSearchResult } from "../contracts/qmd-query.js";
 import type {
   EvidenceRef,
@@ -137,6 +150,7 @@ import {
 import {
   writeManagedGraphRagSettingsSync,
 } from "../graphrag/settings-projection.js";
+import { createRunId } from "../job-state/fingerprint.js";
 
 // NOTE: enableProductionMode() is intentionally NOT called at module scope here.
 // Importing this module for its exports (e.g. buildEditorUri, termLink from
@@ -484,6 +498,44 @@ function defaultProjectProvidersConfig(): CollectionConfig["providers"] {
   };
 }
 
+function updateQueryExpansionPolicyConfig(input: {
+  provider: "builtin" | "dspy";
+  graphVault?: string;
+  policyRef?: string;
+  failurePolicy?: "fallback_to_builtin_expander" | "strict_refuse";
+}): void {
+  if (process.env.QMD_TEST_FAIL_DSPY_CONFIG_WRITE === "1") {
+    throw new Error("test-injected DSPy config write failure");
+  }
+  const config = ensureRuntimeConfigForCli();
+  const graphVault = input.graphVault
+    ? (relativePath(getPwd(), input.graphVault) || ".")
+    : config.graphrag?.vault;
+  const next: CollectionConfig = {
+    ...config,
+    graphrag: {
+      ...(config.graphrag ?? {}),
+      ...(graphVault ? { vault: graphVault } : {}),
+    },
+    query: {
+      ...(config.query ?? {}),
+      expansion_policy: {
+        ...(config.query?.expansion_policy ?? {}),
+        provider: input.provider,
+        policy_ref: input.policyRef
+          ?? config.query?.expansion_policy?.policy_ref
+          ?? "graph_vault/dspy/policies/query-expansion/current.yaml",
+        failure_policy: input.failurePolicy
+          ?? config.query?.expansion_policy?.failure_policy
+          ?? "fallback_to_builtin_expander",
+        strict_schema: config.query?.expansion_policy?.strict_schema ?? true,
+      },
+    },
+  };
+  saveConfig(next);
+  resyncConfig();
+}
+
 function ensureRuntimeConfigForCli(): CollectionConfig {
   const config = loadConfig();
   const configuredDefaultRoute = config.query?.default_route;
@@ -532,12 +584,19 @@ function ensureRuntimeConfigForCli(): CollectionConfig {
     query: {
       default_route: "qmd",
       allow_graph_upgrade: true,
+      ...(config.query ?? {}),
       auto_route: {
         graph_coverage_threshold: 0.7,
         max_cost_class: "medium",
         ...(config.query?.auto_route ?? {}),
       },
-      ...(config.query ?? {}),
+      expansion_policy: {
+        provider: "builtin",
+        policy_ref: "graph_vault/dspy/policies/query-expansion/current.yaml",
+        failure_policy: "fallback_to_builtin_expander",
+        strict_schema: true,
+        ...(config.query?.expansion_policy ?? {}),
+      },
     },
   };
   saveConfig(next);
@@ -1944,6 +2003,15 @@ function parseEmbedBatchOption(name: string, value: unknown): number | undefined
   return parsed;
 }
 
+function parsePositiveIntegerOption(name: string, value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return parsed;
+}
+
 function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
   if (value === undefined) return undefined;
   const s = String(value);
@@ -2983,6 +3051,289 @@ async function graphRagQuerySearch(
   outputUnifiedAnswer(answer, opts);
 }
 
+function createDspyPolicyStore(values: Record<string, unknown>): DspyPolicyStore {
+  const config = ensureRuntimeConfigForCli();
+  const graphVault = resolveGraphVaultForCli(values, config);
+  return new DspyPolicyStore({ graphVault, actor: "qmd-cli" });
+}
+
+function printDspyJson(value: unknown): void {
+  console.log(JSON.stringify(value, null, 2));
+}
+
+function dspyFailurePolicyFromCli(values: Record<string, unknown>) {
+  const strict = values["strict-refuse"] === true;
+  return QueryExpansionFailurePolicySchema.parse({
+    schemaVersion: SchemaVersion,
+    defaultAction: strict ? "strict_refuse" : "fallback_to_builtin_expander",
+    reasonActions: {},
+    strictSchema: true,
+  });
+}
+
+function printDspyArtifactResult(result: DspyArtifactWriteResult): void {
+  printDspyJson({
+    runId: result.run.runId,
+    runPath: result.runPath,
+    artifactId: result.artifact.artifactId,
+    artifactPath: result.artifactPath,
+  });
+}
+
+async function dspyOptimizeQueryPrompt(
+  args: string[],
+  values: Record<string, unknown>,
+): Promise<void> {
+  const trainsetPath = String(values.trainset || args[1] || "");
+  if (!trainsetPath) {
+    throw new Error("Usage: qmd dspy optimize-query-prompt --trainset <jsonl>");
+  }
+  const config = ensureRuntimeConfigForCli();
+  const graphVault = resolveGraphVaultForCli(values, config);
+  const store = new DspyPolicyStore({ graphVault, actor: "qmd-cli" });
+  const runId = createRunId("dspy-cli");
+  const artifactDir = pathJoin(graphVault, "dspy", "runs", runId);
+  mkdirSync(artifactDir, { recursive: true });
+  const savePromptPath = values["save-prompt"]
+    ? pathResolve(getPwd(), String(values["save-prompt"]))
+    : pathJoin(artifactDir, "prompt.txt");
+  const emitPath = values.emit
+    ? pathResolve(getPwd(), String(values.emit))
+    : pathJoin(artifactDir, "generated.jsonl");
+  const runtime = createQmdGraphRagRuntime();
+  const response = await runtime.optimizeQueryPrompt({
+    optimizer: "gepa",
+    trainsetPath: pathResolve(getPwd(), trainsetPath),
+    valsetPath: values.valset
+      ? pathResolve(getPwd(), String(values.valset))
+      : undefined,
+    model: String(values.model || config.models?.generate || "openai/gpt-5.4"),
+    reflectionModel: values["reflection-model"]
+      ? String(values["reflection-model"])
+      : undefined,
+    auto: values.auto
+      ? (String(values.auto) as "light" | "medium" | "heavy")
+      : "light",
+    maxMetricCalls: parsePositiveIntegerOption(
+      "maxMetricCalls",
+      values["max-metric-calls"],
+    ),
+    limit: parsePositiveIntegerOption("limit", values.limit),
+    valLimit: parsePositiveIntegerOption("valLimit", values["val-limit"]),
+    savePromptPath,
+    emitPath,
+    environment: {
+      pythonBin: values["python-bin"]
+        ? pathResolve(getPwd(), String(values["python-bin"]))
+        : config.graphrag?.python_bin
+          ? pathResolve(getPwd(), config.graphrag.python_bin)
+          : undefined,
+      workingDirectory: getPwd(),
+    },
+  });
+  const result = store.writeOptimizationArtifact({
+    request: {
+      optimizer: "gepa",
+      trainsetPath: pathResolve(getPwd(), trainsetPath),
+      valsetPath: values.valset
+        ? pathResolve(getPwd(), String(values.valset))
+        : undefined,
+      model: String(values.model || config.models?.generate || "openai/gpt-5.4"),
+      reflectionModel: values["reflection-model"]
+        ? String(values["reflection-model"])
+        : undefined,
+      auto: values.auto
+        ? (String(values.auto) as "light" | "medium" | "heavy")
+        : "light",
+      maxMetricCalls: parsePositiveIntegerOption(
+        "maxMetricCalls",
+        values["max-metric-calls"],
+      ),
+      limit: parsePositiveIntegerOption("limit", values.limit),
+      valLimit: parsePositiveIntegerOption("valLimit", values["val-limit"]),
+      savePromptPath,
+      emitPath,
+    },
+    response,
+    runId,
+    fingerprints: buildDspyRuntimeFingerprints(config, {
+      generateModel: DEFAULT_QUERY_MODEL,
+      embedModel: DEFAULT_EMBED_MODEL,
+      rerankModel: DEFAULT_RERANK_MODEL,
+    }),
+    providerEnvRefs: dspyProviderEnvRefs(config),
+    metricVersion: String(values.metric || "dspy-query-expansion-schema-v1"),
+    maxExpansionItems: values["max-expansion-items"]
+      ? parsePositiveIntegerOption("maxExpansionItems", values["max-expansion-items"])
+      : undefined,
+  });
+  printDspyArtifactResult(result);
+}
+
+async function dspyEvaluateExpansionPolicy(
+  args: string[],
+  values: Record<string, unknown>,
+): Promise<void> {
+  const artifactPath = String(values.artifact || args[1] || "");
+  if (!artifactPath) {
+    throw new Error("Usage: qmd dspy evaluate-expansion-policy --artifact <path>");
+  }
+  const store = createDspyPolicyStore(values);
+  const report = store.evaluateExpansionPolicy({
+    artifactPath,
+    datasetId: values.dataset ? String(values.dataset) : undefined,
+    metricVersion: values.metric ? String(values.metric) : undefined,
+  });
+  printDspyJson(DspyEvaluationReportSchema.parse(report));
+}
+
+async function dspyPromoteExpansionPolicy(
+  args: string[],
+  values: Record<string, unknown>,
+): Promise<void> {
+  const artifactPath = String(values.artifact || args[1] || "");
+  const reportPath = String(values.report || args[2] || "");
+  if (!artifactPath || !reportPath) {
+    throw new Error(
+      "Usage: qmd dspy promote-expansion-policy --artifact <path> --report <path>",
+    );
+  }
+  const store = createDspyPolicyStore(values);
+  const previousPointer = store.loadPointer();
+  const decision = store.promoteExpansionPolicy({
+    artifactPath,
+    reportPath,
+    reason: String(values.reason || "operator promotion"),
+    failurePolicy: dspyFailurePolicyFromCli(values),
+  });
+  try {
+    updateQueryExpansionPolicyConfig({
+      provider: "dspy",
+      graphVault: store.graphVault,
+      policyRef: graphVaultPolicyRef(store.graphVault, store),
+      failurePolicy: values["strict-refuse"] === true
+        ? "strict_refuse"
+        : "fallback_to_builtin_expander",
+    });
+  } catch (error) {
+    store.restorePointerForCliFailure(previousPointer, "config write failed");
+    throw error;
+  }
+  printDspyJson(DspyPromotionDecisionSchema.parse(decision));
+}
+
+async function dspyDisableExpansionPolicy(
+  _args: string[],
+  values: Record<string, unknown>,
+): Promise<void> {
+  const store = createDspyPolicyStore(values);
+  const previousPointer = store.loadPointer();
+  const pointer = store.disableExpansionPolicy(String(values.reason || "disabled"));
+  try {
+    updateQueryExpansionPolicyConfig({
+      provider: "builtin",
+      failurePolicy: "fallback_to_builtin_expander",
+    });
+  } catch (error) {
+    store.restorePointerForCliFailure(previousPointer, "config write failed");
+    throw error;
+  }
+  printDspyJson(pointer);
+}
+
+async function dspyRollbackExpansionPolicy(
+  _args: string[],
+  values: Record<string, unknown>,
+): Promise<void> {
+  const store = createDspyPolicyStore(values);
+  const previousPointer = store.loadPointer();
+  const pointer = store.rollbackExpansionPolicy();
+  try {
+    updateQueryExpansionPolicyConfig({
+      provider: pointer.provider === "dspy" && pointer.active ? "dspy" : "builtin",
+      graphVault: store.graphVault,
+      policyRef: graphVaultPolicyRef(store.graphVault, store),
+      failurePolicy: pointer.failurePolicy.defaultAction,
+    });
+  } catch (error) {
+    store.restorePointerForCliFailure(previousPointer, "config write failed");
+    throw error;
+  }
+  printDspyJson(pointer);
+}
+
+async function dspyImportExpansionRecords(
+  args: string[],
+  values: Record<string, unknown>,
+): Promise<void> {
+  const recordsPath = String(values.records || args[1] || "");
+  if (!recordsPath) {
+    throw new Error("Usage: qmd dspy import-expansion-records --records <jsonl>");
+  }
+  const records = readFileSync(pathResolve(getPwd(), recordsPath), "utf-8")
+    .split(/\r?\n/)
+    .filter((line) => line.trim().length > 0)
+    .map((line) => DspyGeneratedExpansionRecordSchema.parse(JSON.parse(line)));
+  const config = ensureRuntimeConfigForCli();
+  const store = createDspyPolicyStore(values);
+  const result = store.writeSyntheticArtifact({
+    records,
+    fingerprints: buildDspyRuntimeFingerprints(config, {
+      generateModel: DEFAULT_QUERY_MODEL,
+      embedModel: DEFAULT_EMBED_MODEL,
+      rerankModel: DEFAULT_RERANK_MODEL,
+    }),
+    providerEnvRefs: dspyProviderEnvRefs(config),
+    reason: String(values.reason || "imported expansion records"),
+  });
+  printDspyArtifactResult(result);
+}
+
+async function dspyCommand(
+  args: string[],
+  values: Record<string, unknown>,
+): Promise<void> {
+  const subcommand = args[0];
+  switch (subcommand) {
+    case "optimize-query-prompt":
+      await dspyOptimizeQueryPrompt(args, values);
+      break;
+    case "evaluate-expansion-policy":
+      await dspyEvaluateExpansionPolicy(args, values);
+      break;
+    case "promote-expansion-policy":
+      await dspyPromoteExpansionPolicy(args, values);
+      break;
+    case "rollback-expansion-policy":
+      await dspyRollbackExpansionPolicy(args, values);
+      break;
+    case "disable-expansion-policy":
+      await dspyDisableExpansionPolicy(args, values);
+      break;
+    case "import-expansion-records":
+      await dspyImportExpansionRecords(args, values);
+      break;
+    case "status": {
+      const store = createDspyPolicyStore(values);
+      const pointer = store.loadPointer();
+      printDspyJson({ pointerPath: store.pointerRelativePath(), pointer });
+      break;
+    }
+    default:
+      console.error("Usage: qmd dspy <command> [options]");
+      console.error("");
+      console.error("Commands:");
+      console.error("  optimize-query-prompt       Run offline DSPy GEPA optimization");
+      console.error("  evaluate-expansion-policy   Validate a DSPy artifact before promotion");
+      console.error("  promote-expansion-policy    Promote an evaluated artifact into qmd query");
+      console.error("  rollback-expansion-policy   Restore the previous promoted pointer");
+      console.error("  disable-expansion-policy    Disable DSPy online expansion");
+      console.error("  import-expansion-records    Import typed generated expansion records");
+      console.error("  status                      Show the current DSPy pointer");
+      process.exit(1);
+  }
+}
+
 // Parse CLI arguments using util.parseArgs
 function parseCLI() {
   const { values, positionals } = parseArgs({
@@ -3039,6 +3390,24 @@ function parseCLI() {
       "community-level": { type: "string" },
       "python-bin": { type: "string" },
       intent: { type: "string" },
+      trainset: { type: "string" },
+      valset: { type: "string" },
+      dataset: { type: "string" },
+      artifact: { type: "string" },
+      report: { type: "string" },
+      records: { type: "string" },
+      metric: { type: "string" },
+      model: { type: "string" },
+      "reflection-model": { type: "string" },
+      auto: { type: "string" },
+      "max-metric-calls": { type: "string" },
+      limit: { type: "string" },
+      "val-limit": { type: "string" },
+      "max-expansion-items": { type: "string" },
+      emit: { type: "string" },
+      "save-prompt": { type: "string" },
+      reason: { type: "string" },
+      "strict-refuse": { type: "boolean" },
       // Chunking options
       "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
       // MCP HTTP transport options
@@ -3527,6 +3896,7 @@ function showHelp(): void {
   console.log("Primary commands:");
   console.log("  qmd query <query>             - Whole-corpus qmd search with expansion + reranking");
   console.log("  qmd query --graphrag <query>  - Graph-enhanced qmd query for graph-ready sources");
+  console.log("  qmd dspy <command>            - Offline DSPy query expansion policy lifecycle");
   console.log("  qmd query 'lex:..\\nvec:...'   - Structured query document (you provide lex/vec/hyde lines)");
   console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM)");
   console.log("  qmd vsearch <query>           - Vector similarity only");
@@ -3550,6 +3920,13 @@ function showHelp(): void {
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
+  console.log("");
+  console.log("DSPy offline lifecycle:");
+  console.log("  qmd dspy optimize-query-prompt --trainset <jsonl>");
+  console.log("  qmd dspy evaluate-expansion-policy --artifact <path>");
+  console.log("  qmd dspy promote-expansion-policy --artifact <path> --report <path>");
+  console.log("  qmd dspy rollback-expansion-policy");
+  console.log("  qmd dspy disable-expansion-policy");
   console.log("");
   console.log("Query syntax (qmd query):");
   console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
@@ -4214,6 +4591,20 @@ type PackageJson = {
   devDependencies?: Record<string, string>;
 };
 
+function resolveGraphVaultForCli(
+  values: Record<string, unknown>,
+  config: CollectionConfig,
+): string {
+  return pathResolve(
+    getPwd(),
+    String(values["graph-vault"] || config.graphrag?.vault || "graph_vault"),
+  );
+}
+
+function graphVaultPolicyRef(graphVault: string, store: DspyPolicyStore): string {
+  return pathJoin(basename(graphVault), store.pointerRelativePath());
+}
+
 function readPackageJson(): PackageJson {
   const scriptDir = dirname(fileURLToPath(import.meta.url));
   const pkgPath = resolve(scriptDir, "..", "..", "package.json");
@@ -4564,6 +4955,14 @@ if (isMain) {
           chunkStrategy: embedChunkStrategy,
           collection: embedCollection,
         });
+      } catch (error) {
+        exitWithError(error);
+      }
+      break;
+
+    case "dspy":
+      try {
+        await dspyCommand(cli.args, cli.values);
       } catch (error) {
         exitWithError(error);
       }

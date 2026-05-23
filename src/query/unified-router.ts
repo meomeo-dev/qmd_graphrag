@@ -12,6 +12,7 @@ import {
   QmdRetrievalCandidateSchema,
   QmdSearchResultSchema,
 } from "../contracts/qmd-query.js";
+import { DspyQueryExpansionStrictRefusalError } from "../dspy/errors.js";
 import {
   GraphCapabilityErrorSchema,
   QueryRouteDecisionSchema,
@@ -324,6 +325,24 @@ function typedGraphCapabilityResolutionError(input: {
   }));
 }
 
+function typedDspyQueryExpansionError(input: {
+  request: UnifiedQueryRequest;
+  error: DspyQueryExpansionStrictRefusalError;
+}): TypedQueryErrorException {
+  return new TypedQueryErrorException(createTypedQueryError({
+    route: input.request.requestedRoute,
+    stage: "qmd_retrieval",
+    provider: "dspy",
+    capability: "query_expansion",
+    code: input.error.reason,
+    retryable: false,
+    redactedMessage: input.error.message,
+    metadata: {
+      dspyFailureReason: input.error.reason,
+    },
+  }));
+}
+
 async function resolveGraphScopeCapabilitiesForRoute(
   request: UnifiedQueryRequest,
   services: RouteQueryServices,
@@ -422,16 +441,27 @@ export async function routeQuery(
   const graphScopeCandidates = graphScopeCapabilities == null
     ? null
     : graphScopeCandidatesFromCapabilities(graphScopeCapabilities);
-  const qmdResult = graphScopeCandidates == null
-    ? QmdSearchResultSchema.parse(await services.searchQmd(parsedRequest))
-    : QmdSearchResultSchema.parse({
-        schemaVersion: SchemaVersion,
-        query: parsedRequest.query,
-        results: graphScopeCandidates,
-        metadata: {
-          source: "graph_capability_scope",
-        },
-      });
+  let qmdResult: QmdSearchResult;
+  if (graphScopeCandidates == null) {
+    try {
+      qmdResult = QmdSearchResultSchema.parse(await services.searchQmd(parsedRequest));
+    } catch (error) {
+      if (error instanceof TypedQueryErrorException) throw error;
+      if (error instanceof DspyQueryExpansionStrictRefusalError) {
+        throw typedDspyQueryExpansionError({ request: parsedRequest, error });
+      }
+      throw error;
+    }
+  } else {
+    qmdResult = QmdSearchResultSchema.parse({
+      schemaVersion: SchemaVersion,
+      query: parsedRequest.query,
+      results: graphScopeCandidates,
+      metadata: {
+        source: "graph_capability_scope",
+      },
+    });
+  }
   const capabilitiesByCandidateId = graphScopeCandidates != null
     ? capabilitiesByGraphScopeCandidate(
         graphScopeCandidates,

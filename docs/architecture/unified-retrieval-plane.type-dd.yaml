@@ -112,12 +112,43 @@ contract_artifacts:
   dspy:
     path: src/contracts/dspy.ts
     exports:
+      - VaultRelativePathSchema
+      - EnvVarNameSchema
+      - RedactedTextSchema
       - DspyQueryPromptOptimizationRequestSchema
       - DspyOptimizationEnvelopeSchema
       - DspyQueryPromptOptimizationResponseSchema
       - DspyOptimizationResponseEnvelopeSchema
+      - DspyOptimizationRequestSummarySchema
+      - DspyOptimizationResponseSummarySchema
       - DspyGeneratedExpansionRecordSchema
       - DspyGeneratedExpansionRecordEnvelopeSchema
+      - QueryExpansionFailurePolicySchema
+      - QueryExpansionFailureReasonSchema
+      - CorpusSnapshotRefSchema
+      - QmdIndexSnapshotRefSchema
+      - DspyOptimizationRunSchema
+      - DspyOptimizationRunEnvelopeSchema
+      - DspyOptimizationArtifactSchema
+      - DspyOptimizationArtifactEnvelopeSchema
+      - DspyExpansionPolicySchema
+      - DspyExpansionPolicyEnvelopeSchema
+      - DspyPolicyPointerSchema
+      - DspyPolicyPointerEnvelopeSchema
+      - DspyEvaluationDatasetSchema
+      - DspyEvaluationDatasetEnvelopeSchema
+      - DspyEvaluationReportSchema
+      - DspyEvaluationReportEnvelopeSchema
+      - DspyPromotionDecisionSchema
+      - DspyPromotionDecisionEnvelopeSchema
+      - DspyPromotionHistoryEntrySchema
+      - DspyPromotionHistoryEntryEnvelopeSchema
+      - DspyQueryExpansionProgramInputSchema
+      - DspyQueryExpansionProgramInputEnvelopeSchema
+      - DspyQueryExpansionProgramOutputSchema
+      - DspyQueryExpansionProgramOutputEnvelopeSchema
+      - DspyMetricSpecSchema
+      - DspyMetricSpecEnvelopeSchema
   jina:
     path: src/contracts/jina.ts
     exports:
@@ -347,6 +378,7 @@ typed_buses:
         producers:
           - src/llm.ts#LlamaCpp.expandQuery
           - src/integrations/dspy.ts#optimizeQueryPrompt
+          - src/dspy/policy-store.ts#DspyPolicyStore.expandQuery
         consumers:
           - src/store.ts#structuredSearch
           - src/store.ts#hybridQuery
@@ -555,12 +587,18 @@ typed_buses:
       - name: openai_responses_provider_config
         schema: src/contracts/provider.ts#OpenAIResponsesProviderConfigSchema
         envelope: src/contracts/provider.ts#OpenAIResponsesProviderConfigEnvelopeSchema
-        storage: .qmd/index.yml
+        storage: transient_projection_from_.qmd/index.yml
         producers:
-          - .qmd/index.yml#providers.openai
+          - src/cli/qmd.ts#ensureRuntimeConfigForCli
+          - src/graphrag/settings-projection.ts#buildGraphRagRuntimeSettingsProjection
         consumers:
           - src/cli/qmd.ts#ensureRuntimeConfigForCli
           - python/qmd_graphrag/graphrag_responses_completion.py
+        notes:
+          - .qmd/index.yml stores providers.openai plus models.generate;
+            the provider config schema is a typed projection, not the raw YAML
+            subtree.
+          - apiKeyEnv and baseUrlEnv use EnvVarNameSchema.
       - name: openai_responses_request
         schema: src/contracts/provider.ts#OpenAIResponsesRequestSchema
         envelope: src/contracts/provider.ts#OpenAIResponsesRequestEnvelopeSchema
@@ -657,7 +695,6 @@ typed_buses:
         storage: transient
         producers:
           - src/integrations/dspy.ts#optimizeQueryPrompt
-          - src/llm.ts#LlamaCpp.expandQuery
         consumers:
           - src/integrations/dspy.ts#optimizeQueryPrompt
           - python/qmd_graphrag/bridge.py#_run_dspy_optimize_query_prompt
@@ -678,6 +715,114 @@ typed_buses:
           - finetune/experiments/gepa/dspy_gepa.py
         consumers:
           - finetune/experiments/gepa/dspy_gepa.py
+          - src/dspy/policy-store.ts#DspyPolicyStore.evaluateExpansionPolicy
+          - src/dspy/policy-store.ts#DspyPolicyStore.expandQuery
+      - name: dspy_optimization_run
+        schema: src/contracts/dspy.ts#DspyOptimizationRunSchema
+        envelope: src/contracts/dspy.ts#DspyOptimizationRunEnvelopeSchema
+        storage: graph_vault/dspy/runs/<run_id>/run.yaml
+        producers:
+          - src/dspy/policy-store.ts#DspyPolicyStore.writeOptimizationArtifact
+        consumers:
+          - src/cli/qmd.ts#dspyOptimizeQueryPrompt
+      - name: dspy_optimization_artifact
+        schema: src/contracts/dspy.ts#DspyOptimizationArtifactSchema
+        envelope: src/contracts/dspy.ts#DspyOptimizationArtifactEnvelopeSchema
+        storage: graph_vault/dspy/artifacts/<artifact_id>.yaml
+        producers:
+          - src/dspy/policy-store.ts#DspyPolicyStore.writeOptimizationArtifact
+        consumers:
+          - src/dspy/policy-store.ts#DspyPolicyStore.evaluateExpansionPolicy
+          - src/dspy/policy-store.ts#DspyPolicyStore.promoteExpansionPolicy
+          - src/dspy/policy-store.ts#DspyPolicyStore.loadRuntimePolicy
+      - name: dspy_expansion_policy
+        schema: src/contracts/dspy.ts#DspyExpansionPolicySchema
+        envelope: src/contracts/dspy.ts#DspyExpansionPolicyEnvelopeSchema
+        storage: transient
+        producers:
+          - src/dspy/policy-store.ts#DspyPolicyStore.loadRuntimePolicy
+        consumers:
+          - src/dspy/policy-store.ts#DspyPolicyStore.expandQuery
+          - src/store.ts#expandQuery
+      - name: dspy_policy_pointer
+        schema: src/contracts/dspy.ts#DspyPolicyPointerSchema
+        envelope: src/contracts/dspy.ts#DspyPolicyPointerEnvelopeSchema
+        storage: graph_vault/dspy/policies/query-expansion/current.yaml
+        producers:
+          - src/dspy/policy-store.ts#DspyPolicyStore.promoteExpansionPolicy
+          - src/dspy/policy-store.ts#DspyPolicyStore.rollbackExpansionPolicy
+          - src/dspy/policy-store.ts#DspyPolicyStore.disableExpansionPolicy
+        consumers:
+          - src/dspy/policy-store.ts#DspyPolicyStore.loadRuntimePolicy
+          - src/store.ts#expandQuery
+      - name: dspy_evaluation_report
+        schema: src/contracts/dspy.ts#DspyEvaluationReportSchema
+        envelope: src/contracts/dspy.ts#DspyEvaluationReportEnvelopeSchema
+        storage: graph_vault/dspy/reports/<report_id>.yaml
+        producers:
+          - src/dspy/policy-store.ts#DspyPolicyStore.evaluateExpansionPolicy
+        consumers:
+          - src/dspy/policy-store.ts#DspyPolicyStore.promoteExpansionPolicy
+      - name: dspy_promotion_decision
+        schema: src/contracts/dspy.ts#DspyPromotionDecisionSchema
+        envelope: src/contracts/dspy.ts#DspyPromotionDecisionEnvelopeSchema
+        storage: graph_vault/dspy/promotions/<decision_id>.yaml
+        producers:
+          - src/dspy/policy-store.ts#DspyPolicyStore.promoteExpansionPolicy
+        consumers:
+          - src/dspy/policy-store.ts#DspyPolicyStore.loadRuntimePolicy
+          - src/dspy/policy-store.ts#DspyPolicyStore.rollbackExpansionPolicy
+      - name: dspy_promotion_history_entry
+        schema: src/contracts/dspy.ts#DspyPromotionHistoryEntrySchema
+        envelope: src/contracts/dspy.ts#DspyPromotionHistoryEntryEnvelopeSchema
+        storage: graph_vault/dspy/history/<history_entry_id>.yaml
+        producers:
+          - src/dspy/policy-store.ts#DspyPolicyStore.promoteExpansionPolicy
+          - src/dspy/policy-store.ts#DspyPolicyStore.rollbackExpansionPolicy
+          - src/dspy/policy-store.ts#DspyPolicyStore.disableExpansionPolicy
+        consumers:
+          - src/dspy/policy-store.ts#DspyPolicyStore.rollbackExpansionPolicy
+          - src/dspy/policy-store.ts#DspyPolicyStore.disableExpansionPolicy
+          - audit tooling
+      - name: dspy_query_expansion_program_input
+        schema: src/contracts/dspy.ts#DspyQueryExpansionProgramInputSchema
+        envelope: src/contracts/dspy.ts#DspyQueryExpansionProgramInputEnvelopeSchema
+        storage: transient
+        producers:
+          - src/store.ts#expandQuery
+        consumers:
+          - src/dspy/policy-store.ts#DspyPolicyStore.expandQuery
+      - name: dspy_query_expansion_program_output
+        schema: src/contracts/dspy.ts#DspyQueryExpansionProgramOutputSchema
+        envelope: src/contracts/dspy.ts#DspyQueryExpansionProgramOutputEnvelopeSchema
+        storage: transient
+        producers:
+          - src/dspy/policy-store.ts#DspyPolicyStore.expandQuery
+        consumers:
+          - src/store.ts#expandQuery
+      - name: dspy_metric_spec
+        schema: src/contracts/dspy.ts#DspyMetricSpecSchema
+        envelope: src/contracts/dspy.ts#DspyMetricSpecEnvelopeSchema
+        storage: planned_registry
+        producers:
+          - planned metric registry
+        consumers:
+          - planned optimize/evaluate services
+        notes:
+          - current evaluate path accepts metricVersion as a typed scalar and
+            does not load metric spec files.
+      - name: dspy_evaluation_dataset
+        schema: src/contracts/dspy.ts#DspyEvaluationDatasetSchema
+        envelope: src/contracts/dspy.ts#DspyEvaluationDatasetEnvelopeSchema
+        storage: planned_registry
+        producers:
+          - planned dataset builder
+        consumers:
+          - planned optimize/evaluate services
+        notes:
+          - current CLI optimize accepts trainset/valset/testset paths and
+            records hashes in run/artifact summaries; it does not load dataset
+            registry files.
 
   book_processing_state_bus:
     role: Typed persistence bus for per-book state, checkpoints, artifacts, and cost lineage.

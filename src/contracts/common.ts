@@ -30,8 +30,17 @@ export const QueryExpansionItemSchema = z.object({
   text: z.string().min(1),
 });
 
+export const EnvVarNameSchema = z.string().regex(
+  /^[A-Z_][A-Z0-9_]*$/,
+  "environment variable names must be uppercase shell identifiers",
+);
+
+export const RedactedTextSchema = z.string().max(4000);
+
 export type QueryKind = z.infer<typeof QueryKindSchema>;
 export type QueryExpansionItem = z.infer<typeof QueryExpansionItemSchema>;
+export type EnvVarName = z.infer<typeof EnvVarNameSchema>;
+export type RedactedText = z.infer<typeof RedactedTextSchema>;
 
 export const BridgeEnvironmentSchema = z.object({
   pythonBin: z.string().min(1).optional(),

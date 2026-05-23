@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import {
+  EnvVarNameSchema,
   JsonValueSchema,
   SchemaVersion,
   buildEnvelopeSchema,
@@ -8,8 +9,8 @@ import {
 } from "./common.js";
 
 export const OpenAIResponsesProviderConfigSchema = z.object({
-  apiKeyEnv: z.string().min(1),
-  baseUrlEnv: z.string().min(1),
+  apiKeyEnv: EnvVarNameSchema,
+  baseUrlEnv: EnvVarNameSchema,
   endpoint: z.literal("/responses"),
   stream: z.literal(true),
   model: z.string().min(1),

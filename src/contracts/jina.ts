@@ -1,10 +1,10 @@
 import { z } from "zod";
 
-import { buildEnvelopeSchema } from "./common.js";
+import { EnvVarNameSchema, buildEnvelopeSchema } from "./common.js";
 
 export const JinaProviderConfigSchema = z.object({
-  apiKeyEnv: z.string().min(1),
-  baseUrlEnv: z.string().min(1),
+  apiKeyEnv: EnvVarNameSchema,
+  baseUrlEnv: EnvVarNameSchema,
   baseUrl: z.string().min(1),
   embeddingEndpoint: z.string().startsWith("/"),
   rerankEndpoint: z.string().startsWith("/"),

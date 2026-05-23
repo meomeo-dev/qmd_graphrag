@@ -17,9 +17,10 @@ qmd eval dataset
   -> qmd query consumes promoted expansion policy
 ```
 
-当前仓库已有 DSPy contract、runtime bridge 和 GEPA 脚本，但还没有用户可调用的
-`qmd` 子命令，也没有让线上 `qmd query` 自动消费优化产物。当前状态应视为
-“typed offline bridge 已存在，产品化闭环未完成”。
+当前仓库已有 DSPy contract、runtime bridge、GEPA 脚本、`qmd dspy` 生命周期
+命令组，以及线上 `qmd query` 对 promoted query expansion policy 的消费路径。
+当前实现以 typed offline bridge、typed policy store、active pointer 和 fallback /
+strict failure policy 构成最小产品化闭环。
 
 ## 证据基线
 
@@ -30,8 +31,8 @@ qmd eval dataset
 - DSPy 的 Signature 是软接口，不等于生产级 schema enforcement；线上仍必须
   使用 Type DD schema、validator、retry 和 dead-letter 机制。
 - qmd_graphrag 本地已有 `DspyQueryPromptOptimizationRequestSchema`、
-  `optimizeQueryPrompt()`、Python bridge 和 `dspy_gepa.py`，但 CLI 与线上 query
-  消费路径缺失。
+  `optimizeQueryPrompt()`、Python bridge、`dspy_gepa.py`、`qmd dspy` 生命周期
+  命令组和线上 query policy loader。所有实现路径必须通过这些 typed boundary。
 
 ## 集成边界
 
@@ -77,12 +78,10 @@ user query
 incompatible 统一归类为 `artifact_invalid`，并按 fail-closed 处理。
 `artifact_invalid` 只适用于 `provider=dspy` 且 active promoted pointer 已启用的场景。
 
-## 推荐 Type DD 扩展
+## Type DD 契约
 
-本节列出的 schema 均为拟议 schema（proposed schema），不是当前已实现代码。
-实现时必须以这些名称或等价迁移记录更新 Type DD 与 catalog。
-
-应新增或补强以下拟议 schema，而不是把 DSPy 输出作为裸文件路径传递：
+以下 schema 构成 DSPy 集成的数据总线契约。DSPy 输出不得作为裸文件路径或
+未校验对象跨越边界：
 
 - `DspyOptimizationRunSchema`
 - `DspyOptimizationArtifactSchema`
@@ -198,6 +197,7 @@ textual feedback、reflection trace、candidate lineage 只属于离线
 | `decision_missing` | `fallback_to_builtin_expander` | `strict_refuse` |
 | `policy_unavailable` | `fallback_to_builtin_expander` | `strict_refuse` |
 | `artifact_missing` | `fallback_to_builtin_expander` | `strict_refuse` |
+| `generated_expansion_missing` | `fallback_to_builtin_expander` | `strict_refuse` |
 | `artifact_stale` | `fallback_to_builtin_expander` | `strict_refuse` |
 | `runtime_output_schema_invalid` | `fallback_to_builtin_expander` | `strict_refuse` |
 | `runtime_error` | `fallback_to_builtin_expander` | `strict_refuse` |
@@ -205,8 +205,10 @@ textual feedback、reflection trace、candidate lineage 只属于离线
 默认值为 `fallback_to_builtin_expander`。`strict_refuse` 返回 typed query error。
 `strict_schema: true` 只表示必须执行 schema validation；失败后的行为由
 `QueryExpansionFailurePolicySchema` 决定。
-`artifact_missing` 仅表示缺少可用 promoted artifact，不包含已存在但不可验证的
-artifact；后者属于 `artifact_invalid`。
+`artifact_missing` 仅表示缺少可用 promoted artifact，不包含 generated expansion
+runtime projection。`generated_expansion_missing` 表示 promoted artifact 已存在，
+但 online query 必需的 generated expansion 文件或路径缺失。已存在但不可验证的
+artifact 属于 `artifact_invalid`。
 
 stale 判定规则：
 
@@ -269,7 +271,7 @@ missing-state projection。完整 lineage 审计通过
 
 ## CLI 设计
 
-建议新增 `qmd dspy` 命令组。
+`qmd dspy` 命令组承载离线策略生命周期。
 
 ```text
 qmd dspy optimize-query-prompt
@@ -449,6 +451,8 @@ Compiled artifact loading:
   runtime artifact.
 - missing compiled program, hash mismatch, schema mismatch, or incompatible
   DSPy program version yields `artifact_invalid`.
+- missing generated expansion runtime projection yields
+  `generated_expansion_missing` and follows `QueryExpansionFailurePolicySchema`.
 - `artifact_invalid` is a non-configurable fail-closed class. It returns typed
   `strict_refuse` / `no_load` / `no_promote` and never falls back to builtin
   expansion, because fallback would hide corrupted or incompatible promoted
@@ -472,20 +476,23 @@ Compiled artifact loading:
 - `testsetUsedAt` is recorded in the evaluation report or promotion decision
   after final acceptance.
 
-## 实施顺序
+## 实现基线
 
-1. 增加 proposed schema、vault-relative storage 和 catalog entries。
-2. 增加 typed services for optimize/evaluate/promote/rollback/disable，包括
+当前实现基线：
+
+1. Type DD schema、vault-relative storage 和 catalog entries 是 DSPy 生命周期的
+   契约入口。
+2. typed services 覆盖 optimize/evaluate/promote/rollback/disable，包括
    evaluation report、promotion gate、history、active policy pointer 和 recovery
    service 边界。
-3. 增加 pointer bootstrap/migration 和 drift detection。drift detection 是 online
-   loader 的安全前置条件，必须在任何线上消费 promoted policy 前完成。
-4. 增加 online DSPy policy loader，保留现有 `LlamaCpp.expandQuery()` 作为 fallback。
-5. 修改线上 expansion path，使 `qmd query` 只通过 runtime loader 消费 promoted
-   DSPy policy。
-6. 补 `qmd dspy optimize-query-prompt`、`evaluate-expansion-policy`、
-   `promote-expansion-policy`、`rollback-expansion-policy` 和
-   `disable-expansion-policy` 子命令。
+3. pointer bootstrap/migration 和 drift detection 是 online loader 的安全前置条件，
+   任何线上消费 promoted policy 前必须完成 fingerprint 校验。
+4. online DSPy policy loader 保留 `LlamaCpp.expandQuery()` 作为 fallback。
+5. `qmd query` 只通过 runtime loader 消费 promoted DSPy policy。
+6. `qmd dspy optimize-query-prompt`、`evaluate-expansion-policy`、
+   `promote-expansion-policy`、`rollback-expansion-policy`、
+   `disable-expansion-policy`、`import-expansion-records` 和 `status` 构成 CLI
+   生命周期闭环。
 
 Pointer bootstrap / migration:
 
@@ -591,6 +598,10 @@ release lock
 | drive-letter path in persisted field | VaultRelativePathSchema rejects it |
 | home path in persisted field | VaultRelativePathSchema rejects it |
 | parent escape path in persisted field | VaultRelativePathSchema rejects it |
+| missing generated expansion file | generated_expansion_missing follows failure policy |
+| artifact without generated expansion path | generated_expansion_missing follows failure policy |
+| malformed generated expansion JSON | runtime_error follows failure policy |
+| schema-invalid generated expansion record | runtime_output_schema_invalid follows failure policy |
 | stale provider fingerprint | fallback or strict error according to policy |
 | stale model fingerprint | fallback or strict error according to policy |
 | stale retrieval config fingerprint | fallback or strict error according to policy |
@@ -604,6 +615,7 @@ release lock
 | promote pointer/history mismatch | recovery entry appended and pointer reconciled |
 | rollback pointer/history mismatch | recovery entry appended and pointer reconciled |
 | disable repeated twice | idempotent disabled state and single effective pointer state |
+| rollback from disabled pointer | restores only that disabled pointer's immediate DSPy predecessor |
 | failed promote after decision write | recovery completes pointer update or records typed error |
 
 ## 安全约束
@@ -622,14 +634,14 @@ release lock
 
 Online runtime boundary:
 
-- online DSPy expansion must be exposed through `createQmdGraphRagRuntime()` and
-  `src/integrations/dspy.ts`.
+- online DSPy expansion is exposed through `src/store.ts#expandQuery` and
+  `src/dspy/policy-store.ts#DspyPolicyStore.expandQuery`.
 - qmd query code must not call Python directly.
 - qmd query code must not read prompt text and execute it directly.
 - all online DSPy output must pass through `DspyQueryExpansionProgramOutputSchema`
   and then project to `QueryExpansionItemSchema[]`.
 
-Implementation task table:
+Implementation baseline table:
 
 | task | artifact | DoD |
 | --- | --- | --- |
