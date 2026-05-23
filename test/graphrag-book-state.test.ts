@@ -34,7 +34,7 @@ describe("syncGraphRagBookWorkspace", () => {
   const projectConfig: CollectionConfig = {
     collections: {},
     models: {
-      embed: "jina:jina-embeddings-v3",
+      embed: "jina:jina-embeddings-v5-text-small",
       rerank: "jina:jina-reranker-v3",
       generate: "openai:gpt-5.4",
     },
@@ -55,8 +55,15 @@ describe("syncGraphRagBookWorkspace", () => {
         base_url: "https://api.jina.ai",
         embedding_endpoint: "/v1/embeddings",
         rerank_endpoint: "/v1/rerank",
-        embedding_model: "jina-embeddings-v3",
+        embedding_profile: "text",
+        embedding_model: "jina-embeddings-v5-text-small",
         rerank_model: "jina-reranker-v3",
+        embedding_query_task: "retrieval.query",
+        embedding_document_task: "retrieval.passage",
+        embedding_dimensions: 1024,
+        embedding_normalized: true,
+        embedding_type: "float",
+        embedding_truncate: true,
       },
     },
     graphrag: {
@@ -143,6 +150,35 @@ describe("syncGraphRagBookWorkspace", () => {
     const embedding = (projection.settings.embedding_models as any)
       .default_embedding_model;
     expect(embedding.api_base).toBe("https://api.jina.ai/v1");
+    expect(embedding.model).toBe("jina-embeddings-v5-text-small");
+    expect(embedding.call_args.task).toBe("retrieval.passage");
+    expect(embedding.call_args.normalized).toBe(true);
+    expect(embedding.call_args.embedding_type).toBe("float");
+  });
+
+  test("projects multimodal Jina profile as the authoritative embedding model", () => {
+    const projection = buildGraphRagRuntimeSettingsProjection({
+      ...projectConfig,
+      models: {
+        ...projectConfig.models,
+        embed: "jina:jina-embeddings-v5-text-small",
+        rerank: "jina:jina-reranker-v3",
+      },
+      providers: {
+        ...projectConfig.providers,
+        jina: {
+          ...projectConfig.providers?.jina,
+          embedding_profile: "multimodal",
+        },
+      },
+    });
+
+    const embedding = (projection.settings.embedding_models as any)
+      .default_embedding_model;
+    expect(embedding.model).toBe("jina-embeddings-v5-omni-small");
+    expect((projection.settings.qmd_graphrag as any).jina.embedding_profile)
+      .toBe("multimodal");
+    expect((projection.settings.vector_store as any).vector_size).toBe(1024);
   });
 
   test("includes provider request boundary in high-cost recovery fingerprints", async () => {
@@ -296,7 +332,7 @@ describe("syncGraphRagBookWorkspace", () => {
           "embedding_models:",
           "  default_embedding_model:",
           "    type: litellm",
-          "    model: jina-embeddings-v3",
+          "    model: jina-embeddings-v5-text-small",
           "concurrent_requests: 1",
           "vector_store:",
           "  type: lancedb",

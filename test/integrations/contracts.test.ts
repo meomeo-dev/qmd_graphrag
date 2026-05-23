@@ -42,6 +42,7 @@ import {
   ProviderRequestFingerprintSchema,
 } from "../../src/contracts/provider.js";
 import {
+  ContentVectorEmbeddingRecordSchema,
   QmdQueryRequestSchema,
   QmdRetrievalCandidateSchema,
   QmdSearchResultSchema,
@@ -479,6 +480,15 @@ describe("Jina contracts", () => {
       baseUrl: "https://api.jina.ai",
       embeddingEndpoint: "/v1/embeddings",
       rerankEndpoint: "/v1/rerank",
+      embeddingProfile: "text",
+      embeddingModel: "jina-embeddings-v5-text-small",
+      rerankModel: "jina-reranker-v3",
+      embeddingQueryTask: "retrieval.query",
+      embeddingDocumentTask: "retrieval.passage",
+      embeddingDimensions: 1024,
+      embeddingNormalized: true,
+      embeddingType: "float",
+      embeddingTruncate: true,
     });
 
     expect(parsed.apiKeyEnv).toBe("JINA_API_KEY");
@@ -495,17 +505,73 @@ describe("Jina contracts", () => {
 
   test("accepts an embedding request", () => {
     const parsed = JinaEmbeddingRequestSchema.parse({
-      model: "jina-embeddings-v3",
+      model: "jina-embeddings-v5-text-small",
       input: ["query one", "query two"],
       task: "retrieval.query",
+      dimensions: 1024,
+      normalized: true,
+      embedding_type: "float",
+      truncate: true,
     });
 
-    expect(parsed.model).toBe("jina-embeddings-v3");
+    expect(parsed.model).toBe("jina-embeddings-v5-text-small");
+    expect(() =>
+      JinaEmbeddingRequestSchema.parse({
+        model: "jina-embeddings-v5-text-small",
+        input: ["query one"],
+      }),
+    ).toThrow();
+    expect(() =>
+      JinaEmbeddingRequestSchema.parse({
+        model: "jina-embeddings-v5-text-small",
+        input: ["query one"],
+        task: "retrieval",
+      }),
+    ).toThrow();
+  });
+
+  test("accepts a multimodal Jina provider profile contract", () => {
+    const parsed = JinaProviderConfigSchema.parse({
+      apiKeyEnv: "JINA_API_KEY",
+      baseUrlEnv: "JINA_API_BASE",
+      baseUrl: "https://api.jina.ai",
+      embeddingEndpoint: "/v1/embeddings",
+      rerankEndpoint: "/v1/rerank",
+      embeddingProfile: "multimodal",
+      embeddingModel: "jina-embeddings-v5-omni-small",
+      rerankModel: "jina-reranker-m0",
+      embeddingQueryTask: "retrieval.query",
+      embeddingDocumentTask: "retrieval.passage",
+      embeddingDimensions: 1024,
+      embeddingNormalized: true,
+      embeddingType: "float",
+      embeddingTruncate: true,
+    });
+
+    expect(parsed.embeddingProfile).toBe("multimodal");
+    expect(parsed.rerankModel).toBe("jina-reranker-m0");
+
+    const multimodalEmbedding = JinaEmbeddingRequestSchema.parse({
+      model: "jina-embeddings-v5-omni-small",
+      input: [{ text: "caption" }, { image: "https://example.test/image.png" }],
+      task: "retrieval.passage",
+      dimensions: 1024,
+      normalized: true,
+      embedding_type: "float",
+      truncate: true,
+    });
+    const multimodalRerank = JinaRerankRequestSchema.parse({
+      model: "jina-reranker-m0",
+      query: "architecture diagram",
+      documents: [{ text: "module summary" }, { image: "https://example.test/a.png" }],
+    });
+    expect(Array.isArray(multimodalEmbedding.input)).toBe(true);
+    expect(multimodalRerank.documents).toHaveLength(2);
   });
 
   test("accepts an embedding response", () => {
     const parsed = JinaEmbeddingResponseSchema.parse({
-      model: "jina-embeddings-v3",
+      model: "jina-embeddings-v5-text-small",
       data: [{
         index: 0,
         embedding: [0.1, 0.2, 0.3],
@@ -544,6 +610,51 @@ describe("Jina contracts", () => {
     });
 
     expect(parsed.results[0]?.index).toBe(1);
+  });
+});
+
+describe("QMD vector storage contracts", () => {
+  test("accepts a typed content vector embedding record", () => {
+    const parsed = ContentVectorEmbeddingRecordSchema.parse({
+      contentHash: "sha256:content",
+      chunkSeq: 0,
+      chunkPos: 12,
+      model: "jina:jina-embeddings-v5-text-small",
+      embedFingerprint: "abc123",
+      totalChunks: 3,
+      embeddedAt: "2026-05-23T00:00:00.000Z",
+    });
+
+    expect(parsed.model).toBe("jina:jina-embeddings-v5-text-small");
+    expect(() =>
+      ContentVectorEmbeddingRecordSchema.parse({
+        contentHash: "sha256:content",
+        chunkSeq: 0,
+        chunkPos: 12,
+        model: "jina:jina-embeddings-v5-text-small",
+        embedFingerprint: "",
+        totalChunks: 3,
+        embeddedAt: "2026-05-23T00:00:00.000Z",
+      }),
+    ).toThrow();
+  });
+
+  test("accepts content vector embedding record on the data bus", () => {
+    const parsed = DataBusEnvelopeSchema.parse({
+      schemaVersion: SchemaVersion,
+      kind: "qmd.content_vector.embedding_record",
+      payload: {
+        contentHash: "sha256:content",
+        chunkSeq: 1,
+        chunkPos: 128,
+        model: "jina:jina-embeddings-v5-text-small",
+        embedFingerprint: "abc123",
+        totalChunks: 4,
+        embeddedAt: "2026-05-23T00:00:00.000Z",
+      },
+    });
+
+    expect(parsed.kind).toBe("qmd.content_vector.embedding_record");
   });
 });
 
@@ -972,7 +1083,7 @@ describe("Provider contracts", () => {
       contentHash: "sha256:content",
       stage: "embed",
       provider: "jina",
-      model: "jina-embeddings-v3",
+      model: "jina-embeddings-v5-text-small",
       requestCount: 1,
       tokenCount: 0,
       tokenCountStatus: "unknown",
@@ -1293,8 +1404,13 @@ describe("Data bus contracts", () => {
       schemaVersion: SchemaVersion,
       kind: "provider.jina.embedding_request",
       payload: {
-        model: "jina-embeddings-v3",
+        model: "jina-embeddings-v5-text-small",
         input: ["typed data bus"],
+        task: "retrieval.passage",
+        dimensions: 1024,
+        normalized: true,
+        embedding_type: "float",
+        truncate: true,
       },
     });
 
@@ -1306,7 +1422,7 @@ describe("Data bus contracts", () => {
       schemaVersion: SchemaVersion,
       kind: "provider.jina.embedding_response",
       payload: {
-        model: "jina-embeddings-v3",
+        model: "jina-embeddings-v5-text-small",
         data: [{
           index: 0,
           embedding: [0.1, 0.2],
@@ -1349,7 +1465,7 @@ describe("Data bus contracts", () => {
         kind: "provider_request_fingerprint",
         provider: "jina",
         stage: "embed",
-        model: "jina-embeddings-v3",
+        model: "jina-embeddings-v5-text-small",
         requestFingerprint: "sha256:request",
         createdAt: "2026-05-21T00:00:00.000Z",
       },

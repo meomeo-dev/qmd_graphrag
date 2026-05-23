@@ -13,10 +13,21 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
-import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qmd.ts";
+import {
+  buildEditorUri,
+  termLink,
+  resolveEmbedModelForCli,
+  resolveRerankModelForCli,
+} from "../src/cli/qmd.ts";
 import { openDatabase } from "../src/db.ts";
 import { SchemaVersion } from "../src/contracts/common.ts";
-import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.ts";
+import {
+  DEFAULT_EMBED_MODEL_URI,
+  DEFAULT_GENERATE_MODEL_URI,
+  DEFAULT_RERANK_MODEL_URI,
+  JINA_MULTIMODAL_EMBEDDING_MODEL,
+  JINA_MULTIMODAL_RERANK_MODEL,
+} from "../src/llm.ts";
 import { setConfigSource } from "../src/collections.ts";
 
 // Test fixtures directory and database path
@@ -366,6 +377,38 @@ describe("CLI Embed", () => {
     }
   });
 
+  test("Jina embedding profile drives active embed and rerank model selection", () => {
+    const prevEmbed = process.env.QMD_EMBED_MODEL;
+    const prevRerank = process.env.QMD_RERANK_MODEL;
+    delete process.env.QMD_EMBED_MODEL;
+    delete process.env.QMD_RERANK_MODEL;
+    setConfigSource({
+      config: {
+        collections: {},
+        models: {
+          embed: "jina:jina-embeddings-v5-text-small",
+          rerank: "jina:jina-reranker-v3",
+        },
+        providers: {
+          jina: {
+            embedding_profile: "multimodal",
+          },
+        },
+      },
+    });
+
+    try {
+      expect(resolveEmbedModelForCli()).toBe(`jina:${JINA_MULTIMODAL_EMBEDDING_MODEL}`);
+      expect(resolveRerankModelForCli()).toBe(`jina:${JINA_MULTIMODAL_RERANK_MODEL}`);
+    } finally {
+      setConfigSource();
+      if (prevEmbed === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = prevEmbed;
+      if (prevRerank === undefined) delete process.env.QMD_RERANK_MODEL;
+      else process.env.QMD_RERANK_MODEL = prevRerank;
+    }
+  });
+
   test("rejects invalid --max-docs-per-batch", async () => {
     const { stderr, exitCode } = await runQmd(["embed", "--max-docs-per-batch", "0"]);
     expect(exitCode).toBe(1);
@@ -593,13 +636,14 @@ describe("CLI Status Command", () => {
 
   test("qmd doctor warns when configured models differ from code defaults", async () => {
     const env = await createIsolatedTestEnv("doctor-custom-models");
-    await writeFile(join(env.configDir, "index.yml"), `collections: {}\nmodels:\n  embed: hf:example/custom-embed/custom.gguf\n  generate: ${DEFAULT_GENERATE_MODEL_URI}\n  rerank: ${DEFAULT_RERANK_MODEL_URI}\n`);
+    await writeFile(join(env.configDir, "index.yml"), `collections: {}\nmodels:\n  embed: hf:example/custom-embed/custom.gguf\n  generate: ${DEFAULT_GENERATE_MODEL_URI}\n  rerank: hf:example/custom-rerank/custom.gguf\n`);
 
     const { stdout, exitCode } = await runQmd(["doctor"], { dbPath: env.dbPath, configDir: env.configDir });
     expect(exitCode).toBe(0);
     expect(stdout).toContain("model defaults");
     expect(stdout).toContain("non-default model configuration");
     expect(stdout).toContain("index hf:example/custom-embed/custom.gguf");
+    expect(stdout).toContain("index hf:example/custom-rerank/custom.gguf");
     expect(stdout).toContain("might be ok");
     expect(stdout).toContain("qmd pull");
   }, 20000);

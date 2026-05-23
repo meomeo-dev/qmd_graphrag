@@ -15,7 +15,13 @@ import {
   LlamaCpp,
   getDefaultLlamaCpp,
   disposeDefaultLlamaCpp,
+  setDefaultLlamaCpp,
   DEFAULT_RERANK_MODEL_URI,
+  DEFAULT_EMBED_MODEL_URI,
+  JINA_TEXT_EMBEDDING_MODEL,
+  JINA_MULTIMODAL_EMBEDDING_MODEL,
+  LOCAL_QUERY_EXPANSION_MODEL,
+  resolveJinaProviderConfig,
   resolveLlamaGpuMode,
   setNodeLlamaCppModuleForTest,
   withNativeStdoutRedirectedToStderr,
@@ -32,6 +38,9 @@ import {
   type RerankDocument,
   type ILLMSession,
 } from "../src/llm.js";
+
+const LOCAL_TEST_EMBED_MODEL =
+  "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 
 describe("model name resolution", () => {
   function withModelEnv(env: Record<string, string | undefined>, fn: () => void): void {
@@ -149,13 +158,13 @@ describe("LlamaCpp.modelExists", () => {
 describe("pullModels", () => {
   test("treats API-backed models as remote services without GGUF downloads", async () => {
     const results = await pullModels([
-      "jina:jina-embeddings-v3",
+      DEFAULT_EMBED_MODEL_URI,
       "openai:gpt-5.4",
     ]);
 
     expect(results).toEqual([
       {
-        model: "jina:jina-embeddings-v3",
+        model: DEFAULT_EMBED_MODEL_URI,
         path: "jina-api",
         sizeBytes: 0,
         refreshed: false,
@@ -360,7 +369,9 @@ describe("native llama stdout containment", () => {
     });
 
     const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-    const llm = new LlamaCpp();
+    const llm = new LlamaCpp({
+      embedModel: LOCAL_TEST_EMBED_MODEL,
+    });
     try {
       const result = await llm.embed("hello world");
       expect(result).toEqual({
@@ -483,9 +494,9 @@ describe("LlamaCpp expand context size config", () => {
 });
 
 describe("LlamaCpp model resolution (config > env > default)", () => {
-  const HARDCODED_EMBED = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+  const HARDCODED_EMBED = `jina:${JINA_TEXT_EMBEDDING_MODEL}`;
   const HARDCODED_RERANK = "jina:jina-reranker-v3";
-  const HARDCODED_GENERATE = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
+  const HARDCODED_GENERATE = "openai:gpt-5.4";
 
   test("uses hardcoded default when no config or env is set", () => {
     const prev = process.env.QMD_EMBED_MODEL;
@@ -528,7 +539,9 @@ describe("LlamaCpp model resolution (config > env > default)", () => {
 
 describe("LlamaCpp embedding truncation", () => {
   test("truncates against the active embedding context limit, not the model train context", async () => {
-    const llm = new LlamaCpp({}) as any;
+    const llm = new LlamaCpp({
+      embedModel: LOCAL_TEST_EMBED_MODEL,
+    }) as any;
     const getEmbeddingFor = vi.fn(async (text: string) => ({
       vector: new Float32Array([0.25, 0.5]),
       text,
@@ -689,11 +702,16 @@ describe("LlamaCpp Jina rerank", () => {
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const request = JSON.parse(String(init?.body));
       expect(request).toEqual({
-        model: "jina-embeddings-v3",
+        model: JINA_TEXT_EMBEDDING_MODEL,
         input: ["alpha", "beta"],
+        task: "retrieval.passage",
+        dimensions: 1024,
+        normalized: true,
+        embedding_type: "float",
+        truncate: true,
       });
       return new Response(JSON.stringify({
-        model: "jina-embeddings-v3",
+        model: JINA_TEXT_EMBEDDING_MODEL,
         data: [
           { index: 0, embedding: [0.1, 0.2] },
           { index: 1, embedding: [0.3, 0.4] },
@@ -706,7 +724,7 @@ describe("LlamaCpp Jina rerank", () => {
     globalThis.fetch = fetchMock as typeof fetch;
 
     try {
-      const llm = new LlamaCpp({ embedModel: "jina:jina-embeddings-v3" }) as any;
+      const llm = new LlamaCpp({ embedModel: DEFAULT_EMBED_MODEL_URI }) as any;
       llm._ciMode = false;
       const result = await llm.embedBatch(["alpha", "beta"], {
         costLineage: {
@@ -728,8 +746,8 @@ describe("LlamaCpp Jina rerank", () => {
         }),
       );
       expect(result).toEqual([
-        { embedding: [0.1, 0.2], model: "jina:jina-embeddings-v3" },
-        { embedding: [0.3, 0.4], model: "jina:jina-embeddings-v3" },
+        { embedding: [0.1, 0.2], model: DEFAULT_EMBED_MODEL_URI },
+        { embedding: [0.3, 0.4], model: DEFAULT_EMBED_MODEL_URI },
       ]);
       const ledger = await readFile(
         join(graphVault, "catalog", "cost-accounting.jsonl"),
@@ -750,6 +768,7 @@ describe("LlamaCpp Jina rerank", () => {
         lineageMode: string;
         requestArtifactId: string;
         artifactIds: string[];
+        metadata?: Record<string, unknown>;
       };
       expect(record.sourceId).toBe("source-1");
       expect(record.documentId).toBe("doc-1");
@@ -758,6 +777,8 @@ describe("LlamaCpp Jina rerank", () => {
       expect(record.lineageMode).toBe("corpus_artifact");
       expect(record.requestArtifactId).toBe(record.artifactIds[0]);
       expect(record.artifactIds).toContain("business-artifact-1");
+      expect(JSON.stringify(record.metadata ?? {})).not.toContain("redaction-sentinel");
+      expect(JSON.stringify(record.metadata ?? {})).not.toContain("AUTH_SECRET");
       const providerRequest = await readFile(
         join(
           graphVault,
@@ -769,6 +790,7 @@ describe("LlamaCpp Jina rerank", () => {
       );
       expect(providerRequest).toContain("\"kind\": \"provider_request_fingerprint\"");
       expect(providerRequest).not.toContain("redaction-sentinel");
+      expect(providerRequest).not.toContain("AUTH_SECRET");
     } finally {
       globalThis.fetch = previousFetch;
       await rm(graphVault, { recursive: true, force: true });
@@ -777,6 +799,58 @@ describe("LlamaCpp Jina rerank", () => {
       if (previousGraphVault === undefined) delete process.env.QMD_GRAPH_VAULT;
       else process.env.QMD_GRAPH_VAULT = previousGraphVault;
     }
+  });
+
+  test("uses Jina query task for query embeddings", async () => {
+    const previousApiKey = process.env.JINA_API_KEY;
+    const previousFetch = globalThis.fetch;
+    process.env.JINA_API_KEY = "redaction-sentinel";
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body));
+      expect(request).toEqual({
+        model: JINA_TEXT_EMBEDDING_MODEL,
+        input: ["software design"],
+        task: "retrieval.query",
+        dimensions: 1024,
+        normalized: true,
+        embedding_type: "float",
+        truncate: true,
+      });
+      return new Response(JSON.stringify({
+        model: JINA_TEXT_EMBEDDING_MODEL,
+        data: [{ index: 0, embedding: [0.1, 0.2] }],
+      }));
+    });
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    try {
+      const llm = new LlamaCpp({ embedModel: DEFAULT_EMBED_MODEL_URI }) as any;
+      llm._ciMode = false;
+      await llm.embedBatch(["software design"], {
+        model: DEFAULT_EMBED_MODEL_URI,
+        isQuery: true,
+      });
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousApiKey === undefined) delete process.env.JINA_API_KEY;
+      else process.env.JINA_API_KEY = previousApiKey;
+    }
+  });
+
+  test("derives provider models from the active Jina profile", () => {
+    const provider = resolveJinaProviderConfig({
+      collections: {},
+      providers: {
+        jina: {
+          embedding_profile: "multimodal",
+          embedding_model: "jina-embeddings-v5-text-small",
+          rerank_model: "jina-reranker-v3",
+        },
+      },
+    });
+
+    expect(provider.embeddingModel).toBe(JINA_MULTIMODAL_EMBEDDING_MODEL);
+    expect(provider.rerankModel).toBe("jina-reranker-m0");
   });
 
   test("uses Jina API and maps result indexes back to file paths", async () => {
@@ -866,6 +940,7 @@ describe("LlamaCpp Jina rerank", () => {
         lineageMode: string;
         requestArtifactId: string;
         artifactIds: string[];
+        metadata?: Record<string, unknown>;
       };
       expect(record.sourceId).toBe("source-1");
       expect(record.documentId).toBe("doc-1");
@@ -880,6 +955,8 @@ describe("LlamaCpp Jina rerank", () => {
           "auth-artifact",
         ]),
       );
+      expect(JSON.stringify(record.metadata ?? {})).not.toContain("redaction-sentinel");
+      expect(JSON.stringify(record.metadata ?? {})).not.toContain("AUTH_SECRET");
       const providerRequest = await readFile(
         join(
           graphVault,
@@ -971,6 +1048,61 @@ describe("LlamaCpp Jina rerank", () => {
     }
   });
 
+  test("sanitizes provider cost metadata before writing ledger artifacts", async () => {
+    const previousGraphVault = process.env.QMD_GRAPH_VAULT;
+    const graphVault = await mkdtemp(join(tmpdir(), "qmd-provider-cost-safe-"));
+    process.env.QMD_GRAPH_VAULT = graphVault;
+
+    try {
+      const llm = new LlamaCpp() as any;
+      await llm.recordProviderCost({
+        stage: "embed",
+        provider: "jina",
+        model: "jina-embeddings-v5-text-small",
+        requestCount: 1,
+        tokenCount: 0,
+        tokenCountStatus: "unknown",
+        embeddingCount: 0,
+        embeddingCountStatus: "reported",
+        requestFingerprint: "sha256:request",
+        metadata: {
+          safeLabel: "safe-value",
+          api_key: "sk-redaction-sentinel",
+          AUTH_SECRET: "sk-redaction-sentinel",
+          absolutePath: "/Users/jin/private/source.epub",
+        },
+      });
+
+      const ledger = await readFile(
+        join(graphVault, "catalog", "cost-accounting.jsonl"),
+        "utf8",
+      );
+      const record = JSON.parse(ledger.trim()) as {
+        artifactIds: string[];
+        metadata?: Record<string, unknown>;
+      };
+      const providerRequest = await readFile(
+        join(
+          graphVault,
+          "catalog",
+          "provider-requests",
+          `${record.artifactIds[0]}.json`,
+        ),
+        "utf8",
+      );
+
+      expect(JSON.stringify(record.metadata ?? {})).toContain("safe-value");
+      expect(ledger).not.toContain("sk-redaction-sentinel");
+      expect(ledger).not.toContain("/Users/jin/private");
+      expect(providerRequest).not.toContain("sk-redaction-sentinel");
+      expect(providerRequest).not.toContain("/Users/jin/private");
+    } finally {
+      await rm(graphVault, { recursive: true, force: true });
+      if (previousGraphVault === undefined) delete process.env.QMD_GRAPH_VAULT;
+      else process.env.QMD_GRAPH_VAULT = previousGraphVault;
+    }
+  });
+
   test("requires JINA_API_KEY for Jina rerank models", async () => {
     const previousApiKey = process.env.JINA_API_KEY;
     delete process.env.JINA_API_KEY;
@@ -1026,11 +1158,14 @@ describe("LlamaCpp.getDeviceInfo", () => {
 
 describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
   // Use the singleton to avoid multiple Metal contexts
-  const llm = getDefaultLlamaCpp();
+  const llm = new LlamaCpp({
+    embedModel: LOCAL_TEST_EMBED_MODEL,
+    generateModel: LOCAL_QUERY_EXPANSION_MODEL,
+  });
 
   afterAll(async () => {
     // Ensure native resources are released to avoid ggml-metal asserts on process exit.
-    await disposeDefaultLlamaCpp();
+    await llm.dispose();
   });
 
   describe("embed", () => {
@@ -1149,6 +1284,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
       // We verify this by instrumenting createEmbeddingContext to count invocations.
       
       const freshLlm = new LlamaCpp({
+        embedModel: LOCAL_TEST_EMBED_MODEL,
         rerankModel: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf",
       });
       let contextCreateCount = 0;
@@ -1401,7 +1537,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     }, 30000);
   });
 
-  describe("expandQuery", () => {
+  describe.skipIf(process.env.QMD_TEST_LOCAL_QUERY_EXPANSION !== "1")("expandQuery", () => {
     test("returns query expansions with correct types", async () => {
       const result = await llm.expandQuery("test query");
 
@@ -1413,7 +1549,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
         expect(["lex", "vec", "hyde"]).toContain(q.type);
         expect(q.text.length).toBeGreaterThan(0);
       }
-    }, 30000); // 30s timeout for model loading
+    }, 60000); // Local GGUF query expansion can exceed 30s on CPU hosts.
 
     test("can exclude lexical queries", async () => {
       const result = await llm.expandQuery("authentication setup", { includeLexical: false });
@@ -1430,6 +1566,14 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
 // =============================================================================
 
 describe.skipIf(!!process.env.CI)("LLM Session Management", () => {
+  beforeAll(() => {
+    setDefaultLlamaCpp(new LlamaCpp({ embedModel: LOCAL_TEST_EMBED_MODEL }));
+  });
+
+  afterAll(async () => {
+    await disposeDefaultLlamaCpp();
+  });
+
   describe("withLLMSession", () => {
     test("session provides access to LLM operations", async () => {
       const result = await withLLMSession(async (session) => {

@@ -14,7 +14,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
 import * as llmModule from "../src/llm.js";
-import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
+import {
+  disposeDefaultLlamaCpp,
+  getJinaEmbeddingFingerprintSpec,
+  setDefaultLlamaCpp,
+} from "../src/llm.js";
 import {
   createStore,
   verifySqliteVecLoaded,
@@ -52,6 +56,7 @@ import {
   STRONG_SIGNAL_MIN_GAP,
   insertContent,
   insertDocument,
+  maybeAdoptLegacyEmbeddingFingerprint,
   generateEmbeddings,
   getHybridRrfWeights,
   _resetProductionModeForTesting,
@@ -536,17 +541,59 @@ describe("Document Helpers", () => {
 describe("Embedding Formatting", () => {
   test("formatQueryForEmbedding adds search task prefix", () => {
     const formatted = formatQueryForEmbedding("how to deploy");
-    expect(formatted).toBe("task: search result | query: how to deploy");
+    expect(formatted).toBe("how to deploy");
   });
 
   test("formatDocForEmbedding adds title and text prefix", () => {
     const formatted = formatDocForEmbedding("Some content", "My Title");
-    expect(formatted).toBe("title: My Title | text: Some content");
+    expect(formatted).toBe("Some content");
   });
 
   test("formatDocForEmbedding handles missing title", () => {
     const formatted = formatDocForEmbedding("Some content");
-    expect(formatted).toBe("title: none | text: Some content");
+    expect(formatted).toBe("Some content");
+  });
+
+  test("keeps legacy local embedding prefixes for local models", () => {
+    const model = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+    expect(formatQueryForEmbedding("how to deploy", model)).toBe(
+      "task: search result | query: how to deploy",
+    );
+    expect(formatDocForEmbedding("Some content", "My Title", model)).toBe(
+      "title: My Title | text: Some content",
+    );
+  });
+
+  test("embedding fingerprint changes across Jina model families", () => {
+    expect(getEmbeddingFingerprint("jina:jina-embeddings-v5-text-small")).not.toBe(
+      getEmbeddingFingerprint("jina:jina-embeddings-v5-omni-small"),
+    );
+  });
+
+  test("Jina embedding fingerprint spec records model and downstream task", () => {
+    const spec = getJinaEmbeddingFingerprintSpec(
+      "jina:jina-embeddings-v5-omni-small",
+      {
+        collections: {},
+        providers: {
+          jina: {
+            embedding_profile: "multimodal",
+            embedding_dimensions: 512,
+          },
+        },
+      },
+    );
+
+    expect(spec).toMatchObject({
+      profile: "multimodal",
+      model: "jina-embeddings-v5-omni-small",
+      queryTask: "retrieval.query",
+      documentTask: "retrieval.passage",
+      dimensions: 512,
+      normalized: true,
+      embeddingType: "float",
+      truncate: true,
+    });
   });
 });
 
@@ -2448,6 +2495,72 @@ describe("Index Status", () => {
     await cleanupTestDb(store);
   });
 
+  test("Jina legacy empty fingerprints are not auto-adopted", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const model = "jina:jina-embeddings-v5-text-small";
+    const now = new Date().toISOString();
+
+    store.llm = { embedModelName: model } as any;
+    store.ensureVecTable(3);
+    await insertTestDocument(store.db, collectionName, { name: "doc1", hash: "hash1" });
+    store.db.prepare(`
+      INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at)
+      VALUES (?, 0, 0, ?, '', 1, ?)
+    `).run("hash1", model, now);
+    store.db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`).run("hash1_0");
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`)
+      .run("hash1_0", new Float32Array([1, 2, 3]));
+
+    const adoption = await maybeAdoptLegacyEmbeddingFingerprint(store, model);
+
+    expect(adoption).toEqual({
+      checked: true,
+      adopted: 0,
+      reason:
+        "Jina legacy empty-fingerprint embeddings require re-embedding because profile/task provenance is unavailable",
+    });
+    const row = store.db
+      .prepare(`SELECT embed_fingerprint FROM content_vectors WHERE hash = ? AND model = ?`)
+      .get("hash1", model) as { embed_fingerprint: string };
+    expect(row.embed_fingerprint).toBe("");
+    expect(store.getHashesNeedingEmbedding(undefined, model)).toBe(1);
+
+    await cleanupTestDb(store);
+  });
+
+  test("embedding health treats chunk strategy changes as needing re-embedding", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    const model = "hf:test/embed-model.gguf";
+    const now = new Date().toISOString();
+
+    store.llm = { embedModelName: model } as any;
+    store.ensureVecTable(3);
+    await insertTestDocument(store.db, collectionName, { name: "doc1", hash: "hash1" });
+    store.insertEmbedding(
+      "hash1",
+      0,
+      0,
+      new Float32Array([1, 2, 3]),
+      model,
+      now,
+      1,
+      getEmbeddingFingerprint(model, "regex"),
+    );
+    syncConfigToDb(store.db, {
+      collections: {},
+      embedding: { chunk_strategy: "auto" },
+    });
+
+    expect(getEmbeddingFingerprint(model, "auto")).not.toBe(
+      getEmbeddingFingerprint(model, "regex"),
+    );
+    expect(store.getHashesNeedingEmbedding()).toBe(1);
+
+    await cleanupTestDb(store);
+  });
+
   test("getIndexHealth returns health info", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
@@ -2826,10 +2939,21 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     // Create vector table and insert a vector
     store.ensureVecTable(768);
     const embedding = Array(768).fill(0).map(() => Math.random());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, new Date().toISOString());
+    const model = "embeddinggemma";
+    store.db.prepare(`
+      INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at)
+      VALUES (?, 0, 0, ?, ?, ?)
+    `).run(hash, model, getEmbeddingFingerprint(model), new Date().toISOString());
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, new Float32Array(embedding));
 
-    const results = await store.searchVec("test query", "embeddinggemma", 10);
+    const results = await store.searchVec(
+      "test query",
+      model,
+      10,
+      undefined,
+      undefined,
+      embedding,
+    );
     expect(results).toHaveLength(1);
     expect(results[0]!.displayPath).toBe(`${collectionName}/doc1.md`);
     expect(results[0]!.filepath).toBe(`qmd://${collectionName}/doc1.md`);
@@ -2862,17 +2986,40 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     store.ensureVecTable(768);
     const embedding1 = Array(768).fill(0).map(() => Math.random());
     const embedding2 = Array(768).fill(0).map(() => Math.random());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash1, new Date().toISOString());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash2, new Date().toISOString());
+    const model = "embeddinggemma";
+    const fingerprint = getEmbeddingFingerprint(model);
+    const now = new Date().toISOString();
+    store.db.prepare(`
+      INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at)
+      VALUES (?, 0, 0, ?, ?, ?)
+    `).run(hash1, model, fingerprint, now);
+    store.db.prepare(`
+      INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at)
+      VALUES (?, 0, 0, ?, ?, ?)
+    `).run(hash2, model, fingerprint, now);
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash1}_0`, new Float32Array(embedding1));
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash2}_0`, new Float32Array(embedding2));
 
     // Search without filter - should return both
-    const allResults = await store.searchVec("content", "embeddinggemma", 10);
+    const allResults = await store.searchVec(
+      "content",
+      model,
+      10,
+      undefined,
+      undefined,
+      embedding1,
+    );
     expect(allResults).toHaveLength(2);
 
     // Search with collection filter - should return only from collection1
-    const filtered = await store.searchVec("content", "embeddinggemma", 10, collection1);
+    const filtered = await store.searchVec(
+      "content",
+      model,
+      10,
+      collection1,
+      undefined,
+      embedding1,
+    );
     expect(filtered).toHaveLength(1);
     expect(filtered[0]!.collectionName).toBe(collection1);
 
@@ -2898,13 +3045,24 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     // Create vector table and insert a test vector
     store.ensureVecTable(768);
     const embedding = Array(768).fill(0).map(() => Math.random());
-    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(hash, new Date().toISOString());
+    const model = "embeddinggemma";
+    store.db.prepare(`
+      INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at)
+      VALUES (?, 0, 0, ?, ?, ?)
+    `).run(hash, model, getEmbeddingFingerprint(model), new Date().toISOString());
     store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${hash}_0`, new Float32Array(embedding));
 
     // This should complete quickly (not hang) due to the two-step fix
     // The old code with JOINs in the sqlite-vec query would hang indefinitely
     const startTime = Date.now();
-    const results = await store.searchVec("test content", "embeddinggemma", 5);
+    const results = await store.searchVec(
+      "test content",
+      model,
+      5,
+      undefined,
+      undefined,
+      embedding,
+    );
     const elapsed = Date.now() - startTime;
 
     // If the query took more than 5 seconds, something is wrong
@@ -2917,6 +3075,14 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
 
   test("expandQuery returns typed expansions (no original query)", async () => {
     const store = await createTestStore();
+    const expandedQueries = [
+      { type: "lex", text: "test query lexical" },
+      { type: "vec", text: "test query vector" },
+    ];
+    store.llm = {
+      expandQuery: vi.fn(async () => expandedQueries),
+      generateModelName: "test-generator",
+    } as any;
 
     const expanded = await store.expandQuery("test query");
     // Returns ExpandedQuery[] — typed results from LLM, excluding original
@@ -2932,6 +3098,13 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
 
   test("expandQuery caches results as JSON with types", async () => {
     const store = await createTestStore();
+    const expandSpy = vi.fn(async () => [
+      { type: "vec", text: "cached query vector" },
+    ]);
+    store.llm = {
+      expandQuery: expandSpy,
+      generateModelName: "test-generator",
+    } as any;
 
     // First call — hits LLM
     const queries1 = await store.expandQuery("cached query test");
@@ -2941,12 +3114,22 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     // Cache should preserve full typed structure
     expect(queries1).toEqual(queries2);
     expect(queries2[0]?.type).toBeDefined();
+    expect(expandSpy).toHaveBeenCalledTimes(1);
 
     await cleanupTestDb(store);
   }, 60000);
 
   test("rerank scores documents", async () => {
     const store = await createTestStore();
+    const rerankSpy = vi.fn(async (_query: string, docs: { file: string; text: string }[]) => ({
+      results: docs.map((doc, index) => ({
+        file: doc.file,
+        score: 1 - index * 0.1,
+        index,
+      })),
+      model: "test-reranker",
+    }));
+    store.llm = { rerank: rerankSpy, rerankModelName: "test-reranker" } as any;
 
     const docs = [
       { file: "doc1.md", text: "Relevant content about the topic" },
@@ -2963,6 +3146,15 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
 
   test("rerank caches results", async () => {
     const store = await createTestStore();
+    const rerankSpy = vi.fn(async (_query: string, docs: { file: string; text: string }[]) => ({
+      results: docs.map((doc, index) => ({
+        file: doc.file,
+        score: 0.8 - index * 0.1,
+        index,
+      })),
+      model: "test-reranker",
+    }));
+    store.llm = { rerank: rerankSpy, rerankModelName: "test-reranker" } as any;
 
     const docs = [{ file: "doc1.md", text: "Content for caching test" }];
 
@@ -2972,6 +3164,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     const results = await store.rerank("cache test query", docs);
 
     expect(results).toHaveLength(1);
+    expect(rerankSpy).toHaveBeenCalledTimes(1);
 
     await cleanupTestDb(store);
   });
