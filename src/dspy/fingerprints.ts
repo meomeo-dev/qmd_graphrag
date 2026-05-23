@@ -6,8 +6,6 @@ import {
   DEFAULT_JINA_EMBEDDING_PROFILE,
   JINA_EMBEDDING_PROFILES,
   resolveEmbedModelFromConfig,
-  resolveJinaEmbeddingModelName,
-  resolveJinaRerankModelName,
   resolveRerankModelFromConfig,
 } from "../llm.js";
 
@@ -66,8 +64,8 @@ export function buildDspyRuntimeFingerprints(
         embeddingEndpoint: jina.embedding_endpoint ?? "/v1/embeddings",
         rerankEndpoint: jina.rerank_endpoint ?? "/v1/rerank",
         embeddingProfile: jinaProfileName,
-        embeddingModel: resolveJinaEmbeddingModelName(resolveEmbedModelFromConfig(config)),
-        rerankModel: resolveJinaRerankModelName(resolveRerankModelFromConfig(config)),
+        embeddingModel: jinaProfile.embeddingModel,
+        rerankModel: jinaProfile.rerankModel,
         embeddingQueryTask: jinaProfile.queryTask,
         embeddingDocumentTask: jinaProfile.documentTask,
         embeddingDimensions: jinaProfile.dimensions,

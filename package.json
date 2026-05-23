@@ -24,6 +24,7 @@
     "skills/",
     "scripts/build.mjs",
     "scripts/check-package-grammars.mjs",
+    "scripts/graphrag/resume-book-workspace.mjs",
     "scripts/graphrag/smoke-book-workflow.mjs",
     "scripts/package-smoke.mjs",
     "scripts/test-all.mjs",

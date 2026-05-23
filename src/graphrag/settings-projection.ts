@@ -9,8 +9,6 @@ import { createDeterministicHash } from "../job-state/fingerprint.js";
 import {
   DEFAULT_JINA_EMBEDDING_PROFILE,
   JINA_EMBEDDING_PROFILES,
-  resolveEmbedModelFromConfig,
-  resolveJinaEmbeddingModelName,
 } from "../llm.js";
 
 const ManagedBy = "qmd_graphrag";
@@ -74,10 +72,6 @@ export function buildGraphRagRuntimeSettingsProjection(
   const jina = config.providers?.jina ?? {};
   const profileName = jina.embedding_profile ?? DEFAULT_JINA_EMBEDDING_PROFILE;
   const profile = JINA_EMBEDDING_PROFILES[profileName];
-  const activeEmbedModel = resolveEmbedModelFromConfig(config);
-  const projectedJinaEmbedModel = activeEmbedModel.startsWith("jina:")
-    ? resolveJinaEmbeddingModelName(activeEmbedModel)
-    : profile.embeddingModel;
   const settings = {
     qmd_graphrag: {
       managed_by: ManagedBy,
@@ -124,7 +118,7 @@ export function buildGraphRagRuntimeSettingsProjection(
       default_embedding_model: {
         type: "litellm",
         model_provider: "jina_ai",
-        model: projectedJinaEmbedModel,
+        model: profile.embeddingModel,
         api_key: envPlaceholder(jina.api_key_env, "JINA_API_KEY"),
         api_base: jinaLiteLlmApiBase(jina.base_url),
         call_args: {

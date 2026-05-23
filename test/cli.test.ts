@@ -13,6 +13,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
+import YAML from "yaml";
 import {
   buildEditorUri,
   termLink,
@@ -380,8 +381,8 @@ describe("CLI Embed", () => {
   test("Jina embedding profile drives active embed and rerank model selection", () => {
     const prevEmbed = process.env.QMD_EMBED_MODEL;
     const prevRerank = process.env.QMD_RERANK_MODEL;
-    delete process.env.QMD_EMBED_MODEL;
-    delete process.env.QMD_RERANK_MODEL;
+    process.env.QMD_EMBED_MODEL = "jina:jina-embeddings-v5-text-small";
+    process.env.QMD_RERANK_MODEL = "jina:jina-reranker-v3";
     setConfigSource({
       config: {
         collections: {},
@@ -690,6 +691,32 @@ describe("CLI Status Command", () => {
     expect(stdout).toContain("environment overrides");
     expect(stdout).toContain(`QMD_EMBED_MODEL=${customEmbed}`);
     expect(stdout).toContain("sets the active embed model");
+  }, 20000);
+
+  test("qmd doctor reports Jina model env overrides ignored by profile", async () => {
+    const env = await createIsolatedTestEnv("doctor-jina-profile-env-models");
+    await writeFile(join(env.configDir, "index.yml"), YAML.stringify({
+      collections: {},
+      providers: {
+        jina: {
+          embedding_profile: "multimodal",
+        },
+      },
+    }));
+
+    const { stdout, exitCode } = await runQmd(["doctor"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+      env: {
+        QMD_EMBED_MODEL: "jina:jina-embeddings-v5-text-small",
+        QMD_RERANK_MODEL: "jina:jina-reranker-v3",
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("providers.jina.embedding_profile=multimodal owns");
+    expect(stdout).toContain("ignored");
+    expect(stdout).toContain("jina:jina-embeddings-v5-omni-small");
+    expect(stdout).toContain("jina:jina-reranker-m0");
   }, 20000);
 
   test("qmd doctor shows CPU-forced device mode with QMD_FORCE_CPU=1", async () => {

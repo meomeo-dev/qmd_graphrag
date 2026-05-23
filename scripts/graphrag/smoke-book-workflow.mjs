@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -94,18 +94,180 @@ function requirePath(path, label) {
   }
 }
 
+function qmdRunner() {
+  const binPath = join(root, "bin", "qmd");
+  if (existsSync(binPath)) {
+    return { command: binPath, args: [] };
+  }
+  const sourceCli = join(root, "src", "cli", "qmd.ts");
+  const tsxCli = join(root, "node_modules", "tsx", "dist", "cli.mjs");
+  if (existsSync(sourceCli) && existsSync(tsxCli)) {
+    return { command: process.execPath, args: [tsxCli, sourceCli] };
+  }
+  const distCli = join(root, "dist", "cli", "qmd.js");
+  return { command: process.execPath, args: [distCli] };
+}
+
 function qmd(args, extraEnv = {}) {
-  run("qmd " + args.join(" "), process.execPath, [
-    "--import",
-    "tsx",
-    "src/cli/qmd.ts",
-    ...args,
-  ], {
+  const runner = qmdRunner();
+  run("qmd " + args.join(" "), runner.command, [...runner.args, ...args], {
     env: {
+      INDEX_PATH: qmdIndexPath,
+      QMD_CONFIG_DIR: dirname(configPath),
       QMD_DOCTOR_DEVICE_PROBE: "0",
       ...extraEnv,
     },
   });
+}
+
+function resumeRunnerArgs() {
+  const scriptPath = join(root, "scripts", "graphrag", "resume-book-workspace.mjs");
+  const tsxCli = join(root, "node_modules", "tsx", "dist", "cli.mjs");
+  const useSourceRuntime = existsSync(join(root, ".git")) && existsSync(tsxCli);
+  return useSourceRuntime
+    ? ["--import", "tsx", scriptPath]
+    : [scriptPath];
+}
+
+function normalizeEpubToMarkdown() {
+  if (existsSync(normalizedPath)) return;
+  mkdirSync(dirname(normalizedPath), { recursive: true });
+  const script = String.raw`
+import html
+import posixpath
+import re
+import sys
+import zipfile
+from html.parser import HTMLParser
+from pathlib import PurePosixPath
+from xml.etree import ElementTree as ET
+
+source_path, output_path = sys.argv[1:3]
+
+class MarkdownExtractor(HTMLParser):
+    block_tags = {
+        "address", "article", "aside", "blockquote", "br", "dd", "div", "dl",
+        "dt", "figcaption", "figure", "footer", "h1", "h2", "h3", "h4", "h5",
+        "h6", "header", "hr", "li", "main", "nav", "ol", "p", "pre", "section",
+        "table", "tr", "ul",
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.stack = []
+        self.skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        self.stack.append(tag)
+        if tag in {"script", "style", "noscript"}:
+            self.skip += 1
+            return
+        if tag in self.block_tags:
+            self.parts.append("\n")
+        if tag == "li":
+            self.parts.append("- ")
+        if re.fullmatch(r"h[1-6]", tag):
+            self.parts.append("#" * int(tag[1]) + " ")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in {"script", "style", "noscript"} and self.skip:
+            self.skip -= 1
+        if tag in self.block_tags:
+            self.parts.append("\n")
+        if self.stack:
+            self.stack.pop()
+
+    def handle_data(self, data):
+        if self.skip:
+            return
+        text = re.sub(r"\s+", " ", html.unescape(data)).strip()
+        if text:
+            self.parts.append(text + " ")
+
+    def markdown(self):
+        text = "".join(self.parts)
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip() + "\n"
+
+def xml_text(root, xpath, ns):
+    item = root.find(xpath, ns)
+    if item is None or item.text is None:
+        raise ValueError(f"missing EPUB metadata: {xpath}")
+    return item.text
+
+def read_epub_html(zf):
+    container = ET.fromstring(zf.read("META-INF/container.xml"))
+    ns = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
+    opf_path = container.find(".//c:rootfile", ns).attrib["full-path"]
+    opf_dir = str(PurePosixPath(opf_path).parent)
+    if opf_dir == ".":
+        opf_dir = ""
+    package = ET.fromstring(zf.read(opf_path))
+    ns = {"opf": "http://www.idpf.org/2007/opf", "dc": "http://purl.org/dc/elements/1.1/"}
+    title = xml_text(package, ".//dc:title", ns)
+    manifest = {
+        item.attrib["id"]: item.attrib
+        for item in package.findall(".//opf:manifest/opf:item", ns)
+        if "id" in item.attrib and "href" in item.attrib
+    }
+    output = [f"# {title}\n"]
+    for itemref in package.findall(".//opf:spine/opf:itemref", ns):
+        item = manifest.get(itemref.attrib.get("idref", ""))
+        if not item:
+            continue
+        media_type = item.get("media-type", "")
+        if "html" not in media_type and "xhtml" not in media_type:
+            continue
+        href = posixpath.normpath(posixpath.join(opf_dir, item["href"]))
+        data = zf.read(href)
+        parser = MarkdownExtractor()
+        parser.feed(data.decode("utf-8", errors="replace"))
+        section = parser.markdown()
+        if section:
+            output.append(section)
+    return "\n\n".join(output)
+
+with zipfile.ZipFile(source_path) as zf:
+    markdown = read_epub_html(zf)
+
+with open(output_path, "w", encoding="utf-8") as handle:
+    handle.write(markdown)
+`;
+  run("normalize EPUB to markdown", pythonBin, [
+    "-c",
+    script,
+    sourcePath,
+    normalizedPath,
+  ]);
+}
+
+function runGraphResume() {
+  requirePath(pythonBin, "GraphRAG Python");
+  run("GraphRAG book resume/query", process.execPath, [
+    ...resumeRunnerArgs(),
+    "--state-root",
+    stateRoot,
+    "--source-path",
+    sourcePath,
+    "--normalized-path",
+    normalizedPath,
+    "--qmd-index-path",
+    qmdIndexPath,
+    "--config",
+    configPath,
+    "--python-bin",
+    pythonBin,
+    "--working-directory",
+    root,
+    "--query",
+    query,
+    "--query-method",
+    "local",
+  ]);
 }
 
 loadDotenv();
@@ -119,9 +281,14 @@ const pythonBin = resolve(String(values["python-bin"]));
 const query = String(values.query);
 
 requirePath(configPath, "qmd config");
-requirePath(stateRoot, "graph vault");
 requirePath(sourcePath, "source EPUB");
+mkdirSync(stateRoot, { recursive: true });
+normalizeEpubToMarkdown();
 requirePath(normalizedPath, "normalized markdown");
+
+if (values.graph) {
+  runGraphResume();
+}
 
 qmd(["--version"]);
 qmd(["status"]);
@@ -145,30 +312,6 @@ if (values.mutating) {
 }
 
 if (values.graph) {
-  requirePath(pythonBin, "GraphRAG Python");
-  run("GraphRAG book resume/query", process.execPath, [
-    "--import",
-    "tsx",
-    "scripts/graphrag/resume-book-workspace.mjs",
-    "--state-root",
-    stateRoot,
-    "--source-path",
-    sourcePath,
-    "--normalized-path",
-    normalizedPath,
-    "--qmd-index-path",
-    qmdIndexPath,
-    "--config",
-    configPath,
-    "--python-bin",
-    pythonBin,
-    "--working-directory",
-    root,
-    "--query",
-    query,
-    "--query-method",
-    "local",
-  ]);
   qmd(["query", "--graphrag", "--json", query]);
 }
 

@@ -3,29 +3,39 @@
 import { cwd } from "node:process";
 import { basename, resolve } from "node:path";
 import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { parseArgs } from "node:util";
 
 import YAML from "yaml";
-
-import {
-  FileBookJobStateRepository,
-  createQmdGraphRagRuntime,
-  createRunId,
-  GraphRagWorkflowNameSchema,
-  loadGraphQueryCapabilities,
-  syncGraphRagBookWorkspace,
-  writeManagedGraphRagSettings,
-} from "../../src/index.ts";
-import {
-  loadConfig,
-  setConfigSource,
-} from "../../src/collections.ts";
 
 function required(value, name) {
   if (!value) {
     throw new Error(`missing required argument: --${name}`);
   }
   return value;
+}
+
+async function importRuntime() {
+  const srcIndex = new URL("../../src/index.ts", import.meta.url);
+  const srcCollections = new URL("../../src/collections.ts", import.meta.url);
+  const distIndex = new URL("../../dist/index.js", import.meta.url);
+  const distCollections = new URL("../../dist/collections.js", import.meta.url);
+  const useSource = existsSync(srcIndex) && existsSync(new URL("../../.git", import.meta.url));
+  const [indexModule, collectionsModule] = await Promise.all([
+    import(useSource ? srcIndex.href : distIndex.href),
+    import(useSource ? srcCollections.href : distCollections.href),
+  ]);
+  return {
+    FileBookJobStateRepository: indexModule.FileBookJobStateRepository,
+    createQmdGraphRagRuntime: indexModule.createQmdGraphRagRuntime,
+    createRunId: indexModule.createRunId,
+    GraphRagWorkflowNameSchema: indexModule.GraphRagWorkflowNameSchema,
+    loadGraphQueryCapabilities: indexModule.loadGraphQueryCapabilities,
+    syncGraphRagBookWorkspace: indexModule.syncGraphRagBookWorkspace,
+    writeManagedGraphRagSettings: indexModule.writeManagedGraphRagSettings,
+    loadConfig: collectionsModule.loadConfig,
+    setConfigSource: collectionsModule.setConfigSource,
+  };
 }
 
 const { values } = parseArgs({
@@ -61,14 +71,16 @@ const configPath = values.config
   ? resolve(values.config)
   : resolve(workingDirectory, ".qmd/index.yml");
 
-const runtime = createQmdGraphRagRuntime();
-const repo = new FileBookJobStateRepository(stateRoot);
+let GraphRagWorkflowNameSchemaRef;
 
 function printJson(payload) {
   console.log(JSON.stringify(payload, null, 2));
 }
 
 function stageWorkflows(stage) {
+  if (GraphRagWorkflowNameSchemaRef == null) {
+    throw new Error("GraphRAG workflow schema is not initialized");
+  }
   const workflowsByStage = {
     graph_extract: [
       "load_input_documents",
@@ -90,7 +102,9 @@ function stageWorkflows(stage) {
   if (workflows == null) {
     return null;
   }
-  return workflows.map((workflow) => GraphRagWorkflowNameSchema.parse(workflow));
+  return workflows.map((workflow) =>
+    GraphRagWorkflowNameSchemaRef.parse(workflow)
+  );
 }
 
 function indexScopeFromSync(sync) {
@@ -103,7 +117,7 @@ function indexScopeFromSync(sync) {
   };
 }
 
-async function graphQueryScopeFromSync(sync) {
+async function graphQueryScopeFromSync(sync, loadGraphQueryCapabilities) {
   const sourceId = `sha256:${sync.job.sourceHash}`;
   const capabilities = await loadGraphQueryCapabilities({
     graphVault: stateRoot,
@@ -186,15 +200,20 @@ async function resolveWorkspaceInputs() {
 }
 
 async function run() {
-  setConfigSource({ configPath });
-  const projectConfig = loadConfig();
-  await writeManagedGraphRagSettings({
+  const runtimeApi = await importRuntime();
+  GraphRagWorkflowNameSchemaRef = runtimeApi.GraphRagWorkflowNameSchema;
+  const runtime = runtimeApi.createQmdGraphRagRuntime();
+  const repo = new runtimeApi.FileBookJobStateRepository(stateRoot);
+
+  runtimeApi.setConfigSource({ configPath });
+  const projectConfig = runtimeApi.loadConfig();
+  await runtimeApi.writeManagedGraphRagSettings({
     config: projectConfig,
     graphVault: stateRoot,
   });
   const { sourcePath, sourceIdentityPath, normalizedPath } =
     await resolveWorkspaceInputs();
-  const sync = await syncGraphRagBookWorkspace({
+  const sync = await runtimeApi.syncGraphRagBookWorkspace({
     stateRootDir: stateRoot,
     sourcePath,
     sourceIdentityPath,
@@ -218,7 +237,10 @@ async function run() {
         method: values["query-method"],
         query: values.query,
         responseType: "multiple paragraphs",
-        capabilityScope: await graphQueryScopeFromSync(sync),
+        capabilityScope: await graphQueryScopeFromSync(
+          sync,
+          runtimeApi.loadGraphQueryCapabilities,
+        ),
         verbose: values.verbose,
         environment: {
           pythonBin,
@@ -238,7 +260,7 @@ async function run() {
   }
 
   if (nextStage === "query_ready") {
-    const refreshed = await syncGraphRagBookWorkspace({
+    const refreshed = await runtimeApi.syncGraphRagBookWorkspace({
       stateRootDir: stateRoot,
       sourcePath,
       sourceIdentityPath,
@@ -284,7 +306,7 @@ async function run() {
     );
   }
 
-  const runId = createRunId(nextStage);
+  const runId = runtimeApi.createRunId(nextStage);
   const inputFingerprint = sync.stageFingerprints[nextStage];
 
   await repo.startStage({
@@ -312,7 +334,7 @@ async function run() {
       },
     });
 
-    const refreshed = await syncGraphRagBookWorkspace({
+    const refreshed = await runtimeApi.syncGraphRagBookWorkspace({
       stateRootDir: stateRoot,
       sourcePath,
       sourceIdentityPath,
@@ -334,7 +356,10 @@ async function run() {
         method: values["query-method"],
         query: values.query,
         responseType: "multiple paragraphs",
-        capabilityScope: await graphQueryScopeFromSync(refreshed),
+        capabilityScope: await graphQueryScopeFromSync(
+          refreshed,
+          runtimeApi.loadGraphQueryCapabilities,
+        ),
         verbose: values.verbose,
         environment: {
           pythonBin,

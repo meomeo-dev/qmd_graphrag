@@ -531,22 +531,22 @@ export function resolveRerankModel(config?: ModelResolutionConfig): string {
 }
 
 export function resolveEmbedModelFromConfig(config?: CollectionConfig): string {
-  if (process.env.QMD_EMBED_MODEL) return process.env.QMD_EMBED_MODEL;
   const configuredModel = config?.models?.embed;
   const profileName = configuredJinaProfile(config);
   if (profileName && (!configuredModel || isJinaEmbeddingModel(configuredModel))) {
     return modelUriForJinaEmbeddingProfile(profileName);
   }
+  if (process.env.QMD_EMBED_MODEL) return process.env.QMD_EMBED_MODEL;
   return configuredModel || DEFAULT_EMBED_MODEL;
 }
 
 export function resolveRerankModelFromConfig(config?: CollectionConfig): string {
-  if (process.env.QMD_RERANK_MODEL) return process.env.QMD_RERANK_MODEL;
   const configuredModel = config?.models?.rerank;
   const profileName = configuredJinaProfile(config);
   if (profileName && (!configuredModel || isJinaRerankModel(configuredModel))) {
     return rerankUriForJinaEmbeddingProfile(profileName);
   }
+  if (process.env.QMD_RERANK_MODEL) return process.env.QMD_RERANK_MODEL;
   return configuredModel || DEFAULT_RERANK_MODEL;
 }
 

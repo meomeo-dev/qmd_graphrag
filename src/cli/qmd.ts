@@ -686,12 +686,6 @@ function ensureRuntimeConfigForCli(): CollectionConfig {
       },
       jina: {
         ...jinaProviderDefaults,
-        embedding_model: models.embed.startsWith("jina:")
-          ? models.embed.slice("jina:".length)
-          : jinaProviderDefaults.embedding_model,
-        rerank_model: models.rerank.startsWith("jina:")
-          ? models.rerank.slice("jina:".length)
-          : jinaProviderDefaults.rerank_model,
       },
     },
     embedding: {
@@ -4420,6 +4414,13 @@ function envValueForDisplay(value: string): string {
 
 function collectEnvironmentOverrides(activeModels: { embed: string; generate: string; rerank: string }, configModels: ModelsConfig = {}): EnvOverride[] {
   const overrides: EnvOverride[] = [];
+  const jinaProfile = (() => {
+    try {
+      return loadConfig().providers?.jina?.embedding_profile;
+    } catch {
+      return undefined;
+    }
+  })();
   const add = (name: string, consequence: string) => {
     const raw = process.env[name]?.trim();
     if (!raw) return;
@@ -4429,7 +4430,13 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
     const raw = process.env[name]?.trim();
     if (!raw) return;
     const configured = configModels[key];
-    const consequence = configured && configured !== raw
+    const profileOwnedJinaModel =
+      jinaProfile != null &&
+      (key === "embed" || key === "rerank") &&
+      raw.startsWith("jina:");
+    const consequence = profileOwnedJinaModel
+      ? `set but ignored because providers.jina.embedding_profile=${jinaProfile} owns the active Jina ${key} model ${active}`
+      : configured && configured !== raw
       ? `set but ignored because index models.${key} is configured as ${configured}`
       : `sets the active ${key} model to ${active}; changes embedding/search semantics and may require \`qmd pull\` plus \`qmd embed\``;
     overrides.push({ name, value: envValueForDisplay(raw), consequence });

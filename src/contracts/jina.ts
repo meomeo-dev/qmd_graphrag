@@ -139,6 +139,8 @@ export const JinaRerankResponseEnvelopeSchema = buildEnvelopeSchema(
 );
 
 export type JinaEmbeddingProfileName = z.infer<typeof JinaEmbeddingProfileNameSchema>;
+export type JinaEmbeddingTask = z.infer<typeof JinaEmbeddingTaskSchema>;
+export type JinaEmbeddingType = z.infer<typeof JinaEmbeddingTypeSchema>;
 export type JinaEmbeddingProfile = z.infer<typeof JinaEmbeddingProfileSchema>;
 export type JinaEmbeddingRequest = z.infer<typeof JinaEmbeddingRequestSchema>;
 export type JinaProviderConfig = z.infer<typeof JinaProviderConfigSchema>;
