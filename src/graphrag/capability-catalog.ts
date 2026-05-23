@@ -363,12 +363,103 @@ function capabilitySemanticKey(capability: GraphCapability): string {
   ].join("\0");
 }
 
+function graphIdentityMatchesCapability(
+  identity: DocumentIdentityMap,
+  capability: GraphCapability,
+): boolean {
+  return identity.canonicalBookId === capability.bookId &&
+    identity.documentId === capability.documentId &&
+    identity.contentHash === capability.contentHash &&
+    identity.sourceId === capability.sourceId;
+}
+
+function metadataString(
+  metadata: DocumentIdentityMap["metadata"],
+  key: string,
+): string | null {
+  const value = metadata?.[key];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function parseQmdVirtualPath(value: string): {
+  collection: string;
+  relativePath: string;
+} | null {
+  if (!value.startsWith("qmd://")) return null;
+  const withoutScheme = value.slice("qmd://".length);
+  const slashIndex = withoutScheme.indexOf("/");
+  if (slashIndex < 0) return null;
+  const collection = withoutScheme.slice(0, slashIndex);
+  const relativePath = withoutScheme.slice(slashIndex + 1);
+  if (!collection || !relativePath) return null;
+  return { collection, relativePath };
+}
+
+function parseDisplayPath(value: string): {
+  collection: string;
+  relativePath: string;
+} | null {
+  const parts = value.split("/").filter((part) => part.length > 0);
+  if (parts.length < 2) return null;
+  return {
+    collection: parts[0]!,
+    relativePath: parts.slice(1).join("/"),
+  };
+}
+
+function candidateQmdLocations(
+  candidate: QmdRetrievalCandidate,
+): Array<{ collection: string; relativePath: string }> {
+  const locations: Array<{ collection: string; relativePath: string }> = [];
+  const addLocation = (location: { collection: string; relativePath: string } | null) => {
+    if (location == null) return;
+    if (locations.some((item) =>
+      item.collection === location.collection &&
+      item.relativePath === location.relativePath
+    )) {
+      return;
+    }
+    locations.push(location);
+  };
+
+  const candidatePath = parseQmdVirtualPath(candidate.path);
+  addLocation(candidatePath);
+  if (candidate.collection != null) {
+    addLocation({
+      collection: candidate.collection,
+      relativePath: candidatePath?.relativePath ?? candidate.path,
+    });
+  }
+
+  const metadataPath = candidate.metadata?.path;
+  if (typeof metadataPath === "string") {
+    addLocation(parseQmdVirtualPath(metadataPath));
+    addLocation(parseDisplayPath(metadataPath));
+  }
+
+  return locations;
+}
+
+function candidateMatchesIdentityQmdLocation(
+  candidate: QmdRetrievalCandidate,
+  identity: DocumentIdentityMap,
+): boolean {
+  const qmdCollection = metadataString(identity.metadata, "qmdCollection");
+  const qmdRelativePath = metadataString(identity.metadata, "qmdRelativePath");
+  if (qmdCollection == null || qmdRelativePath == null) return false;
+  return candidateQmdLocations(candidate).some((location) =>
+    location.collection === qmdCollection &&
+    location.relativePath === qmdRelativePath
+  );
+}
+
 function candidateMatchesCapability(input: {
   candidate: QmdRetrievalCandidate;
   capability: GraphCapability;
   uniqueContentHashes: ReadonlySet<string>;
+  identities: readonly DocumentIdentityMap[];
 }): boolean {
-  const { candidate, capability, uniqueContentHashes } = input;
+  const { candidate, capability, uniqueContentHashes, identities } = input;
   if (candidate.documentId != null && candidate.documentId === capability.documentId) {
     return true;
   }
@@ -383,7 +474,10 @@ function candidateMatchesCapability(input: {
     return true;
   }
 
-  return false;
+  return identities.some((identity) =>
+    graphIdentityMatchesCapability(identity, capability) &&
+    candidateMatchesIdentityQmdLocation(candidate, identity)
+  );
 }
 
 export async function resolveCandidateGraphCapabilities(input: {
@@ -393,6 +487,12 @@ export async function resolveCandidateGraphCapabilities(input: {
   const capabilities = await loadGraphQueryCapabilities({
     graphVault: input.graphVault,
   });
+  const identityRaw = await readYaml(
+    join(resolve(input.graphVault), "catalog", "document-identity-map.yaml"),
+  );
+  const identities = identityRaw == null
+    ? []
+    : DocumentIdentityCatalogSchema.parse(identityRaw).items;
   const contentHashCounts = new Map<string, number>();
   for (const capability of capabilities) {
     contentHashCounts.set(
@@ -409,7 +509,12 @@ export async function resolveCandidateGraphCapabilities(input: {
 
   for (const candidate of input.candidates) {
     const matches = capabilities.filter((capability) =>
-      candidateMatchesCapability({ candidate, capability, uniqueContentHashes }),
+      candidateMatchesCapability({
+        candidate,
+        capability,
+        uniqueContentHashes,
+        identities,
+      }),
     );
     if (matches.length > 0) {
       byCandidateId.set(candidate.candidateId, matches);

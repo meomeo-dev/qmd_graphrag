@@ -369,7 +369,10 @@ describe("CLI GraphRAG unified route", () => {
       "auto",
       "--json",
       "--no-rerank",
-      "How do architecture decisions relate across chapters?",
+      [
+        "intent: relationships across chapters",
+        "lex: architecture decisions relate across chapters",
+      ].join("\n"),
     ]);
 
     expect(result.exitCode, result.stderr).toBe(0);

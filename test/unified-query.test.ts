@@ -649,6 +649,73 @@ items:
     expect(candidateCapabilities.get("cand-1")?.[0]?.bookId).toBe(bookId);
   });
 
+  test("matches qmd candidates to graph capabilities by qmd collection path", async () => {
+    const root = await mkdtemp(join(tmpdir(), "qmd-vault-qmd-path-match-"));
+    const bookId = "book-1";
+    await mkdir(join(root, "catalog"), { recursive: true });
+    await mkdir(join(root, "books", bookId), { recursive: true });
+    await writeFile(join(root, "catalog", "books.yaml"), `
+schemaVersion: ${SchemaVersion}
+items:
+  - schemaVersion: ${SchemaVersion}
+    bookId: ${bookId}
+    documentId: doc-from-identity-map
+    sourcePath: sources/book-1/source.epub
+    sourceHash: source-hash-1
+    normalizedContentHash: graph-normalized-hash
+    configFingerprint: config
+    promptFingerprint: prompt
+    modelFingerprint: model
+    overallStatus: succeeded
+    createdAt: 2026-05-21T00:00:00.000Z
+    updatedAt: 2026-05-21T00:00:00.000Z
+`);
+    await writeValidatedQueryReadyArtifacts(root, bookId, {
+      sourceId: "sha256:source-hash-1",
+      sourceHash: "source-hash-1",
+      documentId: "doc-from-identity-map",
+      contentHash: "graph-normalized-hash",
+    });
+    await writeFile(join(root, "catalog", "document-identity-map.yaml"), `
+schemaVersion: ${SchemaVersion}
+items:
+  - schemaVersion: ${SchemaVersion}
+    sourceId: sha256:source-hash-1
+    sourceHash: source-hash-1
+    canonicalBookId: ${bookId}
+    documentId: doc-from-identity-map
+    contentHash: graph-normalized-hash
+    normalizationPolicyVersion: graphrag-normalized-markdown-v1
+    normalizedPath: input/book.md
+    chunkIds: []
+    graphDocumentId: graph-doc-1
+    graphTextUnitIds:
+      - tu-1
+    metadata:
+      qmdCorpusRegistered: true
+      qmdCollection: books
+      qmdRelativePath: book.md
+`);
+
+    const candidateCapabilities = await resolveCandidateGraphCapabilities({
+      graphVault: root,
+      candidates: [candidate({
+        candidateId: "cand-1",
+        sourceId: null,
+        documentId: "qmd-doc-for-different-hash",
+        contentHash: "qmd-sqlite-hash",
+        collection: "books",
+        path: "qmd://books/book.md",
+        metadata: { path: "books/book.md" },
+      })],
+    });
+
+    expect(candidateCapabilities.get("cand-1")?.[0]?.bookId).toBe(bookId);
+    expect(candidateCapabilities.get("cand-1")?.[0]?.contentHash).toBe(
+      "graph-normalized-hash",
+    );
+  });
+
   test("loads query-ready capabilities from community-report and embed artifacts", async () => {
     const root = await mkdtemp(join(tmpdir(), "qmd-vault-cross-stage-ready-"));
     await writeValidatedQueryReadyArtifacts(root, "book-1", {
