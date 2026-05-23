@@ -629,6 +629,57 @@ describe("CLI Status Command", () => {
     expect(configText).toContain("query:");
   }, 20000);
 
+  test("qmd doctor --json emits structured diagnostics", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(["doctor", "--json"], {
+      env: { QMD_DOCTOR_DEVICE_PROBE: "0" },
+    });
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe("");
+
+    const payload = JSON.parse(stdout) as {
+      schemaVersion: string;
+      runtime: string;
+      checks: { label: string; ok: boolean; details: string }[];
+      environmentOverrides: {
+        name: string;
+        value: string;
+        valueRedacted: boolean;
+        consequence: string;
+      }[];
+      nextSteps: string[];
+    };
+    expect(payload.schemaVersion).toBe("qmd.doctor.v1");
+    expect(payload.runtime).toMatch(/sqlite/);
+    expect(payload.checks.some((check) => check.label === "SQLite runtime")).toBe(true);
+    expect(payload.checks.some((check) => check.label === "embedding freshness")).toBe(true);
+    expect(payload.environmentOverrides.some((override) => override.name === "INDEX_PATH")).toBe(true);
+    expect(payload.environmentOverrides.every((override) => override.value === "[redacted]")).toBe(true);
+    expect(payload.environmentOverrides.every((override) => override.valueRedacted)).toBe(true);
+    expect(payload.nextSteps.some((step) => step.includes("QMD_DOCTOR_DEVICE_PROBE"))).toBe(true);
+  }, 20000);
+
+  test("qmd doctor --json redacts invalid config diagnostics", async () => {
+    const env = await createIsolatedTestEnv("doctor-json-invalid-config");
+    await writeFile(join(env.configDir, "index.yml"), "collections:\n  bad: [unterminated\n");
+
+    const { stdout, stderr, exitCode } = await runQmd(["doctor", "--json"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe("");
+
+    const payload = JSON.parse(stdout) as {
+      checks: { label: string; ok: boolean; details: string }[];
+      nextSteps: string[];
+    };
+    const indexConfig = payload.checks.find((check) => check.label === "index config");
+    expect(indexConfig?.ok).toBe(false);
+    expect(indexConfig?.details).toContain("invalid index.yml at index.yml");
+    expect(indexConfig?.details).not.toContain(env.configDir);
+    expect(payload.nextSteps.join("\n")).not.toContain(env.configDir);
+  }, 20000);
+
   test("qmd doctor warns when no collections are configured", async () => {
     const env = await createIsolatedTestEnv("doctor-no-collections");
     const { stdout, exitCode } = await runQmd(["doctor"], { dbPath: env.dbPath, configDir: env.configDir });
@@ -646,7 +697,11 @@ describe("CLI Status Command", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("index config");
     expect(stdout).toContain("invalid index.yml at");
-    expect(stdout).toContain(join(env.configDir, "index.yml"));
+    const diagnosticLines = stdout
+      .split("\n")
+      .filter(line => !line.includes("Index:") && !line.includes("INDEX_PATH=") && !line.includes("QMD_CONFIG_DIR="));
+    expect(diagnosticLines.join("\n")).not.toContain(env.configDir);
+    expect(stdout).toContain("index.yml");
     expect(stdout).toContain("fix the YAML");
   }, 20000);
 

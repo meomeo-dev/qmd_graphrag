@@ -4309,7 +4309,30 @@ function showHelp(): void {
   console.log(`Index: ${getDbPath()}`);
 }
 
+type DoctorCheckRecord = {
+  label: string;
+  ok: boolean;
+  details: string;
+};
+
+type DoctorEnvironmentOverrideRecord = {
+  name: string;
+  value: "[redacted]";
+  valueRedacted: true;
+  consequence: string;
+};
+
+type DoctorCapture = {
+  checks: DoctorCheckRecord[];
+  environmentOverrides: DoctorEnvironmentOverrideRecord[];
+};
+
+let activeDoctorCapture: DoctorCapture | null = null;
+
 function doctorCheck(label: string, ok: boolean, details: string): void {
+  activeDoctorCapture?.checks.push({ label, ok, details });
+  if (activeDoctorCapture) return;
+
   const mark = ok ? `${c.green}✓${c.reset}` : `${c.yellow}⚠${c.reset}`;
   console.log(`${mark} ${label}: ${details}`);
 }
@@ -4372,6 +4395,11 @@ function formatModelDiagnosticPath(path: string): string {
   return sanitizeDiagnosticMessage(path);
 }
 
+function formatConfigDiagnosticPath(path: string): string {
+  const name = basename(path);
+  return name || "index.yml";
+}
+
 function findCachedModelInspection(model: string): CachedModelInspection {
   const invalid: string[] = [];
   if (
@@ -4410,6 +4438,15 @@ type EnvOverride = {
 function envValueForDisplay(value: string): string {
   const sanitized = sanitizeDiagnosticMessage(value);
   return sanitized.length > 96 ? `${sanitized.slice(0, 93)}...` : sanitized;
+}
+
+function envOverrideForJson(override: EnvOverride): DoctorEnvironmentOverrideRecord {
+  return {
+    name: override.name,
+    value: "[redacted]",
+    valueRedacted: true,
+    consequence: override.consequence,
+  };
 }
 
 function collectEnvironmentOverrides(activeModels: { embed: string; generate: string; rerank: string }, configModels: ModelsConfig = {}): EnvOverride[] {
@@ -4485,8 +4522,10 @@ function checkDoctorIndexConfig(nextSteps: string[]): DoctorConfigCheck {
     }
     return { config, valid: true };
   } catch (error) {
-    const message = error instanceof Error ? sanitizeDiagnosticMessage(error.message) : sanitizeDiagnosticMessage(String(error));
-    const configPath = getConfigPath();
+    const rawConfigPath = getConfigPath();
+    const configPath = formatConfigDiagnosticPath(rawConfigPath);
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    const message = sanitizeDiagnosticMessage(rawMessage.replaceAll(rawConfigPath, configPath));
     doctorCheck("index config", false, `invalid index.yml at ${configPath}: ${message}. Next: fix the YAML and rerun \`qmd doctor\``);
     nextSteps.push(`Fix invalid YAML in ${configPath}, then rerun \`qmd doctor\`.`);
     return { config: null, valid: false };
@@ -4495,6 +4534,7 @@ function checkDoctorIndexConfig(nextSteps: string[]): DoctorConfigCheck {
 
 function checkEnvironmentOverrides(activeModels: { embed: string; generate: string; rerank: string }, configModels: ModelsConfig = {}): void {
   const overrides = collectEnvironmentOverrides(activeModels, configModels);
+  activeDoctorCapture?.environmentOverrides.push(...overrides.map(envOverrideForJson));
   if (overrides.length === 0) {
     doctorCheck("environment overrides", true, "none");
     return;
@@ -4502,6 +4542,7 @@ function checkEnvironmentOverrides(activeModels: { embed: string; generate: stri
 
   doctorCheck("environment overrides", false, `${overrides.length} set`);
   for (const override of overrides) {
+    if (activeDoctorCapture) continue;
     console.log(`  - ${override.name}=${override.value}: ${override.consequence}`);
   }
 }
@@ -4715,13 +4756,13 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
   }
 
   const crashHint = "Probing native llama backend now. If qmd crashes here, rerun with `QMD_FORCE_CPU=1 qmd doctor` (or `QMD_DOCTOR_DEVICE_PROBE=0 qmd doctor` to skip this probe).";
-  if (process.stdout.isTTY) {
+  if (process.stdout.isTTY && !activeDoctorCapture) {
     process.stdout.write(`${c.dim}${crashHint}${c.reset}`);
   }
 
   try {
     const device = await getDefaultLlamaCpp().getDeviceInfo({ allowBuild: false });
-    if (process.stdout.isTTY) {
+    if (process.stdout.isTTY && !activeDoctorCapture) {
       process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
     }
     if (device.gpu) {
@@ -4749,7 +4790,7 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
       }
     }
   } catch (error) {
-    if (process.stdout.isTTY) {
+    if (process.stdout.isTTY && !activeDoctorCapture) {
       process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
     }
     const message = error instanceof Error ? sanitizeDiagnosticMessage(error.message) : sanitizeDiagnosticMessage(String(error));
@@ -4758,7 +4799,7 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
   }
 }
 
-async function showDoctor(): Promise<void> {
+async function showDoctor(jsonMode = false): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
   const pkg = readPackageJson();
@@ -4767,116 +4808,140 @@ async function showDoctor(): Promise<void> {
   const embeddingChunkStrategy = resolveEmbeddingChunkStrategyForCli();
   const fingerprint = getEmbeddingFingerprint(embedModel, embeddingChunkStrategy);
   const nextSteps: string[] = [];
+  const capture: DoctorCapture | null = jsonMode ? { checks: [], environmentOverrides: [] } : null;
+  const previousCapture = activeDoctorCapture;
 
-  console.log(`${c.bold}QMD Doctor${c.reset}\n`);
-  console.log(`Index: ${getDbPath()}`);
-  console.log(`Runtime: ${isBun ? "bun:sqlite" : "better-sqlite3"}`);
-
-  try {
-    const row = db.prepare(`SELECT sqlite_version() AS version`).get() as { version: string };
-    doctorCheck("SQLite runtime", true, row.version);
-  } catch (error) {
-    doctorCheck("SQLite runtime", false, error instanceof Error ? error.message : String(error));
-  }
-
-  const betterSqliteVersion = pkg.dependencies?.["better-sqlite3"] ?? pkg.devDependencies?.["better-sqlite3"] ?? "not declared";
-  doctorCheck("better-sqlite3 package", true, String(betterSqliteVersion));
+  activeDoctorCapture = capture;
 
   try {
-    const row = db.prepare(`SELECT vec_version() AS version`).get() as { version: string };
-    doctorCheck("sqlite-vec", true, row.version);
-  } catch (error) {
-    doctorCheck("sqlite-vec", false, error instanceof Error ? error.message : String(error));
-  }
-
-  const configCheck = checkDoctorIndexConfig(nextSteps);
-  const configModels = configCheck.config?.models ?? {};
-  checkEnvironmentOverrides(activeModels, configModels);
-  checkModelDefaults(activeModels, configModels);
-  checkModelCache(activeModels, nextSteps);
-
-  await runDoctorDeviceChecks(nextSteps);
-
-  try {
-    const adoption = await maybeAdoptLegacyEmbeddingFingerprint(storeInstance, embedModel);
-    if (adoption.checked || adoption.adopted > 0) {
-      doctorCheck("legacy fingerprint adoption", adoption.adopted > 0, adoption.adopted > 0 ? `adopted ${adoption.adopted} legacy chunks; ${adoption.reason}` : adoption.reason);
+    if (!jsonMode) {
+      console.log(`${c.bold}QMD Doctor${c.reset}\n`);
+      console.log(`Index: ${getDbPath()}`);
+      console.log(`Runtime: ${isBun ? "bun:sqlite" : "better-sqlite3"}`);
     }
-  } catch (error) {
-    doctorCheck("legacy fingerprint adoption", false, error instanceof Error ? error.message : String(error));
-  }
 
-  try {
-    const pending = getHashesNeedingEmbedding(db, undefined, embedModel);
-    doctorCheck("embedding freshness", pending === 0, pending === 0 ? "all active documents match current fingerprint" : `${formatCount(pending)} active documents need embeddings. Next: \`qmd embed\``);
-    if (pending > 0) {
-      nextSteps.push(`Run \`qmd embed\` to generate ${formatCount(pending)} missing/stale document embeddings.`);
+    try {
+      const row = db.prepare(`SELECT sqlite_version() AS version`).get() as { version: string };
+      doctorCheck("SQLite runtime", true, row.version);
+    } catch (error) {
+      doctorCheck("SQLite runtime", false, error instanceof Error ? error.message : String(error));
     }
-  } catch (error) {
-    doctorCheck("embedding freshness", false, error instanceof Error ? error.message : String(error));
-  }
 
-  try {
-    const rows = db.prepare(`
-      SELECT model, embed_fingerprint AS fingerprint, COUNT(DISTINCT hash) AS docs, COUNT(*) AS chunks
-      FROM content_vectors
-      GROUP BY model, embed_fingerprint
-      ORDER BY chunks DESC, model, embed_fingerprint
-    `).all() as { model: string; fingerprint: string; docs: number; chunks: number }[];
-    const uniqueFingerprints = new Set(rows.map(row => row.fingerprint));
-    const offCurrent = rows.filter(row => row.model === embedModel && row.fingerprint !== fingerprint);
-    const ok = rows.length === 0 || (uniqueFingerprints.size === 1 && rows[0]?.fingerprint === fingerprint && offCurrent.length === 0);
-    const currentDocs = rows
-      .filter(row => row.model === embedModel && row.fingerprint === fingerprint)
-      .reduce((sum, row) => sum + row.docs, 0);
-    const otherDocs = rows.reduce((sum, row) => sum + row.docs, 0) - currentDocs;
-    const groups = rows.map(row => {
-      const label = row.fingerprint === fingerprint ? "current" : (row.fingerprint || "legacy");
-      return `${shortModelName(row.model)}:${label} ${formatCount(row.docs)} docs/${formatCount(row.chunks)} chunks`;
-    }).join("; ");
-    const namedFingerprintRows = rows.filter(row => row.fingerprint);
-    const namedFingerprints = [...new Set(namedFingerprintRows.map(row => row.fingerprint))];
-    if (namedFingerprints.length > 1) {
-      const namedGroups = namedFingerprintRows
-        .map(row => `${row.fingerprint}${row.fingerprint === fingerprint ? " (current)" : ""}: ${shortModelName(row.model)} ${formatCount(row.docs)} docs/${formatCount(row.chunks)} chunks`)
-        .join("; ");
-      doctorCheck("mixed named embedding fingerprints", false, `content_vectors contains ${namedFingerprints.length} named fingerprints: ${namedGroups}. Next: \`qmd embed\` or \`qmd embed --force\``);
-      nextSteps.push("Run `qmd embed` to converge mixed named embedding fingerprints; use `qmd embed --force` if old named fingerprints or vector sample mismatches remain.");
-    }
-    const details = rows.length === 0
-      ? `no vectors yet; current fingerprint ${fingerprint}`
-      : ok
-        ? `${formatCount(currentDocs)} docs on current fingerprint (${fingerprint})`
-        : `${formatCount(currentDocs)} docs current, ${formatCount(otherDocs)} docs legacy/stale. ${groups}. Next: \`qmd embed\``;
-    doctorCheck("embedding fingerprints", ok, details);
-    if (!ok) {
-      nextSteps.push("Run `qmd embed` to migrate active documents to the current embedding fingerprint; use `qmd embed --force` if vector samples still fail afterward.");
-    }
-  } catch (error) {
-    doctorCheck("embedding fingerprints", false, error instanceof Error ? error.message : String(error));
-  }
+    const betterSqliteVersion = pkg.dependencies?.["better-sqlite3"] ?? pkg.devDependencies?.["better-sqlite3"] ?? "not declared";
+    doctorCheck("better-sqlite3 package", true, String(betterSqliteVersion));
 
-  try {
-    const vectorSample = await checkEmbeddingVectorSamples(db, embedModel, fingerprint);
-    doctorCheck("embedding vector sample", vectorSample.ok, vectorSample.details);
-    if (!vectorSample.ok) {
-      nextSteps.push("Run `qmd embed --force` to rebuild existing vectors that no longer reproduce under the current embedding pipeline.");
+    try {
+      const row = db.prepare(`SELECT vec_version() AS version`).get() as { version: string };
+      doctorCheck("sqlite-vec", true, row.version);
+    } catch (error) {
+      doctorCheck("sqlite-vec", false, error instanceof Error ? error.message : String(error));
     }
-  } catch (error) {
-    const message = error instanceof Error ? sanitizeDiagnosticMessage(error.message) : sanitizeDiagnosticMessage(String(error));
-    doctorCheck("embedding vector sample", false, `${message}; rebuild with \`qmd embed --force\``);
-    nextSteps.push("Run `qmd embed --force` to rebuild existing vectors, then rerun `qmd doctor`.");
-  }
 
-  const steps = normalizedDoctorNextSteps(nextSteps);
-  if (steps.length > 0) {
-    console.log(`\n${c.bold}Recommended next step${steps.length === 1 ? "" : "s"}${c.reset}`);
-    for (const step of steps) {
-      console.log(`  - ${step}`);
+    const configCheck = checkDoctorIndexConfig(nextSteps);
+    const configModels = configCheck.config?.models ?? {};
+    checkEnvironmentOverrides(activeModels, configModels);
+    checkModelDefaults(activeModels, configModels);
+    checkModelCache(activeModels, nextSteps);
+
+    await runDoctorDeviceChecks(nextSteps);
+
+    try {
+      const adoption = await maybeAdoptLegacyEmbeddingFingerprint(storeInstance, embedModel);
+      if (adoption.checked || adoption.adopted > 0) {
+        doctorCheck("legacy fingerprint adoption", adoption.adopted > 0, adoption.adopted > 0 ? `adopted ${adoption.adopted} legacy chunks; ${adoption.reason}` : adoption.reason);
+      }
+    } catch (error) {
+      doctorCheck("legacy fingerprint adoption", false, error instanceof Error ? error.message : String(error));
     }
-  }
 
-  closeDb();
+    try {
+      const pending = getHashesNeedingEmbedding(db, undefined, embedModel);
+      doctorCheck("embedding freshness", pending === 0, pending === 0 ? "all active documents match current fingerprint" : `${formatCount(pending)} active documents need embeddings. Next: \`qmd embed\``);
+      if (pending > 0) {
+        nextSteps.push(`Run \`qmd embed\` to generate ${formatCount(pending)} missing/stale document embeddings.`);
+      }
+    } catch (error) {
+      doctorCheck("embedding freshness", false, error instanceof Error ? error.message : String(error));
+    }
+
+    try {
+      const rows = db.prepare(`
+        SELECT model, embed_fingerprint AS fingerprint, COUNT(DISTINCT hash) AS docs, COUNT(*) AS chunks
+        FROM content_vectors
+        GROUP BY model, embed_fingerprint
+        ORDER BY chunks DESC, model, embed_fingerprint
+      `).all() as { model: string; fingerprint: string; docs: number; chunks: number }[];
+      const uniqueFingerprints = new Set(rows.map(row => row.fingerprint));
+      const offCurrent = rows.filter(row => row.model === embedModel && row.fingerprint !== fingerprint);
+      const ok = rows.length === 0 || (uniqueFingerprints.size === 1 && rows[0]?.fingerprint === fingerprint && offCurrent.length === 0);
+      const currentDocs = rows
+        .filter(row => row.model === embedModel && row.fingerprint === fingerprint)
+        .reduce((sum, row) => sum + row.docs, 0);
+      const otherDocs = rows.reduce((sum, row) => sum + row.docs, 0) - currentDocs;
+      const groups = rows.map(row => {
+        const label = row.fingerprint === fingerprint ? "current" : (row.fingerprint || "legacy");
+        return `${shortModelName(row.model)}:${label} ${formatCount(row.docs)} docs/${formatCount(row.chunks)} chunks`;
+      }).join("; ");
+      const namedFingerprintRows = rows.filter(row => row.fingerprint);
+      const namedFingerprints = [...new Set(namedFingerprintRows.map(row => row.fingerprint))];
+      if (namedFingerprints.length > 1) {
+        const namedGroups = namedFingerprintRows
+          .map(row => `${row.fingerprint}${row.fingerprint === fingerprint ? " (current)" : ""}: ${shortModelName(row.model)} ${formatCount(row.docs)} docs/${formatCount(row.chunks)} chunks`)
+          .join("; ");
+        doctorCheck("mixed named embedding fingerprints", false, `content_vectors contains ${namedFingerprints.length} named fingerprints: ${namedGroups}. Next: \`qmd embed\` or \`qmd embed --force\``);
+        nextSteps.push("Run `qmd embed` to converge mixed named embedding fingerprints; use `qmd embed --force` if old named fingerprints or vector sample mismatches remain.");
+      }
+      const details = rows.length === 0
+        ? `no vectors yet; current fingerprint ${fingerprint}`
+        : ok
+          ? `${formatCount(currentDocs)} docs on current fingerprint (${fingerprint})`
+          : `${formatCount(currentDocs)} docs current, ${formatCount(otherDocs)} docs legacy/stale. ${groups}. Next: \`qmd embed\``;
+      doctorCheck("embedding fingerprints", ok, details);
+      if (!ok) {
+        nextSteps.push("Run `qmd embed` to migrate active documents to the current embedding fingerprint; use `qmd embed --force` if vector samples still fail afterward.");
+      }
+    } catch (error) {
+      doctorCheck("embedding fingerprints", false, error instanceof Error ? error.message : String(error));
+    }
+
+    try {
+      const vectorSample = await checkEmbeddingVectorSamples(db, embedModel, fingerprint);
+      doctorCheck("embedding vector sample", vectorSample.ok, vectorSample.details);
+      if (!vectorSample.ok) {
+        nextSteps.push("Run `qmd embed --force` to rebuild existing vectors that no longer reproduce under the current embedding pipeline.");
+      }
+    } catch (error) {
+      const message = error instanceof Error ? sanitizeDiagnosticMessage(error.message) : sanitizeDiagnosticMessage(String(error));
+      doctorCheck("embedding vector sample", false, `${message}; rebuild with \`qmd embed --force\``);
+      nextSteps.push("Run `qmd embed --force` to rebuild existing vectors, then rerun `qmd doctor`.");
+    }
+
+    const steps = normalizedDoctorNextSteps(nextSteps);
+    if (jsonMode) {
+      console.log(JSON.stringify({
+        schemaVersion: "qmd.doctor.v1",
+        index: getDbPath(),
+        runtime: isBun ? "bun:sqlite" : "better-sqlite3",
+        models: activeModels,
+        embedding: {
+          model: embedModel,
+          fingerprint,
+          chunkStrategy: embeddingChunkStrategy,
+        },
+        checks: capture?.checks ?? [],
+        environmentOverrides: capture?.environmentOverrides ?? [],
+        nextSteps: steps,
+      }, null, 2));
+    } else if (steps.length > 0) {
+      console.log(`\n${c.bold}Recommended next step${steps.length === 1 ? "" : "s"}${c.reset}`);
+      for (const step of steps) {
+        console.log(`  - ${step}`);
+      }
+    }
+  } finally {
+    activeDoctorCapture = previousCapture;
+    closeDb();
+  }
 }
 
 function printDoctorHint(): void {
@@ -5257,7 +5322,7 @@ if (isMain) {
       break;
 
     case "doctor":
-      await showDoctor();
+      await showDoctor(cli.opts.format === "json");
       break;
 
     case "update":
