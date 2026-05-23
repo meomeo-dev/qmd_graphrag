@@ -9,6 +9,7 @@ import {
 export const BatchItemStatusSchema = z.enum([
   "pending",
   "running",
+  "skipped",
   "completed",
   "failed",
 ]);
@@ -54,6 +55,7 @@ export const BatchRunManifestSchema = z.object({
   configLocator: z.string().min(1),
   totalItems: z.number().int().nonnegative(),
   completedItems: z.number().int().nonnegative(),
+  skippedItems: z.number().int().nonnegative().default(0),
   failedItems: z.number().int().nonnegative(),
   startedAt: z.string().datetime(),
   updatedAt: z.string().datetime(),

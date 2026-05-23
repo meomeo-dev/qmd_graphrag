@@ -215,10 +215,11 @@ types:
       - src/cli/qmd.ts#vectorSearch
     consumers:
       - src/store.ts#vectorSearchQuery
-      - src/store.ts#searchVec
     storage: transient
     notes:
       - qmd vsearch is whole-corpus vector lookup over the qmd vector index
+      - searchVec is the store adapter invoked by vectorSearchQuery, not a typed
+        data-bus consumer
       - providerPolicy.generation is always false
       - providerPolicy.queryExpansion is always false
       - providerPolicy.rerank is always false
@@ -256,10 +257,11 @@ types:
     producers:
       - src/cli/qmd.ts#vectorSearch
     consumers:
-      - src/cli/qmd.ts#outputResults
+      - src/cli/qmd.ts#vectorSearch
     storage: transient
     notes:
       - result candidates are vector-only retrieval candidates
+      - qmd vsearch --json emits this schema directly
       - candidates must be filtered by active embedding model and embedFingerprint
 
   - name: graph_enhancement_request
@@ -1083,8 +1085,10 @@ buses:
     payloads:
       - content_vector_embedding_record
       - qmd_query_request
+      - qmd_vector_search_request
       - qmd_retrieval_candidate
       - qmd_search_result
+      - qmd_vector_search_result
       - query_expansion_item
       - unified_query_request
 

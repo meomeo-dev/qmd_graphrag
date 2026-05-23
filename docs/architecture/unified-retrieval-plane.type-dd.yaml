@@ -1189,10 +1189,14 @@ query_routes:
       graphrag: false
     request_schema: src/contracts/qmd-query.ts#QmdVectorSearchRequestSchema
     result_schema: src/contracts/qmd-query.ts#QmdVectorSearchResultSchema
+    bus_payloads:
+      - qmd_vector_search_request
+      - qmd_vector_search_result
     producers:
       - src/cli/qmd.ts#vectorSearch
     consumers:
       - src/store.ts#vectorSearchQuery
+    implementation_adapters:
       - src/store.ts#searchVec
     invariant: >-
       qmd vsearch embeds only the original user query and performs vector

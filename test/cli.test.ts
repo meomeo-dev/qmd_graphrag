@@ -7,7 +7,15 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { chmod, copyFile, mkdtemp, rm, writeFile, mkdir } from "fs/promises";
-import { existsSync, lstatSync, readFileSync, symlinkSync, writeFileSync, unlinkSync } from "fs";
+import {
+  existsSync,
+  lstatSync,
+  readFileSync,
+  readdirSync,
+  symlinkSync,
+  writeFileSync,
+  unlinkSync,
+} from "fs";
 import { tmpdir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -995,7 +1003,15 @@ describe("CLI Search Command", () => {
     );
 
     expect(exitCode).toBe(0);
-    expect(() => JSON.parse(stdout)).not.toThrow();
+    const payload = JSON.parse(stdout);
+    expect(payload.schemaVersion).toBe(SchemaVersion);
+    expect(payload.query).toBe("meeting");
+    expect(Array.isArray(payload.results)).toBe(true);
+    for (const result of payload.results) {
+      expect(result).toMatchObject({ source: "vec" });
+      expect(result.candidateId).toBeTypeOf("string");
+      expect(result.retrievalScore).toBeTypeOf("number");
+    }
     expect(stderr).not.toContain("Searching 2 vector queries");
     expect(stderr).not.toContain("lex:");
     expect(stderr).not.toContain("hyde:");
@@ -1017,12 +1033,19 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(contract).toContain("BatchRunManifestSchema");
     expect(contract).toContain("BatchItemCheckpointSchema");
     expect(contract).toContain("BatchEventLogSchema");
+    expect(contract).toContain("\"skipped\"");
+    expect(contract).toContain("skippedItems");
     expect(script).toContain("\"completed-manifest\"");
+    expect(script).toContain("BatchRunManifestSchema.parse");
+    expect(script).toContain("BatchItemCheckpointSchema.parse");
+    expect(script).toContain("BatchEventLogSchema.parse");
     expect(script).toContain("--log-root must be outside graph_vault");
     expect(script).toContain("resume-book-workspace.mjs");
+    expect(script).toContain("resume-book did not reach ready");
     expect(script).toContain("qmd-query-graphrag-json");
     expect(script).toContain("redactLog(stdout)");
     expect(script).toContain("redactLog(stderr)");
+    expect(script).toContain("console.error(redactLog");
     expect(script).not.toContain("metadata: {\\n      logRoot,");
   });
 
@@ -1053,6 +1076,232 @@ describe("GraphRAG EPUB batch runner", () => {
     await rm(tmpRoot, { recursive: true, force: true });
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("--log-root must be outside graph_vault");
+  });
+
+  test("rejects symlinked raw log directories that resolve inside graph_vault", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "qmd-batch-log-symlink-"));
+    const sourceDir = join(tmpRoot, "empty-source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    await mkdir(join(stateRoot, "logs"), { recursive: true });
+    symlinkSync(join(stateRoot, "logs"), join(tmpRoot, "logs-link"));
+    const result = await new Promise<{ stderr: string; exitCode: number | null }>(
+      (resolveResult) => {
+        const proc = spawn(process.execPath, [
+          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+          "--source-dir",
+          sourceDir,
+          "--state-root",
+          stateRoot,
+          "--log-root",
+          join(tmpRoot, "logs-link"),
+          "--skip-dotenv",
+        ]);
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => {
+          stderr += String(chunk);
+        });
+        proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+      },
+    );
+
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("--log-root must be outside graph_vault");
+  });
+
+  test("records completed-manifest items as typed skipped checkpoints", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "qmd-batch-skipped-"));
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "skipped-fixture";
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    const sourceBytes = "not read when skipped";
+    await writeFile(join(sourceDir, "Book.epub"), sourceBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const completedManifest = join(tmpRoot, "completed.json");
+    const { createHash } = await import("crypto");
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    await writeFile(
+      completedManifest,
+      JSON.stringify([{ source: "Book.epub", sourceHash }]),
+    );
+
+    const result = await new Promise<{ stderr: string; exitCode: number | null }>(
+      (resolveResult) => {
+        const proc = spawn(process.execPath, [
+          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+          "--source-dir",
+          sourceDir,
+          "--state-root",
+          stateRoot,
+          "--log-root",
+          logRoot,
+          "--config",
+          join(configDir, "index.yml"),
+          "--qmd-index-path",
+          join(tmpRoot, "index.sqlite"),
+          "--completed-manifest",
+          completedManifest,
+          "--run-id",
+          runId,
+          "--skip-dotenv",
+        ]);
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => {
+          stderr += String(chunk);
+        });
+        proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+      },
+    );
+
+    const batchRoot = join(stateRoot, "catalog", "batch-runs", runId);
+    const manifest = JSON.parse(readFileSync(join(batchRoot, "manifest.json"), "utf8"));
+    const eventLines = readFileSync(join(batchRoot, "events.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const [checkpointName] = readdirSync(join(batchRoot, "items"));
+    const checkpoint = JSON.parse(
+      readFileSync(join(batchRoot, "items", checkpointName), "utf8"),
+    );
+
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(manifest).toMatchObject({
+      schemaVersion: SchemaVersion,
+      runId,
+      status: "completed",
+      totalItems: 1,
+      completedItems: 0,
+      skippedItems: 1,
+      failedItems: 0,
+    });
+    expect(checkpoint).toMatchObject({
+      schemaVersion: SchemaVersion,
+      runId,
+      status: "skipped",
+      sourceName: "Book.epub",
+      metadata: {
+        seedMatchMode: "source_name_and_hash",
+      },
+    });
+    expect(eventLines.some((event) => event.event === "item_skipped")).toBe(true);
+    expect(eventLines.at(-1)).toMatchObject({
+      event: "batch_completed",
+      status: "completed",
+    });
+  });
+
+  test("keeps checkpoints unique for duplicate EPUB content", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "qmd-batch-duplicate-"));
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "duplicate-fixture";
+    const sourceBytes = "same content";
+    const { createHash } = await import("crypto");
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await writeFile(join(sourceDir, "A.epub"), sourceBytes);
+    await writeFile(join(sourceDir, "B.epub"), sourceBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const completedManifest = join(tmpRoot, "completed.json");
+    await writeFile(
+      completedManifest,
+      JSON.stringify([
+        { source: "A.epub", sourceHash },
+        { source: "B.epub", sourceHash },
+      ]),
+    );
+
+    const result = await new Promise<{ stderr: string; exitCode: number | null }>(
+      (resolveResult) => {
+        const proc = spawn(process.execPath, [
+          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+          "--source-dir",
+          sourceDir,
+          "--state-root",
+          stateRoot,
+          "--log-root",
+          logRoot,
+          "--config",
+          join(configDir, "index.yml"),
+          "--qmd-index-path",
+          join(tmpRoot, "index.sqlite"),
+          "--completed-manifest",
+          completedManifest,
+          "--run-id",
+          runId,
+          "--skip-dotenv",
+        ]);
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => {
+          stderr += String(chunk);
+        });
+        proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+      },
+    );
+
+    const batchRoot = join(stateRoot, "catalog", "batch-runs", runId);
+    const itemRoot = join(batchRoot, "items");
+    const manifest = JSON.parse(readFileSync(join(batchRoot, "manifest.json"), "utf8"));
+    const checkpoints = readdirSync(itemRoot).sort();
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(manifest).toMatchObject({
+      totalItems: 2,
+      completedItems: 0,
+      skippedItems: 2,
+      failedItems: 0,
+    });
+    expect(checkpoints).toHaveLength(2);
+    expect(new Set(checkpoints).size).toBe(2);
+  });
+
+  test("redacts exact environment values from preflight errors", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "qmd-batch-redact-"));
+    const sourceDir = join(tmpRoot, "empty-source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const secretBase = join(tmpRoot, "secret-config-path");
+    await mkdir(sourceDir, { recursive: true });
+    const result = await new Promise<{ stderr: string; exitCode: number | null }>(
+      (resolveResult) => {
+        const proc = spawn(process.execPath, [
+          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+          "--source-dir",
+          sourceDir,
+          "--state-root",
+          stateRoot,
+          "--log-root",
+          join(tmpRoot, "logs"),
+          "--config",
+          secretBase,
+          "--skip-dotenv",
+        ], {
+          env: {
+            ...process.env,
+            OPENAI_BASE_URL: secretBase,
+          },
+        });
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => {
+          stderr += String(chunk);
+        });
+        proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+      },
+    );
+
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).not.toContain(secretBase);
+    expect(result.stderr).toContain("[REDACTED:OPENAI_BASE_URL]");
   });
 });
 

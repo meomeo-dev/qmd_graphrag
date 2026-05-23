@@ -163,6 +163,7 @@ import {
 } from "../query/unified-router.js";
 import {
   QmdSearchResultSchema,
+  QmdVectorSearchRequestSchema,
   QmdVectorSearchResultSchema,
 } from "../contracts/qmd-query.js";
 import {
@@ -2984,11 +2985,25 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   checkIndexHealth(store.db);
 
   await withLLMSession(async () => {
-    let results = await vectorSearchQuery(store, query, {
-      collection: singleCollection,
+    const request = QmdVectorSearchRequestSchema.parse({
+      schemaVersion: SchemaVersion,
+      query,
+      ...(collectionNames.length > 0 ? { collections: collectionNames } : {}),
+      intent: opts.intent,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
-      intent: opts.intent,
+      providerPolicy: {
+        generation: false,
+        queryExpansion: false,
+        rerank: false,
+        embedding: true,
+      },
+    });
+    let results = await vectorSearchQuery(store, request.query, {
+      collection: singleCollection,
+      limit: request.limit ?? (opts.all ? 500 : (opts.limit || 10)),
+      minScore: request.minScore ?? 0.3,
+      intent: request.intent,
     });
 
     // Post-filter for multi-collection
@@ -3001,7 +3016,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 
     closeDb();
 
-    if (results.length === 0) {
+    if (results.length === 0 && opts.format !== "json") {
       printEmptySearchResults(opts.format);
       return;
     }
@@ -3031,6 +3046,11 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
         },
       })),
     });
+
+    if (opts.format === "json") {
+      console.log(JSON.stringify(vectorResult, null, 2));
+      return;
+    }
 
     outputResults(vectorResult.results.map((candidate) => ({
       file: candidate.path,

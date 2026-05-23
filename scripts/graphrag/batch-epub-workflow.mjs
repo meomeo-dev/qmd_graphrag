@@ -7,6 +7,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   writeFileSync,
 } from "node:fs";
 import {
@@ -22,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import YAML from "yaml";
+import { z } from "zod";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const defaultSourceDir = join(root, "inbox", "软件工程与系统设计经典著作指南");
@@ -72,12 +74,91 @@ const itemRoot = join(batchRoot, "items");
 const eventsPath = join(batchRoot, "events.jsonl");
 const manifestPath = join(batchRoot, "manifest.json");
 
+const JsonPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
+const JsonValueSchema = z.lazy(() =>
+  z.union([
+    JsonPrimitiveSchema,
+    z.array(JsonValueSchema),
+    z.record(z.string(), JsonValueSchema),
+  ]),
+);
+const BatchItemStatusSchema = z.enum([
+  "pending",
+  "running",
+  "skipped",
+  "completed",
+  "failed",
+]);
+const BatchCommandCheckSchema = z.object({
+  name: z.string().min(1),
+  status: z.enum(["passed", "failed"]),
+  attempts: z.number().int().positive(),
+  exitCode: z.number().int().nullable(),
+  stdoutBytes: z.number().int().nonnegative(),
+  stderrBytes: z.number().int().nonnegative(),
+  startedAt: z.string().datetime(),
+  completedAt: z.string().datetime(),
+  errorSummary: z.string().max(1000).optional(),
+});
+const BatchItemCheckpointSchema = z.object({
+  schemaVersion: z.literal(SchemaVersion),
+  itemId: z.string().min(1),
+  runId: z.string().min(1),
+  status: BatchItemStatusSchema,
+  sourceName: z.string().min(1),
+  sourceRelativePath: z.string().min(1),
+  sourceHash: z.string().min(1).optional(),
+  normalizedPath: z.string().min(1),
+  bookId: z.string().min(1).optional(),
+  attempts: z.number().int().nonnegative(),
+  startedAt: z.string().datetime().optional(),
+  completedAt: z.string().datetime().optional(),
+  failedAt: z.string().datetime().optional(),
+  errorSummary: z.string().max(1000).optional(),
+  commandChecks: z.array(BatchCommandCheckSchema).default([]),
+  metadata: z.record(z.string(), JsonValueSchema).optional(),
+});
+const BatchRunManifestSchema = z.object({
+  schemaVersion: z.literal(SchemaVersion),
+  runId: z.string().min(1),
+  status: z.enum(["running", "completed", "failed"]),
+  sourceRootName: z.string().min(1),
+  stateRootLocator: z.string().min(1),
+  qmdIndexLocator: z.string().min(1),
+  configLocator: z.string().min(1),
+  totalItems: z.number().int().nonnegative(),
+  completedItems: z.number().int().nonnegative(),
+  skippedItems: z.number().int().nonnegative().default(0),
+  failedItems: z.number().int().nonnegative(),
+  startedAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+  completedAt: z.string().datetime().optional(),
+  failedAt: z.string().datetime().optional(),
+  itemIds: z.array(z.string().min(1)),
+  metadata: z.record(z.string(), JsonValueSchema).optional(),
+});
+const BatchEventLogSchema = z.object({
+  schemaVersion: z.literal(SchemaVersion),
+  runId: z.string().min(1),
+  itemId: z.string().min(1).optional(),
+  event: z.string().min(1),
+  status: BatchItemStatusSchema.optional(),
+  command: z.string().min(1).optional(),
+  at: z.string().datetime(),
+  message: z.string().max(1000).optional(),
+  metadata: z.record(z.string(), JsonValueSchema).optional(),
+});
+
 function now() {
   return new Date().toISOString();
 }
 
 function sha256File(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function sha256Text(text) {
+  return createHash("sha256").update(text).digest("hex");
 }
 
 function slugify(name) {
@@ -92,8 +173,8 @@ function slugify(name) {
 }
 
 function redacted(message) {
-  return String(message)
-    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, "Bearer [REDACTED]")
+  return redactExactEnvValues(String(message))
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
     .replace(/(OPENAI_API_KEY|JINA_API_KEY)=\S+/g, "$1=[REDACTED]")
     .replace(/(OPENAI_BASE_URL|JINA_API_BASE)=\S+/g, "$1=[REDACTED]")
     .replace(/sk-[A-Za-z0-9._-]+/g, "sk-[REDACTED]")
@@ -101,11 +182,26 @@ function redacted(message) {
 }
 
 function redactLog(text) {
-  return String(text)
-    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, "Bearer [REDACTED]")
+  return redactExactEnvValues(String(text))
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
     .replace(/(OPENAI_API_KEY|JINA_API_KEY)=\S+/g, "$1=[REDACTED]")
     .replace(/(OPENAI_BASE_URL|JINA_API_BASE)=\S+/g, "$1=[REDACTED]")
     .replace(/sk-[A-Za-z0-9._-]+/g, "sk-[REDACTED]");
+}
+
+function redactExactEnvValues(text) {
+  let output = String(text);
+  const secrets = Object.keys(process.env)
+    .filter((key) =>
+      /(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTHORIZATION|BASE_URL|API_BASE)/iu.test(key),
+    )
+    .map((key) => ({ key, value: process.env[key] }))
+    .filter((item) => item.value && item.value.length >= 4)
+    .sort((a, b) => b.value.length - a.value.length);
+  for (const { key, value } of secrets) {
+    output = output.split(value).join(`[REDACTED:${key}]`);
+  }
+  return output;
 }
 
 function isTransient(text) {
@@ -133,6 +229,7 @@ function sleep(ms) {
 }
 
 function ensureDirs() {
+  mkdirSync(stateRoot, { recursive: true });
   const relativeLogRoot = relative(stateRoot, logRoot);
   const isInsideStateRoot =
     relativeLogRoot === "" ||
@@ -142,9 +239,20 @@ function ensureDirs() {
   if (isInsideStateRoot) {
     throw new Error("--log-root must be outside graph_vault");
   }
+  mkdirSync(logRoot, { recursive: true });
+  const realStateRoot = realpathSync(stateRoot);
+  const realLogRoot = realpathSync(logRoot);
+  const relativeRealLogRoot = relative(realStateRoot, realLogRoot);
+  const isReallyInsideStateRoot =
+    relativeRealLogRoot === "" ||
+    (!relativeRealLogRoot.startsWith(`..${sep}`) &&
+      relativeRealLogRoot !== ".." &&
+      !isAbsolute(relativeRealLogRoot));
+  if (isReallyInsideStateRoot) {
+    throw new Error("--log-root must be outside graph_vault");
+  }
   mkdirSync(batchRoot, { recursive: true });
   mkdirSync(itemRoot, { recursive: true });
-  mkdirSync(logRoot, { recursive: true });
   mkdirSync(join(stateRoot, "input"), { recursive: true });
 }
 
@@ -181,12 +289,12 @@ function loadDotenv() {
 }
 
 function event(payload) {
-  const item = {
+  const item = BatchEventLogSchema.parse({
     schemaVersion: SchemaVersion,
     runId,
     at: now(),
     ...payload,
-  };
+  });
   writeFileSync(eventsPath, JSON.stringify(item) + "\n", {
     flag: "a",
     encoding: "utf8",
@@ -203,9 +311,11 @@ function readJson(path) {
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
-function writeJson(path, value) {
+function writeTypedJson(path, schema, value) {
+  const parsed = schema.parse(value);
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(value, null, 2) + "\n", "utf8");
+  writeFileSync(path, JSON.stringify(parsed, null, 2) + "\n", "utf8");
+  return parsed;
 }
 
 function loadCatalogBySourceHash() {
@@ -240,8 +350,8 @@ function loadCompletedSeed() {
     .map((item) => [item.source, item]));
 }
 
-function itemIdFor(sourceHash) {
-  return `item-${sourceHash.slice(0, 12)}`;
+function itemIdFor(sourceHash, sourceRelativePath) {
+  return `item-${sourceHash.slice(0, 12)}-${sha256Text(sourceRelativePath).slice(0, 8)}`;
 }
 
 function discoverItems() {
@@ -254,14 +364,15 @@ function discoverItems() {
       const sourceHash = sha256File(sourcePath);
       const catalogItem = catalogByHash.get(sourceHash);
       const normalizedPath = normalizedPathFor(sourcePath, sourceHash, catalogByHash);
+      const sourceRelativePath = relative(root, sourcePath);
       return {
-        itemId: itemIdFor(sourceHash),
+        itemId: itemIdFor(sourceHash, sourceRelativePath),
         sourceName: name,
         sourcePath,
         sourceHash,
         normalizedPath,
         normalizedRel: relative(root, normalizedPath),
-        sourceRelativePath: relative(root, sourcePath),
+        sourceRelativePath,
         bookId: typeof catalogItem?.bookId === "string"
           ? catalogItem.bookId
           : undefined,
@@ -280,6 +391,7 @@ function makeManifest(items) {
     configLocator: relative(root, configPath),
     totalItems: items.length,
     completedItems: 0,
+    skippedItems: 0,
     failedItems: 0,
     startedAt: now(),
     updatedAt: now(),
@@ -291,10 +403,11 @@ function makeManifest(items) {
 }
 
 function loadManifest(items) {
-  if (existsSync(manifestPath)) return readJson(manifestPath);
+  if (existsSync(manifestPath)) {
+    return BatchRunManifestSchema.parse(readJson(manifestPath));
+  }
   const manifest = makeManifest(items);
-  writeJson(manifestPath, manifest);
-  return manifest;
+  return writeTypedJson(manifestPath, BatchRunManifestSchema, manifest);
 }
 
 function itemPath(item) {
@@ -303,22 +416,24 @@ function itemPath(item) {
 
 function defaultCheckpoint(item, completedSeed = new Map()) {
   const seed = completedSeed.get(item.sourceName);
-  if (seed) {
+  const seedHash = typeof seed?.sourceHash === "string" ? seed.sourceHash : undefined;
+  const shouldSkip = seed && (seedHash == null || seedHash === item.sourceHash);
+  if (shouldSkip) {
     return {
       schemaVersion: SchemaVersion,
       itemId: item.itemId,
       runId,
-      status: "completed",
+      status: "skipped",
       sourceName: item.sourceName,
       sourceRelativePath: item.sourceRelativePath,
       sourceHash: item.sourceHash,
       normalizedPath: item.normalizedRel,
       bookId: item.bookId,
       attempts: 0,
-      completedAt: now(),
       commandChecks: [],
       metadata: {
         seededFromCompletedManifest: basename(completedManifestPath),
+        seedMatchMode: seedHash == null ? "source_name_only" : "source_name_and_hash",
       },
     };
   }
@@ -341,27 +456,28 @@ function loadCheckpoint(item, completedSeed) {
   const path = itemPath(item);
   if (!existsSync(path)) {
     const checkpoint = defaultCheckpoint(item, completedSeed);
-    writeJson(path, checkpoint);
-    return checkpoint;
+    return writeTypedJson(path, BatchItemCheckpointSchema, checkpoint);
   }
-  return readJson(path);
+  return BatchItemCheckpointSchema.parse(readJson(path));
 }
 
 function saveCheckpoint(item, checkpoint) {
-  writeJson(itemPath(item), checkpoint);
+  return writeTypedJson(itemPath(item), BatchItemCheckpointSchema, checkpoint);
 }
 
 function updateManifest(manifest, checkpoints) {
   const completed = checkpoints.filter((item) => item.status === "completed").length;
+  const skipped = checkpoints.filter((item) => item.status === "skipped").length;
   const failed = checkpoints.filter((item) => item.status === "failed").length;
   manifest.completedItems = completed;
+  manifest.skippedItems = skipped;
   manifest.failedItems = failed;
   manifest.updatedAt = now();
   if (failed > 0) {
     manifest.status = "failed";
     manifest.failedAt = manifest.failedAt ?? now();
     delete manifest.completedAt;
-  } else if (completed === manifest.totalItems) {
+  } else if (completed + skipped === manifest.totalItems) {
     manifest.status = "completed";
     manifest.completedAt = manifest.completedAt ?? now();
     delete manifest.failedAt;
@@ -370,7 +486,7 @@ function updateManifest(manifest, checkpoints) {
     delete manifest.completedAt;
     delete manifest.failedAt;
   }
-  writeJson(manifestPath, manifest);
+  return writeTypedJson(manifestPath, BatchRunManifestSchema, manifest);
 }
 
 function qmdRunner() {
@@ -453,6 +569,18 @@ function qmd(item, name, args, attempts = 1) {
   return runCommand(item, name, runner.command, [...runner.args, ...args], {
     attempts,
   });
+}
+
+function parseResumeOutput(stdout) {
+  const text = stdout.trim();
+  if (!text) throw new Error("resume-book produced empty stdout");
+  try {
+    return JSON.parse(text);
+  } catch {
+    const start = text.lastIndexOf("\n{");
+    if (start >= 0) return JSON.parse(text.slice(start + 1));
+    throw new Error("resume-book stdout did not contain a JSON object");
+  }
 }
 
 function requirePath(path, label) {
@@ -579,39 +707,70 @@ with open(output_path, "w", encoding="utf-8") as handle:
 
 function runGraphResume(item) {
   requirePath(pythonBin, "GraphRAG Python");
-  runCommand(item, "resume-book", process.execPath, [
-    ...resumeRunnerArgs(),
-    "--state-root",
-    stateRoot,
-    "--source-path",
-    item.sourcePath,
-    "--normalized-path",
-    item.normalizedPath,
-    "--qmd-index-path",
-    qmdIndexPath,
-    "--config",
-    configPath,
-    "--python-bin",
-    pythonBin,
-    "--working-directory",
-    root,
-    "--query",
-    query,
-    "--query-method",
-    "local",
-  ], { attempts: maxCommandAttempts });
+  const maxResumePasses = 8;
+  let lastResult = null;
+  for (let pass = 1; pass <= maxResumePasses; pass += 1) {
+    const result = runCommand(item, `resume-book-${pass}`, process.execPath, [
+      ...resumeRunnerArgs(),
+      "--state-root",
+      stateRoot,
+      "--source-path",
+      item.sourcePath,
+      "--normalized-path",
+      item.normalizedPath,
+      "--qmd-index-path",
+      qmdIndexPath,
+      "--config",
+      configPath,
+      "--python-bin",
+      pythonBin,
+      "--working-directory",
+      root,
+      "--query",
+      query,
+      "--query-method",
+      "local",
+    ], { attempts: maxCommandAttempts });
+    lastResult = result;
+
+    let resume;
+    try {
+      resume = parseResumeOutput(result.stdout);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw Object.assign(new Error(message), { commandCheck: result.check });
+    }
+    event({
+      itemId: item.itemId,
+      event: "resume_pass_completed",
+      status: resume.status === "ready" ? "completed" : "running",
+      metadata: {
+        pass,
+        resumeStatus: resume.status,
+        nextStage: resume.nextStage,
+      },
+    });
+    if (resume.status === "ready" && resume.nextStage == null) return;
+  }
+
+  throw Object.assign(
+    new Error(`resume-book did not reach ready after ${maxResumePasses} passes`),
+    { commandCheck: lastResult?.check },
+  );
 }
 
 function parseBookIdFromResume(item) {
-  const path = join(logRoot, `${item.itemId}-resume-book.out`);
-  if (!existsSync(path)) return undefined;
-  const raw = readFileSync(path, "utf8");
-  try {
-    const parsed = JSON.parse(raw);
-    return typeof parsed.bookId === "string" ? parsed.bookId : undefined;
-  } catch {
-    return undefined;
+  for (let pass = 8; pass >= 1; pass -= 1) {
+    const path = join(logRoot, `${item.itemId}-resume-book-${pass}.out`);
+    if (!existsSync(path)) continue;
+    try {
+      const parsed = parseResumeOutput(readFileSync(path, "utf8"));
+      if (typeof parsed.bookId === "string") return parsed.bookId;
+    } catch {
+      continue;
+    }
   }
+  return undefined;
 }
 
 function runCliChecks(item) {
@@ -698,6 +857,15 @@ function main() {
       event({ itemId: item.itemId, event: "item_skip_completed", status: "completed" });
       continue;
     }
+    if (checkpoint?.status === "skipped") {
+      event({
+        itemId: item.itemId,
+        event: "item_skipped",
+        status: "skipped",
+        metadata: checkpoint.metadata,
+      });
+      continue;
+    }
 
     try {
       const completed = runItem(item, checkpoint ?? defaultCheckpoint(item, completedSeed));
@@ -736,6 +904,6 @@ function main() {
 try {
   main();
 } catch (error) {
-  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  console.error(redactLog(error instanceof Error ? error.stack ?? error.message : String(error)));
   process.exitCode = 1;
 }
