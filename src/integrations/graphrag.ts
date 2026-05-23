@@ -29,6 +29,54 @@ import {
 } from "../job-state/fingerprint.js";
 import { callPythonBridge } from "./python-bridge.js";
 
+const GRAPHRAG_QUERY_MAX_RETRIES = 3;
+const GRAPHRAG_QUERY_RETRY_BASE_MS = 1000;
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableGraphRagQueryError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return (
+    message.includes("concurrency limit") ||
+    message.includes("rate limit") ||
+    message.includes("temporarily unavailable") ||
+    message.includes("timeout") ||
+    message.includes("(429)") ||
+    message.includes("(500)") ||
+    message.includes("(502)") ||
+    message.includes("(503)") ||
+    message.includes("(504)")
+  );
+}
+
+async function callGraphRagQueryBridgeWithRetry(
+  parsed: GraphRagQueryRequest,
+): Promise<GraphRagQueryResponse> {
+  for (let attempt = 0; attempt <= GRAPHRAG_QUERY_MAX_RETRIES; attempt += 1) {
+    try {
+      return await callPythonBridge({
+        command: "graphrag_query",
+        pythonBin: parsed.environment?.pythonBin,
+        workingDirectory: parsed.environment?.workingDirectory,
+        request: parsed,
+        responseSchema: GraphRagQueryResponseSchema,
+      });
+    } catch (error) {
+      if (
+        attempt >= GRAPHRAG_QUERY_MAX_RETRIES ||
+        !isRetryableGraphRagQueryError(error)
+      ) {
+        throw error;
+      }
+      await delayMs(GRAPHRAG_QUERY_RETRY_BASE_MS * 2 ** attempt);
+    }
+  }
+  throw new Error("unreachable GraphRAG query retry state");
+}
+
 async function writeGraphRagProviderRequestArtifact(input: {
   rootDir: string;
   stage: string;
@@ -192,13 +240,7 @@ export async function runGraphRagQuery(
     },
   });
 
-  const response = await callPythonBridge({
-    command: "graphrag_query",
-    pythonBin: parsed.environment?.pythonBin,
-    workingDirectory: parsed.environment?.workingDirectory,
-    request: parsed,
-    responseSchema: GraphRagQueryResponseSchema,
-  });
+  const response = await callGraphRagQueryBridgeWithRetry(parsed);
   const lineages = evidenceCostLineage(response.evidence);
   const runId = `graphrag-query-${Date.now()}`;
   for (const [index, lineage] of lineages.entries()) {

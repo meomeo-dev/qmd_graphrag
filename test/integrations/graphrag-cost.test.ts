@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, test, vi } from "vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
 
 import { SchemaVersion } from "../../src/contracts/common.js";
 import { callPythonBridge } from "../../src/integrations/python-bridge.js";
@@ -19,6 +19,10 @@ vi.mock("../../src/integrations/python-bridge.js", () => ({
 }));
 
 const mockedBridge = callPythonBridge as ReturnType<typeof vi.fn>;
+
+beforeEach(() => {
+  mockedBridge.mockReset();
+});
 
 async function writeValidatedGraphVault(root: string): Promise<{
   reportArtifactId: string;
@@ -209,6 +213,49 @@ describe("GraphRAG provider cost accounting", () => {
     expect(existsSync(join(graphVault, requestArtifactPath as string))).toBe(true);
     expect(record?.tokenCountStatus).toBe("unknown");
     expect(record?.embeddingCountStatus).toBe("unknown");
+  });
+
+  test("retries transient GraphRAG query bridge errors without duplicate cost records", async () => {
+    const graphVault = await mkdtemp(join(tmpdir(), "qmd-graphrag-query-retry-"));
+    mockedBridge
+      .mockRejectedValueOnce(new Error("Concurrency limit exceeded for user"))
+      .mockResolvedValueOnce({
+        schemaVersion: SchemaVersion,
+        method: "local",
+        responseText: "Graph answer after retry",
+        evidence: [{
+          evidenceId: "cap-1",
+          graphCapabilityId: "cap-1",
+          sourceId: "source-1",
+          documentId: "doc-1",
+          bookId: "book-1",
+          contentHash: "content-1",
+          graphTextUnitId: "tu-1",
+          artifactId: "artifact-from-evidence",
+        }],
+      });
+
+    const response = await runGraphRagQuery({
+      rootDir: graphVault,
+      method: "local",
+      query: "How do concepts relate?",
+      responseType: "multiple paragraphs",
+      capabilityScope: {
+        selectedBookIds: ["book-1"],
+        graphCapabilityIds: ["cap-1"],
+        sourceIds: ["source-1"],
+        documentIds: ["doc-1"],
+        contentHashes: ["content-1"],
+        artifactIds: ["artifact-from-evidence"],
+      },
+    });
+
+    const records = await readCostLedger(graphVault);
+
+    expect(response.responseText).toBe("Graph answer after retry");
+    expect(mockedBridge).toHaveBeenCalledTimes(2);
+    expect(records).toHaveLength(1);
+    expect(records[0]?.requestCount).toBe(1);
   });
 
   test("keeps multi-book query cost lineage grouped by evidence identity", async () => {
