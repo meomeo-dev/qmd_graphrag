@@ -55,6 +55,14 @@ decision:
       上述字段是向量生产语义的一部分，必须进入 Jina request、
       provider request fingerprint、DSPy provider fingerprint 与 qmd
       embedding fingerprint。
+  response_boundary:
+    rule: >-
+      Jina embedding response schema 保持外部 API 原始响应边界，只解析
+      model、data 与 usage 等供应商返回字段。profile、downstream task、
+      dimensions、normalized、embedding_type、truncate、endpoint 与 base
+      URL 不是 Jina response 的可靠返回字段，必须由 request/config、
+      provider request fingerprint、qmd embedding fingerprint 与
+      content_vector_embedding_record 承载。
   persistence:
     table: content_vectors
     fields:
@@ -84,6 +92,9 @@ invariants:
   - Jina embedding request 对 query embedding 使用 `retrieval.query`。
   - `jina:` embedding 不再叠加 qmd 本地模型的文本 task prefix。
   - 任一向量生产语义字段变化都会改变 `embed_fingerprint`。
+  - Jina response 不作为向量生产语义的唯一事实来源；response 消费者必须
+    结合 request/config fingerprint 和 content_vector_embedding_record 判断
+    向量兼容性。
   - `providers.jina.embedding_profile` 与 active qmd/GraphRAG 模型不可漂移。
   - `embedding.chunk_strategy` 变化会改变 `embed_fingerprint`。
   - GraphRAG `vector_store.vector_size` 与当前 Jina profile dimensions 一致。

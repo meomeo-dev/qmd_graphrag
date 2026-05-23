@@ -383,6 +383,9 @@ typed_buses:
           model and embedFingerprint are required provenance fields for vector
           consumers. Jina records with empty legacy fingerprints are stale and
           require re-embedding because profile/task provenance is unavailable.
+          The external Jina response remains provider-shaped; vector
+          compatibility is determined from request/config fingerprints and
+          content_vector_embedding_record.
       - name: qmd_query_request
         schema: src/contracts/qmd-query.ts#QmdQueryRequestSchema
         envelope: src/contracts/qmd-query.ts#QmdQueryRequestEnvelopeSchema
@@ -709,6 +712,9 @@ typed_buses:
           - src/llm.ts#LlamaCpp.embedBatchWithJina
         notes:
           - external endpoint is Jina API POST /v1/embeddings
+          - response schema mirrors the provider response and is not the source
+            of truth for profile, downstream task, dimensions, normalized,
+            embedding_type, truncate, endpoint, or base URL provenance
           - payload includes downstream task, dimensions, normalized,
             embedding_type, and truncate
       - name: jina_embedding_response

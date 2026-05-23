@@ -141,6 +141,9 @@ types:
       - chunkSeq maps to content_vectors.seq
       - chunkPos maps to content_vectors.pos
       - model and embedFingerprint are required vector provenance fields
+      - Jina profile, downstream task, dimensions, normalized,
+        embedding_type, truncate, endpoint, and base URL provenance is carried
+        by embedFingerprint instead of the external Jina response payload
       - Jina empty legacy fingerprints are never auto-adopted because model
         profile, downstream task, dimensions, normalization, embedding type,
         truncation, endpoint, and base URL provenance is unavailable
@@ -538,6 +541,9 @@ types:
     storage: transient
     notes:
       - external endpoint is Jina API POST /v1/embeddings
+      - response schema mirrors the provider response and is not the source of
+        truth for profile, downstream task, dimensions, normalized,
+        embedding_type, truncate, endpoint, or base URL provenance
       - request carries downstream task, dimensions, normalized,
         embedding_type, and truncate so embedding production semantics remain
         typed and fingerprintable
