@@ -72,10 +72,6 @@ function sha256File(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-function sha256Text(text) {
-  return createHash("sha256").update(text).digest("hex");
-}
-
 function slugify(name) {
   return name
     .normalize("NFKD")
@@ -91,8 +87,17 @@ function redacted(message) {
   return String(message)
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, "Bearer [REDACTED]")
     .replace(/(OPENAI_API_KEY|JINA_API_KEY)=\S+/g, "$1=[REDACTED]")
+    .replace(/(OPENAI_BASE_URL|JINA_API_BASE)=\S+/g, "$1=[REDACTED]")
     .replace(/sk-[A-Za-z0-9._-]+/g, "sk-[REDACTED]")
     .slice(0, 1000);
+}
+
+function redactLog(text) {
+  return String(text)
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, "Bearer [REDACTED]")
+    .replace(/(OPENAI_API_KEY|JINA_API_KEY)=\S+/g, "$1=[REDACTED]")
+    .replace(/(OPENAI_BASE_URL|JINA_API_BASE)=\S+/g, "$1=[REDACTED]")
+    .replace(/sk-[A-Za-z0-9._-]+/g, "sk-[REDACTED]");
 }
 
 function isTransient(text) {
@@ -120,6 +125,10 @@ function sleep(ms) {
 }
 
 function ensureDirs() {
+  const relativeLogRoot = relative(stateRoot, logRoot);
+  if (relativeLogRoot === "" || !relativeLogRoot.startsWith("..")) {
+    throw new Error("--log-root must be outside graph_vault");
+  }
   mkdirSync(batchRoot, { recursive: true });
   mkdirSync(itemRoot, { recursive: true });
   mkdirSync(logRoot, { recursive: true });
@@ -263,7 +272,7 @@ function makeManifest(items) {
     updatedAt: now(),
     itemIds: items.map((item) => item.itemId),
     metadata: {
-      logRoot,
+      logRootName: basename(logRoot),
     },
   };
 }
@@ -296,7 +305,7 @@ function defaultCheckpoint(item, completedSeed = new Map()) {
       completedAt: now(),
       commandChecks: [],
       metadata: {
-        seededFromCompletedManifest: relative(root, completedManifestPath),
+        seededFromCompletedManifest: basename(completedManifestPath),
       },
     };
   }
@@ -338,9 +347,11 @@ function updateManifest(manifest, checkpoints) {
   if (failed > 0) {
     manifest.status = "failed";
     manifest.failedAt = manifest.failedAt ?? now();
+    delete manifest.completedAt;
   } else if (completed === manifest.totalItems) {
     manifest.status = "completed";
     manifest.completedAt = manifest.completedAt ?? now();
+    delete manifest.failedAt;
   } else {
     manifest.status = "running";
     delete manifest.completedAt;
@@ -390,8 +401,8 @@ function runCommand(item, name, command, args, options = {}) {
     const completedAt = now();
     const stdout = result.stdout ?? "";
     const stderr = result.stderr ?? "";
-    writeFileSync(join(logRoot, `${item.itemId}-${name}.out`), stdout);
-    writeFileSync(join(logRoot, `${item.itemId}-${name}.err`), stderr);
+    writeFileSync(join(logRoot, `${item.itemId}-${name}.out`), redactLog(stdout));
+    writeFileSync(join(logRoot, `${item.itemId}-${name}.err`), redactLog(stderr));
     const check = {
       name,
       status: result.status === 0 ? "passed" : "failed",

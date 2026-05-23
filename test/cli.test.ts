@@ -981,6 +981,50 @@ describe("CLI Search Command", () => {
     expect(results[0].line).toBeGreaterThan(0);
     expect(results[0].body).toBeTypeOf("string");
   });
+
+  test("vsearch does not emit query expansion diagnostics", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(
+      ["vsearch", "--json", "meeting"],
+      {
+        env: {
+          OPENAI_API_KEY: "",
+          OPENAI_BASE_URL: "http://127.0.0.1:9",
+        },
+        timeoutMs: 20000,
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(() => JSON.parse(stdout)).not.toThrow();
+    expect(stderr).not.toContain("Searching 2 vector queries");
+    expect(stderr).not.toContain("lex:");
+    expect(stderr).not.toContain("hyde:");
+    expect(stderr).not.toContain("OpenAI Responses");
+  }, 25000);
+});
+
+describe("GraphRAG EPUB batch runner", () => {
+  test("keeps batch state typed and raw logs outside graph_vault", () => {
+    const script = readFileSync(
+      join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+      "utf8",
+    );
+    const contract = readFileSync(
+      join(projectRoot, "src", "contracts", "batch-run.ts"),
+      "utf8",
+    );
+
+    expect(contract).toContain("BatchRunManifestSchema");
+    expect(contract).toContain("BatchItemCheckpointSchema");
+    expect(contract).toContain("BatchEventLogSchema");
+    expect(script).toContain("\"completed-manifest\"");
+    expect(script).toContain("--log-root must be outside graph_vault");
+    expect(script).toContain("resume-book-workspace.mjs");
+    expect(script).toContain("qmd-query-graphrag-json");
+    expect(script).toContain("redactLog(stdout)");
+    expect(script).toContain("redactLog(stderr)");
+    expect(script).not.toContain("metadata: {\\n      logRoot,");
+  });
 });
 
 describe("CLI Unified Query Route", () => {

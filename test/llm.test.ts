@@ -869,6 +869,30 @@ describe("LlamaCpp Jina rerank", () => {
     }
   });
 
+  test("does not retry non-transient Jina embedding failures", async () => {
+    const previousApiKey = process.env.JINA_API_KEY;
+    const previousFetch = globalThis.fetch;
+    process.env.JINA_API_KEY = "redaction-sentinel";
+    const fetchMock = vi.fn(async () =>
+      new Response("unauthorized", { status: 401 })
+    );
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    try {
+      const llm = new LlamaCpp({ embedModel: DEFAULT_EMBED_MODEL_URI }) as any;
+      llm._ciMode = false;
+      await expect(llm.embedBatch(["software design"], {
+        model: DEFAULT_EMBED_MODEL_URI,
+        isQuery: true,
+      })).rejects.toThrow("Jina embedding request failed (401)");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousApiKey === undefined) delete process.env.JINA_API_KEY;
+      else process.env.JINA_API_KEY = previousApiKey;
+    }
+  });
+
   test("Jina embedding adapter ignores direct unsupported Jina model overrides", async () => {
     const previousApiKey = process.env.JINA_API_KEY;
     const previousFetch = globalThis.fetch;
@@ -1191,6 +1215,59 @@ describe("LlamaCpp Jina rerank", () => {
       globalThis.fetch = previousFetch;
       if (previousApiKey === undefined) delete process.env.JINA_API_KEY;
       else process.env.JINA_API_KEY = previousApiKey;
+    }
+  });
+
+  test("records one Jina rerank ledger entry after transient retry succeeds", async () => {
+    const previousApiKey = process.env.JINA_API_KEY;
+    const previousGraphVault = process.env.QMD_GRAPH_VAULT;
+    const previousFetch = globalThis.fetch;
+    const graphVault = await mkdtemp(join(tmpdir(), "qmd-jina-rerank-retry-cost-"));
+    process.env.JINA_API_KEY = "redaction-sentinel";
+    process.env.QMD_GRAPH_VAULT = graphVault;
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("temporarily unavailable", {
+        status: 503,
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        model: "jina-reranker-v3",
+        usage: { total_tokens: 5 },
+        results: [{ index: 0, relevance_score: 0.77 }],
+      })));
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    try {
+      const llm = new LlamaCpp() as any;
+      llm._ciMode = false;
+      await llm.rerank("auth setup", [
+        {
+          file: "auth.md",
+          text: "configure auth",
+          costLineage: {
+            sourceId: "source-1",
+            documentId: "doc-1",
+            bookId: "book-1",
+            contentHash: "hash-1",
+            artifactIds: ["auth-artifact"],
+          },
+        },
+      ]);
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const ledger = await readFile(
+        join(graphVault, "catalog", "cost-accounting.jsonl"),
+        "utf8",
+      );
+      expect(ledger.trim().split(/\r?\n/u)).toHaveLength(1);
+      expect(ledger).toContain("\"stage\":\"rerank\"");
+      expect(ledger).toContain("\"tokenCount\":5");
+    } finally {
+      globalThis.fetch = previousFetch;
+      await rm(graphVault, { recursive: true, force: true });
+      if (previousApiKey === undefined) delete process.env.JINA_API_KEY;
+      else process.env.JINA_API_KEY = previousApiKey;
+      if (previousGraphVault === undefined) delete process.env.QMD_GRAPH_VAULT;
+      else process.env.QMD_GRAPH_VAULT = previousGraphVault;
     }
   });
 

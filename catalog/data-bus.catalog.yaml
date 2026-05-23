@@ -32,7 +32,6 @@ types:
       - scripts/graphrag/batch-epub-workflow.mjs
     consumers:
       - scripts/graphrag/batch-epub-workflow.mjs
-      - scripts/graphrag/resume-book-workspace.mjs
     storage: graph_vault/catalog/batch-runs/<run_id>/items/<item_id>.json
     notes:
       - one checkpoint per EPUB item
@@ -255,10 +254,9 @@ types:
     envelope: src/contracts/qmd-query.ts#QmdVectorSearchResultEnvelopeSchema
     contract_level: required
     producers:
-      - src/store.ts#vectorSearchQuery
-      - src/store.ts#searchVec
-    consumers:
       - src/cli/qmd.ts#vectorSearch
+    consumers:
+      - src/cli/qmd.ts#outputResults
     storage: transient
     notes:
       - result candidates are vector-only retrieval candidates

@@ -161,7 +161,10 @@ import {
   createTypedQueryError,
   routeQuery,
 } from "../query/unified-router.js";
-import { QmdSearchResultSchema } from "../contracts/qmd-query.js";
+import {
+  QmdSearchResultSchema,
+  QmdVectorSearchResultSchema,
+} from "../contracts/qmd-query.js";
 import {
   loadDocumentIdentitiesFromGraphVault,
   toQmdRetrievalCandidates,
@@ -3003,15 +3006,50 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       return;
     }
 
-    outputResults(results.map(r => ({
-      file: r.file,
-      displayPath: r.displayPath,
-      title: r.title,
-      body: r.body,
-      score: r.score,
-      context: r.context,
-      docid: r.docid,
-    })), query, { ...opts, limit: results.length });
+    const vectorResult = QmdVectorSearchResultSchema.parse({
+      schemaVersion: SchemaVersion,
+      query,
+      results: results.map((result, index) => ({
+        candidateId: result.hash
+          ? `${result.hash}:vec:${index}`
+          : `vec:${index}`,
+        sourceId: null,
+        documentId: null,
+        contentHash: result.hash ?? null,
+        chunkId: null,
+        path: result.file,
+        title: result.title,
+        snippet: result.body.slice(0, 300),
+        source: "vec",
+        retrievalScore: result.score,
+        rerankScore: null,
+        metadata: {
+          displayPath: result.displayPath,
+          docid: result.docid,
+          fullText: result.body,
+          ...(result.context ? { context: result.context } : {}),
+        },
+      })),
+    });
+
+    outputResults(vectorResult.results.map((candidate) => ({
+      file: candidate.path,
+      displayPath: typeof candidate.metadata?.displayPath === "string"
+        ? candidate.metadata.displayPath
+        : candidate.path,
+      title: candidate.title ?? "",
+      body: typeof candidate.metadata?.fullText === "string"
+        ? candidate.metadata.fullText
+        : candidate.snippet ?? "",
+      score: candidate.retrievalScore,
+      context: typeof candidate.metadata?.context === "string"
+        ? candidate.metadata.context
+        : null,
+      hash: candidate.contentHash ?? undefined,
+      docid: typeof candidate.metadata?.docid === "string"
+        ? candidate.metadata.docid
+        : undefined,
+    })), query, { ...opts, limit: vectorResult.results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
 }
 
