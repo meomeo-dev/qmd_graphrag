@@ -1,12 +1,10 @@
-### qmd_graphrag GraphRAG template
+### qmd_graphrag GraphRAG reference template
 ### Vector store: LanceDB
 ### Embedding provider: Jina via LiteLLM
-### Rerank provider: qmd local retrieval defaults to Jina via `jina:jina-reranker-v3`
 ###
-### Usage:
-### 1. Copy this file to your GraphRAG root as settings.yaml
-### 2. Ensure the same directory contains a .env file with JINA_API_KEY
-### 3. Replace <...> placeholders before running indexing/query
+### Managed graph_vault/settings.yaml is generated from .qmd/index.yml by
+### src/graphrag/settings-projection.ts. This file documents the current
+### projection shape and must not be edited into graph_vault by hand.
 
 completion_models:
   default_chat_model:
@@ -22,6 +20,9 @@ completion_models:
       max_delay: 30.0
       jitter: true
     call_args:
+      responses_endpoint: /responses
+      responses_stream: true
+      strict_structured_output: true
       reasoning_effort: medium
       max_completion_tokens: 4096
 
@@ -31,9 +32,31 @@ embedding_models:
   default_embedding_model:
     type: litellm
     model_provider: jina_ai
-    model: <JINA_EMBEDDING_MODEL>
+    model: jina-embeddings-v5-text-small
     api_key: ${JINA_API_KEY}
-    call_args: {}
+    api_base: https://api.jina.ai/v1
+    call_args:
+      default_base_url: https://api.jina.ai
+      embedding_endpoint: /v1/embeddings
+      task: retrieval.passage
+      dimensions: 1024
+      normalized: true
+      embedding_type: float
+      truncate: true
+  query_embedding_model:
+    type: litellm
+    model_provider: jina_ai
+    model: jina-embeddings-v5-text-small
+    api_key: ${JINA_API_KEY}
+    api_base: https://api.jina.ai/v1
+    call_args:
+      default_base_url: https://api.jina.ai
+      embedding_endpoint: /v1/embeddings
+      task: retrieval.query
+      dimensions: 1024
+      normalized: true
+      embedding_type: float
+      truncate: true
 
 input:
   type: text
@@ -79,7 +102,7 @@ community_reports:
 
 local_search:
   completion_model_id: default_chat_model
-  embedding_model_id: default_embedding_model
+  embedding_model_id: query_embedding_model
   prompt: "prompts/local_search_system_prompt.txt"
 
 global_search:
@@ -90,11 +113,11 @@ global_search:
 
 drift_search:
   completion_model_id: default_chat_model
-  embedding_model_id: default_embedding_model
+  embedding_model_id: query_embedding_model
   prompt: "prompts/drift_search_system_prompt.txt"
   reduce_prompt: "prompts/drift_search_reduce_prompt.txt"
 
 basic_search:
   completion_model_id: default_chat_model
-  embedding_model_id: default_embedding_model
+  embedding_model_id: query_embedding_model
   prompt: "prompts/basic_search_system_prompt.txt"

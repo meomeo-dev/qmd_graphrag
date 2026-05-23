@@ -31,6 +31,7 @@ import {
   resolveGenerateModel,
   resolveRerankModel,
   resolveModels,
+  resolveModelsFromConfig,
   pullModels,
   withLLMSession,
   canUnloadLLM,
@@ -65,36 +66,36 @@ describe("model name resolution", () => {
 
   test("all model roles resolve config hints before env fallbacks", () => {
     withModelEnv({
-      QMD_EMBED_MODEL: "env-embed",
+      QMD_EMBED_MODEL: "hf:env-embed",
       QMD_GENERATE_MODEL: "env-generate",
-      QMD_RERANK_MODEL: "env-rerank",
+      QMD_RERANK_MODEL: "hf:env-rerank",
     }, () => {
       const config = {
-        embed: "config-embed",
+        embed: "hf:config-embed",
         generate: "config-generate",
-        rerank: "config-rerank",
+        rerank: "hf:config-rerank",
       };
-      expect(resolveEmbedModel(config)).toBe("config-embed");
+      expect(resolveEmbedModel(config)).toBe("hf:config-embed");
       expect(resolveGenerateModel(config)).toBe("config-generate");
-      expect(resolveRerankModel(config)).toBe("config-rerank");
+      expect(resolveRerankModel(config)).toBe("hf:config-rerank");
       expect(resolveModels(config)).toEqual(config);
     });
   });
 
   test("LlamaCpp constructor uses the same resolver as status/embed/query helpers", () => {
     withModelEnv({
-      QMD_EMBED_MODEL: "env-embed",
+      QMD_EMBED_MODEL: "hf:env-embed",
       QMD_GENERATE_MODEL: "env-generate",
-      QMD_RERANK_MODEL: "env-rerank",
+      QMD_RERANK_MODEL: "hf:env-rerank",
     }, () => {
       const llm = new LlamaCpp({
-        embedModel: "config-embed",
+        embedModel: "hf:config-embed",
         generateModel: "config-generate",
-        rerankModel: "config-rerank",
+        rerankModel: "hf:config-rerank",
       });
-      expect(llm.embedModelName).toBe(resolveEmbedModel({ embed: "config-embed" }));
+      expect(llm.embedModelName).toBe(resolveEmbedModel({ embed: "hf:config-embed" }));
       expect(llm.generateModelName).toBe(resolveGenerateModel({ generate: "config-generate" }));
-      expect(llm.rerankModelName).toBe(resolveRerankModel({ rerank: "config-rerank" }));
+      expect(llm.rerankModelName).toBe(resolveRerankModel({ rerank: "hf:config-rerank" }));
     });
   });
 });
@@ -837,6 +838,69 @@ describe("LlamaCpp Jina rerank", () => {
     }
   });
 
+  test("Jina embedding adapter ignores direct unsupported Jina model overrides", async () => {
+    const previousApiKey = process.env.JINA_API_KEY;
+    const previousFetch = globalThis.fetch;
+    process.env.JINA_API_KEY = "redaction-sentinel";
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body));
+      expect(request.model).toBe(JINA_TEXT_EMBEDDING_MODEL);
+      return new Response(JSON.stringify({
+        model: JINA_TEXT_EMBEDDING_MODEL,
+        data: [{ index: 0, embedding: [0.1, 0.2] }],
+      }));
+    });
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    try {
+      const llm = new LlamaCpp({ embedModel: "jina:legacy-embedding-model" }) as any;
+      llm._ciMode = false;
+      const result = await llm.embedBatch(["software design"], {
+        model: "jina:another-legacy-embedding-model",
+      });
+      expect(result).toEqual([{
+        embedding: [0.1, 0.2],
+        model: DEFAULT_EMBED_MODEL_URI,
+      }]);
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousApiKey === undefined) delete process.env.JINA_API_KEY;
+      else process.env.JINA_API_KEY = previousApiKey;
+    }
+  });
+
+  test("Jina rerank adapter ignores direct unsupported Jina model overrides", async () => {
+    const previousApiKey = process.env.JINA_API_KEY;
+    const previousFetch = globalThis.fetch;
+    process.env.JINA_API_KEY = "redaction-sentinel";
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body));
+      expect(request.model).toBe("jina-reranker-v3");
+      return new Response(JSON.stringify({
+        model: "jina-reranker-v3",
+        results: [{ index: 0, relevance_score: 0.9 }],
+      }));
+    });
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    try {
+      const llm = new LlamaCpp({ rerankModel: "jina:legacy-reranker-model" }) as any;
+      llm._ciMode = false;
+      const result = await llm.rerank("design", [{
+        file: "a.md",
+        text: "deep module",
+      }], {
+        model: "jina:another-legacy-reranker-model",
+      });
+      expect(result.model).toBe(DEFAULT_RERANK_MODEL_URI);
+      expect(result.results[0]?.score).toBe(0.9);
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousApiKey === undefined) delete process.env.JINA_API_KEY;
+      else process.env.JINA_API_KEY = previousApiKey;
+    }
+  });
+
   test("derives provider models from the active Jina profile", () => {
     const previousEmbedModel = process.env.QMD_EMBED_MODEL;
     const previousRerankModel = process.env.QMD_RERANK_MODEL;
@@ -869,6 +933,70 @@ describe("LlamaCpp Jina rerank", () => {
       expect(provider.embeddingNormalized).toBe(true);
       expect(provider.embeddingType).toBe("float");
       expect(provider.embeddingTruncate).toBe(true);
+    } finally {
+      if (previousEmbedModel === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = previousEmbedModel;
+      if (previousRerankModel === undefined) delete process.env.QMD_RERANK_MODEL;
+      else process.env.QMD_RERANK_MODEL = previousRerankModel;
+    }
+  });
+
+  test("maps arbitrary Jina model overrides back to the active profile", () => {
+    const previousEmbedModel = process.env.QMD_EMBED_MODEL;
+    const previousRerankModel = process.env.QMD_RERANK_MODEL;
+    process.env.QMD_EMBED_MODEL = "jina:legacy-embedding-model";
+    process.env.QMD_RERANK_MODEL = "jina:legacy-reranker-model";
+
+    try {
+      const config = {
+        collections: {},
+        models: {
+          embed: "jina:unsupported-embedding-model",
+          rerank: "jina:unsupported-reranker-model",
+        },
+        providers: {
+          jina: {
+            embedding_profile: "multimodal" as const,
+          },
+        },
+      };
+
+      expect(resolveModelsFromConfig(config)).toEqual({
+        embed: "jina:jina-embeddings-v5-omni-small",
+        generate: "openai:gpt-5.4",
+        rerank: "jina:jina-reranker-m0",
+      });
+    } finally {
+      if (previousEmbedModel === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = previousEmbedModel;
+      if (previousRerankModel === undefined) delete process.env.QMD_RERANK_MODEL;
+      else process.env.QMD_RERANK_MODEL = previousRerankModel;
+    }
+  });
+
+  test("keeps explicit non-Jina local model overrides outside Jina profiles", () => {
+    const previousEmbedModel = process.env.QMD_EMBED_MODEL;
+    const previousRerankModel = process.env.QMD_RERANK_MODEL;
+    process.env.QMD_EMBED_MODEL = "hf:env/embed.gguf";
+    process.env.QMD_RERANK_MODEL = "hf:env/rerank.gguf";
+
+    try {
+      expect(resolveModelsFromConfig({
+        collections: {},
+        models: {
+          embed: "hf:config/embed.gguf",
+          rerank: "hf:config/rerank.gguf",
+        },
+      })).toEqual({
+        embed: "hf:config/embed.gguf",
+        generate: "openai:gpt-5.4",
+        rerank: "hf:config/rerank.gguf",
+      });
+      expect(resolveModelsFromConfig({ collections: {} })).toEqual({
+        embed: "hf:env/embed.gguf",
+        generate: "openai:gpt-5.4",
+        rerank: "hf:env/rerank.gguf",
+      });
     } finally {
       if (previousEmbedModel === undefined) delete process.env.QMD_EMBED_MODEL;
       else process.env.QMD_EMBED_MODEL = previousEmbedModel;

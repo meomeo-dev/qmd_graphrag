@@ -161,11 +161,16 @@
 
 ## 配置建议（Recommended Configuration）
 
-模板文件：
+受管配置（managed configuration）由以下投影代码生成：
+
+- `src/graphrag/settings-projection.ts`
+
+参考模板文件：
 
 - `configs/graphrag/settings.lancedb-jina.template.yaml`
 
-建议把它复制到实际 GraphRAG root，并与同目录 `.env` 配合使用：
+`graph_vault/settings.yaml` 必须由 qmd 从 `.qmd/index.yml` 投影生成，不手工
+复制模板覆盖。模板只用于审阅当前受管配置形状。
 
 - `JINA_API_KEY`
 - `OPENAI_API_KEY` 或其他 completion provider 对应 key
@@ -174,6 +179,12 @@
 
 - `GraphRAG` 的配置加载器会自动读取 `settings.yaml` 同目录的 `.env`。
 - 模板中的 `${JINA_API_KEY}` 会在加载时被替换。
+- `default_embedding_model` 用于离线索引，Jina downstream task 固定为
+  `retrieval.passage`。
+- `query_embedding_model` 用于 `local` / `drift` / `basic` 查询，Jina
+  downstream task 固定为 `retrieval.query`。
+- Jina request 的 `dimensions`、`normalized`、`embedding_type`、`truncate`、
+  endpoint 与 base URL 均由当前 profile 投影，不允许空 `call_args`。
 - `JINA_API_KEY` 可复用；GraphRAG root 与 `.env` 的实际落点必须保持一致，
   或在运行前显式导出到进程环境。
 

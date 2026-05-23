@@ -530,6 +530,21 @@ describe("CLI Init Command", () => {
     expect(configText).toContain("providers:");
     expect(configText).toContain("graphrag:");
     expect(configText).toContain("query:");
+
+    const initConfig = YAML.parse(configText);
+    const repositoryConfig = YAML.parse(
+      readFileSync(join(projectRoot, ".qmd", "index.yml"), "utf-8"),
+    );
+    expect(initConfig.models).toEqual(repositoryConfig.models);
+    expect(initConfig.providers).toEqual(repositoryConfig.providers);
+    expect(initConfig.embedding).toEqual(repositoryConfig.embedding);
+    expect(initConfig.graphrag).toMatchObject({
+      enabled: repositoryConfig.graphrag.enabled,
+      vault: repositoryConfig.graphrag.vault,
+      default_method: repositoryConfig.graphrag.default_method,
+      default_response_type: repositoryConfig.graphrag.default_response_type,
+    });
+    expect(initConfig.query).toEqual(repositoryConfig.query);
   });
 
   test("refuses to initialize in HOME", async () => {

@@ -13,6 +13,8 @@ import {
 
 const ManagedBy = "qmd_graphrag";
 const ResponsesEndpoint = "/responses";
+const DocumentEmbeddingModelId = "default_embedding_model";
+const QueryEmbeddingModelId = "query_embedding_model";
 
 export type GraphRagRuntimeSettingsProjection = {
   sourceFingerprint: string;
@@ -115,7 +117,7 @@ export function buildGraphRagRuntimeSettingsProjection(
     },
     concurrent_requests: 2,
     embedding_models: {
-      default_embedding_model: {
+      [DocumentEmbeddingModelId]: {
         type: "litellm",
         model_provider: "jina_ai",
         model: profile.embeddingModel,
@@ -125,6 +127,22 @@ export function buildGraphRagRuntimeSettingsProjection(
           default_base_url: jinaApiBase(jina.base_url),
           embedding_endpoint: jina.embedding_endpoint ?? "/v1/embeddings",
           task: profile.documentTask,
+          dimensions: profile.dimensions,
+          normalized: profile.normalized,
+          embedding_type: profile.embeddingType,
+          truncate: profile.truncate,
+        },
+      },
+      [QueryEmbeddingModelId]: {
+        type: "litellm",
+        model_provider: "jina_ai",
+        model: profile.embeddingModel,
+        api_key: envPlaceholder(jina.api_key_env, "JINA_API_KEY"),
+        api_base: jinaLiteLlmApiBase(jina.base_url),
+        call_args: {
+          default_base_url: jinaApiBase(jina.base_url),
+          embedding_endpoint: jina.embedding_endpoint ?? "/v1/embeddings",
+          task: profile.queryTask,
           dimensions: profile.dimensions,
           normalized: profile.normalized,
           embedding_type: profile.embeddingType,
@@ -142,7 +160,7 @@ export function buildGraphRagRuntimeSettingsProjection(
       db_uri: "./output/lancedb",
       vector_size: profile.dimensions,
     },
-    embed_text: { embedding_model_id: "default_embedding_model" },
+    embed_text: { embedding_model_id: DocumentEmbeddingModelId },
     extract_graph: {
       completion_model_id: "default_chat_model",
       prompt: "prompts/extract_graph.txt",
@@ -158,7 +176,7 @@ export function buildGraphRagRuntimeSettingsProjection(
     },
     local_search: {
       completion_model_id: "default_chat_model",
-      embedding_model_id: "default_embedding_model",
+      embedding_model_id: QueryEmbeddingModelId,
       prompt: "prompts/local_search_system_prompt.txt",
     },
     global_search: {
@@ -169,13 +187,13 @@ export function buildGraphRagRuntimeSettingsProjection(
     },
     drift_search: {
       completion_model_id: "default_chat_model",
-      embedding_model_id: "default_embedding_model",
+      embedding_model_id: QueryEmbeddingModelId,
       prompt: "prompts/drift_search_system_prompt.txt",
       reduce_prompt: "prompts/drift_search_reduce_prompt.txt",
     },
     basic_search: {
       completion_model_id: "default_chat_model",
-      embedding_model_id: "default_embedding_model",
+      embedding_model_id: QueryEmbeddingModelId,
       prompt: "prompts/basic_search_system_prompt.txt",
     },
   };

@@ -149,11 +149,21 @@ describe("syncGraphRagBookWorkspace", () => {
 
     const embedding = (projection.settings.embedding_models as any)
       .default_embedding_model;
+    const queryEmbedding = (projection.settings.embedding_models as any)
+      .query_embedding_model;
     expect(embedding.api_base).toBe("https://api.jina.ai/v1");
     expect(embedding.model).toBe("jina-embeddings-v5-text-small");
     expect(embedding.call_args.task).toBe("retrieval.passage");
     expect(embedding.call_args.normalized).toBe(true);
     expect(embedding.call_args.embedding_type).toBe("float");
+    expect(queryEmbedding.model).toBe("jina-embeddings-v5-text-small");
+    expect(queryEmbedding.call_args.task).toBe("retrieval.query");
+    expect((projection.settings.local_search as any).embedding_model_id)
+      .toBe("query_embedding_model");
+    expect((projection.settings.drift_search as any).embedding_model_id)
+      .toBe("query_embedding_model");
+    expect((projection.settings.basic_search as any).embedding_model_id)
+      .toBe("query_embedding_model");
   });
 
   test("projects multimodal Jina profile as the authoritative embedding model", () => {
@@ -180,6 +190,8 @@ describe("syncGraphRagBookWorkspace", () => {
 
     const embedding = (projection.settings.embedding_models as any)
       .default_embedding_model;
+    const queryEmbedding = (projection.settings.embedding_models as any)
+      .query_embedding_model;
     expect(embedding.model).toBe("jina-embeddings-v5-omni-small");
     expect((projection.settings.qmd_graphrag as any).jina.embedding_profile)
       .toBe("multimodal");
@@ -188,6 +200,9 @@ describe("syncGraphRagBookWorkspace", () => {
     expect(embedding.call_args.normalized).toBe(true);
     expect(embedding.call_args.embedding_type).toBe("float");
     expect(embedding.call_args.truncate).toBe(true);
+    expect(queryEmbedding.model).toBe("jina-embeddings-v5-omni-small");
+    expect(queryEmbedding.call_args.task).toBe("retrieval.query");
+    expect(queryEmbedding.call_args.dimensions).toBe(1024);
     expect((projection.settings.vector_store as any).vector_size).toBe(1024);
   });
 

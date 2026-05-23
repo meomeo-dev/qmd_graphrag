@@ -519,7 +519,17 @@ function configuredJinaProfile(config?: CollectionConfig): JinaEmbeddingProfileN
 }
 
 export function resolveEmbedModel(config?: ModelResolutionConfig): string {
-  return config?.embed || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+  const configuredModel = config?.embed;
+  if (configuredModel && !isJinaEmbeddingModel(configuredModel)) {
+    return configuredModel;
+  }
+  const envModel = process.env.QMD_EMBED_MODEL?.trim();
+  if (envModel && !isJinaEmbeddingModel(envModel)) {
+    return envModel;
+  }
+  return modelUriForJinaEmbeddingProfile(
+    resolveJinaEmbeddingProfileName(loadRuntimeConfig().providers?.jina?.embedding_profile),
+  );
 }
 
 export function resolveGenerateModel(config?: ModelResolutionConfig): string {
@@ -527,27 +537,47 @@ export function resolveGenerateModel(config?: ModelResolutionConfig): string {
 }
 
 export function resolveRerankModel(config?: ModelResolutionConfig): string {
-  return config?.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
+  const configuredModel = config?.rerank;
+  if (configuredModel && !isJinaRerankModel(configuredModel)) {
+    return configuredModel;
+  }
+  const envModel = process.env.QMD_RERANK_MODEL?.trim();
+  if (envModel && !isJinaRerankModel(envModel)) {
+    return envModel;
+  }
+  return rerankUriForJinaEmbeddingProfile(
+    resolveJinaEmbeddingProfileName(loadRuntimeConfig().providers?.jina?.embedding_profile),
+  );
 }
 
 export function resolveEmbedModelFromConfig(config?: CollectionConfig): string {
   const configuredModel = config?.models?.embed;
-  const profileName = configuredJinaProfile(config);
-  if (profileName && (!configuredModel || isJinaEmbeddingModel(configuredModel))) {
-    return modelUriForJinaEmbeddingProfile(profileName);
+  const profileName = resolveJinaEmbeddingProfileName(
+    config?.providers?.jina?.embedding_profile,
+  );
+  if (configuredModel && !isJinaEmbeddingModel(configuredModel)) {
+    return configuredModel;
   }
-  if (process.env.QMD_EMBED_MODEL) return process.env.QMD_EMBED_MODEL;
-  return configuredModel || DEFAULT_EMBED_MODEL;
+  const envModel = process.env.QMD_EMBED_MODEL?.trim();
+  if (envModel && !isJinaEmbeddingModel(envModel)) {
+    return envModel;
+  }
+  return modelUriForJinaEmbeddingProfile(profileName);
 }
 
 export function resolveRerankModelFromConfig(config?: CollectionConfig): string {
   const configuredModel = config?.models?.rerank;
-  const profileName = configuredJinaProfile(config);
-  if (profileName && (!configuredModel || isJinaRerankModel(configuredModel))) {
-    return rerankUriForJinaEmbeddingProfile(profileName);
+  const profileName = resolveJinaEmbeddingProfileName(
+    config?.providers?.jina?.embedding_profile,
+  );
+  if (configuredModel && !isJinaRerankModel(configuredModel)) {
+    return configuredModel;
   }
-  if (process.env.QMD_RERANK_MODEL) return process.env.QMD_RERANK_MODEL;
-  return configuredModel || DEFAULT_RERANK_MODEL;
+  const envModel = process.env.QMD_RERANK_MODEL?.trim();
+  if (envModel && !isJinaRerankModel(envModel)) {
+    return envModel;
+  }
+  return rerankUriForJinaEmbeddingProfile(profileName);
 }
 
 export function resolveModelsFromConfig(
@@ -1873,8 +1903,9 @@ export class LlamaCpp implements LLM {
   ): Promise<(EmbeddingResult | null)[]> {
     if (texts.length === 0) return [];
 
-    const jinaModel = resolveJinaEmbeddingModelName(model);
     const providerConfig = resolveJinaProviderConfig();
+    const jinaModel = providerConfig.embeddingModel;
+    const modelUri = `${JINA_EMBED_PREFIX}${jinaModel}`;
     const task = resolveJinaEmbeddingTask(options);
     const request = JinaEmbeddingRequestSchema.parse({
       model: jinaModel,
@@ -1939,7 +1970,7 @@ export class LlamaCpp implements LLM {
     const byIndex = new Map(payload.data.map((item) => [item.index, item.embedding]));
     return texts.map((_, index) => {
       const embedding = byIndex.get(index);
-      return embedding ? { embedding, model } : null;
+      return embedding ? { embedding, model: modelUri } : null;
     });
   }
 
@@ -2462,8 +2493,9 @@ export class LlamaCpp implements LLM {
       };
     }
 
-    const jinaModel = resolveJinaRerankModelName(model);
     const providerConfig = resolveJinaProviderConfig();
+    const jinaModel = providerConfig.rerankModel;
+    const modelUri = `${JINA_RERANK_PREFIX}${jinaModel}`;
     const request = JinaRerankRequestSchema.parse({
       model: jinaModel,
       query,
@@ -2529,7 +2561,7 @@ export class LlamaCpp implements LLM {
 
     return {
       results,
-      model,
+      model: modelUri,
     };
   }
 
