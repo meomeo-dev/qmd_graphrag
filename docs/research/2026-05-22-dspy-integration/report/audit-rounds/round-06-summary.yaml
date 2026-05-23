@@ -1,0 +1,26 @@
+round: 6
+audited_version: dspy-integration-plan-v06.md
+result: fail
+subagents:
+  type_dd_schema:
+    result: fail
+    pass_count: 9
+    fail_count: 1
+    blocking_findings:
+      - DspyExpansionPolicySchema is defined as a runtime projection but is missing from the producer/consumer table.
+      - Promotion command text still says it updates qmd config, conflicting with the canonical graph_vault pointer path.
+  dspy_gepa:
+    result: pass
+    pass_count: 10
+    fail_count: 0
+    blocking_findings: []
+  product_ops:
+    result: pass
+    pass_count: 10
+    fail_count: 0
+    blocking_findings: []
+    non_blocking_findings:
+      - Add parent directory fsync after atomic rename.
+      - Name the typed lock error schema explicitly.
+      - Make absolute path rejection explicit for portability tests.
+next_version: dspy-integration-plan-v07.md

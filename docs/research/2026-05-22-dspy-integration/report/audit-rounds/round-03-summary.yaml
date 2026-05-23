@@ -1,0 +1,25 @@
+round: 3
+audited_version: dspy-integration-plan-v03.md
+result: fail
+subagents:
+  type_dd_schema:
+    result: fail
+    pass_count: 8
+    fail_count: 2
+    blocking_findings:
+      - Promotion history entry boundary is not explicitly separated from promotion decision.
+      - Promotion decision lacks explicit previous pointer state lineage for builtin, disabled, or null states.
+  dspy_gepa:
+    result: fail
+    pass_count: 9
+    fail_count: 1
+    blocking_findings:
+      - Hash, schema, and DSPy program version mismatch are not defined as non-configurable fail-closed artifact_invalid errors.
+  product_ops:
+    result: fail
+    pass_count: 8
+    fail_count: 2
+    blocking_findings:
+      - Configured DSPy provider with missing pointer, decision, or policy is not explicitly covered by fallback rules.
+      - State-management tests do not explicitly cover run transitions, pointer/history consistency, disable idempotency, and state invariance after failures.
+next_version: dspy-integration-plan-v04.md

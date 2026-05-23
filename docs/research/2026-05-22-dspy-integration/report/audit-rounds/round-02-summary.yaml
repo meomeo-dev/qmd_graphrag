@@ -1,0 +1,34 @@
+round: 2
+audited_version: dspy-integration-plan-v02.md
+result: fail
+subagents:
+  type_dd_schema:
+    result: fail
+    pass_count: 3
+    fail_count: 7
+    blocking_findings:
+      - Proposed schemas are not consistently named with Schema suffix.
+      - Policy, artifact, pointer, and promotion decision boundaries overlap.
+      - Stale formula omits provider and retrieval configuration fingerprints.
+      - Online bus output includes metadata beyond QueryExpansionItem.
+      - Type boundary lacks scalar path/env/redaction schemas.
+  dspy_gepa:
+    result: fail
+    pass_count: 6
+    fail_count: 4
+    blocking_findings:
+      - GEPA request lacks explicit program, metric, and acceptance testset inputs.
+      - Anti-overfitting rules do not enforce distinct testset usage.
+      - Compiled artifact load/validation semantics are unclear.
+      - batch_search_only is not isolated as non-promotable.
+  product_ops:
+    result: fail
+    pass_count: 5
+    fail_count: 5
+    blocking_findings:
+      - Active pointer atomic update protocol is underspecified.
+      - Default budget values and fail-closed behavior are missing.
+      - TDD matrix lacks state and concurrency acceptance cases.
+      - Delivery order has schema/storage after optimize.
+      - Online DSPy expansion runtime boundary is underspecified.
+next_version: dspy-integration-plan-v03.md

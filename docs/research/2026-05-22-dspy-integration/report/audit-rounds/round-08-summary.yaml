@@ -1,0 +1,25 @@
+round: 8
+audited_version: dspy-integration-plan-v08.md
+result: fail
+subagents:
+  type_dd_schema:
+    result: pass
+    pass_count: 10
+    fail_count: 0
+    blocking_findings: []
+  dspy_gepa:
+    result: pass
+    pass_count: 10
+    fail_count: 0
+    blocking_findings: []
+    non_blocking_findings:
+      - Online boundary wording can say runtime policy projection instead of strategy artifact.
+      - artifact_invalid applicability can be repeated near the online boundary.
+  product_ops:
+    result: fail
+    pass_count: 8
+    fail_count: 2
+    blocking_findings:
+      - Pointer migration/bootstrap from builtin or missing state into the graph_vault pointer model is not specified.
+      - Drift detection is placed after online loader/query wiring even though stale detection is a precondition for safe online consumption.
+next_version: dspy-integration-plan-v09.md

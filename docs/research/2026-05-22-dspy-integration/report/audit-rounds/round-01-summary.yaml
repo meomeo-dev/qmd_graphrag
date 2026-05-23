@@ -1,0 +1,30 @@
+round: 1
+audited_version: dspy-integration-plan-v01.md
+result: fail
+subagents:
+  type_dd_schema:
+    result: fail
+    pass_count: 7
+    fail_count: 3
+    blocking_findings:
+      - schema names do not close over every DSPy input and output.
+      - stale fingerprint fields and comparison rules are underspecified.
+      - fallback behavior is not a named typed policy.
+  dspy_gepa:
+    result: fail
+    pass_count: 8
+    fail_count: 2
+    blocking_findings:
+      - seed, log-dir, checkpoint/run-dir, and total budget fields missing.
+      - anti-overfitting flow and prompt length controls missing.
+  product_ops:
+    result: fail
+    pass_count: 5
+    fail_count: 5
+    blocking_findings:
+      - fallback and strict behavior need a mode matrix.
+      - optimize/evaluate/promote recovery and idempotency are missing.
+      - rollback or disable path is missing.
+      - unit/integration/CLI test matrix is missing.
+      - stdout/stderr/log/report redaction policy is missing.
+next_version: dspy-integration-plan-v02.md

@@ -1,0 +1,20 @@
+final_version: dspy-integration-plan-v10.md
+entrypoint: dspy-integration-plan.md
+status: passed_after_remediation
+subagent_dispatches: 30
+subagent_rounds: 10
+last_subagent_audited_version: dspy-integration-plan-v09.md
+last_subagent_result: fail
+remediation:
+  source_round: 10
+  fixed_blocking_findings:
+    - Added full Type DD boundary matrix for all proposed schemas and value-object schemas.
+    - Added explicit graph_vault relocation acceptance test.
+    - Added explicit VaultRelativePathSchema negative-path acceptance tests.
+  local_deterministic_checks:
+    - git diff --check passed for research package.
+    - All 17 proposed schema names have boundary matrix rows.
+    - Final entrypoint report matches v10 content.
+note: >-
+  No additional subagents were dispatched after v10 remediation in order to keep
+  the user-specified total at 30 subagent dispatches.

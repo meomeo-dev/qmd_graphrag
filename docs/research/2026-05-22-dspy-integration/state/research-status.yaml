@@ -1,0 +1,57 @@
+research_id: research_2553d25cc3c24b39b90b9c9f11c76728
+title: DSPy integration research for qmd_graphrag
+status: completed
+created_at: "2026-05-22T15:28:53.374Z"
+scope:
+  primary_question: >-
+    How should qmd_graphrag integrate DSPy for offline query prompt
+    optimization and online retrieval consumption while preserving Type DD
+    data-bus contracts?
+  repository_boundary: /Users/jin/projects/qmd_graphrag
+  evidence_dir: docs/research/2026-05-22-dspy-integration/evidence
+  report_dir: docs/research/2026-05-22-dspy-integration/report
+confidentiality:
+  external_research_context: public_names_only
+  excluded_from_external_context:
+    - source_code
+    - secrets
+    - private_paths
+    - local_runtime_data
+subagent_plan:
+  - name: dspy_core_model
+    status: completed
+    task: DSPy programming model, modules, signatures, examples, and assertions.
+  - name: dspy_gepa_optimizer
+    status: completed
+    task: GEPA optimizer capabilities, inputs, outputs, and operational limits.
+  - name: dspy_rag_patterns
+    status: completed
+    task: RAG/query expansion integration patterns and evaluation workflows.
+state_management_notes:
+  - >-
+    Concurrent deep-research evidence verification using @last-evidence caused
+    ambiguous state references. Subsequent verification uses explicit evidence
+    ids only.
+evidence_policy:
+  source_preference:
+    - official_docs
+    - official_repository
+    - peer_reviewed_or_project_papers
+  storage_rule: Store public-source summaries and locators under evidence/.
+deliverables:
+  final_report: report/dspy-integration-plan.md
+  evidence_index: evidence/evidence-index.yaml
+  final_versioned_report: report/dspy-integration-plan-v10.md
+  audit_rounds: report/audit-rounds
+gate_check:
+  status: passed
+  checked_at: "2026-05-22T15:40:38.276Z"
+  verified_evidence_count: 7
+  linked_evidence_count: 7
+dspy_integration_design_audit:
+  status: passed
+  completed_at: "2026-05-22"
+  iterations: 10
+  subagent_dispatches: 30
+  final_version: dspy-integration-plan-v10.md
+  final_entrypoint: dspy-integration-plan.md

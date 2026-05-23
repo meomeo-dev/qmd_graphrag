@@ -1,0 +1,27 @@
+round: 10
+audited_version: dspy-integration-plan-v09.md
+result: fail
+subagents:
+  type_dd_schema:
+    result: fail
+    pass_count: 9
+    fail_count: 1
+    blocking_findings:
+      - Type DD boundary coverage is incomplete for several proposed schemas and value-object schemas.
+      - A full boundary matrix is needed with responsibility, mutability, storage, producer, consumer, and validator owner.
+  dspy_gepa:
+    result: pass
+    pass_count: 10
+    fail_count: 0
+    blocking_findings: []
+    non_blocking_findings:
+      - compiledProgramPath can be made explicit as a required artifact field.
+      - provider call ledger, budget overflow reason, and promotability fields can be made explicit.
+  product_ops:
+    result: fail
+    pass_count: 8
+    fail_count: 2
+    blocking_findings:
+      - Portability tests do not explicitly cover graph_vault relocation.
+      - Negative path tests do not explicitly cover absolute paths, drive-letter paths, home paths, and parent-directory escapes.
+next_version: dspy-integration-plan-v10.md

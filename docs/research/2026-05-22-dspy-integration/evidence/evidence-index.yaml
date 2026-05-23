@@ -1,0 +1,48 @@
+version: 1
+research_id: research_2553d25cc3c24b39b90b9c9f11c76728
+evidence:
+  - id: evidence_dspy_official_overview
+    file: dspy-official-overview.md
+    source_type: official_docs
+    source: https://dspy.ai/
+    role: DSPy programming model, LM configuration, modules, optimizers.
+  - id: evidence_dspy_gepa_docs
+    file: dspy-gepa-official.md
+    source_type: official_docs
+    source: https://github.com/stanfordnlp/dspy/blob/main/docs/docs/api/optimizers/GEPA/overview.md
+    role: GEPA optimizer behavior, feedback metric, detailed results.
+  - id: evidence_gepa_paper
+    file: gepa-paper.md
+    source_type: research_paper
+    source: https://arxiv.org/abs/2507.19457
+    role: GEPA research claim, rollout efficiency, design rationale.
+  - id: evidence_dspy_rag_patterns
+    file: dspy-rag-patterns.md
+    source_type: official_docs
+    source: https://dspy.ai/
+    role: DSPy RAG pattern, retrieval program optimization, SemanticF1.
+  - id: evidence_query_rewriting_rag
+    file: query-rewriting-rag.md
+    source_type: research_paper
+    source: https://arxiv.org/abs/2305.14283
+    role: Query rewriting as a retrieval improvement pattern.
+  - id: evidence_current_qmd_dspy_boundary
+    file: current-qmd-dspy-boundary.md
+    source_type: local_code_review
+    source: local_repository
+    role: Current qmd_graphrag DSPy contracts, bridge, and missing CLI/runtime consumption.
+  - id: evidence_subagent_gepa_findings
+    file: subagent-gepa-findings.md
+    source_type: subagent_public_research
+    source: GPT-5.4 xhigh public-source subagent
+    role: Independent GEPA optimizer synthesis and operational recommendations.
+  - id: evidence_subagent_rag_patterns
+    file: subagent-rag-patterns.md
+    source_type: subagent_public_research
+    source: GPT-5.4 xhigh public-source subagent
+    role: Independent DSPy RAG integration and schema-first risk synthesis.
+  - id: evidence_subagent_dspy_core_findings
+    file: subagent-dspy-core-findings.md
+    source_type: subagent_public_research
+    source: GPT-5.4 xhigh public-source subagent
+    role: Independent DSPy programming model and optimizer flow synthesis.

@@ -1,0 +1,233 @@
+# DSPy 集成研究报告
+
+## 结论
+
+DSPy 在 qmd_graphrag 中的职责应限定为离线查询扩展策略优化
+（offline query expansion policy optimization）。它不应成为 `qmd query`
+每次请求的实时依赖，也不应替代 Type DD / JSON Schema 的硬校验。
+
+推荐目标形态：
+
+```text
+qmd eval dataset
+  -> DSPy query expansion program
+  -> GEPA optimization
+  -> versioned optimization artifact
+  -> evaluation and promotion gate
+  -> qmd query consumes promoted expansion policy
+```
+
+当前仓库已有 DSPy contract、runtime bridge 和 GEPA 脚本，但还没有用户可调用的
+`qmd` 子命令，也没有让线上 `qmd query` 自动消费优化产物。当前状态应视为
+“typed offline bridge 已存在，产品化闭环未完成”。
+
+## 证据基线
+
+- DSPy 使用 Signature、Module、LM、Example、trainset 和 optimizer 组织 LM
+  程序，适合把 query expansion 建模为显式模块，而不是自由拼接 prompt。
+- GEPA 是反思式 prompt optimizer，适合用 score 和 textual feedback 优化查询
+  扩展策略。
+- DSPy 的 Signature 是软接口，不等于生产级 schema enforcement；线上仍必须
+  使用 Type DD schema、validator、retry 和 dead-letter 机制。
+- qmd_graphrag 本地已有 `DspyQueryPromptOptimizationRequestSchema`、
+  `optimizeQueryPrompt()`、Python bridge 和 `dspy_gepa.py`，但 CLI 与线上 query
+  消费路径缺失。
+
+## 集成边界
+
+### 离线优化边界
+
+离线优化只负责产生、评估和推广查询扩展策略。
+
+输入：
+
+- frozen corpus snapshot。
+- frozen qmd index snapshot。
+- train / validation / test query set。
+- gold evidence ids 或 expected retrieval behavior。
+- metric version。
+- provider/model configuration fingerprint。
+
+输出：
+
+- optimized DSPy program artifact。
+- generated expansion records。
+- evaluation report。
+- promotion decision。
+
+### 在线查询边界
+
+在线 `qmd query` 不运行 GEPA。在线路径只加载已推广的策略 artifact，并把输出
+解析为 `QueryExpansionItemSchema`：
+
+```text
+user query
+  -> promoted query expansion policy
+  -> QueryExpansionItem[]
+  -> qmd lexical/vector/rerank retrieval
+```
+
+若 artifact 缺失、失效或 schema 校验失败，系统按配置选择：
+
+- `fallback_to_builtin_expander`：使用现有 `LlamaCpp.expandQuery()`。
+- `strict_refuse`：返回 typed query error。
+
+## 推荐 Type DD 扩展
+
+应新增或补强以下类型，而不是把 DSPy 输出作为裸文件路径传递：
+
+- `DspyOptimizationRun`
+- `DspyOptimizationArtifact`
+- `DspyExpansionPolicy`
+- `DspyEvaluationDataset`
+- `DspyEvaluationReport`
+- `DspyPromotionDecision`
+
+关键字段：
+
+- `artifactId`
+- `optimizer`
+- `programName`
+- `signatureVersion`
+- `promptArtifactPath`
+- `compiledProgramPath`
+- `generatedExpansionPath`
+- `corpusSnapshotId`
+- `qmdIndexSnapshotId`
+- `retrievalConfigFingerprint`
+- `providerFingerprint`
+- `metricVersion`
+- `trainsetHash`
+- `valsetHash`
+- `testsetHash`
+- `schemaVersion`
+- `promotionStatus`
+
+线上只允许消费 `promotionStatus=promoted` 且所有 fingerprint 与当前运行时匹配的
+artifact。
+
+## CLI 设计
+
+建议新增 `qmd dspy` 命令组。
+
+```text
+qmd dspy optimize-query-prompt
+  --trainset <path>
+  --valset <path>
+  --model <provider/model>
+  --reflection-model <provider/model>
+  --auto light|medium|heavy
+  --max-metric-calls <n>
+  --save-artifact <path>
+```
+
+职责：
+
+- 构造 `DspyQueryPromptOptimizationRequest`。
+- 调用 `createQmdGraphRagRuntime().optimizeQueryPrompt()`。
+- 写入 `DspyOptimizationRun` 与 `DspyOptimizationArtifact`。
+
+```text
+qmd dspy evaluate-expansion-policy
+  --artifact <path>
+  --dataset <path>
+  --index <path>
+  --report <path>
+```
+
+职责：
+
+- 运行 frozen eval。
+- 计算 Recall@k、MRR、nDCG、schema validity、cost、latency。
+- 产出 `DspyEvaluationReport`。
+
+```text
+qmd dspy promote-expansion-policy
+  --artifact <path>
+  --report <path>
+  --min-recall-at-k <n>
+  --max-cost-class <class>
+```
+
+职责：
+
+- 校验 evaluation gate。
+- 写入 `DspyPromotionDecision`。
+- 更新 qmd config 中的 active expansion policy pointer。
+
+## 配置设计
+
+`.qmd/index.yml` 应持有策略指针，不直接嵌入 prompt 正文。
+
+```yaml
+query:
+  expansion_policy:
+    provider: dspy
+    artifact: graph_vault/dspy/policies/query-expansion/current.yaml
+    fallback: builtin_expander
+    strict_schema: true
+```
+
+artifact 路径必须 portable / vault-relative。secret 只允许通过 env name 引用。
+
+## Evaluation Metric
+
+GEPA metric 不应只返回标量。建议返回：
+
+```json
+{
+  "score": 0.82,
+  "feedback": "missed document doc-3; query too broad; lex term repeated original query",
+  "retrieval": {
+    "recallAtK": 0.8,
+    "mrr": 0.67,
+    "ndcg": 0.72
+  },
+  "schema": {
+    "valid": true,
+    "invalidItemCount": 0
+  }
+}
+```
+
+metric 需要覆盖：
+
+- gold evidence recall。
+- irrelevant candidate penalty。
+- lex / vec / hyde item balance。
+- duplicated query penalty。
+- schema validity。
+- cost and latency budget。
+
+## 实施顺序
+
+1. 补 `qmd dspy optimize-query-prompt` 子命令。
+2. 为 DSPy artifact 增加 registry schema 和 vault-relative storage。
+3. 增加 `qmd dspy evaluate-expansion-policy` 与 evaluation report schema。
+4. 增加 promotion gate 和 active policy pointer。
+5. 修改线上 expansion path，使 `qmd query` 可加载 promoted DSPy policy。
+6. 保留现有 `LlamaCpp.expandQuery()` 作为 fallback。
+7. 增加 drift detection：schema、corpus、index、retriever、reranker、provider
+   fingerprint 变化时标记 policy stale。
+
+## 风险与约束
+
+- DSPy 不是硬 schema 系统。必须保留 Zod / JSON Schema validator。
+- GEPA 成本受样本量、metric 调用次数和模型影响，需要默认预算上限。
+- 优化结果依赖 corpus/index snapshot。缺少 snapshot fingerprint 会导致线上回归
+  难以归因。
+- 仅优化 query expansion 是第一阶段边界。不要同时优化 answer synthesis、
+  reranker 和 graph routing。
+- 如果 prompt artifact 被人工编辑，必须改变 artifact hash 并重新 evaluation。
+
+## 参考
+
+- DSPy official overview: `../evidence/dspy-official-overview.md`
+- DSPy GEPA official docs: `../evidence/dspy-gepa-official.md`
+- GEPA paper: `../evidence/gepa-paper.md`
+- DSPy RAG patterns: `../evidence/dspy-rag-patterns.md`
+- Query rewriting for RAG: `../evidence/query-rewriting-rag.md`
+- Current local boundary: `../evidence/current-qmd-dspy-boundary.md`
+- Subagent GEPA findings: `../evidence/subagent-gepa-findings.md`
+- Subagent RAG findings: `../evidence/subagent-rag-patterns.md`
+- Subagent DSPy core findings: `../evidence/subagent-dspy-core-findings.md`
