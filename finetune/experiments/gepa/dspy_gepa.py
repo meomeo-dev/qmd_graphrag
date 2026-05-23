@@ -28,6 +28,7 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 from dataset.schema import normalize_output_items, output_items_to_text, parse_output_text
+from responses_lm import OpenAIResponsesDspyLM
 from reward import score_expansion_detailed
 
 
@@ -121,7 +122,7 @@ def main() -> int:
     parser.add_argument(
         "--reflection-model",
         type=str,
-        default="grok-4-1-fast-reasoning",
+        default=None,
         help="LM string in provider/model format (e.g., openai/gpt-4o)",
     )
     parser.add_argument("--max-tokens", type=int, default=512, help="Max tokens for student LM")
@@ -134,10 +135,23 @@ def main() -> int:
     parser.add_argument("--val-limit", type=int, default=None, help="Limit number of val queries")
     parser.add_argument("--emit", type=str, default=None, help="Write generated JSONL after compile")
     parser.add_argument("--save-prompt", type=str, default=None, help="Write best prompt text to file")
+    parser.add_argument("--api-key-env", type=str, default="OPENAI_API_KEY")
+    parser.add_argument("--base-url-env", type=str, default="OPENAI_BASE_URL")
+    parser.add_argument("--responses-endpoint", type=str, default="/responses")
+    parser.add_argument("--responses-stream", type=str, default="true")
+    parser.add_argument(
+        "--reasoning-effort",
+        type=str,
+        default=None,
+        choices=["low", "medium", "high"],
+    )
     args = parser.parse_args()
 
-    if "/" not in args.model or "/" not in args.reflection_model:
-        print("Error: DSPy expects provider/model format for LM strings (e.g., xai/grok-4-1-fast-reasoning).")
+    if args.responses_endpoint != "/responses":
+        print("Error: Responses API endpoint must be /responses.")
+        return 1
+    if args.responses_stream.lower() != "true":
+        print("Error: DSPy optimization requires Responses API stream mode.")
         return 1
 
     if args.max_full_evals is not None and args.max_metric_calls is not None:
@@ -145,6 +159,8 @@ def main() -> int:
         return 1
     if args.max_full_evals is not None or args.max_metric_calls is not None:
         args.auto = None
+    if not args.reflection_model:
+        args.reflection_model = args.model
 
     train_path = Path(args.input)
     queries = load_queries(train_path)
@@ -158,8 +174,22 @@ def main() -> int:
             val_queries = val_queries[: args.val_limit]
         valset = to_examples(val_queries)
 
-    lm = dspy.LM(model=args.model, max_tokens=args.max_tokens)
-    reflection_lm = dspy.LM(model=args.reflection_model, max_tokens=args.reflection_max_tokens)
+    lm = OpenAIResponsesDspyLM(
+        model=args.model,
+        api_key_env=args.api_key_env,
+        base_url_env=args.base_url_env,
+        endpoint=args.responses_endpoint,
+        reasoning_effort=args.reasoning_effort,
+        max_tokens=args.max_tokens,
+    )
+    reflection_lm = OpenAIResponsesDspyLM(
+        model=args.reflection_model,
+        api_key_env=args.api_key_env,
+        base_url_env=args.base_url_env,
+        endpoint=args.responses_endpoint,
+        reasoning_effort=args.reasoning_effort,
+        max_tokens=args.reflection_max_tokens,
+    )
 
     student = Expander()
     student.set_lm(lm)

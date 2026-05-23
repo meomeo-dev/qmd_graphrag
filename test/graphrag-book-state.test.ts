@@ -150,7 +150,7 @@ describe("syncGraphRagBookWorkspace", () => {
         promptsDir: join(graphVault, "prompts"),
         outputDir: join(graphVault, "output"),
         metadata: {
-          api_key: "sk-test-secret",
+          api_key: "opaque-redaction-marker",
           hostPath: root,
         },
       });
@@ -184,7 +184,7 @@ describe("syncGraphRagBookWorkspace", () => {
         promptsDir: join(graphVault, "prompts"),
         outputDir: join(graphVault, "output"),
         metadata: {
-          api_key: "sk-test-secret",
+          api_key: "opaque-redaction-marker",
           hostPath: root,
         },
       });
@@ -210,7 +210,7 @@ describe("syncGraphRagBookWorkspace", () => {
         promptsDir: join(graphVault, "prompts"),
         outputDir: join(graphVault, "output"),
         metadata: {
-          api_key: "sk-test-secret",
+          api_key: "opaque-redaction-marker",
           hostPath: root,
         },
       });
@@ -246,7 +246,7 @@ describe("syncGraphRagBookWorkspace", () => {
         expect(item.providerFingerprint).toBe(recovered.job.providerFingerprint);
       }
       expect(recovered.resumePlan.nextStage).toBe("community_report");
-      expect(jobRaw).not.toContain("sk-test-secret");
+      expect(jobRaw).not.toContain("opaque-redaction-marker");
       expect(jobRaw).not.toContain(root);
       expect(jobRaw).toContain("providerBoundaryFingerprint");
     } finally {

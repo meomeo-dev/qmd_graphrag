@@ -881,6 +881,25 @@ describe("CLI Unified Query Route", () => {
     expect(Array.isArray(answer.evidence)).toBe(true);
   }, 20000);
 
+  test("qmd query --mode auto non-json output exposes route decision", async () => {
+    const { stdout, exitCode } = await runQmd(
+      [
+        "query",
+        "--mode",
+        "auto",
+        "--no-rerank",
+        "lex: Full-text search with BM25",
+      ],
+      { dbPath: localDbPath, configDir: localConfigDir },
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("QueryRouteDecision:");
+    expect(stdout).toContain("selectedRoute: qmd");
+    expect(stdout).toContain("reasonCode: qmd_retrieval");
+    expect(stdout).toContain("refusalReasons:");
+    expect(stdout).toContain("qmd://fixtures/");
+  }, 20000);
+
   test("qmd query --json emits UnifiedAnswer on the default qmd route", async () => {
     const query = "lex: Full-text search with BM25";
     const { stdout, exitCode } = await runQmd(

@@ -1,5 +1,8 @@
 # DSPy 集成研究报告
 
+状态：superseded。当前准生产规范以 `dspy-integration-plan-v10.md` 为准；
+本文仅保留为迭代记录，不构成当前实现契约。
+
 ## 结论
 
 DSPy 在 qmd_graphrag 中的职责应限定为离线查询扩展策略优化
@@ -122,8 +125,10 @@ user query
 - `maxPromptTokens`
 - `maxExpansionItems`
 
-线上只允许消费 `promotionStatus=promoted` 且所有 fingerprint 与当前运行时匹配的
-artifact。
+线上只允许消费 active pointer 指向的 promoted decision。decision 引用的 artifact
+必须是不可变、可推广、可校验的 offline artifact；artifact 的
+`promotionStatus` 保留产物写入时状态，不作为线上开关。线上消费前必须校验
+decision、artifact hash、runtime projection 与所有 fingerprint。
 
 `DspyExpansionPolicy` 是仅面向 query expansion 的 promoted runtime policy。
 它引用 `DspyOptimizationArtifact`，但不复制 prompt 正文。`DspyOptimizationArtifact`

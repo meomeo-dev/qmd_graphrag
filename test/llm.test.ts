@@ -557,7 +557,7 @@ describe("LlamaCpp Jina rerank", () => {
     const previousGraphVault = process.env.QMD_GRAPH_VAULT;
     const previousFetch = globalThis.fetch;
     const graphVault = await mkdtemp(join(tmpdir(), "qmd-jina-cost-"));
-    process.env.JINA_API_KEY = "test-key";
+    process.env.JINA_API_KEY = "redaction-sentinel";
     process.env.QMD_GRAPH_VAULT = graphVault;
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const request = JSON.parse(String(init?.body));
@@ -596,7 +596,7 @@ describe("LlamaCpp Jina rerank", () => {
         expect.objectContaining({
           method: "POST",
           headers: expect.objectContaining({
-            Authorization: "Bearer test-key",
+            Authorization: "Bearer redaction-sentinel",
           }),
         }),
       );
@@ -641,7 +641,7 @@ describe("LlamaCpp Jina rerank", () => {
         "utf8",
       );
       expect(providerRequest).toContain("\"kind\": \"provider_request_fingerprint\"");
-      expect(providerRequest).not.toContain("test-key");
+      expect(providerRequest).not.toContain("redaction-sentinel");
     } finally {
       globalThis.fetch = previousFetch;
       await rm(graphVault, { recursive: true, force: true });
@@ -657,7 +657,7 @@ describe("LlamaCpp Jina rerank", () => {
     const previousGraphVault = process.env.QMD_GRAPH_VAULT;
     const previousFetch = globalThis.fetch;
     const graphVault = await mkdtemp(join(tmpdir(), "qmd-jina-rerank-cost-"));
-    process.env.JINA_API_KEY = "test-key";
+    process.env.JINA_API_KEY = "redaction-sentinel";
     process.env.QMD_GRAPH_VAULT = graphVault;
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const request = JSON.parse(String(init?.body));
@@ -714,7 +714,7 @@ describe("LlamaCpp Jina rerank", () => {
         expect.objectContaining({
           method: "POST",
           headers: expect.objectContaining({
-            Authorization: "Bearer test-key",
+            Authorization: "Bearer redaction-sentinel",
           }),
         }),
       );
@@ -762,7 +762,7 @@ describe("LlamaCpp Jina rerank", () => {
         ),
         "utf8",
       );
-      expect(providerRequest).not.toContain("test-key");
+      expect(providerRequest).not.toContain("redaction-sentinel");
       expect(providerRequest).not.toContain("AUTH_SECRET");
     } finally {
       globalThis.fetch = previousFetch;
@@ -779,7 +779,7 @@ describe("LlamaCpp Jina rerank", () => {
     const previousGraphVault = process.env.QMD_GRAPH_VAULT;
     const previousFetch = globalThis.fetch;
     const graphVault = await mkdtemp(join(tmpdir(), "qmd-jina-rerank-merge-"));
-    process.env.JINA_API_KEY = "test-key";
+    process.env.JINA_API_KEY = "redaction-sentinel";
     process.env.QMD_GRAPH_VAULT = graphVault;
     globalThis.fetch = vi.fn(async () =>
       new Response(JSON.stringify({

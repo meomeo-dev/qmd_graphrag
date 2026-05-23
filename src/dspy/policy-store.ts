@@ -16,10 +16,13 @@ import { QueryExpansionItemSchema, SchemaVersion } from "../contracts/common.js"
 import type { QueryExpansionItem } from "../contracts/common.js";
 import {
   DspyEvaluationReportSchema,
+  DspyEvaluationDatasetSchema,
   DspyExpansionPolicySchema,
   DspyGeneratedExpansionRecordSchema,
+  DspyMetricSpecSchema,
   DspyOptimizationArtifactSchema,
   DspyOptimizationRunSchema,
+  DspyPointerLockErrorSchema,
   DspyPolicyPointerSchema,
   DspyPromotionDecisionSchema,
   DspyPromotionHistoryEntrySchema,
@@ -30,14 +33,17 @@ import {
 } from "../contracts/dspy.js";
 import type {
   DspyEvaluationReport,
+  DspyEvaluationDataset,
   DspyExpansionPolicy,
   DspyFingerprintSet,
   DspyGeneratedExpansionRecord,
+  DspyMetricSpec,
   DspyOptimizationArtifact,
   DspyOptimizationRequestSummary,
   DspyOptimizationResponseSummary,
   DspyOptimizationRun,
   DspyPolicyPointer,
+  DspyPointerLockError as DspyPointerLockErrorPayload,
   DspyPromotionDecision,
   DspyPromotionHistoryEntry,
   DspyQueryPromptOptimizationRequest,
@@ -58,6 +64,12 @@ const DefaultFailurePolicy: QueryExpansionFailurePolicy = {
   reasonActions: {},
   strictSchema: true,
 };
+
+const NativeFallbackReasons = new Set<QueryExpansionFailureReason>([
+  "pointer_missing",
+  "decision_missing",
+  "policy_unavailable",
+]);
 
 export type DspyPolicyStoreOptions = {
   graphVault: string;
@@ -87,6 +99,7 @@ export type DspyArtifactWriteInput = {
   metricVersion?: string;
   runtimeProjection?: DspyOptimizationArtifact["runtimeProjection"];
   maxExpansionItems?: number;
+  metricSpec?: DspyMetricSpec;
 };
 
 export type DspyArtifactWriteResult = {
@@ -100,6 +113,28 @@ export type DspyPolicyEvaluationInput = {
   artifactPath: string;
   datasetId?: string;
   metricVersion?: string;
+};
+
+export type DspyMetricSpecWriteInput = {
+  metricVersion: string;
+  name?: string;
+  description: string;
+  maxMetricCalls?: number;
+  maxTotalTokens?: number;
+  maxExpansionItems?: number;
+};
+
+export type DspyEvaluationDatasetWriteInput = {
+  datasetId: string;
+  datasetPath?: string;
+  trainsetPath?: string;
+  valsetPath?: string;
+  testsetPath?: string;
+};
+
+export type DspyRegistryWriteResult<T> = {
+  value: T;
+  path: string;
 };
 
 export type DspyPromotionInput = {
@@ -124,6 +159,16 @@ export type DspyExpansionResult =
       reason: DspyExpansionFailureReason;
       message: string;
     };
+
+export class DspyPointerLockError extends Error {
+  readonly payload: DspyPointerLockErrorPayload;
+
+  constructor(payload: DspyPointerLockErrorPayload) {
+    super(payload.redactedMessage);
+    this.name = "DspyPointerLockError";
+    this.payload = payload;
+  }
+}
 
 function sha256Text(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -156,6 +201,31 @@ function writeJsonFile(path: string, value: unknown): void {
   const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
   writeFileSync(tmp, body, "utf-8");
   renameSync(tmp, path);
+}
+
+function withDirectoryLock<T>(
+  lockPath: string,
+  onLocked: () => DspyPointerLockErrorPayload,
+  operation: () => T,
+): T {
+  try {
+    mkdirSync(dirname(lockPath), { recursive: true });
+    mkdirSync(lockPath, { recursive: false });
+  } catch (error) {
+    const code = error instanceof Error && "code" in error
+      ? (error as NodeJS.ErrnoException).code
+      : undefined;
+    if (code === "EEXIST") {
+      throw new DspyPointerLockError(onLocked());
+    }
+    throw error;
+  }
+
+  try {
+    return operation();
+  } finally {
+    rmSync(lockPath, { recursive: true, force: true });
+  }
 }
 
 function normalizeVaultRoot(graphVault: string): string {
@@ -274,6 +344,9 @@ function policyAction(
   policy: QueryExpansionFailurePolicy,
   reason: QueryExpansionFailureReason,
 ): QueryExpansionFailureAction {
+  if (NativeFallbackReasons.has(reason)) {
+    return "fallback_to_builtin_expander";
+  }
   if (policy.strictSchema !== true) {
     return "strict_refuse";
   }
@@ -326,8 +399,41 @@ function redactedDiagnosticText(value: string): string {
   return value
     .replace(/[A-Za-z]:[\\/][^\s"']+/g, "[REDACTED_PATH]")
     .replace(/\/[^\s"']+/g, "[REDACTED_PATH]")
+    .replace(/\bbearer\s+[A-Za-z0-9._~+/=-]+/gi, "[REDACTED_SECRET]")
     .replace(/sk-[A-Za-z0-9_-]+/g, "[REDACTED_SECRET]")
     .slice(0, 4000);
+}
+
+function pointerLockPayload(input: {
+  pointerPath: string;
+  lockPath: string;
+  message: string;
+}): DspyPointerLockErrorPayload {
+  return DspyPointerLockErrorSchema.parse({
+    schemaVersion: SchemaVersion,
+    code: "dspy_pointer_lock_unavailable",
+    pointerPath: input.pointerPath,
+    lockPath: input.lockPath,
+    redactedMessage: redactedDiagnosticText(input.message),
+  });
+}
+
+function registrySlug(value: string): string {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 72) || "record";
+  return `${normalized}-${createDeterministicHash(value).slice(0, 12)}`;
+}
+
+function countJsonlRecords(path: string | undefined): number {
+  if (!path || !existsSync(path)) return 0;
+  return readFileSync(path, "utf-8")
+    .split(/\r?\n/)
+    .filter((line) => line.trim().length > 0)
+    .length;
 }
 
 function requestSummary(
@@ -413,6 +519,14 @@ export class DspyPolicyStore {
     return resolveVaultPath(this.graphVault, this.pointerRelativePath());
   }
 
+  pointerLockRelativePath(): string {
+    return normalizeVaultRelative(`${this.pointerRelativePath()}.lock`);
+  }
+
+  pointerLockPath(): string {
+    return resolveVaultPath(this.graphVault, this.pointerLockRelativePath());
+  }
+
   resolvePath(path: string): string {
     return resolveVaultPath(this.graphVault, path);
   }
@@ -448,11 +562,117 @@ export class DspyPolicyStore {
     return DspyPromotionDecisionSchema.parse(loadYamlFile(this.resolvePath(path)));
   }
 
+  metricSpecPath(metricVersion: string): string {
+    return normalizeVaultRelative(`dspy/metrics/${registrySlug(metricVersion)}.yaml`);
+  }
+
+  datasetPath(datasetId: string): string {
+    return normalizeVaultRelative(`dspy/datasets/${registrySlug(datasetId)}.yaml`);
+  }
+
+  loadMetricSpec(metricVersion: string): DspyMetricSpec | null {
+    const metricsDir = this.resolvePath("dspy/metrics");
+    if (!existsSync(metricsDir)) return null;
+    for (const name of readdirSync(metricsDir)) {
+      if (!name.endsWith(".yaml") && !name.endsWith(".yml")) continue;
+      const spec = DspyMetricSpecSchema.parse(
+        loadYamlFile(join(metricsDir, name)),
+      );
+      if (spec.metricVersion === metricVersion) return spec;
+    }
+    return null;
+  }
+
+  loadEvaluationDataset(datasetId: string): DspyEvaluationDataset | null {
+    const datasetsDir = this.resolvePath("dspy/datasets");
+    if (!existsSync(datasetsDir)) return null;
+    for (const name of readdirSync(datasetsDir)) {
+      if (!name.endsWith(".yaml") && !name.endsWith(".yml")) continue;
+      const dataset = DspyEvaluationDatasetSchema.parse(
+        loadYamlFile(join(datasetsDir, name)),
+      );
+      if (dataset.datasetId === datasetId) return dataset;
+    }
+    return null;
+  }
+
+  writeMetricSpec(
+    input: DspyMetricSpecWriteInput,
+  ): DspyRegistryWriteResult<DspyMetricSpec> {
+    const metric = DspyMetricSpecSchema.parse({
+      schemaVersion: SchemaVersion,
+      metricVersion: input.metricVersion,
+      name: input.name ?? input.metricVersion,
+      description: redactedDiagnosticText(input.description),
+      maxMetricCalls: input.maxMetricCalls,
+      maxTotalTokens: input.maxTotalTokens,
+      maxExpansionItems: input.maxExpansionItems ?? 8,
+    });
+    const path = this.metricSpecPath(metric.metricVersion);
+    writeYamlFile(this.resolvePath(path), metric);
+    return { value: metric, path };
+  }
+
+  writeEvaluationDataset(
+    input: DspyEvaluationDatasetWriteInput,
+  ): DspyRegistryWriteResult<DspyEvaluationDataset> {
+    const createdAt = nowIso(this.now);
+    const copyDatasetFile = (
+      sourcePath: string | undefined,
+      role: "dataset" | "train" | "val" | "test",
+    ): { path?: string; hash?: string; count: number } => {
+      if (!sourcePath) return { count: 0 };
+      const source = resolve(sourcePath);
+      if (!existsSync(source)) {
+        throw new Error(`DSPy dataset source does not exist: ${sourcePath}`);
+      }
+      const hash = sha256File(source)!;
+      const ext = source.endsWith(".jsonl") ? ".jsonl" : "";
+      const target = normalizeVaultRelative(
+        `dspy/dataset-files/${registrySlug(input.datasetId)}/${role}-${hash.slice(0, 16)}${ext}`,
+      );
+      const targetPath = this.resolvePath(target);
+      mkdirSync(dirname(targetPath), { recursive: true });
+      writeFileSync(targetPath, readFileSync(source));
+      return { path: target, hash, count: countJsonlRecords(source) };
+    };
+
+    const datasetFile = copyDatasetFile(input.datasetPath, "dataset");
+    const trainset = copyDatasetFile(input.trainsetPath, "train");
+    const valset = copyDatasetFile(input.valsetPath, "val");
+    const testset = copyDatasetFile(input.testsetPath, "test");
+    const queryCount = datasetFile.count + trainset.count + valset.count + testset.count;
+    const dataset = DspyEvaluationDatasetSchema.parse({
+      schemaVersion: SchemaVersion,
+      datasetId: input.datasetId,
+      datasetPath: datasetFile.path,
+      trainsetPath: trainset.path,
+      valsetPath: valset.path,
+      testsetPath: testset.path,
+      trainsetHash: trainset.hash,
+      valsetHash: valset.hash,
+      testsetHash: testset.hash,
+      queryCount,
+      createdAt,
+    });
+    const path = this.datasetPath(dataset.datasetId);
+    writeYamlFile(this.resolvePath(path), dataset);
+    return { value: dataset, path };
+  }
+
   writeOptimizationArtifact(input: DspyArtifactWriteInput): DspyArtifactWriteResult {
     const createdAt = nowIso(this.now);
     const runId = input.runId ?? createRunId("dspy-optimize", this.now());
     const runDir = normalizeVaultRelative(`dspy/runs/${runId}`);
     const fingerprints = resolveFingerprints(input.fingerprints);
+    const metricVersion =
+      input.metricSpec?.metricVersion ??
+      input.metricVersion ??
+      "dspy-query-expansion-schema-v1";
+    const maxExpansionItems =
+      input.maxExpansionItems ??
+      input.metricSpec?.maxExpansionItems ??
+      8;
     const promptSourceHash = sha256File(input.response.savedPromptPath);
     const generatedSourceHash = sha256File(input.response.emitPath);
     const reqSummary = requestSummary(input.request);
@@ -466,8 +686,8 @@ export class DspyPolicyStore {
       requestSummary: reqSummary,
       responseSummary: resSummarySeed,
       fingerprints,
-      metricVersion: input.metricVersion ?? "dspy-query-expansion-schema-v1",
-      maxExpansionItems: input.maxExpansionItems ?? 8,
+      metricVersion,
+      maxExpansionItems,
     });
     const artifactId = `dspy-artifact-${artifactHash.slice(0, 16)}`;
     const artifactPath = normalizeVaultRelative(`dspy/artifacts/${artifactId}.yaml`);
@@ -496,10 +716,10 @@ export class DspyPolicyStore {
       generatedExpansionHash: maybeHashFile(this.graphVault, generatedExpansionPath),
       providerCallLedgerPath: normalizeVaultRelative(`dspy/ledgers/${artifactId}.jsonl`),
       fingerprints,
-      metricVersion: input.metricVersion ?? "dspy-query-expansion-schema-v1",
+      metricVersion,
       trainsetHash: reqSummary.trainsetHash,
       valsetHash: reqSummary.valsetHash,
-      maxExpansionItems: input.maxExpansionItems ?? 8,
+      maxExpansionItems,
       providerEnvRefs: input.providerEnvRefs ?? [
         "JINA_API_BASE",
         "JINA_API_KEY",
@@ -541,11 +761,17 @@ export class DspyPolicyStore {
   evaluateExpansionPolicy(input: DspyPolicyEvaluationInput): DspyEvaluationReport {
     const artifactRelativePath = this.toRelativePath(input.artifactPath);
     const artifact = this.loadArtifact(artifactRelativePath);
+    const dataset = input.datasetId
+      ? this.loadEvaluationDataset(input.datasetId)
+      : null;
+    const metricSpec = input.metricVersion
+      ? this.loadMetricSpec(input.metricVersion)
+      : this.loadMetricSpec(artifact.metricVersion);
     const createdAt = nowIso(this.now);
     const reportId = `dspy-report-${createDeterministicHash({
       artifactId: artifact.artifactId,
       createdAt,
-      datasetId: input.datasetId ?? null,
+      datasetId: dataset?.datasetId ?? input.datasetId ?? null,
     }).slice(0, 16)}`;
     let totalRecords = 0;
     let validRecords = 0;
@@ -575,8 +801,8 @@ export class DspyPolicyStore {
       reportId,
       artifactId: artifact.artifactId,
       artifactHash: artifact.artifactHash,
-      datasetId: input.datasetId,
-      metricVersion: input.metricVersion ?? artifact.metricVersion,
+      datasetId: dataset?.datasetId ?? input.datasetId,
+      metricVersion: metricSpec?.metricVersion ?? input.metricVersion ?? artifact.metricVersion,
       createdAt,
       schemaValidity,
       promotability: schemaValidity && totalRecords > 0 ? "promotable" : "not_promotable",
@@ -587,6 +813,8 @@ export class DspyPolicyStore {
         schema_validity: schemaValidity,
         valid_record_ratio:
           totalRecords === 0 ? 0 : Number((validRecords / totalRecords).toFixed(6)),
+        ...(dataset ? { dataset_query_count: dataset.queryCount } : {}),
+        ...(metricSpec ? { metric_max_expansion_items: metricSpec.maxExpansionItems } : {}),
       },
       failureReason,
     });
@@ -597,6 +825,20 @@ export class DspyPolicyStore {
   }
 
   promoteExpansionPolicy(input: DspyPromotionInput): DspyPromotionDecision {
+    return withDirectoryLock(
+      this.pointerLockPath(),
+      () => pointerLockPayload({
+        pointerPath: this.pointerRelativePath(),
+        lockPath: this.pointerLockRelativePath(),
+        message: "DSPy pointer is locked by another writer",
+      }),
+      () => this.promoteExpansionPolicyLocked(input),
+    );
+  }
+
+  private promoteExpansionPolicyLocked(
+    input: DspyPromotionInput,
+  ): DspyPromotionDecision {
     const artifactPath = this.toRelativePath(input.artifactPath);
     const reportPath = this.toRelativePath(input.reportPath);
     const artifact = this.loadArtifact(artifactPath);
@@ -673,6 +915,18 @@ export class DspyPolicyStore {
   }
 
   disableExpansionPolicy(reason = "disabled by operator"): DspyPolicyPointer {
+    return withDirectoryLock(
+      this.pointerLockPath(),
+      () => pointerLockPayload({
+        pointerPath: this.pointerRelativePath(),
+        lockPath: this.pointerLockRelativePath(),
+        message: "DSPy pointer is locked by another writer",
+      }),
+      () => this.disableExpansionPolicyLocked(reason),
+    );
+  }
+
+  private disableExpansionPolicyLocked(reason: string): DspyPolicyPointer {
     const before = this.loadPointer();
     if (before?.provider === "disabled" && !before.active) {
       return before;
@@ -706,6 +960,18 @@ export class DspyPolicyStore {
   }
 
   rollbackExpansionPolicy(): DspyPolicyPointer {
+    return withDirectoryLock(
+      this.pointerLockPath(),
+      () => pointerLockPayload({
+        pointerPath: this.pointerRelativePath(),
+        lockPath: this.pointerLockRelativePath(),
+        message: "DSPy pointer is locked by another writer",
+      }),
+      () => this.rollbackExpansionPolicyLocked(),
+    );
+  }
+
+  private rollbackExpansionPolicyLocked(): DspyPolicyPointer {
     const before = this.loadPointer();
     if (!before?.currentDecisionPath) {
       const disabledHistory = this.restorableDisableHistoryEntry(before);
@@ -786,6 +1052,16 @@ export class DspyPolicyStore {
       }
       throw error;
     }
+    if (
+      pointer.currentDecisionId !== decision.decisionId ||
+      decision.promotionStatus !== "promoted" ||
+      decision.gateVerdict !== "promote"
+    ) {
+      throw new DspyPolicyFailure(
+        "policy_unavailable",
+        "DSPy decision is not an active promoted decision",
+      );
+    }
     let artifact: DspyOptimizationArtifact;
     try {
       artifact = this.loadArtifact(decision.artifactPath);
@@ -794,6 +1070,16 @@ export class DspyPolicyStore {
         throw new DspyPolicyFailure("artifact_missing", "DSPy artifact file is missing");
       }
       throw error;
+    }
+    if (
+      decision.artifactId !== artifact.artifactId ||
+      decision.artifactHash !== artifact.artifactHash ||
+      artifact.artifactId !== `dspy-artifact-${artifact.artifactHash.slice(0, 16)}`
+    ) {
+      throw new DspyPolicyFailure(
+        "artifact_invalid",
+        "DSPy decision artifact identity is invalid",
+      );
     }
     this.validateArtifactFiles(artifact);
 
@@ -1050,6 +1336,15 @@ export class DspyPolicyStore {
       trainsetPath: generatedAbsolutePath,
       model: "manual/dspy-policy",
       emitPath: generatedAbsolutePath,
+      provider: {
+        apiKeyEnv: "OPENAI_API_KEY",
+        baseUrlEnv: "OPENAI_BASE_URL",
+        endpoint: "/responses" as const,
+        stream: true as const,
+        model: "gpt-5.4",
+        reasoningEffort: "medium" as const,
+        strictStructuredOutput: true as const,
+      },
     };
     const pseudoResponse = {
       schemaVersion: SchemaVersion,

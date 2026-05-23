@@ -1285,6 +1285,18 @@ def _run_dspy_optimize_query_prompt(request: dict[str, Any]) -> dict[str, Any]:
         request["model"],
     ]
 
+    provider = request.get("provider") or {}
+    if provider.get("apiKeyEnv"):
+        command.extend(["--api-key-env", provider["apiKeyEnv"]])
+    if provider.get("baseUrlEnv"):
+        command.extend(["--base-url-env", provider["baseUrlEnv"]])
+    if provider.get("endpoint"):
+        command.extend(["--responses-endpoint", provider["endpoint"]])
+    if provider.get("reasoningEffort"):
+        command.extend(["--reasoning-effort", provider["reasoningEffort"]])
+    if provider.get("stream") is not None:
+        command.extend(["--responses-stream", str(provider["stream"]).lower()])
+
     if request.get("reflectionModel"):
         command.extend(["--reflection-model", request["reflectionModel"]])
     if request.get("maxTokens") is not None:

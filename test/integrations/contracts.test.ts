@@ -60,6 +60,7 @@ import {
 import { SchemaVersion } from "../../src/contracts/common.js";
 import {
   BookArtifactManifestSchema,
+  BookJobSchema,
   BookJobRunRecordEnvelopeSchema,
 } from "../../src/contracts/book-job.js";
 import {
@@ -117,6 +118,63 @@ type CatalogDocument = {
   types: CatalogType[];
   buses: CatalogBus[];
 };
+
+const LocalSymbolRefPattern = /^(src|test|scripts|python|finetune)\//;
+
+function expectLocalSymbolRef(ref: string): void {
+  expect(
+    LocalSymbolRefPattern.test(ref),
+    `${ref} must be a local file#symbol reference`,
+  ).toBe(true);
+  expect(ref, `${ref} must use file#symbol form`).toContain("#");
+}
+
+function collectTypeDdPayloads(typeDd: TypeDdDocument): Map<string, TypeDdPayload> {
+  const payloads = new Map<string, TypeDdPayload>();
+  for (const bus of Object.values(typeDd.typed_buses)) {
+    for (const payload of bus.payloads ?? []) {
+      expect(payloads.has(payload.name)).toBe(false);
+      payloads.set(payload.name, payload);
+    }
+  }
+  return payloads;
+}
+
+function unionEnvelopeNames(source: string): string[] {
+  const match = source.match(/DataBusEnvelopeSchema = z\.union\(\[([\s\S]*?)\]\)/);
+  expect(match?.[1], "DataBusEnvelopeSchema union not found").toBeDefined();
+  return [...match![1].matchAll(/\b([A-Za-z0-9_]+EnvelopeSchema)\b/g)]
+    .map((item) => item[1]!)
+    .sort();
+}
+
+async function expectLocalRefExists(ref: string): Promise<void> {
+  expectLocalSymbolRef(ref);
+
+  const [filePath, symbolPath] = ref.split("#");
+  expect(filePath, `invalid local ref: ${ref}`).toBeTruthy();
+  expect(symbolPath, `${ref} must use file#symbol form`).toBeTruthy();
+  expect(symbolPath, `${ref} must reference a symbol, not descriptive text`)
+    .not.toMatch(/\s/);
+  const source = await readFile(filePath!, "utf8");
+
+  const symbols = symbolPath!.split(".");
+  for (const symbol of symbols) {
+    const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const declaration = new RegExp([
+      `\\b(?:export\\s+)?(?:async\\s+)?function\\s+${escaped}\\b`,
+      `\\b(?:export\\s+)?(?:const|let|var)\\s+${escaped}\\b`,
+      `\\b(?:export\\s+)?class\\s+${escaped}\\b`,
+      `\\bdef\\s+${escaped}\\b`,
+      `\\bclass\\s+${escaped}\\b`,
+      `\\b(?:async\\s+)?${escaped}\\s*\\(`,
+    ].join("|"));
+    expect(
+      source,
+      `${ref} is declared in catalog but ${symbol} is missing from ${filePath}`,
+    ).toMatch(declaration);
+  }
+}
 
 async function writeCompleteLanceDbFixture(root: string): Promise<void> {
   for (const tableName of [
@@ -250,9 +308,6 @@ describe("DSPy contracts", () => {
       schemaVersion: SchemaVersion,
       defaultAction: "fallback_to_builtin_expander",
       reasonActions: {
-        pointer_missing: "strict_refuse",
-        decision_missing: "strict_refuse",
-        policy_unavailable: "strict_refuse",
         artifact_missing: "strict_refuse",
         generated_expansion_missing: "strict_refuse",
         artifact_stale: "strict_refuse",
@@ -269,6 +324,20 @@ describe("DSPy contracts", () => {
       },
       strictSchema: true,
     })).toThrow(/artifact_invalid is fail-closed/);
+    for (const reason of [
+      "pointer_missing",
+      "decision_missing",
+      "policy_unavailable",
+    ]) {
+      expect(() => QueryExpansionFailurePolicySchema.parse({
+        schemaVersion: SchemaVersion,
+        defaultAction: "fallback_to_builtin_expander",
+        reasonActions: {
+          [reason]: "strict_refuse",
+        },
+        strictSchema: true,
+      })).toThrow(/native qmd fallback/);
+    }
   });
 
   test("accepts full query expansion policy lifecycle contracts", () => {
@@ -355,9 +424,17 @@ describe("DSPy contracts", () => {
   });
 
   test("rejects non-portable DSPy vault paths", () => {
-    expect(() => VaultRelativePathSchema.parse("/tmp/artifact.yaml")).toThrow();
-    expect(() => VaultRelativePathSchema.parse("../artifact.yaml")).toThrow();
-    expect(() => VaultRelativePathSchema.parse("~/artifact.yaml")).toThrow();
+    for (const path of [
+      "/tmp/artifact.yaml",
+      "../artifact.yaml",
+      "~/artifact.yaml",
+      "~user/artifact.yaml",
+      "bad\u0000artifact.yaml",
+      "C:/artifact.yaml",
+      "file://artifact.yaml",
+    ]) {
+      expect(() => VaultRelativePathSchema.parse(path)).toThrow(/vault-relative/);
+    }
   });
 
   test("accepts only typed query expansion program output", () => {
@@ -376,10 +453,21 @@ describe("DSPy contracts", () => {
       trainsetPath: "/tmp/train.jsonl",
       model: "openai/gpt-4.1-mini",
       savePromptPath: "/tmp/best_prompt.txt",
+      provider: {
+        apiKeyEnv: "OPENAI_API_KEY",
+        baseUrlEnv: "OPENAI_BASE_URL",
+        endpoint: "/responses",
+        stream: true,
+        model: "gpt-5.4",
+        reasoningEffort: "medium",
+        strictStructuredOutput: true,
+      },
     });
 
     expect(parsed.optimizer).toBe("gepa");
     expect(parsed.savePromptPath).toContain("best_prompt");
+    expect(parsed.provider.endpoint).toBe("/responses");
+    expect(parsed.provider.stream).toBe(true);
   });
 });
 
@@ -504,20 +592,36 @@ describe("Corpus and Graph Enhancement contracts", () => {
   });
 
   test("rejects non-portable public corpus paths", () => {
-    expect(() => SourceDocumentSchema.parse({
-      schemaVersion: SchemaVersion,
-      sourceId: "sha256:source",
-      sourceHash: "source",
-      sourceName: "book.epub",
-      sourceRelativePath: "/tmp/book.epub",
-    })).toThrow(/vault-relative/);
-    expect(() => SourceDocumentSchema.parse({
-      schemaVersion: SchemaVersion,
-      sourceId: "sha256:source",
-      sourceHash: "source",
-      sourceName: "book.epub",
-      locator: { path: "../book.epub" },
-    })).toThrow(/vault-relative/);
+    for (const sourceRelativePath of [
+      "/tmp/book.epub",
+      "~/book.epub",
+      "~other/book.epub",
+      "bad\u0000book.epub",
+      "C:/book.epub",
+    ]) {
+      expect(() => SourceDocumentSchema.parse({
+        schemaVersion: SchemaVersion,
+        sourceId: "sha256:source",
+        sourceHash: "source",
+        sourceName: "book.epub",
+        sourceRelativePath,
+      })).toThrow(/vault-relative/);
+    }
+    for (const path of [
+      "../book.epub",
+      "~/book.epub",
+      "~user/book.epub",
+      "bad\u0000book.epub",
+      "file://book.epub",
+    ]) {
+      expect(() => SourceDocumentSchema.parse({
+        schemaVersion: SchemaVersion,
+        sourceId: "sha256:source",
+        sourceHash: "source",
+        sourceName: "book.epub",
+        locator: { path },
+      })).toThrow(/vault-relative/);
+    }
     expect(() => SourceDocumentSchema.parse({
       schemaVersion: SchemaVersion,
       sourceId: "sha256:source",
@@ -568,28 +672,26 @@ describe("Corpus and Graph Enhancement contracts", () => {
   });
 
   test("rejects non-portable graph enhancement input paths", () => {
-    expect(() => GraphEnhancementRequestSchema.parse({
-      schemaVersion: SchemaVersion,
-      requestId: "req-1",
-      sourceId: "sha256:source",
-      documentId: "doc-1",
-      bookId: "book-1",
-      contentHash: "sha256:content",
-      graphVault: "graph_vault",
-      normalizedInputPath: "../input/book.md",
-      methods: ["local"],
-    })).toThrow(/vault-relative/);
-    expect(() => GraphEnhancementRequestSchema.parse({
-      schemaVersion: SchemaVersion,
-      requestId: "req-1",
-      sourceId: "sha256:source",
-      documentId: "doc-1",
-      bookId: "book-1",
-      contentHash: "sha256:content",
-      graphVault: "graph_vault",
-      normalizedInputPath: "file://input/book.md",
-      methods: ["local"],
-    })).toThrow(/vault-relative/);
+    for (const normalizedInputPath of [
+      "../input/book.md",
+      "file://input/book.md",
+      "~/input/book.md",
+      "~user/input/book.md",
+      "bad\u0000input/book.md",
+      "C:/input/book.md",
+    ]) {
+      expect(() => GraphEnhancementRequestSchema.parse({
+        schemaVersion: SchemaVersion,
+        requestId: "req-1",
+        sourceId: "sha256:source",
+        documentId: "doc-1",
+        bookId: "book-1",
+        contentHash: "sha256:content",
+        graphVault: "graph_vault",
+        normalizedInputPath,
+        methods: ["local"],
+      })).toThrow(/vault-relative/);
+    }
   });
 });
 
@@ -902,6 +1004,51 @@ describe("Provider contracts", () => {
     ).toThrow(/stageFingerprint/);
   });
 
+  test("rejects home-relative book state paths", () => {
+    for (const sourcePath of [
+      "~/sources/book.epub",
+      "~user/sources/book.epub",
+      "bad\u0000sources/book.epub",
+      "C:/sources/book.epub",
+    ]) {
+      expect(() =>
+        BookJobSchema.parse({
+          schemaVersion: SchemaVersion,
+          bookId: "book-1",
+          documentId: "doc-1",
+          sourcePath,
+          sourceHash: "sha256:source",
+          configFingerprint: "config",
+          promptFingerprint: "prompt",
+          modelFingerprint: "model",
+          overallStatus: "pending",
+          createdAt: "2026-05-21T00:00:00.000Z",
+          updatedAt: "2026-05-21T00:00:00.000Z",
+        }),
+      ).toThrow(/vault-relative/);
+    }
+    for (const path of [
+      "~/books/book-1/normalized.md",
+      "~user/books/book-1/normalized.md",
+      "bad\u0000books/book-1/normalized.md",
+      "file://books/book-1/normalized.md",
+    ]) {
+      expect(() =>
+        BookArtifactManifestSchema.parse({
+          schemaVersion: SchemaVersion,
+          artifactId: "artifact-1",
+          bookId: "book-1",
+          stage: "normalize",
+          kind: "normalized_markdown",
+          path,
+          contentHash: "sha256:artifact",
+          producerRunId: "run-1",
+          createdAt: "2026-05-21T00:00:00.000Z",
+        }),
+      ).toThrow(/vault-relative/);
+    }
+  });
+
   test("accepts redacted provider request fingerprints", () => {
     const parsed = ProviderRequestFingerprintSchema.parse({
       schemaVersion: SchemaVersion,
@@ -932,18 +1079,9 @@ describe("Data bus contracts", () => {
     ]);
     const typeDd = YAML.parse(typeDdRaw) as TypeDdDocument;
     const catalog = YAML.parse(catalogRaw) as CatalogDocument;
-    const typeDdPayloads = new Map<string, TypeDdPayload>();
+    const typeDdPayloads = collectTypeDdPayloads(typeDd);
 
-    for (const bus of Object.values(typeDd.typed_buses)) {
-      for (const payload of bus.payloads ?? []) {
-        expect(typeDdPayloads.has(payload.name)).toBe(false);
-        typeDdPayloads.set(payload.name, payload);
-      }
-    }
-
-    for (const type of catalog.types.filter(
-      item => item.contract_level === "required",
-    )) {
+    for (const type of catalog.types) {
       const payload = typeDdPayloads.get(type.name);
       expect(payload, `${type.name} missing from Type DD`).toBeDefined();
       expect(payload?.schema).toBe(type.schema);
@@ -961,6 +1099,50 @@ describe("Data bus contracts", () => {
       ];
       expect(new Set(payloadNames).size).toBe(payloadNames.length);
       expect([...payloadNames].sort()).toEqual([...bus.payloads].sort());
+    }
+  });
+
+  test("keeps catalog envelopes covered by DataBusEnvelopeSchema", async () => {
+    const [catalogRaw, busSource] = await Promise.all([
+      readFile("catalog/data-bus.catalog.yaml", "utf8"),
+      readFile("src/contracts/bus.ts", "utf8"),
+    ]);
+    const catalog = YAML.parse(catalogRaw) as CatalogDocument;
+    const catalogEnvelopes = catalog.types
+      .map(item => item.envelope.split("#")[1])
+      .sort();
+
+    expect(unionEnvelopeNames(busSource)).toEqual(catalogEnvelopes);
+  });
+
+  test("keeps declared producer and consumer symbols implemented", async () => {
+    const [typeDdRaw, catalogRaw] = await Promise.all([
+      readFile(
+        "docs/architecture/unified-retrieval-plane.type-dd.yaml",
+        "utf8",
+      ),
+      readFile("catalog/data-bus.catalog.yaml", "utf8"),
+    ]);
+    const typeDd = YAML.parse(typeDdRaw) as TypeDdDocument;
+    const catalog = YAML.parse(catalogRaw) as CatalogDocument;
+    const typeDdPayloads = collectTypeDdPayloads(typeDd);
+    const refs = new Set<string>();
+
+    for (const type of catalog.types) {
+      for (const ref of [...type.producers, ...type.consumers]) {
+        refs.add(ref);
+      }
+      const payload = typeDdPayloads.get(type.name);
+      for (const ref of [
+        ...(payload?.producers ?? []),
+        ...(payload?.consumers ?? []),
+      ]) {
+        refs.add(ref);
+      }
+    }
+
+    for (const ref of refs) {
+      await expectLocalRefExists(ref);
     }
   });
 
@@ -1174,6 +1356,87 @@ describe("Data bus contracts", () => {
     });
 
     expect(parsed.kind).toBe("provider.request_fingerprint");
+  });
+
+  test("accepts OpenAI Responses and provider cost envelopes", () => {
+    const request = DataBusEnvelopeSchema.parse({
+      schemaVersion: SchemaVersion,
+      kind: "provider.openai_responses.request",
+      payload: {
+        model: "gpt-5.4",
+        input: "answer in JSON",
+        stream: true,
+        reasoning: { effort: "medium" },
+      },
+    });
+    const response = DataBusEnvelopeSchema.parse({
+      schemaVersion: SchemaVersion,
+      kind: "provider.openai_responses.response",
+      payload: {
+        id: "resp-1",
+        model: "gpt-5.4",
+        outputText: "ok",
+        usage: { input_tokens: 3, output_tokens: 1 },
+      },
+    });
+    const streamEvent = DataBusEnvelopeSchema.parse({
+      schemaVersion: SchemaVersion,
+      kind: "provider.openai_responses.stream_event",
+      payload: {
+        type: "response.output_text.delta",
+        sequence: 0,
+        textDelta: "ok",
+        responseId: "resp-1",
+      },
+    });
+    const structuredOutput = DataBusEnvelopeSchema.parse({
+      schemaVersion: SchemaVersion,
+      kind: "provider.openai_responses.structured_output_schema",
+      payload: {
+        name: "Answer",
+        strict: true,
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["answer"],
+          properties: {
+            answer: { type: "string" },
+          },
+        },
+      },
+    });
+    const cost = DataBusEnvelopeSchema.parse({
+      schemaVersion: SchemaVersion,
+      kind: "provider.cost_accounting",
+      payload: {
+        schemaVersion: SchemaVersion,
+        sourceId: null,
+        documentId: null,
+        bookId: null,
+        contentHash: null,
+        lineageMode: "transient_query",
+        stage: "graphrag_query",
+        provider: "graphrag",
+        model: "local",
+        requestCount: 1,
+        tokenCount: 0,
+        tokenCountStatus: "unknown",
+        embeddingCount: 0,
+        embeddingCountStatus: "unknown",
+        cacheHit: false,
+        runId: "run-1",
+        requestArtifactId: "request-artifact-1",
+        artifactIds: ["request-artifact-1"],
+      },
+    });
+
+    expect(request.kind).toBe("provider.openai_responses.request");
+    expect(response.kind).toBe("provider.openai_responses.response");
+    expect(streamEvent.kind).toBe("provider.openai_responses.stream_event");
+    expect(structuredOutput.kind).toBe(
+      "provider.openai_responses.structured_output_schema",
+    );
+    expect(cost.kind).toBe("provider.cost_accounting");
   });
 
   test("accepts vault restore envelopes", () => {
@@ -2326,7 +2589,7 @@ items: []
       targetIndexPath,
       mode: "restore",
       metadata: {
-        authorization: "Bearer sk-secret",
+        authorization: "Bearer opaque-redaction-marker",
         localPath: secretPath,
       },
     });
@@ -2338,7 +2601,7 @@ items: []
     expect(report.failedItems[0]?.redactedMessage).not.toContain(graphVault);
     expect(auditRaw).not.toContain(graphVault);
     expect(auditRaw).not.toContain(secretPath);
-    expect(auditRaw).not.toContain("sk-secret");
+    expect(auditRaw).not.toContain("opaque-redaction-marker");
     expect(auditRaw).toContain("[redacted-path]");
   });
 });

@@ -187,7 +187,6 @@ types:
     producers:
       - src/job-state/repository.ts#FileBookJobStateRepository.getGraphEnhancementState
     consumers:
-      - test/book-job-state.test.ts#FileBookJobStateRepository graph enhancement state tests
       - src/graphrag/capability-catalog.ts#loadGraphCapabilities
     storage: graph_vault/books/<book_id>/job.yaml plus checkpoints and artifacts
     notes:
@@ -293,7 +292,7 @@ types:
     envelope: src/contracts/graphrag.ts#GraphRagIndexEnvelopeSchema
     contract_level: required
     producers:
-      - scripts/graphrag/resume-book-workspace.mjs
+      - scripts/graphrag/resume-book-workspace.mjs#run
     consumers:
       - src/integrations/graphrag.ts#runGraphRagIndex
       - python/qmd_graphrag/bridge.py#_run_graphrag_index
@@ -432,15 +431,21 @@ types:
     contract_level: required
     producers:
       - src/cli/qmd.ts#ensureRuntimeConfigForCli
+      - src/cli/qmd.ts#openAIResponsesProviderConfigForCli
       - src/graphrag/settings-projection.ts#buildGraphRagRuntimeSettingsProjection
     consumers:
       - src/cli/qmd.ts#ensureRuntimeConfigForCli
-      - python/qmd_graphrag/graphrag_responses_completion.py
+      - src/cli/qmd.ts#dspyOptimizeQueryPrompt
+      - python/qmd_graphrag/bridge.py#_run_dspy_optimize_query_prompt
+      - finetune/experiments/gepa/responses_lm.py#OpenAIResponsesDspyLM
+      - python/qmd_graphrag/graphrag_responses_completion.py#OpenAIResponsesCompletion
     storage: transient_projection_from_.qmd/index.yml
     notes:
       - endpoint is `/responses`
       - stream mode is required
       - base URL is not force-prefixed with `/v1`
+      - qmd CLI loads project `.env` before command dispatch; real environment
+        variables win over `.env`
       - qmd project config owns env names and endpoint intent; GraphRAG runtime
         settings receive the projected provider values
       - raw .qmd/index.yml stores providers.openai plus models.generate; this
@@ -452,29 +457,33 @@ types:
     envelope: src/contracts/provider.ts#OpenAIResponsesRequestEnvelopeSchema
     contract_level: required
     producers:
-      - python/qmd_graphrag/graphrag_responses_completion.py
+      - python/qmd_graphrag/graphrag_responses_completion.py#_base_completion
     consumers:
-      - OpenAI Responses API#POST /responses
+      - python/qmd_graphrag/graphrag_responses_completion.py#_base_completion
     storage: transient
+    notes:
+      - external endpoint is OpenAI Responses API POST /responses
 
   - name: openai_responses_response
     schema: src/contracts/provider.ts#OpenAIResponsesResponseSchema
     envelope: src/contracts/provider.ts#OpenAIResponsesResponseEnvelopeSchema
     contract_level: required
     producers:
-      - OpenAI Responses API#POST /responses
+      - python/qmd_graphrag/graphrag_responses_completion.py#_collect_response_stream
     consumers:
-      - python/qmd_graphrag/graphrag_responses_completion.py
+      - python/qmd_graphrag/graphrag_responses_completion.py#_collect_response_stream
     storage: transient
+    notes:
+      - external endpoint is OpenAI Responses API POST /responses
 
   - name: openai_responses_stream_event
     schema: src/contracts/provider.ts#OpenAIResponsesStreamEventSchema
     envelope: src/contracts/provider.ts#OpenAIResponsesStreamEventEnvelopeSchema
     contract_level: required
     producers:
-      - python/qmd_graphrag/graphrag_responses_completion.py
+      - python/qmd_graphrag/graphrag_responses_completion.py#_collect_response_stream
     consumers:
-      - python/qmd_graphrag/graphrag_responses_completion.py
+      - python/qmd_graphrag/graphrag_responses_completion.py#_iter_response_chunks
     storage: transient
 
   - name: openai_structured_output_schema
@@ -482,11 +491,12 @@ types:
     envelope: src/contracts/provider.ts#OpenAIStructuredOutputSchemaEnvelopeSchema
     contract_level: required
     producers:
-      - python/qmd_graphrag/graphrag_responses_completion.py
+      - python/qmd_graphrag/graphrag_responses_completion.py#_build_response_text_config
     consumers:
-      - OpenAI Responses API#text.format.schema
+      - python/qmd_graphrag/graphrag_responses_completion.py#_base_completion
     storage: transient
     notes:
+      - external consumer is OpenAI Responses API text.format.schema
       - zod schema files validate payload shape and are not runtime producers
       - plain completion requests omit text.format and still require
         stream=true
@@ -503,8 +513,10 @@ types:
     producers:
       - src/llm.ts#LlamaCpp.embedBatchWithJina
     consumers:
-      - Jina API#POST /v1/embeddings
+      - src/llm.ts#LlamaCpp.embedBatchWithJina
     storage: transient
+    notes:
+      - external endpoint is Jina API POST /v1/embeddings
 
   - name: jina_provider_config
     schema: src/contracts/jina.ts#JinaProviderConfigSchema
@@ -525,11 +537,13 @@ types:
     envelope: src/contracts/jina.ts#JinaEmbeddingResponseEnvelopeSchema
     contract_level: required
     producers:
-      - Jina API#POST /v1/embeddings
+      - src/llm.ts#LlamaCpp.embedBatchWithJina
     consumers:
       - src/llm.ts#LlamaCpp.embedBatchWithJina
       - src/store.ts#insertEmbedding
     storage: transient
+    notes:
+      - external endpoint is Jina API POST /v1/embeddings
 
   - name: dspy_query_prompt_optimization_request
     schema: src/contracts/dspy.ts#DspyQueryPromptOptimizationRequestSchema
@@ -552,7 +566,7 @@ types:
     producers:
       - python/qmd_graphrag/bridge.py#_run_dspy_optimize_query_prompt
     consumers:
-      - finetune/experiments/gepa/dspy_gepa.py
+      - finetune/experiments/gepa/dspy_gepa.py#main
     storage: file
 
   - name: dspy_generated_expansion_record
@@ -561,9 +575,9 @@ types:
     contract_level: required
     producers:
       - python/qmd_graphrag/bridge.py#_run_dspy_optimize_query_prompt
-      - finetune/experiments/gepa/dspy_gepa.py
+      - finetune/experiments/gepa/dspy_gepa.py#write_jsonl
     consumers:
-      - finetune/experiments/gepa/dspy_gepa.py
+      - finetune/experiments/gepa/dspy_gepa.py#load_queries
       - src/dspy/policy-store.ts#DspyPolicyStore.evaluateExpansionPolicy
       - src/dspy/policy-store.ts#DspyPolicyStore.expandQuery
     storage: file
@@ -620,6 +634,18 @@ types:
       - src/store.ts#expandQuery
     storage: graph_vault/dspy/policies/query-expansion/current.yaml
 
+  - name: dspy_pointer_lock_error
+    schema: src/contracts/dspy.ts#DspyPointerLockErrorSchema
+    envelope: src/contracts/dspy.ts#DspyPointerLockErrorEnvelopeSchema
+    contract_level: required
+    producers:
+      - src/dspy/policy-store.ts#DspyPointerLockError
+    consumers:
+      - src/dspy/policy-store.ts#DspyPolicyStore.promoteExpansionPolicy
+      - src/dspy/policy-store.ts#DspyPolicyStore.rollbackExpansionPolicy
+      - src/dspy/policy-store.ts#DspyPolicyStore.disableExpansionPolicy
+    storage: transient
+
   - name: dspy_evaluation_report
     schema: src/contracts/dspy.ts#DspyEvaluationReportSchema
     envelope: src/contracts/dspy.ts#DspyEvaluationReportEnvelopeSchema
@@ -651,8 +677,6 @@ types:
       - src/dspy/policy-store.ts#DspyPolicyStore.disableExpansionPolicy
     consumers:
       - src/dspy/policy-store.ts#DspyPolicyStore.rollbackExpansionPolicy
-      - src/dspy/policy-store.ts#DspyPolicyStore.disableExpansionPolicy
-      - audit tooling
     storage: graph_vault/dspy/history/<history_entry_id>.yaml
 
   - name: dspy_query_expansion_program_input
@@ -680,27 +704,35 @@ types:
     envelope: src/contracts/dspy.ts#DspyMetricSpecEnvelopeSchema
     contract_level: required
     producers:
-      - planned metric registry
+      - src/dspy/policy-store.ts#DspyPolicyStore.writeMetricSpec
+      - src/cli/qmd.ts#dspyRegisterMetricSpec
     consumers:
-      - planned optimize/evaluate services
-    storage: planned_registry
+      - src/dspy/policy-store.ts#DspyPolicyStore.loadMetricSpec
+      - src/dspy/policy-store.ts#DspyPolicyStore.writeOptimizationArtifact
+      - src/dspy/policy-store.ts#DspyPolicyStore.evaluateExpansionPolicy
+      - src/cli/qmd.ts#dspyOptimizeQueryPrompt
+      - src/cli/qmd.ts#dspyEvaluateExpansionPolicy
+    storage: graph_vault/dspy/metrics/<metric_version>.yaml
     notes:
-      - current evaluate path accepts metricVersion as a typed scalar and does
-        not load metric spec files
+      - metricVersion remains a typed scalar fallback when no registry entry is
+        present
 
   - name: dspy_evaluation_dataset
     schema: src/contracts/dspy.ts#DspyEvaluationDatasetSchema
     envelope: src/contracts/dspy.ts#DspyEvaluationDatasetEnvelopeSchema
     contract_level: required
     producers:
-      - planned dataset builder
+      - src/dspy/policy-store.ts#DspyPolicyStore.writeEvaluationDataset
+      - src/cli/qmd.ts#dspyRegisterEvaluationDataset
     consumers:
-      - planned optimize/evaluate services
-    storage: planned_registry
+      - src/dspy/policy-store.ts#DspyPolicyStore.loadEvaluationDataset
+      - src/dspy/policy-store.ts#DspyPolicyStore.evaluateExpansionPolicy
+      - src/cli/qmd.ts#dspyOptimizeQueryPrompt
+      - src/cli/qmd.ts#dspyEvaluateExpansionPolicy
+    storage: graph_vault/dspy/datasets/<dataset_id>.yaml
     notes:
-      - current CLI optimize accepts trainset/valset/testset paths and records
-        hashes in run/artifact summaries; it does not load dataset registry
-        files
+      - dataset registry copies referenced JSONL files into graph_vault under
+        dspy/dataset-files for portable optimization and evaluation
 
   - name: jina_rerank_request
     schema: src/contracts/jina.ts#JinaRerankRequestSchema
@@ -709,19 +741,23 @@ types:
     producers:
       - src/llm.ts#LlamaCpp.rerankWithJina
     consumers:
-      - Jina API#POST /v1/rerank
+      - src/llm.ts#LlamaCpp.rerankWithJina
     storage: transient
+    notes:
+      - external endpoint is Jina API POST /v1/rerank
 
   - name: jina_rerank_response
     schema: src/contracts/jina.ts#JinaRerankResponseSchema
     envelope: src/contracts/jina.ts#JinaRerankResponseEnvelopeSchema
     contract_level: required
     producers:
-      - Jina API#POST /v1/rerank
+      - src/llm.ts#LlamaCpp.rerankWithJina
     consumers:
       - src/llm.ts#LlamaCpp.rerankWithJina
       - src/store.ts#rerank
     storage: transient
+    notes:
+      - external endpoint is Jina API POST /v1/rerank
 
   - name: book_job
     schema: src/contracts/book-job.ts#BookJobSchema
@@ -902,7 +938,6 @@ types:
     contract_level: required
     producers:
       - src/vault/restore.ts#restoreFromVault
-      - test/integrations/contracts.test.ts#Data bus contracts
     consumers:
       - src/vault/restore.ts#restoreFromVault
     storage: transient
@@ -931,6 +966,8 @@ buses:
     payloads:
       - source_document
       - source_document_catalog
+      - corpus_document
+      - corpus_chunk
       - document_identity_map
       - graph_text_unit_identity_map
       - document_identity_catalog
@@ -994,6 +1031,7 @@ buses:
       - dspy_optimization_artifact
       - dspy_expansion_policy
       - dspy_policy_pointer
+      - dspy_pointer_lock_error
       - dspy_evaluation_report
       - dspy_promotion_decision
       - dspy_promotion_history_entry

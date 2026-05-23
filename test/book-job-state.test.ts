@@ -658,7 +658,8 @@ describe("FileBookJobStateRepository", () => {
         stage: "graph_extract",
         runId: "run-extract-redacted",
         inputFingerprint: "fp-extract",
-        errorSummary: `failed at ${root}/private/book.md with Bearer sk-secret`,
+        errorSummary:
+          `failed at ${root}/private/book.md with Bearer opaque-redaction-marker`,
       });
 
       const checkpointRaw = await readFile(
@@ -677,11 +678,11 @@ describe("FileBookJobStateRepository", () => {
       );
 
       expect(checkpointRaw).not.toContain(root);
-      expect(checkpointRaw).not.toContain("sk-secret");
+      expect(checkpointRaw).not.toContain("opaque-redaction-marker");
       expect(checkpointRaw).toContain("[redacted-path]");
       expect(checkpointRaw).toContain("[redacted-secret]");
       expect(runRaw).not.toContain(root);
-      expect(runRaw).not.toContain("sk-secret");
+      expect(runRaw).not.toContain("opaque-redaction-marker");
       expect(runRaw).toContain("[redacted-path]");
       expect(runRaw).toContain("[redacted-secret]");
     } finally {
@@ -1449,10 +1450,10 @@ describe("FileBookJobStateRepository", () => {
         modelFingerprint: "model-1",
         metadata: {
           sourceName: "Book",
-          OPENAI_API_KEY: "sk-secret",
+          OPENAI_API_KEY: "opaque-redaction-marker",
           workspaceRoot: root,
           nested: {
-            token: "secret-token",
+            token: "opaque-redaction-marker",
             safe: "kept",
           },
         },
@@ -1464,7 +1465,7 @@ describe("FileBookJobStateRepository", () => {
         runId: "run-ingest-1",
         inputFingerprint: "fp-ingest",
         metadata: {
-          authorization: "Bearer secret",
+          authorization: "Bearer redaction-sentinel",
           portable: "yes",
           localPath: root,
         },
@@ -1480,10 +1481,10 @@ describe("FileBookJobStateRepository", () => {
       );
 
       expect(jobRaw).not.toContain("OPENAI_API_KEY");
-      expect(jobRaw).not.toContain("sk-secret");
+      expect(jobRaw).not.toContain("opaque-redaction-marker");
       expect(jobRaw).not.toContain(root);
       expect(jobRaw).toContain("safe: kept");
-      expect(checkpointRaw).not.toContain("Bearer secret");
+      expect(checkpointRaw).not.toContain("Bearer redaction-sentinel");
       expect(checkpointRaw).not.toContain(root);
       expect(checkpointRaw).toContain("portable: yes");
     } finally {

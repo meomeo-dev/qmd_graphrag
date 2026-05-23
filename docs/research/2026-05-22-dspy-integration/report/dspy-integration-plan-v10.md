@@ -6,7 +6,7 @@ DSPy 在 qmd_graphrag 中的职责应限定为离线查询扩展策略优化
 （offline query expansion policy optimization）。它不应成为 `qmd query`
 每次请求的实时依赖，也不应替代 Type DD / JSON Schema 的硬校验。
 
-推荐目标形态：
+准生产目标形态：
 
 ```text
 qmd eval dataset
@@ -17,10 +17,10 @@ qmd eval dataset
   -> qmd query consumes promoted expansion policy
 ```
 
-当前仓库已有 DSPy contract、runtime bridge、GEPA 脚本、`qmd dspy` 生命周期
-命令组，以及线上 `qmd query` 对 promoted query expansion policy 的消费路径。
-当前实现以 typed offline bridge、typed policy store、active pointer 和 fallback /
-strict failure policy 构成最小产品化闭环。
+仓库实现包含 DSPy contract、runtime bridge、GEPA 脚本、`qmd dspy` 生命周期
+命令组、metric / dataset registry，以及线上 `qmd query` 对 promoted query
+expansion policy 的消费路径。产品化闭环由 typed offline bridge、typed policy
+store、active pointer 和 fallback / strict failure policy 构成。
 
 ## 证据基线
 
@@ -33,6 +33,9 @@ strict failure policy 构成最小产品化闭环。
 - qmd_graphrag 本地已有 `DspyQueryPromptOptimizationRequestSchema`、
   `optimizeQueryPrompt()`、Python bridge、`dspy_gepa.py`、`qmd dspy` 生命周期
   命令组和线上 query policy loader。所有实现路径必须通过这些 typed boundary。
+- DSPy 离线优化的 LM 边界使用 qmd_graphrag 自有 Responses API adapter。
+  该 adapter 只调用 `OPENAI_BASE_URL + /responses`，强制 stream transport，
+  不使用 DSPy 默认 chat/completions provider path。
 
 ## 集成边界
 
@@ -73,10 +76,11 @@ user query
 - `fallback_to_builtin_expander`：使用现有 `LlamaCpp.expandQuery()`。
 - `strict_refuse`：返回 typed query error。
 
-若 promoted artifact 已存在但不可验证，系统不执行上述 fallback。`compiledProgramPath`
-缺失、artifact hash mismatch、artifact schema mismatch、DSPy program version
-incompatible 统一归类为 `artifact_invalid`，并按 fail-closed 处理。
-`artifact_invalid` 只适用于 `provider=dspy` 且 active promoted pointer 已启用的场景。
+若 active pointer 指向的 promoted decision 引用的 artifact 已存在但不可验证，
+系统不执行上述 fallback。prompt artifact 或 compiled program 的 hash mismatch、
+artifact schema mismatch、DSPy program version incompatible 统一归类为
+`artifact_invalid`，并按 fail-closed 处理。`artifact_invalid` 只适用于
+`provider=dspy` 且 active promoted pointer 已启用的场景。
 
 ## Type DD 契约
 
@@ -87,6 +91,7 @@ incompatible 统一归类为 `artifact_invalid`，并按 fail-closed 处理。
 - `DspyOptimizationArtifactSchema`
 - `DspyExpansionPolicySchema`
 - `DspyPolicyPointerSchema`
+- `DspyPointerLockErrorSchema`
 - `DspyEvaluationDatasetSchema`
 - `DspyEvaluationReportSchema`
 - `DspyPromotionDecisionSchema`
@@ -139,8 +144,10 @@ incompatible 统一归类为 `artifact_invalid`，并按 fail-closed 处理。
 - `promotability`
 - `testsetUsedAt`
 
-线上只允许消费 `promotionStatus=promoted` 且所有 fingerprint 与当前运行时匹配的
-artifact。
+线上只允许消费 active pointer 指向的 promoted decision。decision 引用的 artifact
+必须是不可变、可推广、可校验的 offline artifact；artifact 的
+`promotionStatus` 保留产物写入时状态，不作为线上开关。线上消费前必须校验
+decision、artifact hash、runtime projection 与所有 fingerprint。
 
 边界定义：
 
@@ -193,9 +200,9 @@ textual feedback、reflection trace、candidate lineage 只属于离线
 
 | failure reason | fallback mode | strict mode |
 | --- | --- | --- |
-| `pointer_missing` | `fallback_to_builtin_expander` | `strict_refuse` |
-| `decision_missing` | `fallback_to_builtin_expander` | `strict_refuse` |
-| `policy_unavailable` | `fallback_to_builtin_expander` | `strict_refuse` |
+| `pointer_missing` | `fallback_to_builtin_expander` | `fallback_to_builtin_expander` |
+| `decision_missing` | `fallback_to_builtin_expander` | `fallback_to_builtin_expander` |
+| `policy_unavailable` | `fallback_to_builtin_expander` | `fallback_to_builtin_expander` |
 | `artifact_missing` | `fallback_to_builtin_expander` | `strict_refuse` |
 | `generated_expansion_missing` | `fallback_to_builtin_expander` | `strict_refuse` |
 | `artifact_stale` | `fallback_to_builtin_expander` | `strict_refuse` |
@@ -205,6 +212,8 @@ textual feedback、reflection trace、candidate lineage 只属于离线
 默认值为 `fallback_to_builtin_expander`。`strict_refuse` 返回 typed query error。
 `strict_schema: true` 只表示必须执行 schema validation；失败后的行为由
 `QueryExpansionFailurePolicySchema` 决定。
+`pointer_missing`、`decision_missing` 和 `policy_unavailable` 是 qmd 原生行为保护类，
+即使 strict mode 启用也必须 fallback，不返回 typed query error。
 `artifact_missing` 仅表示缺少可用 promoted artifact，不包含 generated expansion
 runtime projection。`generated_expansion_missing` 表示 promoted artifact 已存在，
 但 online query 必需的 generated expansion 文件或路径缺失。已存在但不可验证的
@@ -274,9 +283,43 @@ missing-state projection。完整 lineage 审计通过
 `qmd dspy` 命令组承载离线策略生命周期。
 
 ```text
+qmd dspy register-metric-spec
+  --metric <metric-id-or-version>
+  --description <text>
+  --max-metric-calls <n>
+  --max-total-tokens <n>
+  --max-expansion-items <n>
+```
+
+职责：
+
+- 构造 `DspyMetricSpecSchema`。
+- 写入 `graph_vault/dspy/metrics/<metric_version>.yaml`。
+- 给 `optimize-query-prompt` 和 `evaluate-expansion-policy` 提供预算与 metric
+  version 的 typed registry。
+
+```text
+qmd dspy register-evaluation-dataset
+  --dataset <dataset-id>
+  --dataset-path <path>
+  --trainset <path>
+  --valset <path>
+  --testset <path>
+```
+
+职责：
+
+- 构造 `DspyEvaluationDatasetSchema`。
+- 将输入 JSONL 复制进 `graph_vault/dspy/dataset-files`。
+- 写入 `graph_vault/dspy/datasets/<dataset_id>.yaml`。
+- 给 `optimize-query-prompt --dataset <dataset-id>` 和
+  `evaluate-expansion-policy --dataset <dataset-id>` 提供 portable dataset。
+
+```text
 qmd dspy optimize-query-prompt
   --program <program-id-or-version>
   --metric <metric-id-or-version>
+  --dataset <dataset-id>
   --trainset <path>
   --valset <path>
   --testset <path>
@@ -296,6 +339,16 @@ qmd dspy optimize-query-prompt
 - 构造 `DspyQueryPromptOptimizationRequest`。
 - 调用 `createQmdGraphRagRuntime().optimizeQueryPrompt()`。
 - 写入 `DspyOptimizationRun` 与 `DspyOptimizationArtifact`。
+- 当 `--dataset` 指向已注册 dataset 时，读取 graph_vault 内的 portable train /
+  validation / test 路径。
+- 当 `--metric` 指向已注册 metric spec 时，读取 metric budget 和
+  `maxExpansionItems`。
+- OpenAI provider 配置由 `.qmd/index.yml` 的 `providers.openai` 和
+  `models.generate` 投影为 `OpenAIResponsesProviderConfigSchema`，并嵌入
+  `DspyQueryPromptOptimizationRequest.provider`。
+- Python bridge 将 `apiKeyEnv`、`baseUrlEnv`、`endpoint`、`stream` 和
+  `reasoningEffort` 传给 GEPA runner。GEPA runner 使用
+  `OpenAIResponsesDspyLM`，只允许 `/responses` 且 `stream=true`。
 - 失败可按 `runId`、`runDir`、input hash 和 provider fingerprint 幂等恢复。
 - 失败不得修改 active expansion policy pointer。
 - `--testset` 是 acceptance testset，只能由 final acceptance 使用，不参与 optimizer
@@ -304,7 +357,8 @@ qmd dspy optimize-query-prompt
 ```text
 qmd dspy evaluate-expansion-policy
   --artifact <path>
-  --dataset <path>
+  --dataset <dataset-id>
+  --metric <metric-id-or-version>
   --index <path>
   --report <path>
 ```
@@ -314,6 +368,8 @@ qmd dspy evaluate-expansion-policy
 - 运行 frozen eval。
 - 计算 Recall@k、MRR、nDCG、schema validity、cost、latency。
 - 产出 `DspyEvaluationReport`。
+- 已注册 dataset 会把 `datasetId` 和 query count 记录到 evaluation metrics。
+- 已注册 metric spec 会把 `metricVersion` 和 expansion budget 写入 report。
 - evaluation 只读取 artifact 和 frozen snapshot，不更新 active pointer。
 
 ```text
@@ -376,8 +432,9 @@ artifact 路径必须 portable / vault-relative。secret 只允许通过 env nam
 | `fallback_to_builtin_expander` | false | builtin expansion | invalid configuration |
 | `strict_refuse` | false | typed query error | invalid configuration |
 
-The matrix covers pointer, missing artifact, stale artifact, runtime output
-schema, and runtime errors. It does not cover `artifact_invalid`.
+The matrix covers missing artifact, stale artifact, runtime output schema, and
+runtime errors. `pointer_missing`、`decision_missing` 和 `policy_unavailable`
+always preserve native qmd fallback. It does not cover `artifact_invalid`.
 `artifact_invalid` always uses fail-closed semantics.
 
 Disabled state:
@@ -388,7 +445,7 @@ query:
     provider: builtin
 ```
 
-Disabled or missing `expansion_policy` means current qmd behavior is unchanged.
+Disabled or missing `expansion_policy` means native qmd behavior is unchanged.
 
 ## Evaluation Metric
 
@@ -444,26 +501,33 @@ Anti-overfitting gate:
 - `batch_search_only` artifacts are `non_promotable` and cannot produce
   `DspyExpansionPolicySchema` or `DspyPolicyPointerSchema`.
 
-Compiled artifact loading:
+Runtime artifact loading:
 
-- evaluation and online runtime load `compiledProgramPath` first.
+- online runtime consumes the active pointer, the promoted decision, and the
+  artifact's `generatedExpansionPath` runtime projection.
+- evaluation validates the same generated expansion records used by online
+  query expansion.
+- `compiledProgramPath` is an optional offline artifact field. When present,
+  its hash is verified as part of artifact integrity, but it is not the primary
+  online loader.
 - prompt artifact is diagnostic and human-review material, not the primary
   runtime artifact.
-- missing compiled program, hash mismatch, schema mismatch, or incompatible
-  DSPy program version yields `artifact_invalid`.
 - missing generated expansion runtime projection yields
   `generated_expansion_missing` and follows `QueryExpansionFailurePolicySchema`.
+- prompt artifact hash mismatch, generated expansion hash mismatch, compiled
+  program hash mismatch, artifact schema mismatch, or incompatible DSPy program
+  version yields `artifact_invalid`.
 - `artifact_invalid` is a non-configurable fail-closed class. It returns typed
   `strict_refuse` / `no_load` / `no_promote` and never falls back to builtin
   expansion, because fallback would hide corrupted or incompatible promoted
   state.
-- `compiled_program_missing`、`artifact_hash_mismatch`、
-  `artifact_schema_mismatch`、`dspy_program_version_incompatible` are the only
-  valid subreasons for `artifact_invalid`; they are not members of
+- `compiled_program_hash_mismatch`、`artifact_hash_mismatch`、
+  `artifact_schema_mismatch`、`dspy_program_version_incompatible` are valid
+  subreasons for `artifact_invalid`; they are not members of
   `QueryExpansionFailurePolicySchema`.
 - `artifact_invalid` only applies when `provider=dspy` and an active promoted
-  pointer is in use. Disabled or missing `expansion_policy` still keeps current
-  qmd behavior unchanged.
+  pointer is in use. Disabled or missing `expansion_policy` preserves native
+  qmd behavior.
 - rebuilding from prompt creates a new `DspyOptimizationArtifactSchema`; it
   never mutates the existing artifact.
 - `providerCallLedgerPath` is a required `DspyOptimizationArtifactSchema` field.
@@ -478,7 +542,7 @@ Compiled artifact loading:
 
 ## 实现基线
 
-当前实现基线：
+实现基线：
 
 1. Type DD schema、vault-relative storage 和 catalog entries 是 DSPy 生命周期的
    契约入口。
@@ -491,7 +555,8 @@ Compiled artifact loading:
 5. `qmd query` 只通过 runtime loader 消费 promoted DSPy policy。
 6. `qmd dspy optimize-query-prompt`、`evaluate-expansion-policy`、
    `promote-expansion-policy`、`rollback-expansion-policy`、
-   `disable-expansion-policy`、`import-expansion-records` 和 `status` 构成 CLI
+   `disable-expansion-policy`、`import-expansion-records`、
+   `register-metric-spec`、`register-evaluation-dataset` 和 `status` 构成 CLI
    生命周期闭环。
 
 Pointer bootstrap / migration:
@@ -622,6 +687,11 @@ release lock
 
 - secret 值不得进入 artifact、report、log、stdout/stderr、typed error metadata。
 - provider key 只允许以 env name 表示。
+- `qmd` CLI 主入口在解析命令前加载项目根 `.env`。项目根由最近的
+  `.qmd/index.yml` / `.qmd/index.yaml` 决定；没有 project config 时使用当前工作
+  目录。已存在的真实环境变量优先，`.env` 不覆盖。
+- `.env` 只进入当前进程和子进程环境，值不得写入 `.qmd/index.yml`、
+  `graph_vault`、artifact、report 或 stdout/stderr tail。
 - bridge stdout/stderr 必须经过 redaction 后进入 report。
 - `logDir`、`runDir`、artifact path、prompt path、report path 必须是 vault-relative。
 - `VaultRelativePathSchema` rejects absolute paths, drive-letter paths, user-home
@@ -669,7 +739,7 @@ Implementation baseline table:
 - GEPA paper: `../evidence/gepa-paper.md`
 - DSPy RAG patterns: `../evidence/dspy-rag-patterns.md`
 - Query rewriting for RAG: `../evidence/query-rewriting-rag.md`
-- Current local boundary: `../evidence/current-qmd-dspy-boundary.md`
+- Local boundary evidence: `../evidence/current-qmd-dspy-boundary.md`
 - Subagent GEPA findings: `../evidence/subagent-gepa-findings.md`
 - Subagent RAG findings: `../evidence/subagent-rag-patterns.md`
 - Subagent DSPy core findings: `../evidence/subagent-dspy-core-findings.md`

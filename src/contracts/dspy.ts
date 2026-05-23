@@ -9,8 +9,11 @@ import {
   SchemaVersion,
   buildEnvelopeSchema,
 } from "./common.js";
+import { VaultRelativePathSchema } from "./corpus.js";
+import { OpenAIResponsesProviderConfigSchema } from "./provider.js";
 
 export { EnvVarNameSchema, RedactedTextSchema } from "./common.js";
+export { VaultRelativePathSchema } from "./corpus.js";
 
 export const DspyOptimizerSchema = z.enum(["gepa"]);
 export const DspyAutoModeSchema = z.enum(["light", "medium", "heavy"]);
@@ -67,25 +70,6 @@ export const DspyArtifactPromotabilitySchema = z.enum([
   "non_promotable",
 ]);
 
-export const VaultRelativePathSchema = z.string().min(1).superRefine((value, ctx) => {
-  const normalized = value.replace(/\\/g, "/");
-  const parts = normalized.split("/");
-  const invalid =
-    normalized.startsWith("/") ||
-    normalized.startsWith("~") ||
-    /^[A-Za-z]:\//.test(normalized) ||
-    normalized.includes("\0") ||
-    normalized.includes("://") ||
-    parts.some((part) => part.length === 0 || part === "." || part === "..");
-
-  if (invalid) {
-    ctx.addIssue({
-      code: "custom",
-      message: "path must be vault-relative and must not traverse outside vault",
-    });
-  }
-});
-
 export const DspyQueryPromptOptimizationRequestSchema = z.object({
   optimizer: DspyOptimizerSchema,
   trainsetPath: z.string().min(1),
@@ -101,6 +85,15 @@ export const DspyQueryPromptOptimizationRequestSchema = z.object({
   valLimit: z.number().int().positive().optional(),
   savePromptPath: z.string().min(1).optional(),
   emitPath: z.string().min(1).optional(),
+  provider: OpenAIResponsesProviderConfigSchema.default({
+    apiKeyEnv: "OPENAI_API_KEY",
+    baseUrlEnv: "OPENAI_BASE_URL",
+    endpoint: "/responses",
+    stream: true,
+    model: "gpt-5.4",
+    reasoningEffort: "medium",
+    strictStructuredOutput: true,
+  }),
   environment: BridgeEnvironmentSchema.optional(),
 });
 
@@ -144,11 +137,26 @@ export const QueryExpansionFailurePolicySchema = z.strictObject({
   reasonActions: z.record(z.string(), QueryExpansionFailureActionSchema)
     .superRefine((value, ctx) => {
       const allowed = new Set(QueryExpansionFailureReasonSchema.options);
+      const nativeFallbackReasons = new Set([
+        "pointer_missing",
+        "decision_missing",
+        "policy_unavailable",
+      ]);
       for (const key of Object.keys(value)) {
         if (key === "artifact_invalid") {
           ctx.addIssue({
             code: "custom",
             message: "artifact_invalid is fail-closed and is not configurable",
+          });
+          continue;
+        }
+        if (
+          nativeFallbackReasons.has(key) &&
+          value[key] === "strict_refuse"
+        ) {
+          ctx.addIssue({
+            code: "custom",
+            message: `${key} must preserve native qmd fallback behavior`,
           });
           continue;
         }
@@ -264,6 +272,14 @@ export const DspyPolicyPointerSchema = z.strictObject({
   currentDecisionPath: VaultRelativePathSchema.optional(),
   failurePolicy: QueryExpansionFailurePolicySchema,
   updatedAt: z.string().datetime(),
+});
+
+export const DspyPointerLockErrorSchema = z.strictObject({
+  schemaVersion: z.literal(SchemaVersion),
+  code: z.literal("dspy_pointer_lock_unavailable"),
+  pointerPath: VaultRelativePathSchema,
+  lockPath: VaultRelativePathSchema,
+  redactedMessage: RedactedTextSchema,
 });
 
 export const DspyEvaluationDatasetSchema = z.strictObject({
@@ -386,6 +402,11 @@ export const DspyPolicyPointerEnvelopeSchema = buildEnvelopeSchema(
   DspyPolicyPointerSchema,
 );
 
+export const DspyPointerLockErrorEnvelopeSchema = buildEnvelopeSchema(
+  "dspy.pointer_lock_error",
+  DspyPointerLockErrorSchema,
+);
+
 export const DspyEvaluationDatasetEnvelopeSchema = buildEnvelopeSchema(
   "dspy.evaluation_dataset",
   DspyEvaluationDatasetSchema,
@@ -459,6 +480,7 @@ export type DspyOptimizationArtifact = z.infer<
 >;
 export type DspyExpansionPolicy = z.infer<typeof DspyExpansionPolicySchema>;
 export type DspyPolicyPointer = z.infer<typeof DspyPolicyPointerSchema>;
+export type DspyPointerLockError = z.infer<typeof DspyPointerLockErrorSchema>;
 export type DspyEvaluationDataset = z.infer<typeof DspyEvaluationDatasetSchema>;
 export type DspyEvaluationReport = z.infer<typeof DspyEvaluationReportSchema>;
 export type DspyPromotionDecision = z.infer<

@@ -30,7 +30,6 @@ export const RouteRefusalReasonSchema = z.enum([
   "cost_policy_exceeded",
   "graph_upgrade_disabled",
   "capability_missing",
-  "provider_unavailable",
 ]);
 
 export const UnifiedQueryRequestSchema = z.object({

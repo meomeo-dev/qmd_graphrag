@@ -1,5 +1,8 @@
 # DSPy 集成研究报告
 
+状态：superseded。当前准生产规范以 `dspy-integration-plan-v10.md` 为准；
+本文仅保留为迭代记录，不构成当前实现契约。
+
 ## 结论
 
 DSPy 在 qmd_graphrag 中的职责应限定为离线查询扩展策略优化
@@ -72,9 +75,10 @@ user query
 - `fallback_to_builtin_expander`：使用现有 `LlamaCpp.expandQuery()`。
 - `strict_refuse`：返回 typed query error。
 
-若 promoted artifact 已存在但不可验证，系统不执行上述 fallback。`compiledProgramPath`
-缺失、artifact hash mismatch、artifact schema mismatch、DSPy program version
-incompatible 统一归类为 `artifact_invalid`，并按 fail-closed 处理。
+若 active pointer 指向的 promoted decision 引用的 artifact 已存在但不可验证，
+系统不执行上述 fallback。prompt artifact 或 compiled program 的 hash mismatch、
+artifact schema mismatch、DSPy program version incompatible 统一归类为
+`artifact_invalid`，并按 fail-closed 处理。
 
 ## 推荐 Type DD 扩展
 
@@ -134,8 +138,9 @@ incompatible 统一归类为 `artifact_invalid`，并按 fail-closed 处理。
 - `maxPromptTokens`
 - `maxExpansionItems`
 
-线上只允许消费 `promotionStatus=promoted` 且所有 fingerprint 与当前运行时匹配的
-artifact。
+线上只允许消费 active pointer 指向的 promoted decision。decision 引用的 artifact
+必须是不可变、可推广、可校验的 offline artifact；artifact 的
+`promotionStatus` 保留产物写入时状态，不作为线上开关。
 
 边界定义：
 
@@ -166,9 +171,9 @@ textual feedback、reflection trace、candidate lineage 只属于离线
 
 | failure reason | fallback mode | strict mode |
 | --- | --- | --- |
-| `pointer_missing` | `fallback_to_builtin_expander` | `strict_refuse` |
-| `decision_missing` | `fallback_to_builtin_expander` | `strict_refuse` |
-| `policy_unavailable` | `fallback_to_builtin_expander` | `strict_refuse` |
+| `pointer_missing` | `fallback_to_builtin_expander` | `fallback_to_builtin_expander` |
+| `decision_missing` | `fallback_to_builtin_expander` | `fallback_to_builtin_expander` |
+| `policy_unavailable` | `fallback_to_builtin_expander` | `fallback_to_builtin_expander` |
 | `artifact_missing` | `fallback_to_builtin_expander` | `strict_refuse` |
 | `artifact_stale` | `fallback_to_builtin_expander` | `strict_refuse` |
 | `runtime_output_schema_invalid` | `fallback_to_builtin_expander` | `strict_refuse` |
@@ -341,8 +346,8 @@ artifact 路径必须 portable / vault-relative。secret 只允许通过 env nam
 | `fallback_to_builtin_expander` | false | builtin expansion | invalid configuration |
 | `strict_refuse` | false | typed query error | invalid configuration |
 
-The matrix covers pointer, missing artifact, stale artifact, runtime output
-schema, and runtime errors. It does not cover `artifact_invalid`.
+The matrix covers promoted decision, missing artifact, stale artifact, runtime
+output schema, and runtime errors. It does not cover `artifact_invalid`.
 `artifact_invalid` always uses fail-closed semantics.
 
 Disabled state:
@@ -409,12 +414,14 @@ Anti-overfitting gate:
 - `batch_search_only` artifacts are `non_promotable` and cannot produce
   `DspyExpansionPolicySchema` or `DspyPolicyPointerSchema`.
 
-Compiled artifact loading:
+Runtime policy loading:
 
-- evaluation and online runtime load `compiledProgramPath` first.
-- prompt artifact is diagnostic and human-review material, not the primary
-  runtime artifact.
-- missing compiled program, hash mismatch, schema mismatch, or incompatible
+- evaluation and online runtime load the active pointer, promoted decision,
+  and runtime projection before reading expansion records.
+- `generatedExpansionPath` is the current online runtime projection.
+- prompt artifact and compiled program are diagnostic and offline integrity
+  material, not the primary online expansion record source.
+- missing runtime projection, hash mismatch, schema mismatch, or incompatible
   DSPy program version yields `artifact_invalid`.
 - `artifact_invalid` is a non-configurable fail-closed class. It returns typed
   `strict_refuse` / `no_load` / `no_promote` and never falls back to builtin

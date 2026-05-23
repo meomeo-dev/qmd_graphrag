@@ -72,6 +72,7 @@ async function recordGraphRagCost(input: {
   stage: string;
   model: string;
   runId: string;
+  requestCount?: number;
   artifactIds: string[];
   sourceId?: string | null;
   documentId?: string | null;
@@ -92,7 +93,7 @@ async function recordGraphRagCost(input: {
     stage: input.stage,
     provider: "graphrag",
     model: input.model,
-    requestCount: 1,
+    requestCount: input.requestCount ?? 1,
     tokenCount: 0,
     tokenCountStatus: "unknown",
     embeddingCount: 0,
@@ -112,26 +113,46 @@ async function recordGraphRagCost(input: {
 
 function evidenceCostLineage(
   evidence: readonly GraphRagEvidence[],
-): {
+): Array<{
   sourceId: string | null;
   documentId: string | null;
   bookId: string | null;
   contentHash: string | null;
   artifactIds: string[];
-} {
-  const first = evidence[0];
-  const evidenceArtifactIds = [...new Set(
-    evidence
-      .map((item) => item.artifactId)
-      .filter((item): item is string => !!item),
-  )];
-  return {
-    sourceId: first?.sourceId ?? null,
-    documentId: first?.documentId ?? null,
-    bookId: first?.bookId ?? null,
-    contentHash: first?.contentHash ?? null,
-    artifactIds: evidenceArtifactIds,
-  };
+}> {
+  const groups = new Map<string, {
+    sourceId: string | null;
+    documentId: string | null;
+    bookId: string | null;
+    contentHash: string | null;
+    artifactIds: Set<string>;
+  }>();
+
+  for (const item of evidence) {
+    const key = JSON.stringify([
+      item.bookId ?? null,
+      item.sourceId ?? null,
+      item.documentId ?? null,
+      item.contentHash ?? null,
+    ]);
+    const existing = groups.get(key) ?? {
+      sourceId: item.sourceId ?? null,
+      documentId: item.documentId ?? null,
+      bookId: item.bookId ?? null,
+      contentHash: item.contentHash ?? null,
+      artifactIds: new Set<string>(),
+    };
+    if (item.artifactId) existing.artifactIds.add(item.artifactId);
+    groups.set(key, existing);
+  }
+
+  return [...groups.values()].map((item) => ({
+    sourceId: item.sourceId,
+    documentId: item.documentId,
+    bookId: item.bookId,
+    contentHash: item.contentHash,
+    artifactIds: [...item.artifactIds],
+  }));
 }
 
 function indexCostLineage(scope: GraphRagIndexScope | undefined): {
@@ -178,26 +199,33 @@ export async function runGraphRagQuery(
     request: parsed,
     responseSchema: GraphRagQueryResponseSchema,
   });
-  const lineage = evidenceCostLineage(response.evidence);
-  await recordGraphRagCost({
-    rootDir: parsed.rootDir,
-    stage: "graphrag_query",
-    model: parsed.method,
-    runId: `graphrag-query-${Date.now()}`,
-    ...lineage,
-    lineageMode: "graph_artifact",
-    requestArtifactId: requestArtifact.artifactId,
-    requestArtifactPath: requestArtifact.artifactPath,
-    requestFingerprint: requestArtifact.requestFingerprint,
-    metadata: {
-      graphCapabilityIds: parsed.capabilityScope.graphCapabilityIds,
-      selectedBookIds: parsed.capabilityScope.selectedBookIds,
-      sourceIds: parsed.capabilityScope.sourceIds,
-      documentIds: parsed.capabilityScope.documentIds,
-      contentHashes: parsed.capabilityScope.contentHashes,
-      scopedArtifactIds: parsed.capabilityScope.artifactIds,
-    },
-  });
+  const lineages = evidenceCostLineage(response.evidence);
+  const runId = `graphrag-query-${Date.now()}`;
+  for (const [index, lineage] of lineages.entries()) {
+    await recordGraphRagCost({
+      rootDir: parsed.rootDir,
+      stage: "graphrag_query",
+      model: parsed.method,
+      runId,
+      requestCount: index === 0 ? 1 : 0,
+      ...lineage,
+      lineageMode: "graph_artifact",
+      requestArtifactId: requestArtifact.artifactId,
+      requestArtifactPath: requestArtifact.artifactPath,
+      requestFingerprint: requestArtifact.requestFingerprint,
+      metadata: {
+        graphCapabilityIds: parsed.capabilityScope.graphCapabilityIds,
+        selectedBookIds: parsed.capabilityScope.selectedBookIds,
+        sourceIds: parsed.capabilityScope.sourceIds,
+        documentIds: parsed.capabilityScope.documentIds,
+        contentHashes: parsed.capabilityScope.contentHashes,
+        scopedArtifactIds: parsed.capabilityScope.artifactIds,
+        lineageGroupCount: lineages.length,
+        lineageGroupIndex: index,
+        requestCountPolicy: "first_group_counts_request",
+      },
+    });
+  }
   return response;
 }
 

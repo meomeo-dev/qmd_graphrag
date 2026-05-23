@@ -42,26 +42,30 @@ function tempProject(): string {
 function qmdProcess(
   root: string,
   args: string[],
-  env: Record<string, string> = {},
+  env: Record<string, string | undefined> = {},
 ) {
   const { bin, args: commandArgs } = qmdCommandArgs(args);
+  const childEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: join(root, "home"),
+    PWD: root,
+    QMD_DOCTOR_DEVICE_PROBE: "0",
+    ...env,
+  };
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) delete childEnv[key];
+  }
   return spawnSync(bin, commandArgs, {
     cwd: root,
     encoding: "utf-8",
-    env: {
-      ...process.env,
-      HOME: join(root, "home"),
-      PWD: root,
-      QMD_DOCTOR_DEVICE_PROBE: "0",
-      ...env,
-    },
+    env: childEnv,
   });
 }
 
 function runQmd(
   root: string,
   args: string[],
-  env: Record<string, string> = {},
+  env: Record<string, string | undefined> = {},
 ): string {
   const result = qmdProcess(root, args, env);
   if (result.status !== 0) {
@@ -126,6 +130,50 @@ afterEach(() => {
 });
 
 describe("qmd dspy CLI", () => {
+  test("loads project .env before running CLI commands", () => {
+    const root = tempProject();
+    writeFileSync(join(root, ".env"), "QMD_DSPY_DOTENV_TEST=loaded-from-dotenv\n");
+    const trainsetPath = join(root, "train.jsonl");
+    writeFileSync(trainsetPath, JSON.stringify({ query: "hexagonal architecture" }) + "\n");
+    const fakePython = join(root, "fake-python.js");
+    writeFileSync(fakePython, `#!/usr/bin/env node
+const fs = require("fs");
+const path = require("path");
+const request = JSON.parse(fs.readFileSync(0, "utf8"));
+if (process.env.QMD_DSPY_DOTENV_TEST !== "loaded-from-dotenv") {
+  throw new Error("project .env was not loaded into the DSPy bridge environment");
+}
+fs.mkdirSync(path.dirname(request.savePromptPath), { recursive: true });
+fs.writeFileSync(request.savePromptPath, "dotenv optimized prompt");
+fs.writeFileSync(request.emitPath, JSON.stringify({
+  query: "hexagonal architecture",
+  output: [{ type: "lex", text: "ports adapters architecture" }]
+}) + "\\n");
+process.stdout.write(JSON.stringify({
+  schemaVersion: "1.0.0",
+  optimizer: request.optimizer,
+  command: ["fake-python", "dspy_gepa.py"],
+  savedPromptPath: request.savePromptPath,
+  emitPath: request.emitPath,
+  stdoutTail: ["dotenv optimize complete"]
+}));
+`);
+    chmodSync(fakePython, 0o755);
+
+    const output = JSON.parse(runQmd(root, [
+      "dspy",
+      "optimize-query-prompt",
+      "--trainset",
+      trainsetPath,
+      "--graph-vault",
+      "graph_vault",
+      "--python-bin",
+      fakePython,
+    ], { QMD_DSPY_DOTENV_TEST: undefined }));
+
+    expect(output.runPath).toMatch(/^dspy\/runs\/.*\/run.yaml$/);
+  });
+
   test("runs optimize-query-prompt through the CLI bridge with a fake python", () => {
     const root = tempProject();
     const trainsetPath = join(root, "train.jsonl");
@@ -137,6 +185,18 @@ describe("qmd dspy CLI", () => {
     writeFileSync(fakePython, `#!/usr/bin/env node
 const fs = require("fs");
 const request = JSON.parse(fs.readFileSync(0, "utf8"));
+if (request.provider.endpoint !== "/responses") {
+  throw new Error("expected /responses endpoint");
+}
+if (request.provider.stream !== true) {
+  throw new Error("expected Responses API stream mode");
+}
+if (request.provider.apiKeyEnv !== "OPENAI_API_KEY") {
+  throw new Error("expected OPENAI_API_KEY env ref");
+}
+if (request.provider.baseUrlEnv !== "OPENAI_BASE_URL") {
+  throw new Error("expected OPENAI_BASE_URL env ref");
+}
 const savePrompt = request.savePromptPath;
 const emit = request.emitPath;
 fs.mkdirSync(require("path").dirname(savePrompt), { recursive: true });
@@ -171,6 +231,98 @@ process.stdout.write(JSON.stringify({
     expect(output.artifactPath).toMatch(/^dspy\/artifacts\//);
     expect(existsSync(join(root, "graph_vault", output.runPath))).toBe(true);
     expect(existsSync(join(root, "graph_vault", output.artifactPath))).toBe(true);
+  });
+
+  test("registers metric and dataset registries used by optimize and evaluate", () => {
+    const root = tempProject();
+    const trainsetPath = join(root, "train.jsonl");
+    const valsetPath = join(root, "val.jsonl");
+    writeFileSync(trainsetPath, JSON.stringify({
+      query: "hexagonal architecture",
+      output: [{ type: "lex", text: "ports adapters architecture" }],
+    }) + "\n");
+    writeFileSync(valsetPath, JSON.stringify({
+      query: "dependency inversion",
+      output: [{ type: "vec", text: "stable dependency boundaries" }],
+    }) + "\n");
+    const fakePython = join(root, "fake-python.js");
+    writeFileSync(fakePython, `#!/usr/bin/env node
+const fs = require("fs");
+const path = require("path");
+const request = JSON.parse(fs.readFileSync(0, "utf8"));
+fs.mkdirSync(path.dirname(request.savePromptPath), { recursive: true });
+fs.writeFileSync(request.savePromptPath, "registry optimized prompt");
+fs.writeFileSync(request.emitPath, JSON.stringify({
+  query: "hexagonal architecture",
+  output: [{ type: "lex", text: "ports adapters architecture" }]
+}) + "\\n");
+process.stdout.write(JSON.stringify({
+  schemaVersion: "1.0.0",
+  optimizer: request.optimizer,
+  command: ["fake-python", "dspy_gepa.py"],
+  savedPromptPath: request.savePromptPath,
+  emitPath: request.emitPath,
+  stdoutTail: ["registry optimize complete"]
+}));
+`);
+    chmodSync(fakePython, 0o755);
+
+    const metric = JSON.parse(runQmd(root, [
+      "dspy",
+      "register-metric-spec",
+      "--metric",
+      "metric-v1",
+      "--description",
+      "schema-valid query expansion metric",
+      "--max-expansion-items",
+      "3",
+      "--graph-vault",
+      "graph_vault",
+    ]));
+    const dataset = JSON.parse(runQmd(root, [
+      "dspy",
+      "register-evaluation-dataset",
+      "--dataset",
+      "dataset-v1",
+      "--trainset",
+      trainsetPath,
+      "--valset",
+      valsetPath,
+      "--graph-vault",
+      "graph_vault",
+    ]));
+    const output = JSON.parse(runQmd(root, [
+      "dspy",
+      "optimize-query-prompt",
+      "--dataset",
+      "dataset-v1",
+      "--metric",
+      "metric-v1",
+      "--python-bin",
+      fakePython,
+      "--graph-vault",
+      "graph_vault",
+    ]));
+    const report = JSON.parse(runQmd(root, [
+      "dspy",
+      "evaluate-expansion-policy",
+      "--artifact",
+      output.artifactPath,
+      "--dataset",
+      "dataset-v1",
+      "--metric",
+      "metric-v1",
+      "--graph-vault",
+      "graph_vault",
+    ]));
+
+    expect(metric.metricPath).toMatch(/^dspy\/metrics\//);
+    expect(dataset.datasetPath).toMatch(/^dspy\/datasets\//);
+    expect(existsSync(join(root, "graph_vault", metric.metricPath))).toBe(true);
+    expect(existsSync(join(root, "graph_vault", dataset.datasetPath))).toBe(true);
+    expect(report.datasetId).toBe("dataset-v1");
+    expect(report.metricVersion).toBe("metric-v1");
+    expect(report.metrics.metric_max_expansion_items).toBe(3);
   });
 
   test("imports, evaluates, promotes, disables, and rollbacks a policy", () => {

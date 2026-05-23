@@ -120,15 +120,19 @@ import {
 import { DspyPolicyStore } from "../dspy/policy-store.js";
 import type { DspyArtifactWriteResult } from "../dspy/policy-store.js";
 import {
+  DspyEvaluationDatasetSchema,
   DspyGeneratedExpansionRecordSchema,
   DspyOptimizationArtifactSchema,
   DspyEvaluationReportSchema,
+  DspyMetricSpecSchema,
   DspyPromotionDecisionSchema,
   QueryExpansionFailurePolicySchema,
 } from "../contracts/dspy.js";
+import { OpenAIResponsesProviderConfigSchema } from "../contracts/provider.js";
 import type { QmdSearchResult } from "../contracts/qmd-query.js";
 import type {
   EvidenceRef,
+  QueryRouteDecision,
   QueryStage,
   UnifiedAnswer,
 } from "../contracts/unified-query.js";
@@ -496,6 +500,78 @@ function defaultProjectProvidersConfig(): CollectionConfig["providers"] {
       rerank_model: "jina-reranker-v3",
     },
   };
+}
+
+function parseDotenvLine(line: string): { key: string; value: string } | null {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith("#")) return null;
+  const body = trimmed.startsWith("export ") ? trimmed.slice("export ".length).trim() : trimmed;
+  const separatorIndex = body.indexOf("=");
+  if (separatorIndex <= 0) return null;
+  const key = body.slice(0, separatorIndex).trim();
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return null;
+
+  let value = body.slice(separatorIndex + 1).trim();
+  const quote = value[0];
+  if (
+    (quote === "\"" || quote === "'") &&
+    value.endsWith(quote) &&
+    value.length >= 2
+  ) {
+    value = value.slice(1, -1);
+    if (quote === "\"") {
+      value = value
+        .replace(/\\n/g, "\n")
+        .replace(/\\r/g, "\r")
+        .replace(/\\t/g, "\t")
+        .replace(/\\"/g, "\"")
+        .replace(/\\\\/g, "\\");
+    }
+  } else {
+    const commentIndex = value.search(/\s#/);
+    if (commentIndex >= 0) value = value.slice(0, commentIndex).trimEnd();
+  }
+
+  return { key, value };
+}
+
+export function loadProjectDotenvForCli(startDir: string = getPwd()): string[] {
+  const localConfigPath = findLocalConfigPath(startDir);
+  const projectDir = localConfigPath
+    ? dirname(dirname(localConfigPath))
+    : pathResolve(startDir);
+  const dotenvPath = pathJoin(projectDir, ".env");
+  if (!existsSync(dotenvPath)) return [];
+
+  const loaded: string[] = [];
+  const body = readFileSync(dotenvPath, "utf-8");
+  for (const line of body.split(/\r?\n/)) {
+    const parsed = parseDotenvLine(line);
+    if (!parsed || process.env[parsed.key] !== undefined) continue;
+    process.env[parsed.key] = parsed.value;
+    loaded.push(parsed.key);
+  }
+  return loaded;
+}
+
+function openAIResponsesProviderConfigForCli(config: CollectionConfig, model: string) {
+  const openai = {
+    ...defaultProjectProvidersConfig()?.openai,
+    ...(config.providers?.openai ?? {}),
+    response_api: {
+      ...defaultProjectProvidersConfig()?.openai?.response_api,
+      ...(config.providers?.openai?.response_api ?? {}),
+    },
+  };
+  return OpenAIResponsesProviderConfigSchema.parse({
+    apiKeyEnv: openai.api_key_env ?? "OPENAI_API_KEY",
+    baseUrlEnv: openai.base_url_env ?? "OPENAI_BASE_URL",
+    endpoint: openai.response_api?.endpoint ?? "/responses",
+    stream: openai.response_api?.stream ?? true,
+    model,
+    reasoningEffort: openai.response_api?.reasoning_effort,
+    strictStructuredOutput: openai.response_api?.strict_structured_output ?? true,
+  });
 }
 
 function updateQueryExpansionPolicyConfig(input: {
@@ -2189,6 +2265,7 @@ type OutputOptions = {
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
   chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
   displayQuery?: string; // Presentation-only query string for snippets.
+  showRouteSummary?: boolean;
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -2528,10 +2605,40 @@ function outputRowsFromUnifiedAnswer(answer: UnifiedAnswer): OutputRow[] {
   });
 }
 
+function formatRouteRefusals(decision: QueryRouteDecision): string {
+  return decision.refusalReasons.length > 0
+    ? decision.refusalReasons.join(", ")
+    : "none";
+}
+
+function outputRouteDecisionSummary(decision: QueryRouteDecision, format: OutputFormat): void {
+  if (format === "cli") {
+    console.log("QueryRouteDecision:");
+    console.log(`  requestedRoute: ${decision.requestedRoute}`);
+    console.log(`  selectedRoute: ${decision.selectedRoute}`);
+    console.log(`  reasonCode: ${decision.reasonCode}`);
+    console.log(`  refusalReasons: ${formatRouteRefusals(decision)}`);
+    console.log();
+    return;
+  }
+
+  if (format === "md") {
+    console.log("## QueryRouteDecision\n");
+    console.log(`- requestedRoute: \`${decision.requestedRoute}\``);
+    console.log(`- selectedRoute: \`${decision.selectedRoute}\``);
+    console.log(`- reasonCode: \`${decision.reasonCode}\``);
+    console.log(`- refusalReasons: \`${formatRouteRefusals(decision)}\`\n`);
+  }
+}
+
 function outputUnifiedAnswer(answer: UnifiedAnswer, opts: OutputOptions): void {
   if (opts.format === "json") {
     console.log(JSON.stringify(answer, null, 2));
     return;
+  }
+
+  if (opts.showRouteSummary) {
+    outputRouteDecisionSummary(answer.routeDecision, opts.format);
   }
 
   if (answer.routeDecision.selectedRoute === "graphrag") {
@@ -2967,7 +3074,7 @@ async function autoQuerySearch(query: string, opts: OutputOptions): Promise<void
 
     closeDb();
 
-    outputUnifiedAnswer(answer, opts);
+    outputUnifiedAnswer(answer, { ...opts, showRouteSummary: true });
   }, { maxDuration: 10 * 60 * 1000, name: 'autoQuerySearch' });
 }
 
@@ -3080,17 +3187,134 @@ function printDspyArtifactResult(result: DspyArtifactWriteResult): void {
   });
 }
 
+function optionalPositiveIntegerOption(
+  name: string,
+  value: unknown,
+): number | undefined {
+  return value == null ? undefined : parsePositiveIntegerOption(name, value);
+}
+
+function resolveDspyMetricSpec(
+  store: DspyPolicyStore,
+  metricVersion: string | undefined,
+) {
+  return metricVersion ? store.loadMetricSpec(metricVersion) : null;
+}
+
+function resolveDspyDatasetForCli(
+  store: DspyPolicyStore,
+  datasetId: string | undefined,
+) {
+  return datasetId ? store.loadEvaluationDataset(datasetId) : null;
+}
+
+function resolveDspyDatasetSourcePath(
+  store: DspyPolicyStore,
+  relativePath: string | undefined,
+): string | undefined {
+  return relativePath ? store.resolvePath(relativePath) : undefined;
+}
+
+async function dspyRegisterMetricSpec(
+  args: string[],
+  values: Record<string, unknown>,
+): Promise<void> {
+  const metricVersion = String(values.metric || args[1] || "");
+  if (!metricVersion) {
+    throw new Error("Usage: qmd dspy register-metric-spec --metric <version>");
+  }
+  const store = createDspyPolicyStore(values);
+  const result = store.writeMetricSpec({
+    metricVersion,
+    name: values.name ? String(values.name) : metricVersion,
+    description: String(values.description || "DSPy query expansion metric"),
+    maxMetricCalls: values["max-metric-calls"] == null
+      ? undefined
+      : parsePositiveIntegerOption("maxMetricCalls", values["max-metric-calls"]),
+    maxTotalTokens: values["max-total-tokens"] == null
+      ? undefined
+      : parsePositiveIntegerOption("maxTotalTokens", values["max-total-tokens"]),
+    maxExpansionItems: values["max-expansion-items"] == null
+      ? undefined
+      : parsePositiveIntegerOption(
+        "maxExpansionItems",
+        values["max-expansion-items"],
+      ),
+  });
+  printDspyJson({
+    metricPath: result.path,
+    metric: DspyMetricSpecSchema.parse(result.value),
+  });
+}
+
+async function dspyRegisterEvaluationDataset(
+  args: string[],
+  values: Record<string, unknown>,
+): Promise<void> {
+  const datasetId = String(values.dataset || args[1] || "");
+  if (!datasetId) {
+    throw new Error(
+      "Usage: qmd dspy register-evaluation-dataset --dataset <id>",
+    );
+  }
+  if (
+    values["dataset-path"] == null &&
+    values.trainset == null &&
+    values.valset == null &&
+    values.testset == null
+  ) {
+    throw new Error(
+      "register-evaluation-dataset requires --dataset-path, --trainset, --valset, or --testset",
+    );
+  }
+  const store = createDspyPolicyStore(values);
+  const result = store.writeEvaluationDataset({
+    datasetId,
+    datasetPath: values["dataset-path"]
+      ? pathResolve(getPwd(), String(values["dataset-path"]))
+      : undefined,
+    trainsetPath: values.trainset
+      ? pathResolve(getPwd(), String(values.trainset))
+      : undefined,
+    valsetPath: values.valset
+      ? pathResolve(getPwd(), String(values.valset))
+      : undefined,
+    testsetPath: values.testset
+      ? pathResolve(getPwd(), String(values.testset))
+      : undefined,
+  });
+  printDspyJson({
+    datasetPath: result.path,
+    dataset: DspyEvaluationDatasetSchema.parse(result.value),
+  });
+}
+
 async function dspyOptimizeQueryPrompt(
   args: string[],
   values: Record<string, unknown>,
 ): Promise<void> {
-  const trainsetPath = String(values.trainset || args[1] || "");
-  if (!trainsetPath) {
-    throw new Error("Usage: qmd dspy optimize-query-prompt --trainset <jsonl>");
-  }
   const config = ensureRuntimeConfigForCli();
   const graphVault = resolveGraphVaultForCli(values, config);
   const store = new DspyPolicyStore({ graphVault, actor: "qmd-cli" });
+  const dataset = resolveDspyDatasetForCli(
+    store,
+    values.dataset ? String(values.dataset) : undefined,
+  );
+  const metricVersion = values.metric
+    ? String(values.metric)
+    : "dspy-query-expansion-schema-v1";
+  const metricSpec = resolveDspyMetricSpec(store, metricVersion);
+  const trainsetPath = String(
+    values.trainset ||
+    resolveDspyDatasetSourcePath(store, dataset?.trainsetPath) ||
+    args[1] ||
+    "",
+  );
+  if (!trainsetPath) {
+    throw new Error(
+      "Usage: qmd dspy optimize-query-prompt --trainset <jsonl> or --dataset <id>",
+    );
+  }
   const runId = createRunId("dspy-cli");
   const artifactDir = pathJoin(graphVault, "dspy", "runs", runId);
   mkdirSync(artifactDir, { recursive: true });
@@ -3100,14 +3324,18 @@ async function dspyOptimizeQueryPrompt(
   const emitPath = values.emit
     ? pathResolve(getPwd(), String(values.emit))
     : pathJoin(artifactDir, "generated.jsonl");
+  const model = String(values.model || config.models?.generate || "openai/gpt-5.4");
+  const provider = openAIResponsesProviderConfigForCli(config, model);
   const runtime = createQmdGraphRagRuntime();
   const response = await runtime.optimizeQueryPrompt({
     optimizer: "gepa",
     trainsetPath: pathResolve(getPwd(), trainsetPath),
     valsetPath: values.valset
       ? pathResolve(getPwd(), String(values.valset))
+      : dataset?.valsetPath
+        ? store.resolvePath(dataset.valsetPath)
       : undefined,
-    model: String(values.model || config.models?.generate || "openai/gpt-5.4"),
+    model,
     reflectionModel: values["reflection-model"]
       ? String(values["reflection-model"])
       : undefined,
@@ -3116,12 +3344,13 @@ async function dspyOptimizeQueryPrompt(
       : "light",
     maxMetricCalls: parsePositiveIntegerOption(
       "maxMetricCalls",
-      values["max-metric-calls"],
+      values["max-metric-calls"] ?? metricSpec?.maxMetricCalls,
     ),
     limit: parsePositiveIntegerOption("limit", values.limit),
     valLimit: parsePositiveIntegerOption("valLimit", values["val-limit"]),
     savePromptPath,
     emitPath,
+    provider,
     environment: {
       pythonBin: values["python-bin"]
         ? pathResolve(getPwd(), String(values["python-bin"]))
@@ -3137,8 +3366,10 @@ async function dspyOptimizeQueryPrompt(
       trainsetPath: pathResolve(getPwd(), trainsetPath),
       valsetPath: values.valset
         ? pathResolve(getPwd(), String(values.valset))
+        : dataset?.valsetPath
+          ? store.resolvePath(dataset.valsetPath)
         : undefined,
-      model: String(values.model || config.models?.generate || "openai/gpt-5.4"),
+      model,
       reflectionModel: values["reflection-model"]
         ? String(values["reflection-model"])
         : undefined,
@@ -3147,12 +3378,13 @@ async function dspyOptimizeQueryPrompt(
         : "light",
       maxMetricCalls: parsePositiveIntegerOption(
         "maxMetricCalls",
-        values["max-metric-calls"],
+        values["max-metric-calls"] ?? metricSpec?.maxMetricCalls,
       ),
       limit: parsePositiveIntegerOption("limit", values.limit),
       valLimit: parsePositiveIntegerOption("valLimit", values["val-limit"]),
       savePromptPath,
       emitPath,
+      provider,
     },
     response,
     runId,
@@ -3162,10 +3394,11 @@ async function dspyOptimizeQueryPrompt(
       rerankModel: DEFAULT_RERANK_MODEL,
     }),
     providerEnvRefs: dspyProviderEnvRefs(config),
-    metricVersion: String(values.metric || "dspy-query-expansion-schema-v1"),
+    metricVersion,
+    metricSpec: metricSpec ?? undefined,
     maxExpansionItems: values["max-expansion-items"]
       ? parsePositiveIntegerOption("maxExpansionItems", values["max-expansion-items"])
-      : undefined,
+      : metricSpec?.maxExpansionItems,
   });
   printDspyArtifactResult(result);
 }
@@ -3313,6 +3546,12 @@ async function dspyCommand(
     case "import-expansion-records":
       await dspyImportExpansionRecords(args, values);
       break;
+    case "register-metric-spec":
+      await dspyRegisterMetricSpec(args, values);
+      break;
+    case "register-evaluation-dataset":
+      await dspyRegisterEvaluationDataset(args, values);
+      break;
     case "status": {
       const store = createDspyPolicyStore(values);
       const pointer = store.loadPointer();
@@ -3329,6 +3568,8 @@ async function dspyCommand(
       console.error("  rollback-expansion-policy   Restore the previous promoted pointer");
       console.error("  disable-expansion-policy    Disable DSPy online expansion");
       console.error("  import-expansion-records    Import typed generated expansion records");
+      console.error("  register-metric-spec        Register a typed metric spec in graph_vault");
+      console.error("  register-evaluation-dataset Register a typed evaluation dataset in graph_vault");
       console.error("  status                      Show the current DSPy pointer");
       process.exit(1);
   }
@@ -3393,14 +3634,18 @@ function parseCLI() {
       trainset: { type: "string" },
       valset: { type: "string" },
       dataset: { type: "string" },
+      "dataset-path": { type: "string" },
+      testset: { type: "string" },
       artifact: { type: "string" },
       report: { type: "string" },
       records: { type: "string" },
       metric: { type: "string" },
+      description: { type: "string" },
       model: { type: "string" },
       "reflection-model": { type: "string" },
       auto: { type: "string" },
       "max-metric-calls": { type: "string" },
+      "max-total-tokens": { type: "string" },
       limit: { type: "string" },
       "val-limit": { type: "string" },
       "max-expansion-items": { type: "string" },
@@ -3927,6 +4172,8 @@ function showHelp(): void {
   console.log("  qmd dspy promote-expansion-policy --artifact <path> --report <path>");
   console.log("  qmd dspy rollback-expansion-policy");
   console.log("  qmd dspy disable-expansion-policy");
+  console.log("  qmd dspy register-metric-spec --metric <version>");
+  console.log("  qmd dspy register-evaluation-dataset --dataset <id> --trainset <jsonl>");
   console.log("");
   console.log("Query syntax (qmd query):");
   console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
@@ -4638,6 +4885,7 @@ if (isMain) {
   // entrypoint, not when imported for its exports. Tests must set INDEX_PATH
   // or use createStore() with an explicit path.
   enableProductionMode();
+  loadProjectDotenvForCli();
 
   const cli = parseCLI();
 

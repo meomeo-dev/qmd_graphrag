@@ -211,6 +211,85 @@ describe("GraphRAG provider cost accounting", () => {
     expect(record?.embeddingCountStatus).toBe("unknown");
   });
 
+  test("keeps multi-book query cost lineage grouped by evidence identity", async () => {
+    const graphVault = await mkdtemp(join(tmpdir(), "qmd-graphrag-cost-multi-"));
+    mockedBridge.mockResolvedValueOnce({
+      schemaVersion: SchemaVersion,
+      method: "local",
+      responseText: "Graph answer",
+      evidence: [
+        {
+          evidenceId: "cap-1",
+          graphCapabilityId: "cap-1",
+          sourceId: "source-1",
+          documentId: "doc-1",
+          bookId: "book-1",
+          contentHash: "content-1",
+          graphTextUnitId: "tu-1",
+          artifactId: "artifact-book-1",
+        },
+        {
+          evidenceId: "cap-2",
+          graphCapabilityId: "cap-2",
+          sourceId: "source-2",
+          documentId: "doc-2",
+          bookId: "book-2",
+          contentHash: "content-2",
+          graphTextUnitId: "tu-2",
+          artifactId: "artifact-book-2",
+        },
+      ],
+    });
+
+    await runGraphRagQuery({
+      rootDir: graphVault,
+      method: "local",
+      query: "Compare the books",
+      responseType: "multiple paragraphs",
+      capabilityScope: {
+        selectedBookIds: ["book-1", "book-2"],
+        graphCapabilityIds: ["cap-1", "cap-2"],
+        sourceIds: ["source-1", "source-2"],
+        documentIds: ["doc-1", "doc-2"],
+        contentHashes: ["content-1", "content-2"],
+        artifactIds: ["artifact-book-1", "artifact-book-2"],
+      },
+    });
+
+    const records = await readCostLedger(graphVault);
+    const queryRecords = records.filter((record) => record.stage === "graphrag_query");
+    const book1 = queryRecords.find((record) => record.bookId === "book-1");
+    const book2 = queryRecords.find((record) => record.bookId === "book-2");
+
+    expect(queryRecords).toHaveLength(2);
+    expect(book1?.sourceId).toBe("source-1");
+    expect(book1?.documentId).toBe("doc-1");
+    expect(book1?.contentHash).toBe("content-1");
+    expect(book2?.sourceId).toBe("source-2");
+    expect(book2?.documentId).toBe("doc-2");
+    expect(book2?.contentHash).toBe("content-2");
+
+    const book1ArtifactIds = book1?.artifactIds as string[];
+    const book2ArtifactIds = book2?.artifactIds as string[];
+    expect(book1ArtifactIds).toContain("artifact-book-1");
+    expect(book1ArtifactIds).not.toContain("artifact-book-2");
+    expect(book2ArtifactIds).toContain("artifact-book-2");
+    expect(book2ArtifactIds).not.toContain("artifact-book-1");
+
+    expect(book1?.requestArtifactId).toBe(book2?.requestArtifactId);
+    expect(queryRecords.map((record) => record.requestCount)).toEqual([1, 0]);
+    expect(queryRecords.reduce(
+      (sum, record) => sum + (record.requestCount as number),
+      0,
+    )).toBe(1);
+    for (const [index, record] of queryRecords.entries()) {
+      const metadata = record.metadata as Record<string, unknown>;
+      expect(metadata.lineageGroupCount).toBe(2);
+      expect(metadata.lineageGroupIndex).toBe(index);
+      expect(metadata.requestCountPolicy).toBe("first_group_counts_request");
+    }
+  });
+
   test("records index lineage only from explicit index scope", async () => {
     const graphVault = await mkdtemp(join(tmpdir(), "qmd-graphrag-cost-index-"));
     const { reportArtifactId, lancedbArtifactId } =

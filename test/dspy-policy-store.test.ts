@@ -1,5 +1,5 @@
 import { cp, mkdir, mkdtemp, writeFile } from "node:fs/promises";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,7 +7,10 @@ import { describe, expect, test } from "vitest";
 
 import { SchemaVersion } from "../src/contracts/common.js";
 import { buildDspyRuntimeFingerprints } from "../src/dspy/fingerprints.js";
-import { DspyPolicyStore } from "../src/dspy/policy-store.js";
+import {
+  DspyPointerLockError,
+  DspyPolicyStore,
+} from "../src/dspy/policy-store.js";
 
 async function makeVault(): Promise<string> {
   return mkdtemp(join(tmpdir(), "qmd-dspy-policy-"));
@@ -33,6 +36,9 @@ describe("DSPy policy store", () => {
     expect(() => store.resolvePath("/tmp/outside.yaml")).toThrow(/vault-relative/);
     expect(() => store.resolvePath("../outside.yaml")).toThrow(/vault-relative/);
     expect(() => store.resolvePath("~/outside.yaml")).toThrow(/vault-relative/);
+    expect(() => store.resolvePath("file:artifact.yaml")).toThrow(/vault-relative/);
+    expect(() => store.resolvePath("mailto:foo")).toThrow(/vault-relative/);
+    expect(() => store.resolvePath("C:artifact.yaml")).toThrow(/vault-relative/);
   });
 
   test("writes artifact, report, promotion pointer, and online expansion", async () => {
@@ -59,7 +65,7 @@ describe("DSPy policy store", () => {
         command: ["dspy"],
         emitPath,
         savedPromptPath: promptPath,
-        stdoutTail: [`wrote ${emitPath} sk-secret123`],
+        stdoutTail: [`wrote ${emitPath} Bearer opaque-redaction-marker`],
       },
       fingerprints: {},
     });
@@ -78,7 +84,7 @@ describe("DSPy policy store", () => {
     expect(existsSync(join(vault, store.pointerRelativePath()))).toBe(true);
     const runBody = readFileSync(join(vault, result.runPath), "utf8");
     expect(runBody).not.toContain(vault);
-    expect(runBody).not.toContain("sk-secret123");
+    expect(runBody).not.toContain("opaque-redaction-marker");
     expect(runBody).toContain("requestFingerprint:");
 
     const expanded = store.expandQuery("hexagonal architecture");
@@ -171,6 +177,15 @@ describe("DSPy policy store", () => {
         trainsetPath: "train.jsonl",
         model: "openai/gpt-5.4",
         emitPath,
+        provider: {
+          apiKeyEnv: "OPENAI_API_KEY",
+          baseUrlEnv: "OPENAI_BASE_URL",
+          endpoint: "/responses",
+          stream: true,
+          model: "gpt-5.4",
+          reasoningEffort: "medium",
+          strictStructuredOutput: true,
+        },
       },
       response: {
         schemaVersion: SchemaVersion,
@@ -239,6 +254,31 @@ describe("DSPy policy store", () => {
     const rolledBack = store.rollbackExpansionPolicy();
     expect(rolledBack.active).toBe(true);
     expect(store.expandQuery("hexagonal architecture").status).toBe("expanded");
+  });
+
+  test("fails pointer mutations with a typed lock error when writer lock exists", async () => {
+    const vault = await makeVault();
+    const store = new DspyPolicyStore({ graphVault: vault, actor: "test" });
+    mkdirSync(store.pointerLockPath(), { recursive: true });
+
+    try {
+      expect(() => store.disableExpansionPolicy()).toThrow(DspyPointerLockError);
+    } finally {
+      rmSync(store.pointerLockPath(), { recursive: true, force: true });
+    }
+
+    mkdirSync(store.pointerLockPath(), { recursive: true });
+    try {
+      store.disableExpansionPolicy();
+    } catch (error) {
+      expect(error).toBeInstanceOf(DspyPointerLockError);
+      const payload = (error as DspyPointerLockError).payload;
+      expect(payload.code).toBe("dspy_pointer_lock_unavailable");
+      expect(payload.pointerPath).toBe(store.pointerRelativePath());
+      expect(payload.lockPath).toBe(store.pointerLockRelativePath());
+    } finally {
+      rmSync(store.pointerLockPath(), { recursive: true, force: true });
+    }
   });
 
   test("rollback from disabled restores only the current disable transition", async () => {
@@ -391,7 +431,82 @@ describe("DSPy policy store", () => {
     expect(expanded.status).toBe("expanded");
   });
 
-  test("honors configured pointer_ref and strict failure policy", async () => {
+  test("registers metric specs and evaluation datasets in graph_vault", async () => {
+    const vault = await makeVault();
+    const trainsetPath = join(vault, "train.jsonl");
+    const valsetPath = join(vault, "val.jsonl");
+    await writeRecords(trainsetPath);
+    await writeRecords(valsetPath);
+    const store = new DspyPolicyStore({ graphVault: vault, actor: "test" });
+
+    const metric = store.writeMetricSpec({
+      metricVersion: "metric-v1",
+      description: "schema-valid query expansion metric",
+      maxMetricCalls: 12,
+      maxExpansionItems: 5,
+    });
+    const dataset = store.writeEvaluationDataset({
+      datasetId: "dataset-v1",
+      trainsetPath,
+      valsetPath,
+    });
+
+    expect(existsSync(join(vault, metric.path))).toBe(true);
+    expect(existsSync(join(vault, dataset.path))).toBe(true);
+    expect(store.loadMetricSpec("metric-v1")?.maxExpansionItems).toBe(5);
+    expect(store.loadEvaluationDataset("dataset-v1")?.queryCount).toBe(2);
+    expect(dataset.value.trainsetPath).toMatch(/^dspy\/dataset-files\//);
+    expect(dataset.value.valsetHash).toBeTruthy();
+  });
+
+  test("applies registered metric and dataset during artifact evaluation", async () => {
+    const vault = await makeVault();
+    const emitPath = join(vault, "generated.jsonl");
+    const trainsetPath = join(vault, "train.jsonl");
+    await writeRecords(emitPath);
+    await writeRecords(trainsetPath);
+    const store = new DspyPolicyStore({ graphVault: vault, actor: "test" });
+    const metric = store.writeMetricSpec({
+      metricVersion: "metric-v1",
+      description: "schema-valid query expansion metric",
+      maxExpansionItems: 3,
+    });
+    store.writeEvaluationDataset({
+      datasetId: "dataset-v1",
+      trainsetPath,
+    });
+    const result = store.writeOptimizationArtifact({
+      request: {
+        optimizer: "gepa",
+        trainsetPath,
+        model: "openai/gpt-5.4",
+        emitPath,
+      },
+      response: {
+        schemaVersion: SchemaVersion,
+        optimizer: "gepa",
+        command: ["dspy"],
+        emitPath,
+        stdoutTail: [],
+      },
+      fingerprints: {},
+      metricSpec: metric.value,
+    });
+
+    const report = store.evaluateExpansionPolicy({
+      artifactPath: result.artifactPath,
+      datasetId: "dataset-v1",
+      metricVersion: "metric-v1",
+    });
+
+    expect(result.artifact.metricVersion).toBe("metric-v1");
+    expect(result.artifact.maxExpansionItems).toBe(3);
+    expect(report.datasetId).toBe("dataset-v1");
+    expect(report.metricVersion).toBe("metric-v1");
+    expect(report.metrics.dataset_query_count).toBe(1);
+  });
+
+  test("honors configured pointer_ref and preserves native fallback for missing pointer", async () => {
     const vault = await makeVault();
     const store = new DspyPolicyStore({
       graphVault: vault,
@@ -405,8 +520,121 @@ describe("DSPy policy store", () => {
     });
     expect(store.pointerRelativePath()).toBe("dspy/policies/query-expansion/current.yaml");
     const result = store.expandQuery("missing pointer");
-    expect(result.status).toBe("strict_refuse");
+    expect(result.status).toBe("fallback");
     expect(result.reason).toBe("pointer_missing");
+  });
+
+  test("requires active pointer to reference a promoted decision", async () => {
+    const vault = await makeVault();
+    const emitPath = join(vault, "generated.jsonl");
+    await writeRecords(emitPath);
+    const store = new DspyPolicyStore({ graphVault: vault, actor: "test" });
+    const result = store.writeOptimizationArtifact({
+      request: {
+        optimizer: "gepa",
+        trainsetPath: "train.jsonl",
+        model: "openai/gpt-5.4",
+        emitPath,
+      },
+      response: {
+        schemaVersion: SchemaVersion,
+        optimizer: "gepa",
+        command: ["dspy"],
+        emitPath,
+        stdoutTail: [],
+      },
+      fingerprints: {},
+    });
+    const report = store.evaluateExpansionPolicy({ artifactPath: result.artifactPath });
+    const decision = store.promoteExpansionPolicy({
+      artifactPath: result.artifactPath,
+      reportPath: `dspy/reports/${report.reportId}.yaml`,
+      reason: "test promotion",
+    });
+    const decisionPath = join(vault, "dspy", "promotions", `${decision.decisionId}.yaml`);
+    const demotedDecision = readFileSync(decisionPath, "utf8")
+      .replace("promotionStatus: promoted", "promotionStatus: rejected");
+    writeFileSync(decisionPath, demotedDecision, "utf8");
+
+    const unavailable = store.expandQuery("hexagonal architecture");
+    expect(unavailable.status).toBe("fallback");
+    expect(unavailable.reason).toBe("policy_unavailable");
+  });
+
+  test("requires pointer decision id to match the loaded promoted decision", async () => {
+    const vault = await makeVault();
+    const emitPath = join(vault, "generated.jsonl");
+    await writeRecords(emitPath);
+    const store = new DspyPolicyStore({ graphVault: vault, actor: "test" });
+    const result = store.writeOptimizationArtifact({
+      request: {
+        optimizer: "gepa",
+        trainsetPath: "train.jsonl",
+        model: "openai/gpt-5.4",
+        emitPath,
+      },
+      response: {
+        schemaVersion: SchemaVersion,
+        optimizer: "gepa",
+        command: ["dspy"],
+        emitPath,
+        stdoutTail: [],
+      },
+      fingerprints: {},
+    });
+    const report = store.evaluateExpansionPolicy({ artifactPath: result.artifactPath });
+    store.promoteExpansionPolicy({
+      artifactPath: result.artifactPath,
+      reportPath: `dspy/reports/${report.reportId}.yaml`,
+      reason: "test promotion",
+    });
+    const pointerPath = join(vault, store.pointerRelativePath());
+    const mismatchedPointer = readFileSync(pointerPath, "utf8")
+      .replace(/currentDecisionId: .+\n/, "currentDecisionId: dspy-decision-mismatch\n");
+    writeFileSync(pointerPath, mismatchedPointer, "utf8");
+
+    const unavailable = store.expandQuery("hexagonal architecture");
+    expect(unavailable.status).toBe("fallback");
+    expect(unavailable.reason).toBe("policy_unavailable");
+  });
+
+  test("fails closed when a promoted decision references a mismatched artifact hash", async () => {
+    const vault = await makeVault();
+    const emitPath = join(vault, "generated.jsonl");
+    await writeRecords(emitPath);
+    const store = new DspyPolicyStore({ graphVault: vault, actor: "test" });
+    const result = store.writeOptimizationArtifact({
+      request: {
+        optimizer: "gepa",
+        trainsetPath: "train.jsonl",
+        model: "openai/gpt-5.4",
+        emitPath,
+      },
+      response: {
+        schemaVersion: SchemaVersion,
+        optimizer: "gepa",
+        command: ["dspy"],
+        emitPath,
+        stdoutTail: [],
+      },
+      fingerprints: {},
+    });
+    const report = store.evaluateExpansionPolicy({ artifactPath: result.artifactPath });
+    const decision = store.promoteExpansionPolicy({
+      artifactPath: result.artifactPath,
+      reportPath: `dspy/reports/${report.reportId}.yaml`,
+      reason: "test promotion",
+    });
+    const decisionPath = join(vault, "dspy", "promotions", `${decision.decisionId}.yaml`);
+    const mismatchedDecision = readFileSync(decisionPath, "utf8")
+      .replace(/artifactHash: .+\n/, "artifactHash: mismatched-artifact-hash\n");
+    writeFileSync(decisionPath, mismatchedDecision, "utf8");
+
+    const refused = store.expandQuery("hexagonal architecture");
+    expect(refused.status).toBe("strict_refuse");
+    if (refused.status === "strict_refuse") {
+      expect(refused.reason).toBe("artifact_invalid");
+    }
   });
 
   test("detects stale runtime fingerprints when supplied", async () => {

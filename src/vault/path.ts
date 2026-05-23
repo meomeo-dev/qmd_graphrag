@@ -8,17 +8,20 @@ export function hasAbsolutePathSyntax(path: string): boolean {
 }
 
 export function normalizePortableVaultRelativePath(path: string): string {
+  const normalized = path.replaceAll("\\", "/");
   if (
     path.length === 0 ||
     path.includes("\0") ||
+    normalized === "~" ||
+    normalized.startsWith("~/") ||
+    /^~[^/]*(?:\/|$)/u.test(normalized) ||
     hasAbsolutePathSyntax(path) ||
     UriLikePrefix.test(path)
   ) {
     throw new Error(`path must be vault-relative and portable: ${path}`);
   }
 
-  const parts = path
-    .replaceAll("\\", "/")
+  const parts = normalized
     .split("/")
     .filter((part) => part.length > 0 && part !== ".");
 
