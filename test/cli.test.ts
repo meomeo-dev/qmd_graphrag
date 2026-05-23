@@ -1025,6 +1025,35 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(script).toContain("redactLog(stderr)");
     expect(script).not.toContain("metadata: {\\n      logRoot,");
   });
+
+  test("rejects raw log directories that still resolve inside graph_vault", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "qmd-batch-log-root-"));
+    const sourceDir = join(tmpRoot, "empty-source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const result = await new Promise<{ stderr: string; exitCode: number | null }>(
+      (resolveResult) => {
+        const proc = spawn(process.execPath, [
+          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+          "--source-dir",
+          sourceDir,
+          "--state-root",
+          stateRoot,
+          "--log-root",
+          join(stateRoot, "..logs"),
+          "--skip-dotenv",
+        ]);
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => {
+          stderr += String(chunk);
+        });
+        proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+      },
+    );
+
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("--log-root must be outside graph_vault");
+  });
 });
 
 describe("CLI Unified Query Route", () => {

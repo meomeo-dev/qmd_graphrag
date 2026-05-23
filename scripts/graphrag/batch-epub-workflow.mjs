@@ -9,7 +9,15 @@ import {
   readdirSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
@@ -126,7 +134,12 @@ function sleep(ms) {
 
 function ensureDirs() {
   const relativeLogRoot = relative(stateRoot, logRoot);
-  if (relativeLogRoot === "" || !relativeLogRoot.startsWith("..")) {
+  const isInsideStateRoot =
+    relativeLogRoot === "" ||
+    (!relativeLogRoot.startsWith(`..${sep}`) &&
+      relativeLogRoot !== ".." &&
+      !isAbsolute(relativeLogRoot));
+  if (isInsideStateRoot) {
     throw new Error("--log-root must be outside graph_vault");
   }
   mkdirSync(batchRoot, { recursive: true });
