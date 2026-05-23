@@ -166,6 +166,24 @@ types:
       - qmd_retrieval_candidate is the downstream candidate contract consumed by
         the unified router
 
+  - name: qmd_vector_search_request
+    schema: src/contracts/qmd-query.ts#QmdVectorSearchRequestSchema
+    envelope: src/contracts/qmd-query.ts#QmdVectorSearchRequestEnvelopeSchema
+    contract_level: required
+    producers:
+      - src/cli/qmd.ts#vectorSearch
+    consumers:
+      - src/store.ts#vectorSearchQuery
+      - src/store.ts#searchVec
+    storage: transient
+    notes:
+      - qmd vsearch is whole-corpus vector lookup over the qmd vector index
+      - providerPolicy.generation is always false
+      - providerPolicy.queryExpansion is always false
+      - providerPolicy.rerank is always false
+      - providerPolicy.embedding is true because the original query is embedded
+      - DSPy query expansion policy is not a producer or consumer of this type
+
   - name: qmd_retrieval_candidate
     schema: src/contracts/qmd-query.ts#QmdRetrievalCandidateSchema
     envelope: src/contracts/qmd-query.ts#QmdRetrievalCandidateEnvelopeSchema
@@ -189,6 +207,20 @@ types:
       - src/cli/qmd.ts#autoQuerySearch
       - src/query/unified-answer.ts#buildUnifiedAnswer
     storage: transient
+
+  - name: qmd_vector_search_result
+    schema: src/contracts/qmd-query.ts#QmdVectorSearchResultSchema
+    envelope: src/contracts/qmd-query.ts#QmdVectorSearchResultEnvelopeSchema
+    contract_level: required
+    producers:
+      - src/store.ts#vectorSearchQuery
+      - src/store.ts#searchVec
+    consumers:
+      - src/cli/qmd.ts#vectorSearch
+    storage: transient
+    notes:
+      - result candidates are vector-only retrieval candidates
+      - candidates must be filtered by active embedding model and embedFingerprint
 
   - name: graph_enhancement_request
     schema: src/contracts/graph-enhancement.ts#GraphEnhancementRequestSchema

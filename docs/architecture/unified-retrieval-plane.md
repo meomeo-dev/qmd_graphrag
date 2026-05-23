@@ -77,6 +77,30 @@ source、document、content 和 chunk identity。
 - 支持 query expansion、embedding 和 rerank。
 - 不承担实体关系、多跳归纳或全书级综合报告职责。
 
+### qmd 基础检索命令
+
+`qmd search`、`qmd vsearch` 与 `qmd query` 是同一 qmd corpus 的不同能力
+投影，不是三套索引。
+
+| 命令 | 语料范围 | Provider 边界 | 输出契约 | 成本边界 |
+| --- | --- | --- | --- | --- |
+| `qmd search` | qmd corpus 全集 | 不调用 LLM、embedding、rerank 或 GraphRAG provider | `QmdSearchResult` | 本地 SQLite/FTS 成本 |
+| `qmd vsearch` | qmd corpus 全集的 active vector index | 只允许 embedding/vector lookup；不得调用 query expansion、generation、rerank 或 GraphRAG provider | `QmdVectorSearchResult` | embedding provider 成本；已缓存 query embedding 时为本地向量成本 |
+| `qmd query` | qmd corpus 全集 | 允许 query expansion、embedding、rerank；generation 只可通过 OpenAI Responses stream | `UnifiedAnswer` | qmd RAG 成本 |
+| `qmd query --graphrag` | graph-ready 子集 | 允许 GraphRAG provider、OpenAI Responses stream、Jina embedding/rerank | `UnifiedAnswer` | graph query 成本 |
+
+硬不变量：
+
+- `qmd vsearch` 的 typed request 是 `QmdVectorSearchRequest`。
+- `QmdVectorSearchRequest.providerPolicy.generation` 恒为 `false`。
+- `QmdVectorSearchRequest.providerPolicy.queryExpansion` 恒为 `false`。
+- `QmdVectorSearchRequest.providerPolicy.rerank` 恒为 `false`。
+- `qmd vsearch` 只消费已写入 `content_vectors` 与 `vectors_vec` 的向量索引。
+- `qmd vsearch` 的查询端 embedding 必须使用 active embedding model 与
+  `embedFingerprint` 过滤，不能读取模型不匹配的向量。
+- DSPy 只优化 `qmd query` 的 query expansion policy，不改变 `qmd vsearch`
+  的无扩展语义。
+
 ### GraphRAG 增强查询
 
 `qmd query --graphrag` 是 qmd 的图增强查询能力。
@@ -625,6 +649,21 @@ bridge 将该投影传给 GEPA runner。GEPA runner 只允许 `endpoint=/respons
 恢复执行器必须以 `BookResumePlan.nextStage` 和 typed workflow override 为准。
 单书失败不得回滚已成功提交的 qmd 文档、其他书的 checkpoint 或其他书的
 GraphRAG capability。
+
+批量 EPUB 执行器必须以一本书为闭环单位（book-closed-loop unit）。批量状态
+不替代单书 checkpoint，只记录批量调度事实：
+
+- `BatchRunManifest` 保存于 `graph_vault/catalog/batch-runs/<runId>/manifest.json`。
+- `BatchItemCheckpoint` 保存每本 EPUB 的 `pending/running/completed/failed`
+  状态、source locator、normalized locator、bookId、attempts、startedAt、
+  completedAt、failedAt 和 redacted error summary。
+- `BatchEventLog` 保存于 `graph_vault/catalog/batch-runs/<runId>/events.jsonl`。
+- 批量恢复时先读取 batch manifest，再读取单书 `BookResumePlan.nextStage`。
+- 已 `completed` 的批量 item 不重跑；单书 checkpoint 不完整时以
+  `BookResumePlan.nextStage` 继续，不从第一本或第一阶段重跑。
+- Provider 429、concurrency limit、timeout、502、503、504 属于 transient
+  failure。批量执行器对 transient failure 做有限重试；重试耗尽后标记当前
+  item failed 并停止批次，保留已完成 item。
 
 active vault 目录必须保持 canonical：
 

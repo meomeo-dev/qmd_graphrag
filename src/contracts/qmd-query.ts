@@ -26,6 +26,21 @@ export const QmdQueryRequestSchema = z.object({
   explain: z.boolean().optional(),
 });
 
+export const QmdVectorSearchRequestSchema = z.object({
+  schemaVersion: z.literal(SchemaVersion),
+  query: z.string().min(1),
+  collections: z.array(z.string().min(1)).optional(),
+  intent: z.string().min(1).optional(),
+  limit: z.number().int().positive().optional(),
+  minScore: z.number().optional(),
+  providerPolicy: z.object({
+    generation: z.literal(false),
+    queryExpansion: z.literal(false),
+    rerank: z.literal(false),
+    embedding: z.literal(true),
+  }).optional(),
+});
+
 export const QmdRetrievalCandidateSchema = z.object({
   candidateId: z.string().min(1),
   sourceId: z.string().min(1).nullable(),
@@ -50,6 +65,14 @@ export const QmdSearchResultSchema = z.object({
   metadata: z.record(z.string(), JsonValueSchema).optional(),
 });
 
+export const QmdVectorSearchResultSchema = z.object({
+  schemaVersion: z.literal(SchemaVersion),
+  query: z.string().min(1),
+  results: z.array(QmdRetrievalCandidateSchema),
+  elapsedMs: z.number().nonnegative().optional(),
+  metadata: z.record(z.string(), JsonValueSchema).optional(),
+});
+
 export const ContentVectorEmbeddingRecordSchema = z.object({
   contentHash: z.string().min(1),
   chunkSeq: z.number().int().nonnegative(),
@@ -65,6 +88,11 @@ export const QmdQueryRequestEnvelopeSchema = buildEnvelopeSchema(
   QmdQueryRequestSchema,
 );
 
+export const QmdVectorSearchRequestEnvelopeSchema = buildEnvelopeSchema(
+  "qmd.vector_search.request",
+  QmdVectorSearchRequestSchema,
+);
+
 export const QmdRetrievalCandidateEnvelopeSchema = buildEnvelopeSchema(
   "qmd.retrieval.candidate",
   QmdRetrievalCandidateSchema,
@@ -75,6 +103,11 @@ export const QmdSearchResultEnvelopeSchema = buildEnvelopeSchema(
   QmdSearchResultSchema,
 );
 
+export const QmdVectorSearchResultEnvelopeSchema = buildEnvelopeSchema(
+  "qmd.vector_search.result",
+  QmdVectorSearchResultSchema,
+);
+
 export const ContentVectorEmbeddingRecordEnvelopeSchema = buildEnvelopeSchema(
   "qmd.content_vector.embedding_record",
   ContentVectorEmbeddingRecordSchema,
@@ -82,10 +115,16 @@ export const ContentVectorEmbeddingRecordEnvelopeSchema = buildEnvelopeSchema(
 
 export type QmdQuerySearch = z.infer<typeof QmdQuerySearchSchema>;
 export type QmdQueryRequest = z.infer<typeof QmdQueryRequestSchema>;
+export type QmdVectorSearchRequest = z.infer<
+  typeof QmdVectorSearchRequestSchema
+>;
 export type QmdRetrievalCandidate = z.infer<
   typeof QmdRetrievalCandidateSchema
 >;
 export type QmdSearchResult = z.infer<typeof QmdSearchResultSchema>;
+export type QmdVectorSearchResult = z.infer<
+  typeof QmdVectorSearchResultSchema
+>;
 export type ContentVectorEmbeddingRecord = z.infer<
   typeof ContentVectorEmbeddingRecordSchema
 >;

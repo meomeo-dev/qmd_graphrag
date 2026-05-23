@@ -160,6 +160,8 @@ import type {
   QmdQuerySearch,
   QmdRetrievalCandidate,
   QmdSearchResult,
+  QmdVectorSearchRequest,
+  QmdVectorSearchResult,
 } from "./contracts/qmd-query.js";
 import type {
   GraphCapability,
@@ -310,8 +312,10 @@ export type {
   ContentVectorEmbeddingRecord,
   QmdQuerySearch,
   QmdQueryRequest,
+  QmdVectorSearchRequest,
   QmdRetrievalCandidate,
   QmdSearchResult,
+  QmdVectorSearchResult,
   GraphCapabilityKind,
   GraphEnhancementStatus,
   GraphEnhancementRequest,
@@ -403,10 +407,14 @@ export {
   QmdQuerySearchSchema,
   QmdQueryRequestSchema,
   QmdQueryRequestEnvelopeSchema,
+  QmdVectorSearchRequestSchema,
+  QmdVectorSearchRequestEnvelopeSchema,
   QmdRetrievalCandidateSchema,
   QmdRetrievalCandidateEnvelopeSchema,
   QmdSearchResultSchema,
   QmdSearchResultEnvelopeSchema,
+  QmdVectorSearchResultSchema,
+  QmdVectorSearchResultEnvelopeSchema,
 } from "./contracts/qmd-query.js";
 export {
   GraphCapabilityKindSchema,

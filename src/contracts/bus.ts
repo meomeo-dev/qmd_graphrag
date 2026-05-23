@@ -75,6 +75,8 @@ import {
   QmdQueryRequestEnvelopeSchema,
   QmdRetrievalCandidateEnvelopeSchema,
   QmdSearchResultEnvelopeSchema,
+  QmdVectorSearchRequestEnvelopeSchema,
+  QmdVectorSearchResultEnvelopeSchema,
 } from "./qmd-query.js";
 import {
   CandidateRouteDecisionEnvelopeSchema,
@@ -101,8 +103,10 @@ export const DataBusEnvelopeSchema = z.union([
   QueryExpansionItemEnvelopeSchema,
   ContentVectorEmbeddingRecordEnvelopeSchema,
   QmdQueryRequestEnvelopeSchema,
+  QmdVectorSearchRequestEnvelopeSchema,
   QmdRetrievalCandidateEnvelopeSchema,
   QmdSearchResultEnvelopeSchema,
+  QmdVectorSearchResultEnvelopeSchema,
   GraphEnhancementRequestEnvelopeSchema,
   GraphEnhancementStateEnvelopeSchema,
   GraphCapabilityEnvelopeSchema,

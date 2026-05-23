@@ -42,10 +42,14 @@ contract_artifacts:
       - ContentVectorEmbeddingRecordEnvelopeSchema
       - QmdQueryRequestSchema
       - QmdQueryRequestEnvelopeSchema
+      - QmdVectorSearchRequestSchema
+      - QmdVectorSearchRequestEnvelopeSchema
       - QmdRetrievalCandidateSchema
       - QmdRetrievalCandidateEnvelopeSchema
       - QmdSearchResultSchema
       - QmdSearchResultEnvelopeSchema
+      - QmdVectorSearchResultSchema
+      - QmdVectorSearchResultEnvelopeSchema
   common:
     path: src/contracts/common.ts
     exports:
@@ -1151,6 +1155,41 @@ provider_contracts:
       chunking strategy, chunk window, and chunking policy version.
 
 query_routes:
+  search:
+    corpus_scope: whole
+    cost: local_only
+    entrypoint: qmd search
+    provider_boundary:
+      generation: false
+      query_expansion: false
+      embedding: false
+      rerank: false
+      graphrag: false
+    request_schema: src/contracts/qmd-query.ts#QmdQueryRequestSchema
+    result_schema: src/contracts/qmd-query.ts#QmdSearchResultSchema
+    invariant: lexical SQLite FTS query only.
+  vsearch:
+    corpus_scope: whole
+    cost: embedding_only
+    entrypoint: qmd vsearch
+    provider_boundary:
+      generation: false
+      query_expansion: false
+      embedding: true
+      rerank: false
+      graphrag: false
+    request_schema: src/contracts/qmd-query.ts#QmdVectorSearchRequestSchema
+    result_schema: src/contracts/qmd-query.ts#QmdVectorSearchResultSchema
+    producers:
+      - src/cli/qmd.ts#vectorSearch
+    consumers:
+      - src/store.ts#vectorSearchQuery
+      - src/store.ts#searchVec
+    invariant: >-
+      qmd vsearch embeds only the original user query and performs vector
+      lookup against active vectors whose model and embedFingerprint match the
+      active embedding provider profile. It never calls expandQuery,
+      OpenAI Responses generation, DSPy expansion, rerank, or GraphRAG query.
   qmd:
     corpus_scope: whole
     cost: low_to_medium
@@ -1226,6 +1265,27 @@ route_contracts:
   qmd_search_result:
     schema: src/contracts/qmd-query.ts#QmdSearchResultSchema
     envelope: src/contracts/qmd-query.ts#QmdSearchResultEnvelopeSchema
+    required_fields:
+      - schemaVersion
+      - query
+      - results
+    optional_fields:
+      - elapsedMs
+      - metadata
+  qmd_vector_search_request:
+    schema: src/contracts/qmd-query.ts#QmdVectorSearchRequestSchema
+    envelope: src/contracts/qmd-query.ts#QmdVectorSearchRequestEnvelopeSchema
+    required_fields:
+      - schemaVersion
+      - query
+    provider_policy:
+      generation: false
+      queryExpansion: false
+      rerank: false
+      embedding: true
+  qmd_vector_search_result:
+    schema: src/contracts/qmd-query.ts#QmdVectorSearchResultSchema
+    envelope: src/contracts/qmd-query.ts#QmdVectorSearchResultEnvelopeSchema
     required_fields:
       - schemaVersion
       - query
@@ -1341,6 +1401,20 @@ state_and_recovery:
   graph_business_unit: book_id
   recovery_unit: book_id_plus_processing_stage
   cache_unit: normalized_provider_request_hash
+  batch_execution:
+    closed_loop_unit: book_id
+    manifest_schema: BatchRunManifest
+    item_checkpoint_schema: BatchItemCheckpoint
+    event_log_schema: BatchEventLog
+    storage_root: graph_vault/catalog/batch-runs/<run_id>
+    runner: scripts/graphrag/batch-epub-workflow.mjs
+    resume_rule: >-
+      Batch resume reads item checkpoints first and then delegates each
+      unfinished item to the existing BookResumePlan nextStage calculation.
+    completed_item_rule: completed items are not reprocessed by the same run.
+    transient_failure_policy: >-
+      429, concurrency limit, timeout, and 5xx provider failures are retried
+      with bounded backoff before the current item is marked failed.
   commit_rule: >-
     A processing stage is committed only after required artifact manifests
     pass schema validation and vault-relative paths resolve from graph_vault.
