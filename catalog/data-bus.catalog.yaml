@@ -11,6 +11,48 @@ notes:
     boundaries.
 
 types:
+  - name: batch_run_manifest
+    schema: src/contracts/batch-run.ts#BatchRunManifestSchema
+    envelope: src/contracts/batch-run.ts#BatchRunManifestEnvelopeSchema
+    contract_level: required
+    producers:
+      - scripts/graphrag/batch-epub-workflow.mjs
+    consumers:
+      - scripts/graphrag/batch-epub-workflow.mjs
+    storage: graph_vault/catalog/batch-runs/<run_id>/manifest.json
+    notes:
+      - tracks batch scheduling state only
+      - does not replace per-book stage checkpoints
+
+  - name: batch_item_checkpoint
+    schema: src/contracts/batch-run.ts#BatchItemCheckpointSchema
+    envelope: src/contracts/batch-run.ts#BatchItemCheckpointEnvelopeSchema
+    contract_level: required
+    producers:
+      - scripts/graphrag/batch-epub-workflow.mjs
+    consumers:
+      - scripts/graphrag/batch-epub-workflow.mjs
+      - scripts/graphrag/resume-book-workspace.mjs
+    storage: graph_vault/catalog/batch-runs/<run_id>/items/<item_id>.json
+    notes:
+      - one checkpoint per EPUB item
+      - completed items are skipped on resume
+      - unfinished items delegate recovery to BookResumePlan.nextStage
+
+  - name: batch_event_log
+    schema: src/contracts/batch-run.ts#BatchEventLogSchema
+    envelope: src/contracts/batch-run.ts#BatchEventLogEnvelopeSchema
+    contract_level: required
+    producers:
+      - scripts/graphrag/batch-epub-workflow.mjs
+    consumers:
+      - operators
+      - audit
+    storage: graph_vault/catalog/batch-runs/<run_id>/events.jsonl
+    notes:
+      - stores redacted event summaries
+      - raw stdout and stderr stay in temporary run logs
+
   - name: source_document
     schema: src/contracts/corpus.ts#SourceDocumentSchema
     envelope: src/contracts/corpus.ts#SourceDocumentEnvelopeSchema

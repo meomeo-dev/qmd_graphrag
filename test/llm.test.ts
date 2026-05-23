@@ -838,6 +838,37 @@ describe("LlamaCpp Jina rerank", () => {
     }
   });
 
+  test("retries retryable Jina embedding failures", async () => {
+    const previousApiKey = process.env.JINA_API_KEY;
+    const previousFetch = globalThis.fetch;
+    process.env.JINA_API_KEY = "redaction-sentinel";
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("rate limit", { status: 429 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        model: JINA_TEXT_EMBEDDING_MODEL,
+        data: [{ index: 0, embedding: [0.1, 0.2] }],
+      })));
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    try {
+      const llm = new LlamaCpp({ embedModel: DEFAULT_EMBED_MODEL_URI }) as any;
+      llm._ciMode = false;
+      const result = await llm.embedBatch(["software design"], {
+        model: DEFAULT_EMBED_MODEL_URI,
+        isQuery: true,
+      });
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result).toEqual([
+        { embedding: [0.1, 0.2], model: DEFAULT_EMBED_MODEL_URI },
+      ]);
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousApiKey === undefined) delete process.env.JINA_API_KEY;
+      else process.env.JINA_API_KEY = previousApiKey;
+    }
+  });
+
   test("Jina embedding adapter ignores direct unsupported Jina model overrides", async () => {
     const previousApiKey = process.env.JINA_API_KEY;
     const previousFetch = globalThis.fetch;
@@ -1127,6 +1158,39 @@ describe("LlamaCpp Jina rerank", () => {
       else process.env.JINA_API_KEY = previousApiKey;
       if (previousGraphVault === undefined) delete process.env.QMD_GRAPH_VAULT;
       else process.env.QMD_GRAPH_VAULT = previousGraphVault;
+    }
+  });
+
+  test("retries retryable Jina rerank failures", async () => {
+    const previousApiKey = process.env.JINA_API_KEY;
+    const previousFetch = globalThis.fetch;
+    process.env.JINA_API_KEY = "redaction-sentinel";
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("temporarily unavailable", {
+        status: 503,
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        model: "jina-reranker-v3",
+        results: [{ index: 0, relevance_score: 0.77 }],
+      })));
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    try {
+      const llm = new LlamaCpp() as any;
+      llm._ciMode = false;
+      const result = await llm.rerank("auth setup", [
+        { file: "auth.md", text: "configure auth" },
+      ]);
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result).toEqual({
+        model: DEFAULT_RERANK_MODEL_URI,
+        results: [{ file: "auth.md", score: 0.77, index: 0 }],
+      });
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousApiKey === undefined) delete process.env.JINA_API_KEY;
+      else process.env.JINA_API_KEY = previousApiKey;
     }
   });
 

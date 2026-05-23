@@ -82,6 +82,13 @@ import {
 } from "./collections.js";
 import { createQmdGraphRagRuntime, type QmdGraphRagRuntime } from "./runtime.js";
 import type {
+  BatchCommandCheck,
+  BatchEventLog,
+  BatchItemCheckpoint,
+  BatchItemStatus,
+  BatchRunManifest,
+} from "./contracts/batch-run.js";
+import type {
   GraphRagIndexMethod,
   GraphRagIndexRequest,
   GraphRagIndexResponse,
@@ -256,6 +263,11 @@ export type {
   CollectionConfig,
   NamedCollection,
   ContextMap,
+  BatchCommandCheck,
+  BatchEventLog,
+  BatchItemCheckpoint,
+  BatchItemStatus,
+  BatchRunManifest,
   GraphRagIndexMethod,
   GraphRagIndexRequest,
   GraphRagIndexResponse,
@@ -401,6 +413,16 @@ export {
   GraphTextUnitIdentityMapSchema,
   GraphTextUnitIdentityMapEnvelopeSchema,
 } from "./contracts/corpus.js";
+export {
+  BatchItemStatusSchema,
+  BatchCommandCheckSchema,
+  BatchItemCheckpointSchema,
+  BatchRunManifestSchema,
+  BatchEventLogSchema,
+  BatchRunManifestEnvelopeSchema,
+  BatchItemCheckpointEnvelopeSchema,
+  BatchEventLogEnvelopeSchema,
+} from "./contracts/batch-run.js";
 export {
   ContentVectorEmbeddingRecordSchema,
   ContentVectorEmbeddingRecordEnvelopeSchema,

@@ -4,6 +4,11 @@ import {
   QueryExpansionItemEnvelopeSchema,
 } from "./common.js";
 import {
+  BatchEventLogEnvelopeSchema,
+  BatchItemCheckpointEnvelopeSchema,
+  BatchRunManifestEnvelopeSchema,
+} from "./batch-run.js";
+import {
   BookArtifactManifestListEnvelopeSchema,
   BookArtifactManifestEnvelopeSchema,
   BookJobCatalogEnvelopeSchema,
@@ -93,6 +98,9 @@ import {
 } from "./vault.js";
 
 export const DataBusEnvelopeSchema = z.union([
+  BatchRunManifestEnvelopeSchema,
+  BatchItemCheckpointEnvelopeSchema,
+  BatchEventLogEnvelopeSchema,
   SourceDocumentEnvelopeSchema,
   SourceDocumentCatalogEnvelopeSchema,
   CorpusDocumentEnvelopeSchema,

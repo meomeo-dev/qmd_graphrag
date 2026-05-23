@@ -5206,6 +5206,10 @@ export interface VectorSearchOptions {
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
   intent?: string;          // domain intent hint for disambiguation
+  /**
+   * Deprecated: vectorSearchQuery is intentionally no-expansion. Kept for
+   * source compatibility with older callers.
+   */
   hooks?: Pick<SearchHooks, 'onExpand'>;
 }
 
@@ -5221,13 +5225,15 @@ export interface VectorSearchResult {
 }
 
 /**
- * Vector-only semantic search with query expansion.
+ * Vector-only semantic search.
  *
  * Pipeline:
- * 1. expandQuery() → typed variants, filter to vec/hyde only (lex irrelevant here)
- * 2. searchVec() for original + vec/hyde variants (sequential — node-llama-cpp embed limitation)
- * 3. Dedup by filepath (keep max score)
- * 4. Sort by score descending, filter by minScore, slice to limit
+ * 1. Embed the original user query with the active embedding model.
+ * 2. searchVec() against active vectors filtered by model and embedFingerprint.
+ * 3. Sort by score descending, filter by minScore, slice to limit.
+ *
+ * This path must not call expandQuery(), OpenAI Responses generation, DSPy
+ * expansion, rerank, or GraphRAG provider code.
  */
 export async function vectorSearchQuery(
   store: Store,
@@ -5237,43 +5243,26 @@ export async function vectorSearchQuery(
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0.3;
   const collection = options?.collection;
-  const intent = options?.intent;
 
   const hasVectors = !!store.db.prepare(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
   ).get();
   if (!hasVectors) return [];
 
-  // Expand query — filter to vec/hyde only (lex queries target FTS, not vector)
-  const expandStart = Date.now();
-  const allExpanded = await store.expandQuery(query, undefined, intent);
-  const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
-  options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
-
-  // Run original + vec/hyde expanded through vector, sequentially — concurrent embed() hangs
   const embedModel = getLlm(store).embedModelName;
-  const queryTexts = [query, ...vecExpanded.map(q => q.query)];
-  const allResults = new Map<string, VectorSearchResult>();
-  for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, embedModel, limit, collection);
-    for (const r of vecResults) {
-      const existing = allResults.get(r.filepath);
-      if (!existing || r.score > existing.score) {
-        allResults.set(r.filepath, {
-          file: r.filepath,
-          displayPath: r.displayPath,
-          title: r.title,
-          body: r.body || "",
-          score: r.score,
-          context: store.getContextForFile(r.filepath),
-          docid: r.docid,
-          hash: r.hash,
-        });
-      }
-    }
-  }
+  const vecResults = await store.searchVec(query, embedModel, limit, collection);
 
-  return Array.from(allResults.values())
+  return vecResults
+    .map((r) => ({
+      file: r.filepath,
+      displayPath: r.displayPath,
+      title: r.title,
+      body: r.body || "",
+      score: r.score,
+      context: store.getContextForFile(r.filepath),
+      docid: r.docid,
+      hash: r.hash,
+    }))
     .sort((a, b) => b.score - a.score)
     .filter(r => r.score >= minScore)
     .slice(0, limit);

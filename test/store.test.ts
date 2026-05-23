@@ -3627,6 +3627,58 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("vectorSearchQuery does not expand the query or call generation", async () => {
+    const store = await createTestStore();
+    const model = "jina:jina-embeddings-v5-text-small";
+    const expandSpy = vi.fn(async () => {
+      throw new Error("vsearch must not call expandQuery");
+    });
+    const searchVecSpy = vi.fn(async () => [{
+      filepath: "qmd://books/book.md",
+      displayPath: "books/book.md",
+      title: "Book",
+      hash: "hash-1",
+      docid: "doc-1",
+      collectionName: "books",
+      modifiedAt: "",
+      bodyLength: 12,
+      body: "deep module",
+      context: null,
+      score: 0.91,
+      source: "vec" as const,
+      chunkPos: 0,
+      chunkSeq: 0,
+    }] as SearchResult[]) as any;
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = { embedModelName: model } as any;
+    store.expandQuery = expandSpy as any;
+    store.searchVec = searchVecSpy as any;
+
+    try {
+      const results = await vectorSearchQuery(store, "deep module", {
+        limit: 5,
+        minScore: 0,
+        hooks: {
+          onExpand: vi.fn(() => {
+            throw new Error("vsearch must not report expansion");
+          }),
+        },
+      });
+
+      expect(expandSpy).not.toHaveBeenCalled();
+      expect(searchVecSpy).toHaveBeenCalledTimes(1);
+      expect(searchVecSpy.mock.calls[0]?.[0]).toBe("deep module");
+      expect(searchVecSpy.mock.calls[0]?.[1]).toBe(model);
+      expect(results).toEqual([expect.objectContaining({
+        file: "qmd://books/book.md",
+        score: 0.91,
+      })]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
   test("hybridQuery uses the active llm embed model for precomputed vector lookups", async () => {
     const store = await createTestStore();
     const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";

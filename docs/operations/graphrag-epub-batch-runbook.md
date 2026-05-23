@@ -51,6 +51,10 @@ graph_vault/catalog/batch-runs/<runId>/
 同一 runId 再次运行不会重跑已 completed item。更换 runId 会创建新的批量审计
 记录，但单书仍由 `BookResumePlan.nextStage` 防止重复高成本 stage。
 
+从临时批次迁移到正式批次时，可用 `--completed-manifest <path>` 导入已完成
+item 种子。导入只标记同名 EPUB 为 completed；未完成 item 仍按
+`BookResumePlan.nextStage` 继续。
+
 ## Provider 限流与重试
 
 以下错误归类为 transient failure：

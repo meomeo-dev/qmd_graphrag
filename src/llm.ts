@@ -421,6 +421,28 @@ function isOpenAIResponsesRetryableError(error: unknown): boolean {
   );
 }
 
+async function withProviderRetry<T>(
+  maxRetries: number,
+  fn: () => Promise<T>,
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (
+        attempt >= maxRetries ||
+        !isOpenAIResponsesRetryableError(error)
+      ) {
+        throw error;
+      }
+      await delayMs(750 * 2 ** attempt);
+    }
+  }
+  throw lastError;
+}
+
 function delayMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -480,6 +502,7 @@ const DEFAULT_JINA_API_BASE = "https://api.jina.ai";
 const OPENAI_RESPONSES_PREFIX = "openai:";
 const DEFAULT_OPENAI_RESPONSES_ENDPOINT = "/responses";
 const OPENAI_RESPONSES_MAX_RETRIES = 3;
+const JINA_API_MAX_RETRIES = 3;
 
 // Alternative generation models for query expansion:
 // LiquidAI LFM2 - hybrid architecture optimized for edge/on-device inference
@@ -1916,23 +1939,25 @@ export class LlamaCpp implements LLM {
       embedding_type: providerConfig.embeddingType,
       truncate: providerConfig.embeddingTruncate,
     });
-    const response = await fetch(
-      `${resolveJinaApiBase()}${resolveJinaEmbeddingEndpoint()}`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${resolveJinaApiKey()}`,
-          "Content-Type": "application/json",
+    const response = await withProviderRetry(JINA_API_MAX_RETRIES, async () => {
+      const result = await fetch(
+        `${resolveJinaApiBase()}${resolveJinaEmbeddingEndpoint()}`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${resolveJinaApiKey()}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(request),
         },
-        body: JSON.stringify(request),
-      },
-    );
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => "");
-      const detail = body ? `: ${body.slice(0, 300)}` : "";
-      throw new Error(`Jina embedding request failed (${response.status})${detail}`);
-    }
+      );
+      if (!result.ok) {
+        const body = await result.text().catch(() => "");
+        const detail = body ? `: ${body.slice(0, 300)}` : "";
+        throw new Error(`Jina embedding request failed (${result.status})${detail}`);
+      }
+      return result;
+    });
 
     const payload = JinaEmbeddingResponseSchema.parse(await response.json());
     const tokenCount = readJinaUsageTokens(payload.usage);
@@ -2502,23 +2527,25 @@ export class LlamaCpp implements LLM {
       documents: documents.map((doc) => doc.text),
       return_documents: false,
     });
-    const response = await fetch(
-      `${resolveJinaApiBase()}${resolveJinaRerankEndpoint()}`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${resolveJinaApiKey()}`,
-          "Content-Type": "application/json",
+    const response = await withProviderRetry(JINA_API_MAX_RETRIES, async () => {
+      const result = await fetch(
+        `${resolveJinaApiBase()}${resolveJinaRerankEndpoint()}`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${resolveJinaApiKey()}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(request),
         },
-        body: JSON.stringify(request),
-      },
-    );
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => "");
-      const detail = body ? `: ${body.slice(0, 300)}` : "";
-      throw new Error(`Jina rerank request failed (${response.status})${detail}`);
-    }
+      );
+      if (!result.ok) {
+        const body = await result.text().catch(() => "");
+        const detail = body ? `: ${body.slice(0, 300)}` : "";
+        throw new Error(`Jina rerank request failed (${result.status})${detail}`);
+      }
+      return result;
+    });
 
     const payload = JinaRerankResponseSchema.parse(await response.json());
     const tokenCount = readJinaUsageTokens(payload.usage);

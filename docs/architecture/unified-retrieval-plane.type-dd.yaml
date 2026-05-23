@@ -18,6 +18,15 @@ normative_principles:
   - formatter_is_presentation_only
 
 contract_artifacts:
+  batch_run:
+    path: src/contracts/batch-run.ts
+    exports:
+      - BatchRunManifestSchema
+      - BatchRunManifestEnvelopeSchema
+      - BatchItemCheckpointSchema
+      - BatchItemCheckpointEnvelopeSchema
+      - BatchEventLogSchema
+      - BatchEventLogEnvelopeSchema
   corpus:
     path: src/contracts/corpus.ts
     exports:
