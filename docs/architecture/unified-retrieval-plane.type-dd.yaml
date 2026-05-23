@@ -156,6 +156,10 @@ contract_artifacts:
   jina:
     path: src/contracts/jina.ts
     exports:
+      - JinaEmbeddingProfileNameSchema
+      - JinaEmbeddingTaskSchema
+      - JinaEmbeddingTypeSchema
+      - JinaEmbeddingProfileSchema
       - JinaProviderConfigSchema
       - JinaProviderConfigEnvelopeSchema
       - JinaEmbeddingRequestSchema

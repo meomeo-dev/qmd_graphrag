@@ -132,6 +132,8 @@ import type {
 } from "./contracts/vault.js";
 import type {
   JinaEmbeddingItem,
+  JinaEmbeddingProfile,
+  JinaEmbeddingProfileName,
   JinaEmbeddingRequest,
   JinaEmbeddingResponse,
   JinaProviderConfig,
@@ -456,6 +458,10 @@ export {
   ProviderRequestFingerprintEnvelopeSchema,
 } from "./contracts/provider.js";
 export {
+  JinaEmbeddingProfileNameSchema,
+  JinaEmbeddingTaskSchema,
+  JinaEmbeddingTypeSchema,
+  JinaEmbeddingProfileSchema,
   JinaProviderConfigSchema,
   JinaProviderConfigEnvelopeSchema,
   JinaEmbeddingRequestSchema,

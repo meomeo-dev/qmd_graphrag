@@ -845,12 +845,24 @@ describe("LlamaCpp Jina rerank", () => {
           embedding_profile: "multimodal",
           embedding_model: "jina-embeddings-v5-text-small",
           rerank_model: "jina-reranker-v3",
+          embedding_query_task: "text-matching",
+          embedding_document_task: "classification",
+          embedding_dimensions: 512,
+          embedding_normalized: false,
+          embedding_type: "base64",
+          embedding_truncate: false,
         },
       },
     });
 
     expect(provider.embeddingModel).toBe(JINA_MULTIMODAL_EMBEDDING_MODEL);
     expect(provider.rerankModel).toBe("jina-reranker-m0");
+    expect(provider.embeddingQueryTask).toBe("retrieval.query");
+    expect(provider.embeddingDocumentTask).toBe("retrieval.passage");
+    expect(provider.embeddingDimensions).toBe(1024);
+    expect(provider.embeddingNormalized).toBe(true);
+    expect(provider.embeddingType).toBe("float");
+    expect(provider.embeddingTruncate).toBe(true);
   });
 
   test("uses Jina API and maps result indexes back to file paths", async () => {

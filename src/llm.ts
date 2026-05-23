@@ -629,12 +629,12 @@ export function resolveJinaProviderConfig(
     embeddingProfile: profile.name,
     embeddingModel: profile.embeddingModel,
     rerankModel: profile.rerankModel,
-    embeddingQueryTask: provider?.embedding_query_task ?? profile.queryTask,
-    embeddingDocumentTask: provider?.embedding_document_task ?? profile.documentTask,
-    embeddingDimensions: provider?.embedding_dimensions ?? profile.dimensions,
-    embeddingNormalized: provider?.embedding_normalized ?? profile.normalized,
-    embeddingType: provider?.embedding_type ?? profile.embeddingType,
-    embeddingTruncate: provider?.embedding_truncate ?? profile.truncate,
+    embeddingQueryTask: profile.queryTask,
+    embeddingDocumentTask: profile.documentTask,
+    embeddingDimensions: profile.dimensions,
+    embeddingNormalized: profile.normalized,
+    embeddingType: profile.embeddingType,
+    embeddingTruncate: profile.truncate,
   });
 }
 

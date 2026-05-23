@@ -169,6 +169,11 @@ describe("syncGraphRagBookWorkspace", () => {
         jina: {
           ...projectConfig.providers?.jina,
           embedding_profile: "multimodal",
+          embedding_document_task: "classification",
+          embedding_dimensions: 512,
+          embedding_normalized: false,
+          embedding_type: "base64",
+          embedding_truncate: false,
         },
       },
     });
@@ -178,6 +183,11 @@ describe("syncGraphRagBookWorkspace", () => {
     expect(embedding.model).toBe("jina-embeddings-v5-omni-small");
     expect((projection.settings.qmd_graphrag as any).jina.embedding_profile)
       .toBe("multimodal");
+    expect(embedding.call_args.task).toBe("retrieval.passage");
+    expect(embedding.call_args.dimensions).toBe(1024);
+    expect(embedding.call_args.normalized).toBe(true);
+    expect(embedding.call_args.embedding_type).toBe("float");
+    expect(embedding.call_args.truncate).toBe(true);
     expect((projection.settings.vector_store as any).vector_size).toBe(1024);
   });
 
