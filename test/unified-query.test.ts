@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { SchemaVersion } from "../src/contracts/common.js";
+import { DspyQueryExpansionStrictRefusalError } from "../src/dspy/errors.js";
 import type { GraphCapability } from "../src/contracts/graph-enhancement.js";
 import type { QmdRetrievalCandidate } from "../src/contracts/qmd-query.js";
 import type { UnifiedQueryRequest } from "../src/contracts/unified-query.js";
@@ -263,6 +264,32 @@ describe("unified query routing", () => {
 
     expect(answer.routeDecision.selectedRoute).toBe("qmd");
     expect(answer.evidence[0]?.documentId).toBe("doc-1");
+  });
+
+  test("wraps DSPy strict refusal as typed qmd retrieval error", async () => {
+    await expect(routeQuery(request({
+      requestedRoute: "qmd",
+      query: "find source",
+    }), {
+      searchQmd: async () => {
+        throw new DspyQueryExpansionStrictRefusalError(
+          "pointer_missing",
+          "DSPy query expansion failed (pointer_missing)",
+        );
+      },
+    })).rejects.toMatchObject({
+      payload: {
+        route: "qmd",
+        stage: "qmd_retrieval",
+        provider: "dspy",
+        capability: "query_expansion",
+        code: "pointer_missing",
+        retryable: false,
+        metadata: {
+          dspyFailureReason: "pointer_missing",
+        },
+      },
+    });
   });
 
   test("projects qmd-only document and chunk lineage from qmd SQLite identity", () => {

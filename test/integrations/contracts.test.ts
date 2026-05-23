@@ -5,7 +5,17 @@ import { join } from "node:path";
 import YAML from "yaml";
 
 import { DataBusEnvelopeSchema } from "../../src/contracts/bus.js";
-import { DspyQueryPromptOptimizationRequestSchema } from "../../src/contracts/dspy.js";
+import {
+  DspyEvaluationReportSchema,
+  DspyOptimizationArtifactSchema,
+  DspyPolicyPointerSchema,
+  DspyPromotionDecisionSchema,
+  DspyQueryExpansionProgramOutputSchema,
+  DspyQueryPromptOptimizationRequestSchema,
+  QueryExpansionFailurePolicySchema,
+  QueryExpansionFailureReasonSchema,
+  VaultRelativePathSchema,
+} from "../../src/contracts/dspy.js";
 import {
   GraphCapabilitySchema,
   GraphEnhancementRequestSchema,
@@ -78,6 +88,10 @@ type TypeDdBus = {
 };
 
 type TypeDdDocument = {
+  contract_artifacts?: Record<string, {
+    path: string;
+    exports: string[];
+  }>;
   typed_buses: Record<string, TypeDdBus>;
   route_contracts: Record<string, {
     schema: string;
@@ -221,6 +235,141 @@ describe("GraphRAG contracts", () => {
 });
 
 describe("DSPy contracts", () => {
+  test("keeps query expansion failure policy taxonomy exact", () => {
+    expect(QueryExpansionFailureReasonSchema.options).toEqual([
+      "pointer_missing",
+      "decision_missing",
+      "policy_unavailable",
+      "artifact_missing",
+      "generated_expansion_missing",
+      "artifact_stale",
+      "runtime_output_schema_invalid",
+      "runtime_error",
+    ]);
+    expect(QueryExpansionFailurePolicySchema.parse({
+      schemaVersion: SchemaVersion,
+      defaultAction: "fallback_to_builtin_expander",
+      reasonActions: {
+        pointer_missing: "strict_refuse",
+        decision_missing: "strict_refuse",
+        policy_unavailable: "strict_refuse",
+        artifact_missing: "strict_refuse",
+        generated_expansion_missing: "strict_refuse",
+        artifact_stale: "strict_refuse",
+        runtime_output_schema_invalid: "strict_refuse",
+        runtime_error: "strict_refuse",
+      },
+      strictSchema: true,
+    }).reasonActions?.generated_expansion_missing).toBe("strict_refuse");
+    expect(() => QueryExpansionFailurePolicySchema.parse({
+      schemaVersion: SchemaVersion,
+      defaultAction: "fallback_to_builtin_expander",
+      reasonActions: {
+        artifact_invalid: "fallback_to_builtin_expander",
+      },
+      strictSchema: true,
+    })).toThrow(/artifact_invalid is fail-closed/);
+  });
+
+  test("accepts full query expansion policy lifecycle contracts", () => {
+    const fingerprints = {
+      modelFingerprint: "model",
+      providerFingerprint: "provider",
+      retrievalConfigFingerprint: "retrieval",
+      corpusSnapshotFingerprint: "corpus",
+      indexSnapshotFingerprint: "index",
+      retrieverFingerprint: "retriever",
+      rerankerFingerprint: "reranker",
+      schemaFingerprint: "schema",
+    };
+    const artifact = DspyOptimizationArtifactSchema.parse({
+      schemaVersion: SchemaVersion,
+      artifactId: "artifact-1",
+      optimizer: "gepa",
+      programName: "query_expansion",
+      signatureVersion: "query-expansion-v1",
+      runtimeProjection: "generated_expansion_records",
+      requestMode: "online_policy",
+      promotability: "promotable",
+      promotionStatus: "candidate",
+      createdAt: "2026-05-22T00:00:00.000Z",
+      artifactHash: "hash",
+      generatedExpansionPath: "dspy/artifact-files/artifact-1/generated.jsonl",
+      generatedExpansionHash: "generated-hash",
+      providerCallLedgerPath: "dspy/ledgers/artifact-1.jsonl",
+      fingerprints,
+      metricVersion: "metric-v1",
+      trainsetHash: "train-hash",
+      maxExpansionItems: 8,
+      providerEnvRefs: ["OPENAI_API_KEY"],
+      stdoutTail: [],
+    });
+    const report = DspyEvaluationReportSchema.parse({
+      schemaVersion: SchemaVersion,
+      reportId: "report-1",
+      artifactId: artifact.artifactId,
+      artifactHash: artifact.artifactHash,
+      metricVersion: "metric-v1",
+      createdAt: "2026-05-22T00:00:00.000Z",
+      schemaValidity: true,
+      promotability: "promotable",
+      totalRecords: 1,
+      validRecords: 1,
+      invalidRecords: 0,
+      metrics: { schema_validity: true },
+    });
+    const pointer = DspyPolicyPointerSchema.parse({
+      schemaVersion: SchemaVersion,
+      pointerId: "query-expansion-current",
+      provider: "dspy",
+      active: true,
+      currentDecisionId: "decision-1",
+      currentDecisionPath: "dspy/promotions/decision-1.yaml",
+      failurePolicy: {
+        schemaVersion: SchemaVersion,
+        defaultAction: "fallback_to_builtin_expander",
+        reasonActions: {},
+        strictSchema: true,
+      },
+      updatedAt: "2026-05-22T00:00:00.000Z",
+    });
+    const decision = DspyPromotionDecisionSchema.parse({
+      schemaVersion: SchemaVersion,
+      decisionId: "decision-1",
+      artifactId: artifact.artifactId,
+      artifactHash: artifact.artifactHash,
+      artifactPath: "dspy/artifacts/artifact-1.yaml",
+      reportId: report.reportId,
+      reportHash: "report-hash",
+      reportPath: "dspy/reports/report-1.yaml",
+      previousDecisionId: null,
+      previousPointerState: null,
+      historyEntryId: "history-1",
+      decisionReason: "contract test",
+      promotionStatus: "promoted",
+      gateVerdict: "promote",
+      decidedAt: "2026-05-22T00:00:00.000Z",
+    });
+
+    expect(pointer.currentDecisionId).toBe(decision.decisionId);
+  });
+
+  test("rejects non-portable DSPy vault paths", () => {
+    expect(() => VaultRelativePathSchema.parse("/tmp/artifact.yaml")).toThrow();
+    expect(() => VaultRelativePathSchema.parse("../artifact.yaml")).toThrow();
+    expect(() => VaultRelativePathSchema.parse("~/artifact.yaml")).toThrow();
+  });
+
+  test("accepts only typed query expansion program output", () => {
+    const parsed = DspyQueryExpansionProgramOutputSchema.parse({
+      schemaVersion: SchemaVersion,
+      output: [{ type: "vec", text: "architecture boundaries" }],
+    });
+    expect(parsed.output[0]?.type).toBe("vec");
+  });
+});
+
+describe("DSPy contracts", () => {
   test("accepts an optimization request", () => {
     const parsed = DspyQueryPromptOptimizationRequestSchema.parse({
       optimizer: "gepa",
@@ -245,6 +394,15 @@ describe("Jina contracts", () => {
     });
 
     expect(parsed.apiKeyEnv).toBe("JINA_API_KEY");
+    expect(() =>
+      JinaProviderConfigSchema.parse({
+        apiKeyEnv: "jina-key",
+        baseUrlEnv: "JINA_API_BASE",
+        baseUrl: "https://api.jina.ai",
+        embeddingEndpoint: "/v1/embeddings",
+        rerankEndpoint: "/v1/rerank",
+      }),
+    ).toThrow();
   });
 
   test("accepts an embedding request", () => {
@@ -566,6 +724,16 @@ describe("Provider contracts", () => {
     expect(parsed.strictStructuredOutput).toBe(true);
     expect(() =>
       OpenAIResponsesProviderConfigSchema.parse({
+        apiKeyEnv: "openai-key",
+        baseUrlEnv: "OPENAI_BASE_URL",
+        endpoint: "/responses",
+        stream: true,
+        model: "gpt-5.4",
+        strictStructuredOutput: true,
+      }),
+    ).toThrow();
+    expect(() =>
+      OpenAIResponsesProviderConfigSchema.parse({
         apiKeyEnv: "OPENAI_API_KEY",
         baseUrlEnv: "OPENAI_BASE_URL",
         endpoint: "/responses",
@@ -794,6 +962,59 @@ describe("Data bus contracts", () => {
       expect(new Set(payloadNames).size).toBe(payloadNames.length);
       expect([...payloadNames].sort()).toEqual([...bus.payloads].sort());
     }
+  });
+
+  test("keeps Type DD contract exports aligned with SDK public exports", async () => {
+    const typeDdRaw = await readFile(
+      "docs/architecture/unified-retrieval-plane.type-dd.yaml",
+      "utf8",
+    );
+    const typeDd = YAML.parse(typeDdRaw) as TypeDdDocument;
+    const sdkExports = await import("../../src/index.js") as Record<string, unknown>;
+
+    for (const [artifactName, artifact] of Object.entries(
+      typeDd.contract_artifacts ?? {},
+    )) {
+      for (const exportName of artifact.exports) {
+        expect(
+          sdkExports,
+          `${artifactName}.${exportName} missing from src/index.ts exports`,
+        ).toHaveProperty(exportName);
+      }
+    }
+  });
+
+  test("keeps provider bus producer symbols tied to implemented projection", async () => {
+    const [typeDdRaw, catalogRaw] = await Promise.all([
+      readFile(
+        "docs/architecture/unified-retrieval-plane.type-dd.yaml",
+        "utf8",
+      ),
+      readFile("catalog/data-bus.catalog.yaml", "utf8"),
+    ]);
+    const typeDd = YAML.parse(typeDdRaw) as TypeDdDocument;
+    const catalog = YAML.parse(catalogRaw) as CatalogDocument;
+    const typeDdPayload =
+      typeDd.typed_buses.provider_bus.payloads?.find(
+        item => item.name === "openai_responses_provider_config",
+      );
+    const catalogType = catalog.types.find(
+      item => item.name === "openai_responses_provider_config",
+    );
+    const expectedProducer =
+      "src/graphrag/settings-projection.ts#buildGraphRagRuntimeSettingsProjection";
+
+    expect(typeDdPayload?.producers).toContain(expectedProducer);
+    expect(typeDdPayload?.producers).not.toContain(
+      "src/graphrag/settings-projection.ts#projectGraphRagSettings",
+    );
+    expect(catalogType?.producers).toContain(expectedProducer);
+    const projectionModule = await import(
+      "../../src/graphrag/settings-projection.js"
+    ) as Record<string, unknown>;
+    expect(
+      typeof projectionModule.buildGraphRagRuntimeSettingsProjection,
+    ).toBe("function");
   });
 
   test("keeps route contract required fields aligned with Zod schemas", async () => {
