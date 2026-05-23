@@ -71,6 +71,7 @@ import {
   ProviderRequestFingerprintEnvelopeSchema,
 } from "./provider.js";
 import {
+  ContentVectorEmbeddingRecordEnvelopeSchema,
   QmdQueryRequestEnvelopeSchema,
   QmdRetrievalCandidateEnvelopeSchema,
   QmdSearchResultEnvelopeSchema,
@@ -98,6 +99,7 @@ export const DataBusEnvelopeSchema = z.union([
   GraphTextUnitIdentityMapEnvelopeSchema,
   DocumentIdentityCatalogEnvelopeSchema,
   QueryExpansionItemEnvelopeSchema,
+  ContentVectorEmbeddingRecordEnvelopeSchema,
   QmdQueryRequestEnvelopeSchema,
   QmdRetrievalCandidateEnvelopeSchema,
   QmdSearchResultEnvelopeSchema,

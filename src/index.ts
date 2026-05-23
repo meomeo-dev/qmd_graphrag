@@ -151,6 +151,7 @@ import type {
   SourceLocator,
 } from "./contracts/corpus.js";
 import type {
+  ContentVectorEmbeddingRecord,
   QmdQueryRequest,
   QmdQuerySearch,
   QmdRetrievalCandidate,
@@ -298,6 +299,7 @@ export type {
   CorpusChunk,
   DocumentIdentityMap,
   DocumentIdentityCatalog,
+  ContentVectorEmbeddingRecord,
   QmdQuerySearch,
   QmdQueryRequest,
   QmdRetrievalCandidate,
@@ -388,6 +390,8 @@ export {
   GraphTextUnitIdentityMapEnvelopeSchema,
 } from "./contracts/corpus.js";
 export {
+  ContentVectorEmbeddingRecordSchema,
+  ContentVectorEmbeddingRecordEnvelopeSchema,
   QmdQuerySearchSchema,
   QmdQueryRequestSchema,
   QmdQueryRequestEnvelopeSchema,

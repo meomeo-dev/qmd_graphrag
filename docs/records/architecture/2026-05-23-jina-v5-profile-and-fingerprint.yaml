@@ -1,0 +1,98 @@
+date: 2026-05-23
+title: Jina v5 Profile 与 Embedding 指纹决策
+status: accepted
+scope: qmd_graphrag
+
+problem:
+  summary: >-
+    Jina provider 需要同时支持文本检索与多模态检索两套模型组合，并且
+    embedding 持久化必须能识别向量由哪个模型、任务与请求语义产生。
+    如果只保存向量值或只保存模型名，模型升级、task 变更或维度变更会让
+    stale embedding 被误用于当前检索。
+
+decision:
+  profiles:
+    text:
+      embedding_model: jina-embeddings-v5-text-small
+      rerank_model: jina-reranker-v3
+      modality: text
+      dimensions: 1024
+    multimodal:
+      embedding_model: jina-embeddings-v5-omni-small
+      rerank_model: jina-reranker-m0
+      modality: multimodal
+      dimensions: 1024
+  default_profile:
+    value: text
+    rationale: >-
+      当前 qmd corpus 以 EPUB 归一化后的 Markdown 文本为主，默认文本
+      profile 可降低输入结构复杂度；多模态 profile 通过配置显式启用。
+  default_generation_model:
+    value: openai:gpt-5.4
+    rationale: >-
+      项目默认生成模型与仓库 `.qmd/index.yml` 保持一致，统一使用
+      OpenAI Responses API。原本地 query expansion GGUF 模型保留为显式
+      离线路径，不再作为新初始化项目的默认值。
+  profile_authority:
+    rule: >-
+      `providers.jina.embedding_profile` 是 Jina embedding/rerank 组合的
+      权威字段。配置中显式声明 profile 时，qmd runtime、GraphRAG
+      projection 与 DSPy fingerprint 均从 profile 派生 active
+      `models.embed`、`models.rerank`、`providers.jina.embedding_model`
+      与 `providers.jina.rerank_model`，避免配置漂移。
+  embedding_task_policy:
+    query_task: retrieval.query
+    document_task: retrieval.passage
+    rationale: >-
+      查询 embedding 与文档 embedding 是不同下游任务（downstream task）。
+      task 必须由 adapter 传给 Jina API，不能通过 qmd 文本前缀伪造。
+  request_metadata:
+    normalized: true
+    embedding_type: float
+    truncate: true
+    dimensions: 1024
+    rule: >-
+      上述字段是向量生产语义的一部分，必须进入 Jina request、
+      provider request fingerprint、DSPy provider fingerprint 与 qmd
+      embedding fingerprint。
+  persistence:
+    table: content_vectors
+    fields:
+      - model
+      - embed_fingerprint
+    rule: >-
+      `model` 保存 qmd 当前使用的模型 URI，例如
+      `jina:jina-embeddings-v5-text-small`。`embed_fingerprint` 由模型、
+      profile、query task、document task、dimensions、normalized、
+      embedding_type、truncate、endpoint、base URL、chunk 策略、
+      chunk window 和 chunking policy version 共同生成。
+  retrieval_filter:
+    rule: >-
+      `searchVec` 只返回 `content_vectors.model` 与当前模型相同且
+      `embed_fingerprint` 与当前指纹相同的 chunks。sqlite-vec 先召回
+      hash_seq，qmd 第二阶段必须按当前 Type DD 元数据过滤 stale chunks。
+  embedding_config:
+    chunk_strategy: regex
+    rule: >-
+      `embedding.chunk_strategy` 是 qmd embedding 的默认 chunk 策略配置。
+      CLI `--chunk-strategy` 可覆盖单次执行，并且覆盖值进入本次运行写入的
+      embedding fingerprint。
+
+invariants:
+  - Jina API key 只从环境变量读取，不写入配置、状态、catalog 或日志。
+  - Jina embedding request 对 document embedding 使用 `retrieval.passage`。
+  - Jina embedding request 对 query embedding 使用 `retrieval.query`。
+  - `jina:` embedding 不再叠加 qmd 本地模型的文本 task prefix。
+  - 任一向量生产语义字段变化都会改变 `embed_fingerprint`。
+  - `providers.jina.embedding_profile` 与 active qmd/GraphRAG 模型不可漂移。
+  - `embedding.chunk_strategy` 变化会改变 `embed_fingerprint`。
+  - GraphRAG `vector_store.vector_size` 与当前 Jina profile dimensions 一致。
+
+validation:
+  required:
+    - TypeScript contract 测试覆盖 provider config、embedding request 与
+      data bus envelope。
+    - LLM adapter 测试覆盖 document task 与 query task 请求体。
+    - Store 测试覆盖 Jina 模型族变化会产生不同 embedding fingerprint。
+    - Store vector search 测试覆盖当前 model/fingerprint 过滤。
+    - GraphRAG settings projection 测试覆盖模型、task、normalized 与维度。

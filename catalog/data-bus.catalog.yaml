@@ -124,6 +124,27 @@ types:
       - src/store.ts#hybridQuery
     storage: transient
 
+  - name: content_vector_embedding_record
+    schema: src/contracts/qmd-query.ts#ContentVectorEmbeddingRecordSchema
+    envelope: src/contracts/qmd-query.ts#ContentVectorEmbeddingRecordEnvelopeSchema
+    contract_level: required
+    producers:
+      - src/store.ts#insertEmbedding
+    consumers:
+      - src/store.ts#searchVec
+      - src/store.ts#getHashesNeedingEmbedding
+      - src/store.ts#getPendingEmbeddingDocs
+      - src/store.ts#maybeAdoptLegacyEmbeddingFingerprint
+    storage: .qmd/index.sqlite#content_vectors
+    notes:
+      - contentHash maps to content_vectors.hash
+      - chunkSeq maps to content_vectors.seq
+      - chunkPos maps to content_vectors.pos
+      - model and embedFingerprint are required vector provenance fields
+      - Jina empty legacy fingerprints are never auto-adopted because model
+        profile, downstream task, dimensions, normalization, embedding type,
+        truncation, endpoint, and base URL provenance is unavailable
+
   - name: qmd_query_request
     schema: src/contracts/qmd-query.ts#QmdQueryRequestSchema
     envelope: src/contracts/qmd-query.ts#QmdQueryRequestEnvelopeSchema
@@ -517,6 +538,11 @@ types:
     storage: transient
     notes:
       - external endpoint is Jina API POST /v1/embeddings
+      - request carries downstream task, dimensions, normalized,
+        embedding_type, and truncate so embedding production semantics remain
+        typed and fingerprintable
+      - embedding fingerprint also carries qmd chunk strategy and chunking
+        policy version
 
   - name: jina_provider_config
     schema: src/contracts/jina.ts#JinaProviderConfigSchema
@@ -531,6 +557,8 @@ types:
     storage: transient
     notes:
       - stores environment variable names and endpoints, never secret values
+      - stores profile name, embedding/rerank model names, query/document
+        downstream tasks, dimensions, normalized, embedding_type, and truncate
 
   - name: jina_embedding_response
     schema: src/contracts/jina.ts#JinaEmbeddingResponseSchema
@@ -975,6 +1003,7 @@ buses:
   - name: qmd_retrieval_bus
     description: Typed whole-corpus lexical, vector, expansion, and rerank bus.
     payloads:
+      - content_vector_embedding_record
       - qmd_query_request
       - qmd_retrieval_candidate
       - qmd_search_result
@@ -1120,5 +1149,7 @@ dependencies:
       - typed_embedding_payloads
       - typed_rerank_payloads
       - provider_cost_accounting
+      - embedding_profile_fingerprints
+      - profile_authoritative_model_resolution
     exit_conditions:
       - if embedding quality, latency, or cost no longer fit the retrieval pipeline

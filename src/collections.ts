@@ -61,8 +61,15 @@ export interface JinaProviderConfig {
   base_url_env?: string;
   embedding_endpoint?: string;
   rerank_endpoint?: string;
+  embedding_profile?: "text" | "multimodal";
   embedding_model?: string;
   rerank_model?: string;
+  embedding_query_task?: string;
+  embedding_document_task?: string;
+  embedding_dimensions?: number;
+  embedding_normalized?: boolean;
+  embedding_type?: string;
+  embedding_truncate?: boolean;
 }
 
 export interface ProvidersConfig {
@@ -77,6 +84,10 @@ export interface GraphRagConfig {
   default_method?: "local" | "global" | "drift" | "basic";
   default_response_type?: string;
   enhanced_collections?: string[];
+}
+
+export interface EmbeddingConfig {
+  chunk_strategy?: "auto" | "regex";
 }
 
 export interface QueryAutoRouteConfig {
@@ -108,6 +119,7 @@ export interface CollectionConfig {
   collections: Record<string, Collection>;    // Collection name -> config
   models?: ModelsConfig;
   providers?: ProvidersConfig;
+  embedding?: EmbeddingConfig;
   graphrag?: GraphRagConfig;
   query?: QueryConfig;
 }

@@ -38,6 +38,8 @@ contract_artifacts:
   qmd_query:
     path: src/contracts/qmd-query.ts
     exports:
+      - ContentVectorEmbeddingRecordSchema
+      - ContentVectorEmbeddingRecordEnvelopeSchema
       - QmdQueryRequestSchema
       - QmdQueryRequestEnvelopeSchema
       - QmdRetrievalCandidateSchema
@@ -362,6 +364,21 @@ typed_buses:
     role: Fast whole-corpus lexical, vector, expansion, and rerank retrieval.
     invariant: Formatter strings are not consumed by downstream retrieval logic.
     payloads:
+      - name: content_vector_embedding_record
+        schema: src/contracts/qmd-query.ts#ContentVectorEmbeddingRecordSchema
+        envelope: src/contracts/qmd-query.ts#ContentVectorEmbeddingRecordEnvelopeSchema
+        storage: .qmd/index.sqlite#content_vectors
+        producers:
+          - src/store.ts#insertEmbedding
+        consumers:
+          - src/store.ts#searchVec
+          - src/store.ts#getHashesNeedingEmbedding
+          - src/store.ts#getPendingEmbeddingDocs
+          - src/store.ts#maybeAdoptLegacyEmbeddingFingerprint
+        invariant: >-
+          model and embedFingerprint are required provenance fields for vector
+          consumers. Jina records with empty legacy fingerprints are stale and
+          require re-embedding because profile/task provenance is unavailable.
       - name: qmd_query_request
         schema: src/contracts/qmd-query.ts#QmdQueryRequestSchema
         envelope: src/contracts/qmd-query.ts#QmdQueryRequestEnvelopeSchema
@@ -688,6 +705,8 @@ typed_buses:
           - src/llm.ts#LlamaCpp.embedBatchWithJina
         notes:
           - external endpoint is Jina API POST /v1/embeddings
+          - payload includes downstream task, dimensions, normalized,
+            embedding_type, and truncate
       - name: jina_embedding_response
         schema: src/contracts/jina.ts#JinaEmbeddingResponseSchema
         envelope: src/contracts/jina.ts#JinaEmbeddingResponseEnvelopeSchema
@@ -1095,6 +1114,31 @@ provider_contracts:
       - rerank_provider
     required_env:
       - JINA_API_KEY
+    profiles:
+      text:
+        embedding_model: jina-embeddings-v5-text-small
+        rerank_model: jina-reranker-v3
+        query_task: retrieval.query
+        document_task: retrieval.passage
+        dimensions: 1024
+      multimodal:
+        embedding_model: jina-embeddings-v5-omni-small
+        rerank_model: jina-reranker-m0
+        query_task: retrieval.query
+        document_task: retrieval.passage
+        dimensions: 1024
+    embedding_request_semantics:
+      normalized: true
+      embedding_type: float
+      truncate: true
+    profile_authority_rule: >-
+      providers.jina.embedding_profile is the authoritative source for the
+      active Jina embedding and rerank model pair.
+    embedding_fingerprint_rule: >-
+      qmd vector consumers accept only chunks whose model and
+      embed_fingerprint match the active model, profile, query/document task,
+      dimensions, normalized, embedding_type, truncate, endpoint, base URL, and
+      chunking strategy, chunk window, and chunking policy version.
 
 query_routes:
   qmd:

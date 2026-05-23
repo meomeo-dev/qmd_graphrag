@@ -50,6 +50,16 @@ export const QmdSearchResultSchema = z.object({
   metadata: z.record(z.string(), JsonValueSchema).optional(),
 });
 
+export const ContentVectorEmbeddingRecordSchema = z.object({
+  contentHash: z.string().min(1),
+  chunkSeq: z.number().int().nonnegative(),
+  chunkPos: z.number().int().nonnegative(),
+  model: z.string().min(1),
+  embedFingerprint: z.string().min(1),
+  totalChunks: z.number().int().positive(),
+  embeddedAt: z.string().datetime(),
+});
+
 export const QmdQueryRequestEnvelopeSchema = buildEnvelopeSchema(
   "qmd.query.request",
   QmdQueryRequestSchema,
@@ -65,9 +75,17 @@ export const QmdSearchResultEnvelopeSchema = buildEnvelopeSchema(
   QmdSearchResultSchema,
 );
 
+export const ContentVectorEmbeddingRecordEnvelopeSchema = buildEnvelopeSchema(
+  "qmd.content_vector.embedding_record",
+  ContentVectorEmbeddingRecordSchema,
+);
+
 export type QmdQuerySearch = z.infer<typeof QmdQuerySearchSchema>;
 export type QmdQueryRequest = z.infer<typeof QmdQueryRequestSchema>;
 export type QmdRetrievalCandidate = z.infer<
   typeof QmdRetrievalCandidateSchema
 >;
 export type QmdSearchResult = z.infer<typeof QmdSearchResultSchema>;
+export type ContentVectorEmbeddingRecord = z.infer<
+  typeof ContentVectorEmbeddingRecordSchema
+>;

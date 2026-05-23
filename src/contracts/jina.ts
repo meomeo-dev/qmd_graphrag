@@ -2,22 +2,76 @@ import { z } from "zod";
 
 import { EnvVarNameSchema, buildEnvelopeSchema } from "./common.js";
 
+export const JinaEmbeddingProfileNameSchema = z.enum(["text", "multimodal"]);
+export const JinaEmbeddingTaskSchema = z.enum([
+  "retrieval.query",
+  "retrieval.passage",
+  "text-matching",
+  "clustering",
+  "classification",
+]);
+export const JinaEmbeddingTypeSchema = z.enum([
+  "float",
+  "base64",
+  "binary",
+  "ubinary",
+]);
+
+export const JinaEmbeddingProfileSchema = z.object({
+  name: JinaEmbeddingProfileNameSchema,
+  embeddingModel: z.string().min(1),
+  rerankModel: z.string().min(1),
+  queryTask: JinaEmbeddingTaskSchema,
+  documentTask: JinaEmbeddingTaskSchema,
+  dimensions: z.number().int().positive(),
+  normalized: z.boolean(),
+  embeddingType: JinaEmbeddingTypeSchema,
+  truncate: z.boolean(),
+  modality: z.enum(["text", "multimodal"]),
+});
+
 export const JinaProviderConfigSchema = z.object({
   apiKeyEnv: EnvVarNameSchema,
   baseUrlEnv: EnvVarNameSchema,
   baseUrl: z.string().min(1),
   embeddingEndpoint: z.string().startsWith("/"),
   rerankEndpoint: z.string().startsWith("/"),
+  embeddingProfile: JinaEmbeddingProfileNameSchema,
+  embeddingModel: z.string().min(1),
+  rerankModel: z.string().min(1),
+  embeddingQueryTask: JinaEmbeddingTaskSchema,
+  embeddingDocumentTask: JinaEmbeddingTaskSchema,
+  embeddingDimensions: z.number().int().positive(),
+  embeddingNormalized: z.boolean(),
+  embeddingType: JinaEmbeddingTypeSchema,
+  embeddingTruncate: z.boolean(),
 });
+
+export const JinaTextDocumentSchema = z.object({
+  text: z.string().min(1),
+});
+
+export const JinaImageDocumentSchema = z.object({
+  image: z.string().min(1),
+});
+
+export const JinaEmbeddingInputSchema = z.union([
+  z.string().min(1),
+  JinaTextDocumentSchema,
+  JinaImageDocumentSchema,
+]);
 
 export const JinaEmbeddingRequestSchema = z.object({
   model: z.string().min(1),
   input: z.union([
-    z.string().min(1),
-    z.array(z.string().min(1)).nonempty(),
+    JinaEmbeddingInputSchema,
+    z.array(JinaEmbeddingInputSchema).nonempty(),
   ]),
-  task: z.string().min(1).optional(),
-  dimensions: z.number().int().positive().optional(),
+  task: JinaEmbeddingTaskSchema,
+  dimensions: z.number().int().positive(),
+  normalized: z.boolean(),
+  embedding_type: JinaEmbeddingTypeSchema,
+  truncate: z.boolean(),
 });
 
 export const JinaEmbeddingItemSchema = z.object({
@@ -35,9 +89,8 @@ export const JinaEmbeddingResponseSchema = z.object({
 
 export const JinaRerankDocumentSchema = z.union([
   z.string(),
-  z.object({
-    text: z.string().min(1),
-  }),
+  JinaTextDocumentSchema,
+  JinaImageDocumentSchema,
 ]);
 
 export const JinaRerankRequestSchema = z.object({
@@ -85,6 +138,8 @@ export const JinaRerankResponseEnvelopeSchema = buildEnvelopeSchema(
   JinaRerankResponseSchema,
 );
 
+export type JinaEmbeddingProfileName = z.infer<typeof JinaEmbeddingProfileNameSchema>;
+export type JinaEmbeddingProfile = z.infer<typeof JinaEmbeddingProfileSchema>;
 export type JinaEmbeddingRequest = z.infer<typeof JinaEmbeddingRequestSchema>;
 export type JinaProviderConfig = z.infer<typeof JinaProviderConfigSchema>;
 export type JinaEmbeddingItem = z.infer<typeof JinaEmbeddingItemSchema>;
