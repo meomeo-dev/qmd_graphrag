@@ -13,9 +13,13 @@ import type {
 import {
   JinaEmbeddingRequestSchema,
   JinaEmbeddingResponseSchema,
+  JinaEmbeddingProfileNameSchema,
   JinaProviderConfigSchema,
   JinaRerankRequestSchema,
   JinaRerankResponseSchema,
+  type JinaEmbeddingProfile,
+  type JinaEmbeddingProfileName,
+  type JinaProviderConfig,
 } from "./contracts/jina.js";
 import {
   OpenAIResponsesRequestSchema,
@@ -121,6 +125,10 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
   return /qwen.*embed/i.test(modelUri) || /embed.*qwen/i.test(modelUri);
 }
 
+export function isJinaEmbeddingModelUri(modelUri: string): boolean {
+  return modelUri.startsWith("jina:");
+}
+
 /**
  * Format a query for embedding.
  * Uses nomic-style task prefix format for embeddinggemma (default).
@@ -128,6 +136,7 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  if (isJinaEmbeddingModelUri(uri)) return query;
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
@@ -141,6 +150,7 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  if (isJinaEmbeddingModelUri(uri)) return text;
   if (isQwen3EmbeddingModel(uri)) {
     // Qwen3-Embedding: documents are raw text, no task prefix
     return title ? `${title}\n${text}` : text;
@@ -419,25 +429,66 @@ function delayMs(ms: number): Promise<void> {
 // Model Configuration
 // =============================================================================
 
+export const JINA_TEXT_EMBEDDING_MODEL = "jina-embeddings-v5-text-small";
+export const JINA_TEXT_RERANK_MODEL = "jina-reranker-v3";
+export const JINA_MULTIMODAL_EMBEDDING_MODEL = "jina-embeddings-v5-omni-small";
+export const JINA_MULTIMODAL_RERANK_MODEL = "jina-reranker-m0";
+export const JINA_RETRIEVAL_QUERY_TASK = "retrieval.query";
+export const JINA_RETRIEVAL_DOCUMENT_TASK = "retrieval.passage";
+export const JINA_EMBEDDING_DIMENSIONS = 1024;
+export const JINA_EMBEDDING_NORMALIZED = true;
+export const JINA_EMBEDDING_TYPE = "float";
+export const JINA_EMBEDDING_TRUNCATE = true;
+
+export const JINA_EMBEDDING_PROFILES: Record<JinaEmbeddingProfileName, JinaEmbeddingProfile> = {
+  text: {
+    name: "text",
+    embeddingModel: JINA_TEXT_EMBEDDING_MODEL,
+    rerankModel: JINA_TEXT_RERANK_MODEL,
+    queryTask: JINA_RETRIEVAL_QUERY_TASK,
+    documentTask: JINA_RETRIEVAL_DOCUMENT_TASK,
+    dimensions: JINA_EMBEDDING_DIMENSIONS,
+    normalized: JINA_EMBEDDING_NORMALIZED,
+    embeddingType: JINA_EMBEDDING_TYPE,
+    truncate: JINA_EMBEDDING_TRUNCATE,
+    modality: "text",
+  },
+  multimodal: {
+    name: "multimodal",
+    embeddingModel: JINA_MULTIMODAL_EMBEDDING_MODEL,
+    rerankModel: JINA_MULTIMODAL_RERANK_MODEL,
+    queryTask: JINA_RETRIEVAL_QUERY_TASK,
+    documentTask: JINA_RETRIEVAL_DOCUMENT_TASK,
+    dimensions: JINA_EMBEDDING_DIMENSIONS,
+    normalized: JINA_EMBEDDING_NORMALIZED,
+    embeddingType: JINA_EMBEDDING_TYPE,
+    truncate: JINA_EMBEDDING_TRUNCATE,
+    modality: "multimodal",
+  },
+};
+
+export const DEFAULT_JINA_EMBEDDING_PROFILE: JinaEmbeddingProfileName = "text";
+
 // HuggingFace model URIs for node-llama-cpp and API model URIs.
 // Format: hf:<user>/<repo>/<file>
 // Override via QMD_EMBED_MODEL env var (e.g. hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf)
-const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
-const DEFAULT_RERANK_MODEL = "jina:jina-reranker-v3";
+const DEFAULT_EMBED_MODEL = `jina:${JINA_TEXT_EMBEDDING_MODEL}`;
+const DEFAULT_RERANK_MODEL = `jina:${JINA_TEXT_RERANK_MODEL}`;
 const JINA_EMBED_PREFIX = "jina:";
 const JINA_RERANK_PREFIX = "jina:";
 const DEFAULT_JINA_API_BASE = "https://api.jina.ai";
 const OPENAI_RESPONSES_PREFIX = "openai:";
 const DEFAULT_OPENAI_RESPONSES_ENDPOINT = "/responses";
 const OPENAI_RESPONSES_MAX_RETRIES = 3;
-// const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
-const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 
 // Alternative generation models for query expansion:
 // LiquidAI LFM2 - hybrid architecture optimized for edge/on-device inference
 // Use these as base for fine-tuning with configs/sft_lfm2.yaml
 export const LFM2_GENERATE_MODEL = "hf:LiquidAI/LFM2-1.2B-GGUF/LFM2-1.2B-Q4_K_M.gguf";
 export const LFM2_INSTRUCT_MODEL = "hf:LiquidAI/LFM2.5-1.2B-Instruct-GGUF/LFM2.5-1.2B-Instruct-Q4_K_M.gguf";
+export const LOCAL_QUERY_EXPANSION_MODEL =
+  "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
+const DEFAULT_GENERATE_MODEL = "openai:gpt-5.4";
 
 export const DEFAULT_EMBED_MODEL_URI = DEFAULT_EMBED_MODEL;
 export const DEFAULT_RERANK_MODEL_URI = DEFAULT_RERANK_MODEL;
@@ -449,6 +500,24 @@ export type ModelResolutionConfig = {
   rerank?: string;
 };
 
+export function modelUriForJinaEmbeddingProfile(
+  profileName: JinaEmbeddingProfileName,
+): string {
+  return `${JINA_EMBED_PREFIX}${JINA_EMBEDDING_PROFILES[profileName].embeddingModel}`;
+}
+
+export function rerankUriForJinaEmbeddingProfile(
+  profileName: JinaEmbeddingProfileName,
+): string {
+  return `${JINA_RERANK_PREFIX}${JINA_EMBEDDING_PROFILES[profileName].rerankModel}`;
+}
+
+function configuredJinaProfile(config?: CollectionConfig): JinaEmbeddingProfileName | null {
+  const value = config?.providers?.jina?.embedding_profile;
+  if (value == null) return null;
+  return JinaEmbeddingProfileNameSchema.parse(value);
+}
+
 export function resolveEmbedModel(config?: ModelResolutionConfig): string {
   return config?.embed || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
 }
@@ -459,6 +528,36 @@ export function resolveGenerateModel(config?: ModelResolutionConfig): string {
 
 export function resolveRerankModel(config?: ModelResolutionConfig): string {
   return config?.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
+}
+
+export function resolveEmbedModelFromConfig(config?: CollectionConfig): string {
+  if (process.env.QMD_EMBED_MODEL) return process.env.QMD_EMBED_MODEL;
+  const configuredModel = config?.models?.embed;
+  const profileName = configuredJinaProfile(config);
+  if (profileName && (!configuredModel || isJinaEmbeddingModel(configuredModel))) {
+    return modelUriForJinaEmbeddingProfile(profileName);
+  }
+  return configuredModel || DEFAULT_EMBED_MODEL;
+}
+
+export function resolveRerankModelFromConfig(config?: CollectionConfig): string {
+  if (process.env.QMD_RERANK_MODEL) return process.env.QMD_RERANK_MODEL;
+  const configuredModel = config?.models?.rerank;
+  const profileName = configuredJinaProfile(config);
+  if (profileName && (!configuredModel || isJinaRerankModel(configuredModel))) {
+    return rerankUriForJinaEmbeddingProfile(profileName);
+  }
+  return configuredModel || DEFAULT_RERANK_MODEL;
+}
+
+export function resolveModelsFromConfig(
+  config?: CollectionConfig,
+): Required<ModelResolutionConfig> {
+  return {
+    embed: resolveEmbedModelFromConfig(config),
+    generate: resolveGenerateModel(config?.models),
+    rerank: resolveRerankModelFromConfig(config),
+  };
 }
 
 export function isJinaRerankModel(model: string): boolean {
@@ -473,18 +572,34 @@ export function isOpenAIResponsesModel(model: string): boolean {
   return model.startsWith(OPENAI_RESPONSES_PREFIX);
 }
 
-function resolveOpenAIResponsesModelName(model: string): string {
+export function resolveOpenAIResponsesModelName(model: string): string {
   return isOpenAIResponsesModel(model)
     ? model.slice(OPENAI_RESPONSES_PREFIX.length)
     : model;
 }
 
-function resolveJinaEmbeddingModelName(model: string): string {
+export function resolveJinaEmbeddingModelName(model: string): string {
   return isJinaEmbeddingModel(model) ? model.slice(JINA_EMBED_PREFIX.length) : model;
 }
 
-function resolveJinaRerankModelName(model: string): string {
+export function resolveJinaRerankModelName(model: string): string {
   return isJinaRerankModel(model) ? model.slice(JINA_RERANK_PREFIX.length) : model;
+}
+
+export function resolveJinaEmbeddingProfileName(
+  value?: string,
+): JinaEmbeddingProfileName {
+  const parsed = JinaEmbeddingProfileNameSchema.safeParse(value);
+  return parsed.success ? parsed.data : DEFAULT_JINA_EMBEDDING_PROFILE;
+}
+
+function jinaProviderProfile(
+  config: CollectionConfig = loadRuntimeConfig(),
+): JinaEmbeddingProfile {
+  const profileName = resolveJinaEmbeddingProfileName(
+    config.providers?.jina?.embedding_profile,
+  );
+  return JINA_EMBEDDING_PROFILES[profileName];
 }
 
 function loadRuntimeConfig(): CollectionConfig {
@@ -500,15 +615,56 @@ function envValue(envName: string | undefined, fallbackName: string): string | u
   return process.env[name]?.trim();
 }
 
-function resolveJinaProviderConfig(config: CollectionConfig = loadRuntimeConfig()) {
+export function resolveJinaProviderConfig(
+  config: CollectionConfig = loadRuntimeConfig(),
+): JinaProviderConfig {
   const provider = config.providers?.jina;
+  const profile = jinaProviderProfile(config);
   return JinaProviderConfigSchema.parse({
     apiKeyEnv: provider?.api_key_env ?? "JINA_API_KEY",
     baseUrlEnv: provider?.base_url_env ?? "JINA_API_BASE",
     baseUrl: provider?.base_url ?? process.env.JINA_API_BASE ?? DEFAULT_JINA_API_BASE,
     embeddingEndpoint: provider?.embedding_endpoint ?? "/v1/embeddings",
     rerankEndpoint: provider?.rerank_endpoint ?? "/v1/rerank",
+    embeddingProfile: profile.name,
+    embeddingModel: profile.embeddingModel,
+    rerankModel: profile.rerankModel,
+    embeddingQueryTask: provider?.embedding_query_task ?? profile.queryTask,
+    embeddingDocumentTask: provider?.embedding_document_task ?? profile.documentTask,
+    embeddingDimensions: provider?.embedding_dimensions ?? profile.dimensions,
+    embeddingNormalized: provider?.embedding_normalized ?? profile.normalized,
+    embeddingType: provider?.embedding_type ?? profile.embeddingType,
+    embeddingTruncate: provider?.embedding_truncate ?? profile.truncate,
   });
+}
+
+export function resolveJinaEmbeddingTask(
+  options: { isQuery?: boolean } = {},
+  config?: CollectionConfig,
+): string {
+  const provider = resolveJinaProviderConfig(config);
+  return options.isQuery ? provider.embeddingQueryTask : provider.embeddingDocumentTask;
+}
+
+export function getJinaEmbeddingFingerprintSpec(
+  model: string,
+  config?: CollectionConfig,
+) {
+  const provider = resolveJinaProviderConfig(config);
+  const resolvedModel = resolveJinaEmbeddingModelName(model);
+  return {
+    provider: "jina",
+    profile: provider.embeddingProfile,
+    model: resolvedModel,
+    queryTask: provider.embeddingQueryTask,
+    documentTask: provider.embeddingDocumentTask,
+    dimensions: provider.embeddingDimensions,
+    normalized: provider.embeddingNormalized,
+    embeddingType: provider.embeddingType,
+    truncate: provider.embeddingTruncate,
+    endpoint: provider.embeddingEndpoint,
+    baseUrl: provider.baseUrl.replace(/\/+$/u, ""),
+  };
 }
 
 function resolveJinaApiBase(): string {
@@ -1718,9 +1874,16 @@ export class LlamaCpp implements LLM {
     if (texts.length === 0) return [];
 
     const jinaModel = resolveJinaEmbeddingModelName(model);
+    const providerConfig = resolveJinaProviderConfig();
+    const task = resolveJinaEmbeddingTask(options);
     const request = JinaEmbeddingRequestSchema.parse({
       model: jinaModel,
       input: texts,
+      task,
+      dimensions: providerConfig.embeddingDimensions,
+      normalized: providerConfig.embeddingNormalized,
+      embedding_type: providerConfig.embeddingType,
+      truncate: providerConfig.embeddingTruncate,
     });
     const response = await fetch(
       `${resolveJinaApiBase()}${resolveJinaEmbeddingEndpoint()}`,
@@ -1753,9 +1916,22 @@ export class LlamaCpp implements LLM {
       embeddingCountStatus: "reported",
       requestFingerprint: createDeterministicHash({
         model: jinaModel,
+        task,
+        dimensions: providerConfig.embeddingDimensions,
+        normalized: providerConfig.embeddingNormalized,
+        embeddingType: providerConfig.embeddingType,
+        truncate: providerConfig.embeddingTruncate,
+        endpoint: providerConfig.embeddingEndpoint,
+        profile: providerConfig.embeddingProfile,
         input: texts,
       }),
       metadata: {
+        profile: providerConfig.embeddingProfile,
+        task,
+        dimensions: providerConfig.embeddingDimensions,
+        normalized: providerConfig.embeddingNormalized,
+        embeddingType: providerConfig.embeddingType,
+        truncate: providerConfig.embeddingTruncate,
         inputCount: texts.length,
       },
       costLineage: options.costLineage,
@@ -1843,7 +2019,7 @@ export class LlamaCpp implements LLM {
         ...new Set(input.costLineage?.artifactIds ?? []),
       ],
       metadata: {
-        ...(input.metadata ?? {}),
+        ...(metadata ?? {}),
         requestArtifactPath:
           `catalog/provider-requests/${requestArtifactId}.json`,
       },
@@ -2287,6 +2463,7 @@ export class LlamaCpp implements LLM {
     }
 
     const jinaModel = resolveJinaRerankModelName(model);
+    const providerConfig = resolveJinaProviderConfig();
     const request = JinaRerankRequestSchema.parse({
       model: jinaModel,
       query,
@@ -2324,10 +2501,13 @@ export class LlamaCpp implements LLM {
       embeddingCountStatus: "reported",
       requestFingerprint: createDeterministicHash({
         model: jinaModel,
+        profile: providerConfig.embeddingProfile,
+        endpoint: providerConfig.rerankEndpoint,
         query,
         documents: documents.map((doc) => doc.text),
       }),
       metadata: {
+        profile: providerConfig.embeddingProfile,
         documentCount: documents.length,
       },
       costLineage: mergeProviderCostLineage([

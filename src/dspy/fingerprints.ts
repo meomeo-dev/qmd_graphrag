@@ -2,6 +2,14 @@ import type { CollectionConfig } from "../collections.js";
 import type { DspyFingerprintSet } from "../contracts/dspy.js";
 import { SchemaVersion } from "../contracts/common.js";
 import { createDeterministicHash } from "../job-state/fingerprint.js";
+import {
+  DEFAULT_JINA_EMBEDDING_PROFILE,
+  JINA_EMBEDDING_PROFILES,
+  resolveEmbedModelFromConfig,
+  resolveJinaEmbeddingModelName,
+  resolveJinaRerankModelName,
+  resolveRerankModelFromConfig,
+} from "../llm.js";
 
 export type DspyRuntimeFingerprintDefaults = {
   generateModel: string;
@@ -27,13 +35,15 @@ export function buildDspyRuntimeFingerprints(
   const openai = config.providers?.openai ?? {};
   const responseApi = openai.response_api ?? {};
   const jina = config.providers?.jina ?? {};
+  const jinaProfileName = jina.embedding_profile ?? DEFAULT_JINA_EMBEDDING_PROFILE;
+  const jinaProfile = JINA_EMBEDDING_PROFILES[jinaProfileName];
   const query = config.query ?? {};
   const autoRoute = query.auto_route ?? {};
   const graph = config.graphrag ?? {};
   const model = {
     generate: config.models?.generate ?? defaults.generateModel,
-    embed: config.models?.embed ?? defaults.embedModel,
-    rerank: config.models?.rerank ?? defaults.rerankModel,
+    embed: resolveEmbedModelFromConfig(config) ?? defaults.embedModel,
+    rerank: resolveRerankModelFromConfig(config) ?? defaults.rerankModel,
   };
 
   return {
@@ -55,8 +65,16 @@ export function buildDspyRuntimeFingerprints(
         baseUrl: jina.base_url ?? "https://api.jina.ai",
         embeddingEndpoint: jina.embedding_endpoint ?? "/v1/embeddings",
         rerankEndpoint: jina.rerank_endpoint ?? "/v1/rerank",
-        embeddingModel: jina.embedding_model ?? "jina-embeddings-v3",
-        rerankModel: jina.rerank_model ?? "jina-reranker-v3",
+        embeddingProfile: jinaProfileName,
+        embeddingModel: resolveJinaEmbeddingModelName(resolveEmbedModelFromConfig(config)),
+        rerankModel: resolveJinaRerankModelName(resolveRerankModelFromConfig(config)),
+        embeddingQueryTask: jina.embedding_query_task ?? jinaProfile.queryTask,
+        embeddingDocumentTask:
+          jina.embedding_document_task ?? jinaProfile.documentTask,
+        embeddingDimensions: jina.embedding_dimensions ?? jinaProfile.dimensions,
+        embeddingNormalized: jina.embedding_normalized ?? jinaProfile.normalized,
+        embeddingType: jina.embedding_type ?? jinaProfile.embeddingType,
+        embeddingTruncate: jina.embedding_truncate ?? jinaProfile.truncate,
       },
     }),
     retrievalConfigFingerprint: createDeterministicHash({
@@ -81,6 +99,9 @@ export function buildDspyRuntimeFingerprints(
       models: {
         embed: model.embed,
         rerank: model.rerank,
+      },
+      embedding: {
+        chunkStrategy: config.embedding?.chunk_strategy ?? "regex",
       },
     }),
     corpusSnapshotFingerprint: createDeterministicHash({

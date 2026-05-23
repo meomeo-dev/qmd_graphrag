@@ -24,6 +24,8 @@ import {
   getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
+  getJinaEmbeddingFingerprintSpec,
+  isJinaEmbeddingModel,
   withLLMSessionForLlm,
   DEFAULT_EMBED_MODEL_URI,
   DEFAULT_RERANK_MODEL_URI,
@@ -78,15 +80,34 @@ export const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 540 chars
 export const CHUNK_WINDOW_TOKENS = 200;
 export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
 
-export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): string {
-  const significant = [
-    `model:${model}`,
-    `query:${formatQueryForEmbedding(EMBED_FINGERPRINT_PROBE_QUERY, model)}`,
-    `doc:${formatDocForEmbedding(EMBED_FINGERPRINT_PROBE_DOC, EMBED_FINGERPRINT_PROBE_TITLE, model)}`,
-    `chunk_tokens:${CHUNK_SIZE_TOKENS}`,
-    `chunk_overlap_tokens:${CHUNK_OVERLAP_TOKENS}`,
-  ].join("\n");
-  return createHash("sha256").update(significant).digest("hex").slice(0, 6);
+export const DEFAULT_EMBED_CHUNK_STRATEGY: ChunkStrategy = "regex";
+export const EMBED_CHUNKING_POLICY_VERSION = "qmd-embedding-chunking-v2";
+
+export function getEmbeddingFingerprint(
+  model: string = DEFAULT_EMBED_MODEL,
+  chunkStrategy: ChunkStrategy = DEFAULT_EMBED_CHUNK_STRATEGY,
+): string {
+  const significant = {
+    model,
+    jina: isJinaEmbeddingModel(model)
+      ? getJinaEmbeddingFingerprintSpec(model)
+      : null,
+    query: formatQueryForEmbedding(EMBED_FINGERPRINT_PROBE_QUERY, model),
+    doc: formatDocForEmbedding(
+      EMBED_FINGERPRINT_PROBE_DOC,
+      EMBED_FINGERPRINT_PROBE_TITLE,
+      model,
+    ),
+    chunkTokens: CHUNK_SIZE_TOKENS,
+    chunkOverlapTokens: CHUNK_OVERLAP_TOKENS,
+    chunkWindowTokens: CHUNK_WINDOW_TOKENS,
+    chunkStrategy,
+    chunkingPolicyVersion: EMBED_CHUNKING_POLICY_VERSION,
+  };
+  return createHash("sha256")
+    .update(JSON.stringify(significant))
+    .digest("hex")
+    .slice(0, 6);
 }
 
 /**
@@ -996,6 +1017,7 @@ type StoreCollectionRow = {
 
 type StoreRuntimeConfig = {
   graphVault?: string;
+  embeddingChunkStrategy?: ChunkStrategy;
   queryExpansionPolicyProvider?: "builtin" | "dspy";
   queryExpansionPolicyRef?: string;
   queryExpansionFailurePolicy?: QueryExpansionFailurePolicy;
@@ -1169,6 +1191,24 @@ function getStoreRuntimeConfig(db: Database): StoreRuntimeConfig {
   return getStoreConfigValue<StoreRuntimeConfig>(db, "runtime_config") ?? {};
 }
 
+function resolveEmbeddingChunkStrategy(config?: CollectionConfig): ChunkStrategy {
+  return config?.embedding?.chunk_strategy ?? DEFAULT_EMBED_CHUNK_STRATEGY;
+}
+
+function currentEmbeddingFingerprint(
+  db: Database,
+  model: string,
+  chunkStrategy?: ChunkStrategy,
+): string {
+  const runtimeConfig = getStoreRuntimeConfig(db);
+  return getEmbeddingFingerprint(
+    model,
+    chunkStrategy
+      ?? runtimeConfig.embeddingChunkStrategy
+      ?? DEFAULT_EMBED_CHUNK_STRATEGY,
+  );
+}
+
 function currentDspyFingerprints(_model: string, db: Database): {
   modelFingerprint: string;
   providerFingerprint: string;
@@ -1203,6 +1243,7 @@ export function syncConfigToDb(db: Database, config: CollectionConfig): void {
   });
   const runtimeConfig = {
     graphVault: config.graphrag?.vault,
+    embeddingChunkStrategy: resolveEmbeddingChunkStrategy(config),
     queryExpansionPolicyProvider: config.query?.expansion_policy?.provider ?? "builtin",
     queryExpansionPolicyRef: config.query?.expansion_policy?.policy_ref,
     queryExpansionFailurePolicy: queryExpansionFailurePolicyFromConfig(config),
@@ -1615,7 +1656,7 @@ function withLazyContentVectorMigration<T>(db: Database, operation: () => T): T 
 
 function getPendingEmbeddingDocs(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
-  const fingerprint = getEmbeddingFingerprint(model);
+  const fingerprint = currentEmbeddingFingerprint(db, model);
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
       SELECT d.hash, MIN(d.path) as path, MIN(d.collection) as collection,
@@ -1776,7 +1817,10 @@ export async function generateEmbeddings(
   const db = store.db;
   const llm = getLlm(store);
   const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
-  const fingerprint = getEmbeddingFingerprint(model);
+  const chunkStrategy = options?.chunkStrategy
+    ?? getStoreRuntimeConfig(db).embeddingChunkStrategy
+    ?? DEFAULT_EMBED_CHUNK_STRATEGY;
+  const fingerprint = getEmbeddingFingerprint(model, chunkStrategy);
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();
@@ -1900,7 +1944,7 @@ export async function generateEmbeddings(
           doc.body,
           undefined, undefined, undefined,
           doc.path,
-          options?.chunkStrategy,
+          chunkStrategy,
           session.signal,
         );
 
@@ -2342,7 +2386,7 @@ export type IndexStatus = {
 
 export function getHashesNeedingEmbedding(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): number {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
-  const fingerprint = getEmbeddingFingerprint(model);
+  const fingerprint = currentEmbeddingFingerprint(db, model);
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
       SELECT COUNT(DISTINCT d.hash) as count
@@ -2376,7 +2420,23 @@ export type LegacyFingerprintAdoptionResult = {
 
 export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: string = DEFAULT_EMBED_MODEL): Promise<LegacyFingerprintAdoptionResult> {
   const db = store.db;
-  const fingerprint = getEmbeddingFingerprint(model);
+  const fingerprint = currentEmbeddingFingerprint(db, model);
+  if (isJinaEmbeddingModel(model)) {
+    const legacyCount = withLazyContentVectorMigration(db, () => {
+      const row = db
+        .prepare(`SELECT COUNT(DISTINCT hash) AS count FROM content_vectors WHERE model = ? AND embed_fingerprint = ''`)
+        .get(model) as { count: number };
+      return row.count;
+    });
+    return legacyCount === 0
+      ? { checked: false, adopted: 0, reason: "no legacy empty-fingerprint embeddings" }
+      : {
+          checked: true,
+          adopted: 0,
+          reason:
+            "Jina legacy empty-fingerprint embeddings require re-embedding because profile/task provenance is unavailable",
+        };
+  }
   const legacyCount = withLazyContentVectorMigration(db, () => {
     const row = db.prepare(`SELECT COUNT(DISTINCT hash) AS count FROM content_vectors WHERE model = ? AND embed_fingerprint = ''`).get(model) as { count: number };
     return row.count;
@@ -2410,7 +2470,17 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
   const llm = getLlm(store);
 
   return await withLLMSessionForLlm(llm, async (session) => {
-    const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
+    const chunkStrategy = getStoreRuntimeConfig(db).embeddingChunkStrategy
+      ?? DEFAULT_EMBED_CHUNK_STRATEGY;
+    const chunks = await chunkDocumentByTokens(
+      sample.body,
+      undefined,
+      undefined,
+      undefined,
+      sample.path,
+      chunkStrategy,
+      session.signal,
+    );
     const chunk = chunks[sample.seq];
     if (!chunk) {
       return { checked: true, adopted: 0, reason: `sample chunk ${expectedHashSeq} no longer exists` };
@@ -3753,6 +3823,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
   // Build query for document lookup
   const placeholders = hashSeqs.map(() => '?').join(',');
+  const fingerprint = currentEmbeddingFingerprint(db, model);
   let docSql = `
     SELECT
       cv.hash || '_' || cv.seq as hash_seq,
@@ -3767,8 +3838,10 @@ export async function searchVec(db: Database, query: string, model: string, limi
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
     JOIN content ON content.hash = d.hash
     WHERE cv.hash || '_' || cv.seq IN (${placeholders})
+      AND cv.model = ?
+      AND cv.embed_fingerprint = ?
   `;
-  const params: string[] = [...hashSeqs];
+  const params: string[] = [...hashSeqs, model, fingerprint];
 
   if (collectionName) {
     docSql += ` AND d.collection = ?`;
@@ -3835,7 +3908,7 @@ export function getHashesForEmbedding(
   db: Database,
   model: string = DEFAULT_EMBED_MODEL,
 ): { hash: string; body: string; path: string; collection: string }[] {
-  const fingerprint = getEmbeddingFingerprint(model);
+  const fingerprint = currentEmbeddingFingerprint(db, model);
   return withLazyContentVectorMigration(db, () => db.prepare(`
     SELECT d.hash, c.doc as body, MIN(d.path) as path,
            MIN(d.collection) as collection
@@ -4908,7 +4981,10 @@ export async function hybridQuery(
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
+    const embeddings = await llm.embedBatch(textsToEmbed, {
+      model: embedModel,
+      isQuery: true,
+    });
     hooks?.onEmbedDone?.(Date.now() - embedStart);
 
     // Run sqlite-vec lookups with pre-computed embeddings
@@ -5323,7 +5399,10 @@ export async function structuredSearch(
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
+      const embeddings = await llm.embedBatch(textsToEmbed, {
+        model: embedModel,
+        isQuery: true,
+      });
       hooks?.onEmbedDone?.(Date.now() - embedStart);
 
       for (let i = 0; i < vecSearches.length; i++) {

@@ -78,6 +78,7 @@ import {
   generateEmbeddings,
   maybeAdoptLegacyEmbeddingFingerprint,
   syncConfigToDb,
+  DEFAULT_EMBED_CHUNK_STRATEGY,
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
@@ -93,10 +94,13 @@ import {
   resolveGenerateModel,
   resolveRerankModel,
   resolveModels,
+  resolveModelsFromConfig,
   inspectGgufFile,
   isJinaEmbeddingModel,
   isJinaRerankModel,
   isOpenAIResponsesModel,
+  DEFAULT_JINA_EMBEDDING_PROFILE,
+  JINA_EMBEDDING_PROFILES,
 } from "../llm.js";
 import {
   formatSearchResults,
@@ -512,8 +516,23 @@ function defaultProjectProvidersConfig(): CollectionConfig["providers"] {
       base_url: "https://api.jina.ai",
       embedding_endpoint: "/v1/embeddings",
       rerank_endpoint: "/v1/rerank",
-      embedding_model: "jina-embeddings-v3",
-      rerank_model: "jina-reranker-v3",
+      embedding_profile: DEFAULT_JINA_EMBEDDING_PROFILE,
+      embedding_model:
+        JINA_EMBEDDING_PROFILES[DEFAULT_JINA_EMBEDDING_PROFILE].embeddingModel,
+      rerank_model:
+        JINA_EMBEDDING_PROFILES[DEFAULT_JINA_EMBEDDING_PROFILE].rerankModel,
+      embedding_query_task:
+        JINA_EMBEDDING_PROFILES[DEFAULT_JINA_EMBEDDING_PROFILE].queryTask,
+      embedding_document_task:
+        JINA_EMBEDDING_PROFILES[DEFAULT_JINA_EMBEDDING_PROFILE].documentTask,
+      embedding_dimensions:
+        JINA_EMBEDDING_PROFILES[DEFAULT_JINA_EMBEDDING_PROFILE].dimensions,
+      embedding_normalized:
+        JINA_EMBEDDING_PROFILES[DEFAULT_JINA_EMBEDDING_PROFILE].normalized,
+      embedding_type:
+        JINA_EMBEDDING_PROFILES[DEFAULT_JINA_EMBEDDING_PROFILE].embeddingType,
+      embedding_truncate:
+        JINA_EMBEDDING_PROFILES[DEFAULT_JINA_EMBEDDING_PROFILE].truncate,
     },
   };
 }
@@ -640,7 +659,11 @@ function ensureRuntimeConfigForCli(): CollectionConfig {
       "query.default_route must be qmd or auto; use --graphrag for graph-only queries",
     );
   }
-  const models = resolveModels(config.models);
+  const models = resolveModelsFromConfig(config);
+  const jinaProviderDefaults = {
+    ...defaultProjectProvidersConfig()?.jina,
+    ...(config.providers?.jina ?? {}),
+  };
   const next: CollectionConfig = {
     ...config,
     collections: config.collections ?? {},
@@ -662,9 +685,18 @@ function ensureRuntimeConfigForCli(): CollectionConfig {
         },
       },
       jina: {
-        ...defaultProjectProvidersConfig()?.jina,
-        ...(config.providers?.jina ?? {}),
+        ...jinaProviderDefaults,
+        embedding_model: models.embed.startsWith("jina:")
+          ? models.embed.slice("jina:".length)
+          : jinaProviderDefaults.embedding_model,
+        rerank_model: models.rerank.startsWith("jina:")
+          ? models.rerank.slice("jina:".length)
+          : jinaProviderDefaults.rerank_model,
       },
+    },
+    embedding: {
+      chunk_strategy: DEFAULT_EMBED_CHUNK_STRATEGY,
+      ...(config.embedding ?? {}),
     },
     graphrag: {
       enabled: true,
@@ -2113,7 +2145,7 @@ function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
 
 function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
   try {
-    return resolveModels(ensureRuntimeConfigForCli().models);
+    return resolveModelsFromConfig(ensureRuntimeConfigForCli());
   } catch {
     return resolveModels();
   }
@@ -2131,6 +2163,15 @@ export function resolveRerankModelForCli(): string {
   return ensureModelsConfiguredForCli().rerank;
 }
 
+function resolveEmbeddingChunkStrategyForCli(): ChunkStrategy {
+  try {
+    return ensureRuntimeConfigForCli().embedding?.chunk_strategy
+      ?? DEFAULT_EMBED_CHUNK_STRATEGY;
+  } catch {
+    return DEFAULT_EMBED_CHUNK_STRATEGY;
+  }
+}
+
 function resolveModelsForCli(): { embed: string; generate: string; rerank: string } {
   return ensureModelsConfiguredForCli();
 }
@@ -2142,6 +2183,12 @@ async function vectorIndex(
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+  const effectiveChunkStrategy = batchOptions?.chunkStrategy
+    ?? resolveEmbeddingChunkStrategyForCli();
+  syncConfigToDb(db, {
+    ...loadConfig(),
+    embedding: { chunk_strategy: effectiveChunkStrategy },
+  });
 
   if (force) {
     console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
@@ -2172,7 +2219,7 @@ async function vectorIndex(
     collection: batchOptions?.collection,
     maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
     maxBatchBytes: batchOptions?.maxBatchBytes,
-    chunkStrategy: batchOptions?.chunkStrategy,
+    chunkStrategy: effectiveChunkStrategy,
     onProgress: (info) => {
       if (info.totalBytes === 0) return;
       // Progress is measured by input bytes, not by chunks. The final chunk
@@ -4710,7 +4757,8 @@ async function showDoctor(): Promise<void> {
   const pkg = readPackageJson();
   const activeModels = resolveModelsForCli();
   const embedModel = activeModels.embed;
-  const fingerprint = getEmbeddingFingerprint(embedModel);
+  const embeddingChunkStrategy = resolveEmbeddingChunkStrategyForCli();
+  const fingerprint = getEmbeddingFingerprint(embedModel, embeddingChunkStrategy);
   const nextSteps: string[] = [];
 
   console.log(`${c.bold}QMD Doctor${c.reset}\n`);

@@ -5,7 +5,7 @@ collections:
     context:
       /: Normalized books available to qmd and GraphRAG.
 models:
-  embed: jina:jina-embeddings-v3
+  embed: jina:jina-embeddings-v5-text-small
   rerank: jina:jina-reranker-v3
   generate: openai:gpt-5.4
 providers:
@@ -23,8 +23,17 @@ providers:
     base_url: https://api.jina.ai
     embedding_endpoint: /v1/embeddings
     rerank_endpoint: /v1/rerank
-    embedding_model: jina-embeddings-v3
+    embedding_profile: text
+    embedding_model: jina-embeddings-v5-text-small
     rerank_model: jina-reranker-v3
+    embedding_query_task: retrieval.query
+    embedding_document_task: retrieval.passage
+    embedding_dimensions: 1024
+    embedding_normalized: true
+    embedding_type: float
+    embedding_truncate: true
+embedding:
+  chunk_strategy: regex
 graphrag:
   enabled: true
   vault: graph_vault

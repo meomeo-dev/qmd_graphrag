@@ -6,6 +6,12 @@ import YAML from "yaml";
 
 import type { CollectionConfig } from "../collections.js";
 import { createDeterministicHash } from "../job-state/fingerprint.js";
+import {
+  DEFAULT_JINA_EMBEDDING_PROFILE,
+  JINA_EMBEDDING_PROFILES,
+  resolveEmbedModelFromConfig,
+  resolveJinaEmbeddingModelName,
+} from "../llm.js";
 
 const ManagedBy = "qmd_graphrag";
 const ResponsesEndpoint = "/responses";
@@ -38,6 +44,7 @@ export function graphRagProjectConfigFingerprint(config: CollectionConfig): stri
   return createDeterministicHash({
     models: config.models ?? {},
     providers: config.providers ?? {},
+    embedding: config.embedding ?? {},
     graphrag: config.graphrag ?? {},
     query: config.query ?? {},
   });
@@ -65,6 +72,12 @@ export function buildGraphRagRuntimeSettingsProjection(
     throw new Error("OpenAI Responses API structured output must be strict");
   }
   const jina = config.providers?.jina ?? {};
+  const profileName = jina.embedding_profile ?? DEFAULT_JINA_EMBEDDING_PROFILE;
+  const profile = JINA_EMBEDDING_PROFILES[profileName];
+  const activeEmbedModel = resolveEmbedModelFromConfig(config);
+  const projectedJinaEmbedModel = activeEmbedModel.startsWith("jina:")
+    ? resolveJinaEmbeddingModelName(activeEmbedModel)
+    : profile.embeddingModel;
   const settings = {
     qmd_graphrag: {
       managed_by: ManagedBy,
@@ -74,6 +87,13 @@ export function buildGraphRagRuntimeSettingsProjection(
         default_base_url: jinaApiBase(jina.base_url),
         embedding_endpoint: jina.embedding_endpoint ?? "/v1/embeddings",
         rerank_endpoint: jina.rerank_endpoint ?? "/v1/rerank",
+        embedding_profile: profileName,
+        embedding_query_task: jina.embedding_query_task ?? profile.queryTask,
+        embedding_document_task: jina.embedding_document_task ?? profile.documentTask,
+        embedding_dimensions: jina.embedding_dimensions ?? profile.dimensions,
+        embedding_normalized: jina.embedding_normalized ?? profile.normalized,
+        embedding_type: jina.embedding_type ?? profile.embeddingType,
+        embedding_truncate: jina.embedding_truncate ?? profile.truncate,
       },
     },
     completion_models: {
@@ -104,15 +124,17 @@ export function buildGraphRagRuntimeSettingsProjection(
       default_embedding_model: {
         type: "litellm",
         model_provider: "jina_ai",
-        model: jina.embedding_model ?? modelName(
-          config.models?.embed,
-          "jina-embeddings-v3",
-        ),
+        model: projectedJinaEmbedModel,
         api_key: envPlaceholder(jina.api_key_env, "JINA_API_KEY"),
         api_base: jinaLiteLlmApiBase(jina.base_url),
         call_args: {
           default_base_url: jinaApiBase(jina.base_url),
           embedding_endpoint: jina.embedding_endpoint ?? "/v1/embeddings",
+          task: jina.embedding_document_task ?? profile.documentTask,
+          dimensions: jina.embedding_dimensions ?? profile.dimensions,
+          normalized: jina.embedding_normalized ?? profile.normalized,
+          embedding_type: jina.embedding_type ?? profile.embeddingType,
+          truncate: jina.embedding_truncate ?? profile.truncate,
         },
       },
     },
@@ -124,7 +146,7 @@ export function buildGraphRagRuntimeSettingsProjection(
     vector_store: {
       type: "lancedb",
       db_uri: "./output/lancedb",
-      vector_size: 1024,
+      vector_size: jina.embedding_dimensions ?? profile.dimensions,
     },
     embed_text: { embedding_model_id: "default_embedding_model" },
     extract_graph: {
