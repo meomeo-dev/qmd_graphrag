@@ -878,6 +878,105 @@ describe("FileBookJobStateRepository", () => {
     }
   });
 
+  test("migrates legacy high-cost artifact fingerprints from metadata", async () => {
+    const root = await createFixtureDir();
+    try {
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "fixture epub content", "utf8");
+      const job = await repo.registerBookSource({
+        sourcePath,
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+      });
+
+      await writeFile(
+        join(graphVault, "books", job.bookId, "artifacts.yaml"),
+        YAML.stringify({
+          schemaVersion: SchemaVersion,
+          items: [
+            {
+              schemaVersion: SchemaVersion,
+              artifactId: "legacy-artifact",
+              bookId: job.bookId,
+              stage: "graph_extract",
+              kind: "graphrag_entities_parquet",
+              path: "output/entities.parquet",
+              contentHash: "content-hash",
+              producerRunId: "run-legacy",
+              createdAt: "2026-05-22T00:00:00.000Z",
+              metadata: {
+                stageFingerprint: "stage-from-metadata",
+                providerFingerprint: "provider-from-metadata",
+              },
+            },
+          ],
+        }),
+        "utf8",
+      );
+
+      const artifacts = await repo.listArtifacts(job.bookId);
+
+      expect(artifacts[0]?.stageFingerprint).toBe("stage-from-metadata");
+      expect(artifacts[0]?.providerFingerprint).toBe("provider-from-metadata");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("migrates legacy high-cost checkpoint fingerprints from job state", async () => {
+    const root = await createFixtureDir();
+    try {
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "fixture epub content", "utf8");
+      const job = await repo.registerBookSource({
+        sourcePath,
+        normalizedContentHash: "normalized-content",
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+        providerFingerprint: "provider-from-job",
+        stageFingerprints: {
+          query_ready: "query-ready-from-job",
+        },
+      });
+
+      await writeFile(
+        join(graphVault, "books", job.bookId, "checkpoints.yaml"),
+        YAML.stringify({
+          schemaVersion: SchemaVersion,
+          items: [
+            {
+              schemaVersion: SchemaVersion,
+              bookId: job.bookId,
+              stage: "query_ready",
+              status: "succeeded",
+              attemptCount: 1,
+              runId: "run-query-ready",
+              startedAt: "2026-05-22T00:00:00.000Z",
+              finishedAt: "2026-05-22T00:01:00.000Z",
+              inputFingerprint: "input-query-ready",
+              artifactIds: ["upstream-artifact"],
+            },
+          ],
+        }),
+        "utf8",
+      );
+
+      const checkpoints = await repo.listStageCheckpoints(job.bookId);
+
+      expect(checkpoints[0]?.contentHash).toBe("normalized-content");
+      expect(checkpoints[0]?.stageFingerprint).toBe("query-ready-from-job");
+      expect(checkpoints[0]?.providerFingerprint).toBe("provider-from-job");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("does not deduplicate high-cost artifacts across provider fingerprints", async () => {
     const root = await createFixtureDir();
     try {

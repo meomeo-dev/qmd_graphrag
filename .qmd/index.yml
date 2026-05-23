@@ -1,0 +1,46 @@
+collections:
+  books:
+    path: graph_vault/input
+    pattern: "**/*.md"
+    context:
+      /: Normalized books available to qmd and GraphRAG.
+models:
+  embed: jina:jina-embeddings-v3
+  rerank: jina:jina-reranker-v3
+  generate: openai:gpt-5.4
+providers:
+  openai:
+    api_key_env: OPENAI_API_KEY
+    base_url_env: OPENAI_BASE_URL
+    response_api:
+      endpoint: /responses
+      stream: true
+      reasoning_effort: medium
+      strict_structured_output: true
+  jina:
+    api_key_env: JINA_API_KEY
+    base_url_env: JINA_API_BASE
+    base_url: https://api.jina.ai
+    embedding_endpoint: /v1/embeddings
+    rerank_endpoint: /v1/rerank
+    embedding_model: jina-embeddings-v3
+    rerank_model: jina-reranker-v3
+graphrag:
+  enabled: true
+  vault: graph_vault
+  default_method: local
+  default_response_type: multiple paragraphs
+  python_bin: .venv-graphrag/bin/python
+  enhanced_collections:
+    - books
+query:
+  default_route: qmd
+  allow_graph_upgrade: true
+  auto_route:
+    graph_coverage_threshold: 0.7
+    max_cost_class: medium
+  expansion_policy:
+    provider: builtin
+    policy_ref: graph_vault/dspy/policies/query-expansion/current.yaml
+    failure_policy: fallback_to_builtin_expander
+    strict_schema: true

@@ -81,7 +81,23 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile } from "../llm.js";
+import {
+  disposeDefaultLlamaCpp,
+  getDefaultLlamaCpp,
+  setDefaultLlamaCpp,
+  LlamaCpp,
+  withLLMSession,
+  pullModels,
+  DEFAULT_MODEL_CACHE_DIR,
+  resolveEmbedModel,
+  resolveGenerateModel,
+  resolveRerankModel,
+  resolveModels,
+  inspectGgufFile,
+  isJinaEmbeddingModel,
+  isJinaRerankModel,
+  isOpenAIResponsesModel,
+} from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -4317,6 +4333,13 @@ function formatModelDiagnosticPath(path: string): string {
 
 function findCachedModelInspection(model: string): CachedModelInspection {
   const invalid: string[] = [];
+  if (
+    isJinaEmbeddingModel(model) ||
+    isJinaRerankModel(model) ||
+    isOpenAIResponsesModel(model)
+  ) {
+    return { path: model, invalid };
+  }
   if (model.startsWith("hf:")) {
     const filename = model.split("/").pop();
     if (!filename || !existsSync(DEFAULT_MODEL_CACHE_DIR)) return { path: null, invalid };

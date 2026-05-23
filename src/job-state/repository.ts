@@ -465,17 +465,22 @@ function migrateLegacyArtifactManifest(
   bookId: string,
 ): BookArtifactManifest {
   const raw = value as Record<string, unknown>;
+  const metadata = raw.metadata as Record<string, unknown> | undefined;
   const stage = BookStageSchema.parse(raw.stage);
   const contentHash = String(raw.contentHash ?? "");
   const stageFingerprint =
     typeof raw.stageFingerprint === "string"
       ? raw.stageFingerprint
+      : typeof metadata?.stageFingerprint === "string"
+        ? metadata.stageFingerprint
       : HIGH_COST_STAGES.has(stage)
         ? createDeterministicHash(["legacy-stage", bookId, stage, contentHash])
         : undefined;
   const providerFingerprint =
     typeof raw.providerFingerprint === "string"
       ? raw.providerFingerprint
+      : typeof metadata?.providerFingerprint === "string"
+        ? metadata.providerFingerprint
       : HIGH_COST_STAGES.has(stage)
         ? createDeterministicHash(["legacy-provider", bookId, stage])
         : undefined;
@@ -1518,11 +1523,31 @@ export class FileBookJobStateRepository {
   }
 
   async listStageCheckpoints(bookId: string): Promise<BookJobStageCheckpoint[]> {
-    const list = await readYamlFile(
-      this.stageCheckpointPath(bookId),
-      BookJobCheckpointListSchema,
-      EMPTY_CHECKPOINT_LIST,
-    );
+    let list: BookJobCheckpointList;
+    try {
+      list = await readYamlFile(
+        this.stageCheckpointPath(bookId),
+        BookJobCheckpointListSchema,
+        EMPTY_CHECKPOINT_LIST,
+      );
+    } catch (error) {
+      if (error instanceof Error && error.name === "ZodError") {
+        const [artifacts, job] = await Promise.all([
+          this.listArtifacts(bookId),
+          this.getBookJob(bookId),
+        ]);
+        const raw = YAML.parse(
+          await readFile(this.stageCheckpointPath(bookId), "utf8"),
+        );
+        list = migrateLegacyStageCheckpointList(raw, {
+          bookId,
+          artifacts,
+          job,
+        });
+      } else {
+        throw error;
+      }
+    }
     await this.repairCheckpointRunRecordStageConsistency(bookId, list.items);
     return list.items;
   }
@@ -1562,11 +1587,23 @@ export class FileBookJobStateRepository {
     bookId: string,
     stage?: BookStage,
   ): Promise<BookArtifactManifest[]> {
-    const list = await readYamlFile(
-      this.artifactManifestPath(bookId),
-      BookArtifactManifestListSchema,
-      EMPTY_ARTIFACT_LIST,
-    );
+    let list: BookArtifactManifestList;
+    try {
+      list = await readYamlFile(
+        this.artifactManifestPath(bookId),
+        BookArtifactManifestListSchema,
+        EMPTY_ARTIFACT_LIST,
+      );
+    } catch (error) {
+      if (error instanceof Error && error.name === "ZodError") {
+        const raw = YAML.parse(
+          await readFile(this.artifactManifestPath(bookId), "utf8"),
+        );
+        list = migrateLegacyArtifactManifestList(raw, bookId);
+      } else {
+        throw error;
+      }
+    }
     if (stage == null) {
       return list.items;
     }

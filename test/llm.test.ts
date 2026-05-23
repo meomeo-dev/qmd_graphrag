@@ -25,6 +25,7 @@ import {
   resolveGenerateModel,
   resolveRerankModel,
   resolveModels,
+  pullModels,
   withLLMSession,
   canUnloadLLM,
   SessionReleasedError,
@@ -126,12 +127,46 @@ describe("LlamaCpp.modelExists", () => {
     });
   });
 
+  test("returns exists:true for OpenAI Responses model URIs", async () => {
+    const llm = getDefaultLlamaCpp();
+    const result = await llm.modelExists("openai:gpt-5.4");
+
+    expect(result).toEqual({
+      name: "openai:gpt-5.4",
+      exists: true,
+    });
+  });
+
   test("returns exists:false for non-existent local paths", async () => {
     const llm = getDefaultLlamaCpp();
     const result = await llm.modelExists("/nonexistent/path/model.gguf");
 
     expect(result.exists).toBe(false);
     expect(result.name).toBe("/nonexistent/path/model.gguf");
+  });
+});
+
+describe("pullModels", () => {
+  test("treats API-backed models as remote services without GGUF downloads", async () => {
+    const results = await pullModels([
+      "jina:jina-embeddings-v3",
+      "openai:gpt-5.4",
+    ]);
+
+    expect(results).toEqual([
+      {
+        model: "jina:jina-embeddings-v3",
+        path: "jina-api",
+        sizeBytes: 0,
+        refreshed: false,
+      },
+      {
+        model: "openai:gpt-5.4",
+        path: "openai-responses-api",
+        sizeBytes: 0,
+        refreshed: false,
+      },
+    ]);
   });
 });
 
@@ -552,6 +587,58 @@ describe("LlamaCpp rerank deduping", () => {
 });
 
 describe("LlamaCpp Jina rerank", () => {
+  test("uses OpenAI Responses API for query expansion models", async () => {
+    const previousApiKey = process.env.OPENAI_API_KEY;
+    const previousBaseUrl = process.env.OPENAI_BASE_URL;
+    const previousFetch = globalThis.fetch;
+    process.env.OPENAI_API_KEY = "redaction-sentinel";
+    process.env.OPENAI_BASE_URL = "http://gateway.local";
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body));
+      expect(request.model).toBe("gpt-5.4");
+      expect(request.stream).toBe(true);
+      return new Response([
+        "event: response.output_text.delta",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"lex: deep modules\\n\"}",
+        "",
+        "event: response.output_text.delta",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"vec: module depth\\n\"}",
+        "",
+        "event: response.completed",
+        "data: {\"type\":\"response.completed\"}",
+        "",
+      ].join("\n"));
+    });
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    try {
+      const llm = new LlamaCpp({ generateModel: "openai:gpt-5.4" }) as any;
+      llm._ciMode = false;
+      const result = await llm.expandQuery("deep modules");
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://gateway.local/responses",
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({
+            Authorization: "Bearer redaction-sentinel",
+            Accept: "text/event-stream",
+          }),
+        }),
+      );
+      expect(result).toEqual([
+        { type: "lex", text: "deep modules" },
+        { type: "vec", text: "module depth" },
+      ]);
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousApiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousApiKey;
+      if (previousBaseUrl === undefined) delete process.env.OPENAI_BASE_URL;
+      else process.env.OPENAI_BASE_URL = previousBaseUrl;
+    }
+  });
+
   test("uses Jina API for embedding models", async () => {
     const previousApiKey = process.env.JINA_API_KEY;
     const previousGraphVault = process.env.QMD_GRAPH_VAULT;

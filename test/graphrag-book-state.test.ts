@@ -127,6 +127,24 @@ describe("syncGraphRagBookWorkspace", () => {
     ).toThrow("strict");
   });
 
+  test("projects Jina API base without unsupported placeholder fallback", () => {
+    const projection = buildGraphRagRuntimeSettingsProjection({
+      ...projectConfig,
+      providers: {
+        ...projectConfig.providers,
+        jina: {
+          ...projectConfig.providers?.jina,
+          base_url_env: "JINA_API_BASE",
+          base_url: "https://api.jina.ai",
+        },
+      },
+    });
+
+    const embedding = (projection.settings.embedding_models as any)
+      .default_embedding_model;
+    expect(embedding.api_base).toBe("https://api.jina.ai");
+  });
+
   test("includes provider request boundary in high-cost recovery fingerprints", async () => {
     const root = await createWorkspace();
     try {

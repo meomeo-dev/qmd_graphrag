@@ -2865,6 +2865,21 @@ export async function chunkDocumentByTokens(
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
   const llm = getDefaultLlamaCpp();
+  if (llm.supportsNativeEmbeddingTokenizer?.() === false) {
+    const chunks = await chunkDocumentAsync(
+      content,
+      maxTokens * 3,
+      overlapTokens * 3,
+      windowTokens * 3,
+      filepath,
+      chunkStrategy,
+    );
+    return chunks.map((chunk) => ({
+      text: chunk.text,
+      pos: chunk.pos,
+      tokens: Math.ceil(chunk.text.length / 3),
+    }));
+  }
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio

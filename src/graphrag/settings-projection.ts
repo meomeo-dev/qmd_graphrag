@@ -25,6 +25,10 @@ function modelName(value: string | undefined, fallback: string): string {
   return separator < 0 ? value : value.slice(separator + 1);
 }
 
+function jinaApiBase(value: string | undefined): string {
+  return value ?? "https://api.jina.ai";
+}
+
 export function graphRagProjectConfigFingerprint(config: CollectionConfig): string {
   return createDeterministicHash({
     models: config.models ?? {},
@@ -61,8 +65,8 @@ export function buildGraphRagRuntimeSettingsProjection(
       managed_by: ManagedBy,
       source_fingerprint: sourceFingerprint,
       jina: {
-        api_base: envPlaceholder(jina.base_url_env, "JINA_API_BASE"),
-        default_base_url: jina.base_url ?? "https://api.jina.ai",
+        api_base: jinaApiBase(jina.base_url),
+        default_base_url: jinaApiBase(jina.base_url),
         embedding_endpoint: jina.embedding_endpoint ?? "/v1/embeddings",
         rerank_endpoint: jina.rerank_endpoint ?? "/v1/rerank",
       },
@@ -100,9 +104,9 @@ export function buildGraphRagRuntimeSettingsProjection(
           "jina-embeddings-v3",
         ),
         api_key: envPlaceholder(jina.api_key_env, "JINA_API_KEY"),
-        api_base: envPlaceholder(jina.base_url_env, "JINA_API_BASE"),
+        api_base: jinaApiBase(jina.base_url),
         call_args: {
-          default_base_url: jina.base_url ?? "https://api.jina.ai",
+          default_base_url: jinaApiBase(jina.base_url),
           embedding_endpoint: jina.embedding_endpoint ?? "/v1/embeddings",
         },
       },

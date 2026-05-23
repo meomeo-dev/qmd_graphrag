@@ -3272,6 +3272,38 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("generateEmbeddings does not require native tokenizer for Jina embeddings", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+    const model = "jina:jina-embeddings-v3";
+
+    setDefaultLlamaCpp({
+      supportsNativeEmbeddingTokenizer: () => false,
+      async tokenize() {
+        throw new Error("native tokenizer should not be used");
+      },
+      async detokenize() {
+        throw new Error("native detokenizer should not be used");
+      },
+    } as any);
+    store.llm = { ...fakeLlm, embedModelName: model } as any;
+
+    try {
+      await insertTestDocument(db, "docs", { name: "one", body: "# One\n\nAlpha" });
+
+      const result = await generateEmbeddings(store);
+
+      expect(result.errors).toBe(0);
+      expect(result.chunksEmbedded).toBe(1);
+      expect(fakeLlm.embedBatchModelCalls[0]?.model).toBe(model);
+      expect(db.prepare(`SELECT DISTINCT model FROM content_vectors`).all()).toEqual([{ model }]);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
   test("generateEmbeddings does not mark a partially embedded multi-chunk document complete", async () => {
     const store = await createTestStore();
     const db = store.db;

@@ -22,6 +22,8 @@ finetune/outputs/
 finetune/data/train/
 .claude/
 .env
+.qmd/*.sqlite
+.qmd/*.sqlite-*
 graph_vault/
 inbox/
 tmp/

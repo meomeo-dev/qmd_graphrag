@@ -17,6 +17,10 @@ import {
   JinaRerankRequestSchema,
   JinaRerankResponseSchema,
 } from "./contracts/jina.js";
+import {
+  OpenAIResponsesRequestSchema,
+  OpenAIResponsesResponseSchema,
+} from "./contracts/provider.js";
 import { loadConfig, type CollectionConfig } from "./collections.js";
 import { ProviderRequestFingerprintSchema } from "./contracts/provider.js";
 import type { ProviderCostLineageMode } from "./contracts/provider.js";
@@ -345,6 +349,52 @@ function resolveProviderCostLineageMode(
   return hasCorpusIdentity ? "corpus_artifact" : "transient_query";
 }
 
+function parseSseEvents(body: string): Array<{ event: string; data: string }> {
+  const events: Array<{ event: string; data: string }> = [];
+  let event = "message";
+  let dataLines: string[] = [];
+
+  const flush = () => {
+    if (dataLines.length > 0) {
+      events.push({ event, data: dataLines.join("\n") });
+    }
+    event = "message";
+    dataLines = [];
+  };
+
+  for (const line of body.split(/\r?\n/u)) {
+    if (line === "") {
+      flush();
+      continue;
+    }
+    if (line.startsWith("event:")) {
+      event = line.slice("event:".length).trim();
+      continue;
+    }
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice("data:".length).trimStart());
+    }
+  }
+  flush();
+  return events;
+}
+
+function parseTypedQueryExpansion(text: string, includeLexical: boolean): Queryable[] {
+  return text
+    .split(/\r?\n/u)
+    .map((line) => {
+      const colon = line.indexOf(":");
+      if (colon < 0) return null;
+      const type = line.slice(0, colon).trim();
+      if (type !== "lex" && type !== "vec" && type !== "hyde") return null;
+      if (!includeLexical && type === "lex") return null;
+      const query = line.slice(colon + 1).trim();
+      if (!query) return null;
+      return { type, text: query } satisfies Queryable;
+    })
+    .filter((item): item is Queryable => item != null);
+}
+
 // =============================================================================
 // Model Configuration
 // =============================================================================
@@ -357,6 +407,8 @@ const DEFAULT_RERANK_MODEL = "jina:jina-reranker-v3";
 const JINA_EMBED_PREFIX = "jina:";
 const JINA_RERANK_PREFIX = "jina:";
 const DEFAULT_JINA_API_BASE = "https://api.jina.ai";
+const OPENAI_RESPONSES_PREFIX = "openai:";
+const DEFAULT_OPENAI_RESPONSES_ENDPOINT = "/responses";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 
@@ -394,6 +446,16 @@ export function isJinaRerankModel(model: string): boolean {
 
 export function isJinaEmbeddingModel(model: string): boolean {
   return model.startsWith(JINA_EMBED_PREFIX);
+}
+
+export function isOpenAIResponsesModel(model: string): boolean {
+  return model.startsWith(OPENAI_RESPONSES_PREFIX);
+}
+
+function resolveOpenAIResponsesModelName(model: string): string {
+  return isOpenAIResponsesModel(model)
+    ? model.slice(OPENAI_RESPONSES_PREFIX.length)
+    : model;
 }
 
 function resolveJinaEmbeddingModelName(model: string): string {
@@ -467,6 +529,43 @@ function resolveJinaApiKey(): string {
     );
   }
   return apiKey;
+}
+
+function resolveOpenAIResponsesProviderConfig(config: CollectionConfig = loadRuntimeConfig()) {
+  const provider = config.providers?.openai;
+  const responseApi = provider?.response_api;
+  return {
+    apiKeyEnv: provider?.api_key_env ?? "OPENAI_API_KEY",
+    baseUrlEnv: provider?.base_url_env ?? "OPENAI_BASE_URL",
+    endpoint: responseApi?.endpoint ?? DEFAULT_OPENAI_RESPONSES_ENDPOINT,
+    stream: responseApi?.stream ?? true,
+    reasoningEffort: responseApi?.reasoning_effort,
+    strictStructuredOutput: responseApi?.strict_structured_output ?? true,
+  };
+}
+
+function resolveOpenAIResponsesApiKey(): string {
+  const config = resolveOpenAIResponsesProviderConfig();
+  const apiKey = envValue(config.apiKeyEnv, "OPENAI_API_KEY");
+  if (!apiKey) {
+    throw new Error(`${config.apiKeyEnv} is required for OpenAI Responses models`);
+  }
+  return apiKey;
+}
+
+function resolveOpenAIResponsesApiUrl(): string {
+  const config = resolveOpenAIResponsesProviderConfig();
+  if (config.endpoint !== DEFAULT_OPENAI_RESPONSES_ENDPOINT) {
+    throw new Error("OpenAI Responses API endpoint must be /responses");
+  }
+  if (config.stream !== true) {
+    throw new Error("OpenAI Responses API stream transport must be enabled");
+  }
+  const baseUrl = envValue(config.baseUrlEnv, "OPENAI_BASE_URL");
+  if (!baseUrl) {
+    throw new Error(`${config.baseUrlEnv} is required for OpenAI Responses models`);
+  }
+  return `${baseUrl.replace(/\/+$/u, "")}${config.endpoint}`;
 }
 
 export function resolveModels(config?: ModelResolutionConfig): Required<ModelResolutionConfig> {
@@ -649,10 +748,19 @@ export async function pullModels(
 
   const results: PullResult[] = [];
   for (const model of models) {
-    if (isJinaRerankModel(model)) {
+    if (isJinaEmbeddingModel(model) || isJinaRerankModel(model)) {
       results.push({
         model,
         path: "jina-api",
+        sizeBytes: 0,
+        refreshed: false,
+      });
+      continue;
+    }
+    if (isOpenAIResponsesModel(model)) {
+      results.push({
+        model,
+        path: "openai-responses-api",
         sizeBytes: 0,
         refreshed: false,
       });
@@ -730,6 +838,12 @@ export interface LLM {
    * Check if a model exists/is available
    */
   modelExists(model: string): Promise<ModelInfo>;
+
+  /**
+   * Whether the active embedding model exposes a local tokenizer. API-backed
+   * embedding models such as Jina do not require local GGUF model loading.
+   */
+  supportsNativeEmbeddingTokenizer?(): boolean;
 
   /**
    * Expand a search query into multiple variations for different backends.
@@ -936,6 +1050,10 @@ export class LlamaCpp implements LLM {
 
   get rerankModelName(): string {
     return this.rerankModelUri;
+  }
+
+  supportsNativeEmbeddingTokenizer(): boolean {
+    return !isJinaEmbeddingModel(this.embedModelUri);
   }
 
   /**
@@ -1712,8 +1830,115 @@ export class LlamaCpp implements LLM {
     await appendProviderCostAccounting(graphVault, record);
   }
 
+  private async callOpenAIResponsesText(
+    input: string,
+    model: string,
+    options: {
+      maxTokens?: number;
+      metadata?: Record<string, string | number | boolean | null>;
+    } = {},
+  ): Promise<GenerateResult> {
+    const modelName = resolveOpenAIResponsesModelName(model);
+    const provider = resolveOpenAIResponsesProviderConfig();
+    const request = OpenAIResponsesRequestSchema.parse({
+      model: modelName,
+      input,
+      stream: true,
+      ...(provider.reasoningEffort
+        ? { reasoning: { effort: provider.reasoningEffort } }
+        : {}),
+      metadata: {
+        ...(options.metadata ?? {}),
+        ...(options.maxTokens ? { max_completion_tokens: options.maxTokens } : {}),
+      },
+    });
+    const response = await fetch(resolveOpenAIResponsesApiUrl(), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${resolveOpenAIResponsesApiKey()}`,
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+      },
+      body: JSON.stringify(request),
+    });
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      const detail = body ? `: ${body.slice(0, 300)}` : "";
+      throw new Error(`OpenAI Responses request failed (${response.status})${detail}`);
+    }
+
+    const text = await this.collectOpenAIResponsesStreamText(response);
+    const parsed = OpenAIResponsesResponseSchema.parse({
+      model: modelName,
+      outputText: text,
+    });
+    await this.recordProviderCost({
+      stage: "query_expansion",
+      provider: "openai_responses",
+      model: modelName,
+      requestCount: 1,
+      tokenCount: 0,
+      tokenCountStatus: "unknown",
+      embeddingCount: 0,
+      embeddingCountStatus: "reported",
+      requestFingerprint: createDeterministicHash(request),
+      metadata: options.metadata,
+    });
+    return {
+      text: parsed.outputText ?? "",
+      model,
+      done: true,
+    };
+  }
+
+  private async collectOpenAIResponsesStreamText(response: Response): Promise<string> {
+    const body = await response.text();
+    const textParts: string[] = [];
+    for (const event of parseSseEvents(body)) {
+      if (event.data === "[DONE]") continue;
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(event.data) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      const type = String(payload.type ?? event.event ?? "");
+      if (type === "response.output_text.delta") {
+        textParts.push(String(payload.delta ?? ""));
+        continue;
+      }
+      if (type === "response.output_text.done" && textParts.length === 0) {
+        textParts.push(String(payload.text ?? ""));
+        continue;
+      }
+      if (type === "error" || type === "response.failed" || type === "response.incomplete") {
+        const error = payload.error;
+        const message = typeof error === "object" && error != null && "message" in error
+          ? String((error as { message?: unknown }).message)
+          : JSON.stringify(payload);
+        throw new Error(`OpenAI Responses stream failed: ${message}`);
+      }
+    }
+    return textParts.join("");
+  }
+
+  private async generateWithOpenAIResponses(
+    prompt: string,
+    model: string,
+    options: GenerateOptions,
+  ): Promise<GenerateResult> {
+    return this.callOpenAIResponsesText(prompt, model, {
+      maxTokens: options.maxTokens,
+      metadata: { operation: "generate" },
+    });
+  }
+
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    const modelName = options.model ?? this.generateModelUri;
+    if (isOpenAIResponsesModel(modelName)) {
+      return this.generateWithOpenAIResponses(prompt, modelName, options);
+    }
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1754,8 +1979,37 @@ export class LlamaCpp implements LLM {
     }
   }
 
+  private async expandQueryWithOpenAIResponses(
+    query: string,
+    options: { includeLexical?: boolean; intent?: string } = {},
+  ): Promise<Queryable[]> {
+    const includeLexical = options.includeLexical ?? true;
+    const prompt = [
+      "Expand the search query into typed retrieval lines.",
+      "Return only lines in the format `lex: ...`, `vec: ...`, or `hyde: ...`.",
+      includeLexical
+        ? "Include lexical and semantic variants."
+        : "Do not include lexical variants.",
+      options.intent ? `Query intent: ${options.intent}` : "",
+      `Query: ${query}`,
+    ].filter(Boolean).join("\n");
+    const result = await this.callOpenAIResponsesText(prompt, this.generateModelUri, {
+      maxTokens: 600,
+      metadata: { operation: "query_expansion" },
+    });
+    const queryables = parseTypedQueryExpansion(result.text, includeLexical);
+    if (queryables.length > 0) return queryables;
+
+    const fallback: Queryable[] = [{ type: "vec", text: query }];
+    if (includeLexical) fallback.unshift({ type: "lex", text: query });
+    return fallback;
+  }
+
   async modelExists(modelUri: string): Promise<ModelInfo> {
-    if (isJinaRerankModel(modelUri)) {
+    if (isOpenAIResponsesModel(modelUri)) {
+      return { name: modelUri, exists: true };
+    }
+    if (isJinaEmbeddingModel(modelUri) || isJinaRerankModel(modelUri)) {
       return { name: modelUri, exists: true };
     }
 
@@ -1779,6 +2033,9 @@ export class LlamaCpp implements LLM {
 
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+    if (isOpenAIResponsesModel(this.generateModelUri)) {
+      return this.expandQueryWithOpenAIResponses(query, options);
+    }
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
