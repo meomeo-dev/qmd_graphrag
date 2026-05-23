@@ -12,6 +12,7 @@ import json
 
 import pandas as pd
 import yaml
+import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "python"))
@@ -470,6 +471,35 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                     }
                 ],
             )
+
+    def test_filter_graphrag_frames_for_scope_accepts_parquet_list_values(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmd-bridge-scope-") as tmp:
+            root = Path(tmp)
+            _write_books(root)
+            frames = _frames()
+            frames["documents"].at[0, "text_unit_ids"] = np.array(["tu-1"])
+            frames["communities"].at[0, "text_unit_ids"] = np.array(["tu-1"])
+
+            scoped, _evidence_scope = _filter_graphrag_frames_for_scope(
+                root,
+                frames,
+                ["book-1"],
+                [
+                    {
+                        "capabilityId": "book-1:graph_query",
+                        "bookId": "book-1",
+                        "sourceId": "sha256:source-1",
+                        "documentId": "doc-1",
+                        "contentHash": "content-1",
+                        "artifactIds": ["artifact-1", "artifact-1-lancedb"],
+                    }
+                ],
+            )
+
+            self.assertEqual(scoped["documents"]["id"].tolist(), ["doc-1"])
+            self.assertEqual(scoped["communities"]["community"].tolist(), [1])
 
     def test_build_graphrag_evidence_uses_text_unit_lineage(self) -> None:
         with tempfile.TemporaryDirectory(prefix="qmd-bridge-evidence-") as tmp:

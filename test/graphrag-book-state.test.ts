@@ -142,7 +142,7 @@ describe("syncGraphRagBookWorkspace", () => {
 
     const embedding = (projection.settings.embedding_models as any)
       .default_embedding_model;
-    expect(embedding.api_base).toBe("https://api.jina.ai");
+    expect(embedding.api_base).toBe("https://api.jina.ai/v1");
   });
 
   test("includes provider request boundary in high-cost recovery fingerprints", async () => {

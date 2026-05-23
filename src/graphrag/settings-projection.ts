@@ -29,6 +29,11 @@ function jinaApiBase(value: string | undefined): string {
   return value ?? "https://api.jina.ai";
 }
 
+function jinaLiteLlmApiBase(value: string | undefined): string {
+  const base = jinaApiBase(value).replace(/\/+$/u, "");
+  return base.endsWith("/v1") ? base : `${base}/v1`;
+}
+
 export function graphRagProjectConfigFingerprint(config: CollectionConfig): string {
   return createDeterministicHash({
     models: config.models ?? {},
@@ -104,7 +109,7 @@ export function buildGraphRagRuntimeSettingsProjection(
           "jina-embeddings-v3",
         ),
         api_key: envPlaceholder(jina.api_key_env, "JINA_API_KEY"),
-        api_base: jinaApiBase(jina.base_url),
+        api_base: jinaLiteLlmApiBase(jina.base_url),
         call_args: {
           default_base_url: jinaApiBase(jina.base_url),
           embedding_endpoint: jina.embedding_endpoint ?? "/v1/embeddings",

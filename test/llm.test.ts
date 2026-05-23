@@ -639,6 +639,46 @@ describe("LlamaCpp Jina rerank", () => {
     }
   });
 
+  test("retries retryable OpenAI Responses stream errors", async () => {
+    const previousApiKey = process.env.OPENAI_API_KEY;
+    const previousBaseUrl = process.env.OPENAI_BASE_URL;
+    const previousFetch = globalThis.fetch;
+    process.env.OPENAI_API_KEY = "redaction-sentinel";
+    process.env.OPENAI_BASE_URL = "http://gateway.local";
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response([
+        "event: response.failed",
+        "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"Concurrency limit exceeded for user, please retry later\"}}",
+        "",
+      ].join("\n")))
+      .mockResolvedValueOnce(new Response([
+        "event: response.output_text.delta",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"vec: module depth\\n\"}",
+        "",
+        "event: response.completed",
+        "data: {\"type\":\"response.completed\"}",
+        "",
+      ].join("\n")));
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    try {
+      const llm = new LlamaCpp({ generateModel: "openai:gpt-5.4" }) as any;
+      llm._ciMode = false;
+      const result = await llm.expandQuery("deep modules", {
+        includeLexical: false,
+      });
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result).toEqual([{ type: "vec", text: "module depth" }]);
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousApiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousApiKey;
+      if (previousBaseUrl === undefined) delete process.env.OPENAI_BASE_URL;
+      else process.env.OPENAI_BASE_URL = previousBaseUrl;
+    }
+  });
+
   test("uses Jina API for embedding models", async () => {
     const previousApiKey = process.env.JINA_API_KEY;
     const previousGraphVault = process.env.QMD_GRAPH_VAULT;

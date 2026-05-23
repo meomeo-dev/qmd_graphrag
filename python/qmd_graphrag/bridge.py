@@ -193,6 +193,11 @@ def _value_id_set(value: Any) -> set[str]:
             except Exception:  # noqa: BLE001
                 return {text}
         return {text}
+    if hasattr(value, "tolist"):
+        try:
+            return _value_id_set(value.tolist())
+        except Exception:  # noqa: BLE001
+            pass
     return {str(value)}
 
 

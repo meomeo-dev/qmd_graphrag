@@ -395,6 +395,26 @@ function parseTypedQueryExpansion(text: string, includeLexical: boolean): Querya
     .filter((item): item is Queryable => item != null);
 }
 
+function isOpenAIResponsesRetryableError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return (
+    message.includes("concurrency limit") ||
+    message.includes("rate limit") ||
+    message.includes("temporarily unavailable") ||
+    message.includes("timeout") ||
+    message.includes("(429)") ||
+    message.includes("(500)") ||
+    message.includes("(502)") ||
+    message.includes("(503)") ||
+    message.includes("(504)")
+  );
+}
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // =============================================================================
 // Model Configuration
 // =============================================================================
@@ -409,6 +429,7 @@ const JINA_RERANK_PREFIX = "jina:";
 const DEFAULT_JINA_API_BASE = "https://api.jina.ai";
 const OPENAI_RESPONSES_PREFIX = "openai:";
 const DEFAULT_OPENAI_RESPONSES_ENDPOINT = "/responses";
+const OPENAI_RESPONSES_MAX_RETRIES = 3;
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 
@@ -1852,22 +1873,44 @@ export class LlamaCpp implements LLM {
         ...(options.maxTokens ? { max_completion_tokens: options.maxTokens } : {}),
       },
     });
-    const response = await fetch(resolveOpenAIResponsesApiUrl(), {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${resolveOpenAIResponsesApiKey()}`,
-        "Content-Type": "application/json",
-        Accept: "text/event-stream",
-      },
-      body: JSON.stringify(request),
-    });
-    if (!response.ok) {
-      const body = await response.text().catch(() => "");
-      const detail = body ? `: ${body.slice(0, 300)}` : "";
-      throw new Error(`OpenAI Responses request failed (${response.status})${detail}`);
+    let text = "";
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= OPENAI_RESPONSES_MAX_RETRIES; attempt += 1) {
+      try {
+        const response = await fetch(resolveOpenAIResponsesApiUrl(), {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${resolveOpenAIResponsesApiKey()}`,
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+          },
+          body: JSON.stringify(request),
+        });
+        if (!response.ok) {
+          const body = await response.text().catch(() => "");
+          const detail = body ? `: ${body.slice(0, 300)}` : "";
+          throw new Error(
+            `OpenAI Responses request failed (${response.status})${detail}`,
+          );
+        }
+        text = await this.collectOpenAIResponsesStreamText(response);
+        lastError = undefined;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (
+          attempt >= OPENAI_RESPONSES_MAX_RETRIES ||
+          !isOpenAIResponsesRetryableError(error)
+        ) {
+          throw error;
+        }
+        await delayMs(750 * 2 ** attempt);
+      }
+    }
+    if (lastError !== undefined) {
+      throw lastError;
     }
 
-    const text = await this.collectOpenAIResponsesStreamText(response);
     const parsed = OpenAIResponsesResponseSchema.parse({
       model: modelName,
       outputText: text,
