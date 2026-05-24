@@ -819,6 +819,191 @@ describe("syncGraphRagBookWorkspace", () => {
     }
   });
 
+  test("accepts pyarrow parquet artifacts produced by a real GraphRAG stage", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+      await writeFile(join(graphVault, "settings.yaml"), "vector_store: {}\n", "utf8");
+      await writeFile(join(graphVault, "prompts", "extract_graph.txt"), "prompt", "utf8");
+
+      const initial = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        recordRecoveredStages: false,
+      });
+      const outputDir = graphRagBookOutputDir({
+        stateRootDir: graphVault,
+        bookId: initial.job.bookId,
+      });
+      await writeMinimalGraphOutput(outputDir);
+      await writeGraphRagOutputProducerManifest({
+        outputDir,
+        bookId: initial.job.bookId,
+        sourceHash: initial.job.sourceHash,
+        documentId: initial.job.documentId,
+        contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+        stageFingerprints: initial.stageFingerprints,
+        providerFingerprint: initial.job.providerFingerprint!,
+        producerRunId: "real-graph-run",
+        stage: "graph_extract",
+      });
+
+      const synced = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        recordRecoveredStages: false,
+      });
+      await expect(assertGraphRagStageArtifactsReady({
+        stateRootDir: graphVault,
+        bookId: initial.job.bookId,
+        stage: "graph_extract",
+        producerRunId: "real-graph-run",
+        artifacts: synced.artifacts,
+      })).resolves.toEqual(
+        expect.arrayContaining(
+          synced.artifacts
+            .filter((item) =>
+              item.stage === "graph_extract" &&
+              item.producerRunId === "real-graph-run" &&
+              item.kind.endsWith("_parquet")
+            )
+            .map((item) => item.artifactId),
+        ),
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps graph_extract ready when mutable stats sidecar changes", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+      await writeFile(join(graphVault, "settings.yaml"), "vector_store: {}\n", "utf8");
+      await writeFile(join(graphVault, "prompts", "extract_graph.txt"), "prompt", "utf8");
+
+      const initial = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        recordRecoveredStages: false,
+      });
+      const outputDir = graphRagBookOutputDir({
+        stateRootDir: graphVault,
+        bookId: initial.job.bookId,
+      });
+      await writeMinimalGraphOutput(outputDir);
+      await writeGraphRagOutputProducerManifest({
+        outputDir,
+        bookId: initial.job.bookId,
+        sourceHash: initial.job.sourceHash,
+        documentId: initial.job.documentId,
+        contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+        stageFingerprints: initial.stageFingerprints,
+        providerFingerprint: initial.job.providerFingerprint!,
+        producerRunId: "graph-run",
+        stage: "graph_extract",
+      });
+      const synced = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        recordRecoveredStages: false,
+      });
+      await writeFile(join(outputDir, "stats.json"), '{"workflows":{"later":1}}', "utf8");
+
+      const artifactIds = await assertGraphRagStageArtifactsReady({
+        stateRootDir: graphVault,
+        bookId: initial.job.bookId,
+        stage: "graph_extract",
+        producerRunId: "graph-run",
+        artifacts: synced.artifacts,
+      });
+
+      expect(artifactIds).toHaveLength(6);
+      expect(
+        synced.artifacts.some((artifact) =>
+          artifact.kind === "graphrag_stats_json" &&
+          artifact.producerRunId === "graph-run"
+        ),
+      ).toBe(true);
+
+      const repo = new FileBookJobStateRepository(graphVault);
+      await repo.completeStage({
+        bookId: initial.job.bookId,
+        stage: "ingest",
+        runId: "ingest-run",
+        inputFingerprint: synced.stageFingerprints.ingest,
+        stageFingerprint: synced.stageFingerprints.ingest,
+        providerFingerprint: synced.job.providerFingerprint,
+        artifactIds: synced.artifacts
+          .filter((artifact) => artifact.stage === "ingest")
+          .map((artifact) => artifact.artifactId),
+      });
+      await repo.completeStage({
+        bookId: initial.job.bookId,
+        stage: "normalize",
+        runId: "normalize-run",
+        inputFingerprint: synced.stageFingerprints.normalize,
+        stageFingerprint: synced.stageFingerprints.normalize,
+        providerFingerprint: synced.job.providerFingerprint,
+        artifactIds: synced.artifacts
+          .filter((artifact) => artifact.stage === "normalize")
+          .map((artifact) => artifact.artifactId),
+      });
+      await repo.completeStage({
+        bookId: initial.job.bookId,
+        stage: "graph_extract",
+        runId: "graph-run",
+        inputFingerprint: synced.stageFingerprints.graph_extract,
+        stageFingerprint: synced.stageFingerprints.graph_extract,
+        providerFingerprint: synced.job.providerFingerprint,
+        artifactIds: synced.artifacts
+          .filter((artifact) => artifact.stage === "graph_extract")
+          .map((artifact) => artifact.artifactId),
+      });
+      const resumed = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        recordRecoveredStages: false,
+      });
+      expect(resumed.resumePlan.completedStages).toContain("graph_extract");
+      expect(resumed.resumePlan.nextStage).toBe("community_report");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("publishes query-ready from book-scoped validated artifacts", async () => {
     const root = await createWorkspace();
     try {

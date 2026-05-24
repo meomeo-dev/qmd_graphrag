@@ -1087,7 +1087,6 @@ const graphStageArtifactKinds = {
     "graphrag_relationships_parquet",
     "graphrag_communities_parquet",
     "graphrag_context_json",
-    "graphrag_stats_json",
   ],
   community_report: ["graphrag_community_reports_parquet"],
   embed: ["lancedb_index"],
@@ -1398,8 +1397,23 @@ function validateGraphStageEvidence({
     };
   }
 
+  const requiredKinds = new Set(graphStageArtifactKinds[stage]);
+  const gateArtifactIds = artifactIds.filter((artifactId) => {
+    const artifact = artifacts.find((candidate) =>
+      String(candidate?.artifactId) === artifactId
+    );
+    return artifact != null && requiredKinds.has(artifact.kind);
+  });
+  if (gateArtifactIds.length === 0) {
+    return {
+      ok: false,
+      reason: "stage_artifact_missing",
+      artifactIds,
+    };
+  }
+
   const stageArtifacts = [];
-  for (const artifactId of artifactIds) {
+  for (const artifactId of gateArtifactIds) {
     const artifact = artifacts.find((candidate) =>
       String(candidate?.artifactId) === artifactId
     );
@@ -1413,7 +1427,7 @@ function validateGraphStageEvidence({
     }
     stageArtifacts.push(artifact);
   }
-  if (stageArtifacts.length !== artifactIds.length) {
+  if (stageArtifacts.length !== gateArtifactIds.length) {
     return {
       ok: false,
       reason: "stage_artifact_missing",

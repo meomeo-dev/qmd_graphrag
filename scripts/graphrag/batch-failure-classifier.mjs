@@ -30,15 +30,30 @@ export function classifyFailure(text) {
       ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
     };
   }
-  const transient =
-    message.includes("concurrency limit") ||
-    message.includes("partial-output") ||
-    message.includes("partial output") ||
+  const localArtifactGateFailure =
     message.includes("missingartifactkinds") ||
     message.includes("missing artifact kinds") ||
     message.includes("missingartifactids") ||
     message.includes("missing artifact ids") ||
+    message.includes("invalidartifacts") ||
+    message.includes("invalid artifacts") ||
     message.includes("did not produce valid book-scoped artifacts") ||
+    message.includes("producer_run_id_mismatch") ||
+    message.includes("stage_fingerprint_mismatch") ||
+    message.includes("provider_fingerprint_mismatch") ||
+    message.includes("corpus_content_hash_mismatch") ||
+    message.includes("artifact_not_book_scoped_graph_output");
+  if (localArtifactGateFailure) {
+    return {
+      failureKind: "permanent",
+      retryable: false,
+      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+    };
+  }
+  const transient =
+    message.includes("concurrency limit") ||
+    message.includes("partial-output") ||
+    message.includes("partial output") ||
     message.includes("no report found for community") ||
     message.includes("community report extraction error") ||
     message.includes("error generating community report") ||
@@ -48,6 +63,7 @@ export function classifyFailure(text) {
     message.includes("kind=server_error") ||
     message.includes("kind=rate_limit_exceeded") ||
     message.includes("kind=timeout") ||
+    message.includes("stream_read_error") ||
     message.includes("timeout") ||
     message.includes("timed out") ||
     message.includes("service unavailable") ||

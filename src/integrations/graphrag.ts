@@ -39,16 +39,16 @@ function delayMs(ms: number): Promise<void> {
 function isRetryableGraphRagQueryError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const message = error.message.toLowerCase();
+  const statusMatch = /(?:http|status(?: code)?|error code|code)[^\d]*([5]\d\d)/iu
+    .exec(message) ?? /\(([5]\d\d)\)/iu.exec(message);
   return (
     message.includes("concurrency limit") ||
     message.includes("rate limit") ||
     message.includes("temporarily unavailable") ||
+    message.includes("stream_read_error") ||
     message.includes("timeout") ||
     message.includes("(429)") ||
-    message.includes("(500)") ||
-    message.includes("(502)") ||
-    message.includes("(503)") ||
-    message.includes("(504)")
+    statusMatch != null
   );
 }
 

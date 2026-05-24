@@ -153,6 +153,24 @@ function indexScopeFromSync(sync) {
   };
 }
 
+function isLocalArtifactGateError(value) {
+  const message = String(value ?? "").toLowerCase();
+  return (
+    message.includes("did not produce valid book-scoped artifacts") ||
+    message.includes("missingartifactkinds") ||
+    message.includes("missing artifact kinds") ||
+    message.includes("missingartifactids") ||
+    message.includes("missing artifact ids") ||
+    message.includes("invalidartifacts") ||
+    message.includes("invalid artifacts") ||
+    message.includes("producer_run_id_mismatch") ||
+    message.includes("stage_fingerprint_mismatch") ||
+    message.includes("provider_fingerprint_mismatch") ||
+    message.includes("corpus_content_hash_mismatch") ||
+    message.includes("artifact_not_book_scoped_graph_output")
+  );
+}
+
 async function graphQueryScopeFromSync(sync, loadGraphQueryCapabilities) {
   const sourceId = `sha256:${sync.job.sourceHash}`;
   const capabilities = await loadGraphQueryCapabilities({
@@ -302,6 +320,63 @@ async function refreshOutputProducerManifestFromCheckpoints(
   }
 }
 
+async function repairLocalArtifactGateFailureIfPossible({
+  runtimeApi,
+  repo,
+  sync,
+  scopedOutputDir,
+}) {
+  const nextStage = sync.resumePlan.nextStage;
+  if (!["graph_extract", "community_report", "embed"].includes(nextStage)) {
+    return false;
+  }
+  const checkpoints = await repo.listStageCheckpoints(sync.job.bookId);
+  const checkpoint = checkpoints.find((item) => item.stage === nextStage);
+  if (
+    checkpoint == null ||
+    checkpoint.status !== "failed" ||
+    typeof checkpoint.runId !== "string" ||
+    !isLocalArtifactGateError(checkpoint.errorSummary)
+  ) {
+    return false;
+  }
+
+  await runtimeApi.writeGraphRagOutputProducerManifest({
+    outputDir: scopedOutputDir,
+    bookId: sync.job.bookId,
+    sourceHash: sync.job.sourceHash,
+    documentId: sync.job.documentId,
+    contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
+    stageFingerprints: sync.stageFingerprints,
+    providerFingerprint: sync.job.providerFingerprint,
+    producerRunId: checkpoint.runId,
+    stage: nextStage,
+  });
+  const artifactIds = await runtimeApi.assertGraphRagStageArtifactsReady({
+    stateRootDir: stateRoot,
+    bookId: sync.job.bookId,
+    stage: nextStage,
+    producerRunId: checkpoint.runId,
+    artifacts: sync.artifacts,
+  });
+  await repo.completeStage({
+    bookId: sync.job.bookId,
+    stage: nextStage,
+    runId: checkpoint.runId,
+    inputFingerprint: sync.stageFingerprints[nextStage],
+    contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
+    stageFingerprint: sync.stageFingerprints[nextStage],
+    providerFingerprint: sync.job.providerFingerprint,
+    artifactIds,
+    metadata: {
+      ...(checkpoint.metadata ?? {}),
+      recoveredFromLocalArtifactGateFailure: true,
+      graphWorkspace: "book_scoped",
+    },
+  });
+  return true;
+}
+
 async function run() {
   const runtimeApi = await importRuntime();
   GraphRagWorkflowNameSchemaRef = runtimeApi.GraphRagWorkflowNameSchema;
@@ -316,7 +391,7 @@ async function run() {
   });
   const { sourcePath, sourceIdentityPath, normalizedPath } =
     await resolveWorkspaceInputs();
-  const {
+  let {
     sync,
     scopedInputDir,
     scopedOutputDir,
@@ -327,6 +402,23 @@ async function run() {
     sourceIdentityPath,
     normalizedPath,
   );
+
+  for (let repairPass = 0; repairPass < 3; repairPass += 1) {
+    const repaired = await repairLocalArtifactGateFailureIfPossible({
+      runtimeApi,
+      repo,
+      sync,
+      scopedOutputDir,
+    });
+    if (!repaired) break;
+    ({ sync, scopedInputDir, scopedOutputDir } = await syncCurrentBook(
+      runtimeApi,
+      projectConfig,
+      sourcePath,
+      sourceIdentityPath,
+      normalizedPath,
+    ));
+  }
 
   const nextStage = sync.resumePlan.nextStage;
   if (nextStage == null) {
@@ -609,11 +701,15 @@ async function run() {
       stage: nextStage,
       runId,
       inputFingerprint,
+      contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
+      stageFingerprint: sync.stageFingerprints[nextStage],
+      providerFingerprint: sync.job.providerFingerprint,
       errorSummary: safeText(runtimeApi, error instanceof Error
         ? error.message
         : String(error)),
       metadata: {
         resumedFrom: nextStage,
+        graphWorkspace: "book_scoped",
       },
     });
     throw error;

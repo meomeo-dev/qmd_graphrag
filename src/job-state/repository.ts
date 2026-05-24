@@ -733,6 +733,7 @@ function buildResumePlan(
           reason: "artifact_missing",
           missingArtifactIds: validity.missingArtifactIds,
           missingArtifactKinds: validity.missingArtifactKinds,
+          invalidArtifacts: validity.invalidArtifacts,
         };
         stageStates.push(state);
         if (nextStage == null) {
@@ -806,6 +807,12 @@ type ArtifactStageValidity = {
   isSatisfied: boolean;
   missingArtifactIds: string[];
   missingArtifactKinds: BookArtifactKind[];
+  invalidArtifacts: Array<{
+    artifactId: string;
+    kind: BookArtifactKind;
+    path: string;
+    reason: string;
+  }>;
 };
 
 export class FileBookJobStateRepository {
@@ -2094,18 +2101,28 @@ export class FileBookJobStateRepository {
       }
 
       const requiredKinds = requirements[checkpoint.stage] ?? [];
+      const requiredKindSet = new Set<BookArtifactKind>(requiredKinds);
+      const artifactIds = checkpoint.artifactIds.filter((artifactId) => {
+        if (requiredKindSet.size === 0) return true;
+        const artifact = artifacts.find((candidate) =>
+          candidate.artifactId === artifactId
+        );
+        return artifact != null && requiredKindSet.has(artifact.kind);
+      });
       const queryReadyProducerRunIds = checkpoint.stage === "query_ready"
         ? producerRunIdsForQueryReady(checkpointByStage)
         : undefined;
       const artifactValidation = await validateBookArtifactSet({
         graphVault: this.rootDir,
         bookId,
-        artifactIds: checkpoint.artifactIds,
+        artifactIds,
         artifacts,
         requiredKinds,
         allowedKinds: checkpoint.stage === "query_ready"
           ? QUERY_READY_ARTIFACT_KINDS
-          : undefined,
+          : requiredKinds.length > 0
+            ? requiredKinds
+            : undefined,
         requireBookScopedGraphOutput: checkpoint.stage === "query_ready" ||
           requiredKinds.some((kind) =>
             kind === "graphrag_community_reports_parquet" ||
@@ -2131,6 +2148,7 @@ export class FileBookJobStateRepository {
         isSatisfied: artifactValidation.isSatisfied,
         missingArtifactIds: artifactValidation.missingArtifactIds,
         missingArtifactKinds: artifactValidation.missingArtifactKinds,
+        invalidArtifacts: artifactValidation.invalidArtifacts,
       });
     }
 
@@ -2186,7 +2204,10 @@ export class FileBookJobStateRepository {
     const existing = await this.getStageCheckpoint(input.bookId, input.stage);
     const now = toIsoTimestamp();
     const job = await this.getBookJob(input.bookId);
-    const artifactIds = input.artifactIds ?? existing?.artifactIds ?? [];
+    const artifactIds = input.artifactIds ??
+      (input.status === "running" || input.status === "failed"
+        ? []
+        : existing?.artifactIds ?? []);
     const stageArtifacts = artifactIds.length === 0
       ? []
       : (await this.listArtifacts(input.bookId)).filter((artifact) =>
@@ -2275,6 +2296,7 @@ export class FileBookJobStateRepository {
             JSON.stringify({
               missingArtifactIds: validation.missingArtifactIds,
               missingArtifactKinds: validation.missingArtifactKinds,
+              invalidArtifacts: validation.invalidArtifacts,
             }),
         );
       }

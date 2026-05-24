@@ -50,13 +50,14 @@ _DEFAULT_RESPONSES_RETRY_MAX_RETRIES = 12
 _DEFAULT_RESPONSES_RETRY_BASE_DELAY = 2.0
 _DEFAULT_RESPONSES_RETRY_MAX_DELAY = 120.0
 _DEFAULT_RESPONSES_RETRY_JITTER = True
-_TRANSIENT_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+_TRANSIENT_STATUS_CODES = {408, 409, 425, 429, *range(500, 600)}
 _TRANSIENT_MESSAGE_FRAGMENTS = (
     "concurrency limit",
     "rate limit",
     "temporarily unavailable",
     "timeout",
     "timed out",
+    "stream_read_error",
     "connection error",
     "connection reset",
     "server error",
@@ -67,10 +68,6 @@ _TRANSIENT_MESSAGE_FRAGMENTS = (
     "(409)",
     "(425)",
     "(429)",
-    "(500)",
-    "(502)",
-    "(503)",
-    "(504)",
 )
 _RESPONSES_GATE_LOCK = Lock()
 _RESPONSES_GATES: dict[tuple[str, str, int], "_ResponsesConcurrencyGate"] = {}

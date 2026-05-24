@@ -182,6 +182,13 @@ export const BookJobRunCatalogSchema = z.object({
   items: z.array(BookJobRunCatalogEntrySchema),
 });
 
+export const BookInvalidArtifactEvidenceSchema = z.object({
+  artifactId: z.string().min(1),
+  kind: BookArtifactKindSchema,
+  path: VaultRelativePathSchema,
+  reason: z.string().min(1),
+});
+
 export const BookResumeStageStateSchema = z.object({
   stage: BookStageSchema,
   checkpointStatus: StageCheckpointStatusSchema.nullable(),
@@ -199,6 +206,7 @@ export const BookResumeStageStateSchema = z.object({
   ]),
   missingArtifactIds: z.array(z.string().min(1)).optional(),
   missingArtifactKinds: z.array(BookArtifactKindSchema).optional(),
+  invalidArtifacts: z.array(BookInvalidArtifactEvidenceSchema).optional(),
 });
 
 export const BookResumePlanSchema = z.object({

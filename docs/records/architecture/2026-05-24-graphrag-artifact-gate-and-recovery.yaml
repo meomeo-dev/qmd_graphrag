@@ -1,0 +1,65 @@
+schemaVersion: 1.0.0
+date: 2026-05-24
+title: GraphRAG artifact gate and recovery classification
+status: accepted
+context:
+  summary: >-
+    Real EPUB batch execution produced book-scoped GraphRAG parquet artifacts
+    that Python readers could load with positive row counts, while the local
+    TypeScript artifact gate rejected them as missing GraphRAG artifact kinds.
+  observed_failure:
+    stage: graph_extract
+    symptom: did_not_produce_valid_book_scoped_artifacts
+    validator_reason: parquet_metadata_unreadable
+    impact: repeated full GraphRAG rebuilds can consume LLM budget without
+      changing the local gate outcome.
+decisions:
+  parquet_validation:
+    rule: >-
+      A GraphRAG parquet artifact is valid when its content hash matches, it is
+      a non-empty Parquet file, and row count evidence is positive. The runtime
+      first checks lightweight Parquet structure and then uses the project
+      Python environment with pyarrow or pandas as the authoritative row-count
+      reader when available.
+    invariant: >-
+      The validator fails closed when no reader can prove a positive row count.
+  artifact_gate_diagnostics:
+    rule: >-
+      Artifact set validation records typed invalid artifact evidence including
+      artifactId, kind, path, and reason. Missing catalog entries and invalid
+      on-disk artifacts are separate diagnostic states.
+    invariant: >-
+      Error summaries must expose enough redacted local evidence to determine
+      whether a failure is provider transient or local gate failure.
+  recovery_classification:
+    rule: >-
+      Provider rate limits, network timeouts, 5xx responses, and upstream
+      partial-output reports are transient. Local artifact gate, producer
+      lineage, missingArtifactIds, and missingArtifactKinds failures are
+      permanent until code or state is repaired.
+    invariant: >-
+      The batch runner must not automatically repeat a complete GraphRAG LLM
+      build for a local validation defect.
+  checkpoint_failure_evidence:
+    rule: >-
+      Failed high-cost stage checkpoints record the current run fingerprints and
+      explicit artifactIds when available. They do not silently inherit stale
+      artifactIds from an earlier checkpoint.
+    invariant: >-
+      A failed checkpoint remains diagnosable without presenting stale artifacts
+      as current evidence.
+  mutable_observability_sidecars:
+    rule: >-
+      GraphRAG stats.json is a mutable observability sidecar that later
+      workflows may rewrite. It can be cataloged for diagnostics but it is not a
+      hard completion requirement for graph_extract.
+    invariant: >-
+      A later workflow must not make an already validated graph_extract
+      checkpoint stale only because stats.json changed.
+consequences:
+  - Existing failed checkpoints caused by the old Parquet gate can be repaired
+    by re-running status or resume after the validator fix; no graph_vault reset
+    is required.
+  - Artifact gate failures stop automatic retry until the local validator or
+    persisted state is corrected.
+  - Provider transient recovery remains bounded and resumes with the same runId.

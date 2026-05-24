@@ -1456,6 +1456,10 @@ describe("GraphRAG EPUB batch runner", () => {
       failureKind: "transient",
       retryable: true,
     });
+    expect(classifyFailure("openai.APIError: stream_read_error")).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+    });
     expect(classifyFailure(
       "Responses API transient error kind=server_error status_code=unknown",
     )).toMatchObject({
@@ -1476,8 +1480,8 @@ describe("GraphRAG EPUB batch runner", () => {
       "GraphRAG stage did not produce valid book-scoped artifacts: " +
       "{\"missingArtifactKinds\":[\"graphrag_documents_parquet\"]}",
     )).toMatchObject({
-      failureKind: "transient",
-      retryable: true,
+      failureKind: "permanent",
+      retryable: false,
     });
     expect(classifyFailure("No report found for community: 16")).toMatchObject({
       failureKind: "transient",
@@ -1812,7 +1816,6 @@ describe("GraphRAG EPUB batch runner", () => {
       join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
       "utf8",
     );
-    await rm(tmpRoot, { recursive: true, force: true });
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toBe("");
     expect(manifest.outputDir).toBe(`books/${bookId}/output`);
@@ -1917,7 +1920,6 @@ describe("GraphRAG EPUB batch runner", () => {
       proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
     });
 
-    await rm(tmpRoot, { recursive: true, force: true });
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toBe("");
     const summary = JSON.parse(result.stdout);
@@ -2300,7 +2302,6 @@ describe("GraphRAG EPUB batch runner", () => {
     ));
     const eventLogPath = join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl");
     const eventsExist = existsSync(eventLogPath);
-    await rm(tmpRoot, { recursive: true, force: true });
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toBe("");
     const summary = JSON.parse(result.stdout);
@@ -2562,14 +2563,14 @@ describe("GraphRAG EPUB batch runner", () => {
     });
   });
 
-  test("status-json recovers legacy unknown GraphRAG artifact gaps as transient", async () => {
-    const tmpRoot = await mkProjectTmpDir("qmd-batch-artifact-gap-transient-");
+  test("status-json keeps local GraphRAG artifact gate failures stop-until-fixed", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-artifact-gap-local-gate-");
     const sourceDir = join(tmpRoot, "source");
     const stateRoot = join(tmpRoot, "graph_vault");
     const logRoot = join(tmpRoot, "logs");
     const configDir = join(tmpRoot, "config");
-    const runId = "artifact-gap-transient";
-    const sourceBytes = "artifact gap transient";
+    const runId = "artifact-gap-local-gate";
+    const sourceBytes = "artifact gap local gate";
     const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
     await mkdir(sourceDir, { recursive: true });
     await mkdir(configDir, { recursive: true });
@@ -2690,15 +2691,15 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toBe("");
     const summary = JSON.parse(result.stdout);
-    expect(summary.recoveryDecision).toBe("retry_same_run_id");
-    expect(summary.retryableItemCount).toBe(1);
+    expect(summary.recoveryDecision).toBe("stop_until_fixed");
+    expect(summary.retryableItemCount).toBe(0);
     expect(summary.items[0]).toMatchObject({
-      status: "pending",
-      failureKind: "transient",
-      retryable: true,
-      retryExhausted: false,
-      recoveryDecision: "retry_same_run_id",
-      waitingForProviderRecovery: true,
+      status: "failed",
+      failureKind: "permanent",
+      retryable: false,
+      retryExhausted: true,
+      recoveryDecision: "stop_until_fixed",
+      waitingForProviderRecovery: false,
     });
   });
 
@@ -3252,6 +3253,7 @@ describe("GraphRAG EPUB batch runner", () => {
       providerFingerprint,
       corpusContentHash: contentHash,
     });
+    await writeFile(join(outputDir, "stats.json"), '{"workflows":{"later":1}}', "utf8");
     await writeFile(
       join(outputDir, "qmd_output_manifest.json"),
       JSON.stringify({
@@ -3438,7 +3440,6 @@ describe("GraphRAG EPUB batch runner", () => {
     ));
     const eventLogPath = join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl");
     const eventsExist = existsSync(eventLogPath);
-    await rm(tmpRoot, { recursive: true, force: true });
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toBe("");
     const summary = JSON.parse(result.stdout);
@@ -3451,6 +3452,47 @@ describe("GraphRAG EPUB batch runner", () => {
       qmdBuildStatus: { status: "succeeded" },
       graphBuildStatus: { status: "succeeded", stage: "query_ready" },
     });
+
+    await writeFile(join(outputDir, "documents.parquet"), "", "utf8");
+    const missingCoreResult = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--status-json",
+      ]);
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => { stdout += String(chunk); });
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+    const missingCoreSummary = JSON.parse(missingCoreResult.stdout);
+    expect(missingCoreResult.exitCode).toBe(0);
+    expect(missingCoreResult.stderr).toBe("");
+    expect(missingCoreSummary.items[0].graphBuildStatus).toMatchObject({
+      status: "stale",
+      stage: "graph_extract",
+      reason: "stage_artifact_invalid:content_hash_mismatch",
+    });
+    expect(missingCoreSummary.items[0].graphBuildStatus.reason)
+      .not.toContain("stats");
+    await rm(tmpRoot, { recursive: true, force: true });
   });
 
   test("status-json reopens completed items when GraphRAG query check failed", async () => {

@@ -61,7 +61,6 @@ const GRAPH_EXTRACT_KINDS = [
   "graphrag_relationships_parquet",
   "graphrag_communities_parquet",
   "graphrag_context_json",
-  "graphrag_stats_json",
 ] as const;
 
 const GRAPH_RAG_STAGE_ARTIFACT_REQUIREMENTS: StageArtifactRequirementMap = {
@@ -1207,6 +1206,17 @@ function artifactsForProducerRun(
   );
 }
 
+function gateArtifactsForProducerRun(
+  artifacts: readonly BookArtifactManifest[],
+  stage: BookStage,
+  producerRunId: string,
+  requiredKinds: readonly BookArtifactKind[],
+): BookArtifactManifest[] {
+  const requiredKindSet = new Set<BookArtifactKind>(requiredKinds);
+  return artifactsForProducerRun(artifacts, stage, producerRunId)
+    .filter((artifact) => requiredKindSet.has(artifact.kind));
+}
+
 export async function assertGraphRagStageArtifactsReady(input: {
   stateRootDir: string;
   bookId: string;
@@ -1215,10 +1225,11 @@ export async function assertGraphRagStageArtifactsReady(input: {
   artifacts: readonly BookArtifactManifest[];
 }): Promise<string[]> {
   const requiredKinds = GRAPH_RAG_STAGE_ARTIFACT_REQUIREMENTS[input.stage] ?? [];
-  const stageArtifacts = artifactsForProducerRun(
+  const stageArtifacts = gateArtifactsForProducerRun(
     input.artifacts,
     input.stage,
     input.producerRunId,
+    requiredKinds,
   );
   const validation = await validateBookArtifactSet({
     graphVault: input.stateRootDir,
@@ -1226,6 +1237,7 @@ export async function assertGraphRagStageArtifactsReady(input: {
     artifactIds: stageArtifacts.map((artifact) => artifact.artifactId),
     artifacts: input.artifacts,
     requiredKinds,
+    allowedKinds: requiredKinds,
   });
   if (!validation.isSatisfied) {
     throw new Error(
@@ -1236,6 +1248,7 @@ export async function assertGraphRagStageArtifactsReady(input: {
           producerRunId: input.producerRunId,
           missingArtifactIds: validation.missingArtifactIds,
           missingArtifactKinds: validation.missingArtifactKinds,
+          invalidArtifacts: validation.invalidArtifacts,
         }),
     );
   }

@@ -161,6 +161,19 @@ def test_collect_response_stream_raises_typed_transient_error():
         raise AssertionError("expected OpenAIResponsesTransientError")
 
 
+def test_collect_response_stream_treats_stream_read_error_as_transient():
+    try:
+        _collect_response_stream(
+            iter([_error("openai.APIError: stream_read_error")]),
+            model="gpt-5.4",
+        )
+    except OpenAIResponsesTransientError as error:
+        assert error.kind == "transient"
+        assert "stream_read_error" in str(error)
+    else:
+        raise AssertionError("expected OpenAIResponsesTransientError")
+
+
 def test_build_response_text_config_closes_object_schemas():
     class FindingModel(BaseModel):
         summary: str
@@ -400,6 +413,7 @@ if __name__ == "__main__":
     test_collect_response_stream_raises_on_error_event()
     test_iter_response_chunks_raises_on_error_event()
     test_collect_response_stream_raises_typed_transient_error()
+    test_collect_response_stream_treats_stream_read_error_as_transient()
     test_build_response_text_config_closes_object_schemas()
     test_build_response_text_config_rejects_json_object_fallback()
     test_build_response_text_config_omits_format_for_plain_completion()

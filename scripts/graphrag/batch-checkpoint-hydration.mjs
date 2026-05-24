@@ -22,9 +22,11 @@ export function hydrateBatchCheckpoint({
       (check.retryable === false ||
         check.failureKind === "unknown" ||
         check.recoveryDecision === "stop_until_fixed");
+    const reclassifyLegacyKnown =
+      check.failureKind === "unknown" && failure.failureKind !== "unknown";
     return {
       ...check,
-      failureKind: recoverLegacyTransient
+      failureKind: recoverLegacyTransient || reclassifyLegacyKnown
         ? failure.failureKind
         : check.failureKind ?? failure.failureKind,
       retryable: recoverLegacyTransient ? true : check.retryable ?? failure.retryable,
@@ -50,6 +52,10 @@ export function hydrateBatchCheckpoint({
     (checkpoint.retryable === false ||
       checkpoint.failureKind === "unknown" ||
       checkpoint.recoveryDecision === "stop_until_fixed");
+  const reclassifyLegacyKnown =
+    checkpoint.failureKind === "unknown" &&
+    inferredFailure != null &&
+    inferredFailure.failureKind !== "unknown";
   const retryable = recoverLegacyTransient ? true :
     checkpoint.retryable ?? inferredFailure?.retryable;
   return {
@@ -67,7 +73,7 @@ export function hydrateBatchCheckpoint({
     retryMaxDelaySeconds: checkpoint.retryMaxDelaySeconds ?? retryMaxDelaySeconds,
     retryBudgetSeconds: checkpoint.retryBudgetSeconds ?? retryBudgetSeconds,
     commandTimeoutSeconds: checkpoint.commandTimeoutSeconds ?? commandTimeoutSeconds,
-    failureKind: recoverLegacyTransient
+    failureKind: recoverLegacyTransient || reclassifyLegacyKnown
       ? inferredFailure?.failureKind
       : checkpoint.failureKind ?? inferredFailure?.failureKind,
     retryable,
