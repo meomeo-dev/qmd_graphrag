@@ -16,6 +16,7 @@ types:
     envelope: src/contracts/batch-run.ts#BatchRunManifestEnvelopeSchema
     contract_level: required
     producers:
+      - scripts/graphrag/batch-epub-workflow.mjs#loadManifest
       - scripts/graphrag/batch-epub-workflow.mjs#updateManifest
     consumers:
       - scripts/graphrag/batch-epub-workflow.mjs#loadManifest
@@ -31,6 +32,7 @@ types:
     envelope: src/contracts/batch-run.ts#BatchItemCheckpointEnvelopeSchema
     contract_level: required
     producers:
+      - scripts/graphrag/batch-epub-workflow.mjs#loadCheckpoint
       - scripts/graphrag/batch-epub-workflow.mjs#saveCheckpoint
     consumers:
       - scripts/graphrag/batch-epub-workflow.mjs#loadCheckpoint
@@ -49,7 +51,7 @@ types:
     producers:
       - scripts/graphrag/batch-epub-workflow.mjs#event
     consumers:
-      - scripts/graphrag/batch-epub-workflow.mjs#main
+      - test/integrations/contracts.test.ts#batchEventLogEnvelopeFixture
     storage: graph_vault/catalog/batch-runs/<run_id>/events.jsonl
     notes:
       - stores redacted event summaries

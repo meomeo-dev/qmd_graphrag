@@ -8,6 +8,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   writeFileSync,
 } from "node:fs";
 import {
@@ -24,6 +25,9 @@ import { parseArgs } from "node:util";
 
 import YAML from "yaml";
 import { z } from "zod";
+
+import { classifyFailure } from "./batch-failure-classifier.mjs";
+import { hydrateBatchCheckpoint } from "./batch-checkpoint-hydration.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const defaultSourceDir = join(root, "inbox", "软件工程与系统设计经典著作指南");
@@ -47,6 +51,7 @@ const { values } = parseArgs({
     },
     "max-command-attempts": { type: "string", default: "3" },
     "completed-manifest": { type: "string" },
+    "migrate-only": { type: "boolean", default: false },
     "skip-dotenv": { type: "boolean", default: false },
     "fail-fast": { type: "boolean", default: false },
     verbose: { type: "boolean", default: true },
@@ -70,6 +75,7 @@ const maxCommandAttempts = Math.max(
   Number.parseInt(String(values["max-command-attempts"]), 10) || 3,
 );
 const failFast = Boolean(values["fail-fast"]);
+const migrateOnly = Boolean(values["migrate-only"]);
 
 const batchRoot = join(stateRoot, "catalog", "batch-runs", runId);
 const itemRoot = join(batchRoot, "items");
@@ -138,6 +144,16 @@ const BatchRecoveryDecisionSchema = z.enum([
   "continue_pending",
   "stop_until_fixed",
 ]);
+const BatchProjectRelativeLocatorSchema = z.string().min(1).refine(
+  (value) => {
+    if (value.includes("\0")) return false;
+    if (value.startsWith("/") || value.startsWith("\\")) return false;
+    if (/^[A-Za-z]:[\\/]/u.test(value)) return false;
+    if (/^[A-Za-z][A-Za-z0-9+.-]*:/u.test(value)) return false;
+    return !value.split(/[\\/]+/u).some((part) => part === "" || part === "..");
+  },
+  "path must be project-relative and portable",
+);
 const BatchCommandCheckSchema = z.object({
   name: z.string().min(1),
   status: z.enum(["passed", "failed"]),
@@ -160,9 +176,9 @@ const BatchItemCheckpointSchema = z.object({
   runId: z.string().min(1),
   status: BatchItemStatusSchema,
   sourceName: z.string().min(1),
-  sourceRelativePath: z.string().min(1),
+  sourceRelativePath: BatchProjectRelativeLocatorSchema,
   sourceHash: z.string().min(1),
-  normalizedPath: z.string().min(1),
+  normalizedPath: BatchProjectRelativeLocatorSchema,
   bookId: z.string().min(1),
   attempts: z.number().int().nonnegative(),
   expectedCommandCheckCount: z.number().int().positive().optional(),
@@ -184,9 +200,9 @@ const BatchRunManifestSchema = z.object({
   runId: z.string().min(1),
   status: BatchRunStatusSchema,
   sourceRootName: z.string().min(1),
-  stateRootLocator: z.string().min(1),
-  qmdIndexLocator: z.string().min(1),
-  configLocator: z.string().min(1),
+  stateRootLocator: BatchProjectRelativeLocatorSchema,
+  qmdIndexLocator: BatchProjectRelativeLocatorSchema,
+  configLocator: BatchProjectRelativeLocatorSchema,
   totalItems: z.number().int().nonnegative(),
   pendingItems: z.number().int().nonnegative().default(0),
   runningItems: z.number().int().nonnegative().default(0),
@@ -247,6 +263,7 @@ function slugify(name) {
 
 function redacted(message) {
   return redactExactEnvValues(String(message))
+    .split(root).join("[PROJECT_ROOT]")
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
     .replace(/(OPENAI_API_KEY|JINA_API_KEY)=\S+/g, "$1=[REDACTED]")
     .replace(/(OPENAI_BASE_URL|JINA_API_BASE)=\S+/g, "$1=[REDACTED]")
@@ -256,6 +273,7 @@ function redacted(message) {
 
 function redactLog(text) {
   return redactExactEnvValues(String(text))
+    .split(root).join("[PROJECT_ROOT]")
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
     .replace(/(OPENAI_API_KEY|JINA_API_KEY)=\S+/g, "$1=[REDACTED]")
     .replace(/(OPENAI_BASE_URL|JINA_API_BASE)=\S+/g, "$1=[REDACTED]")
@@ -275,77 +293,6 @@ function redactExactEnvValues(text) {
     output = output.split(value).join(`[REDACTED:${key}]`);
   }
   return output;
-}
-
-function classifyFailure(text) {
-  const message = String(text).toLowerCase();
-  const statusCodeMatch = message.match(
-    /(?:status|code|error code)[:\s-]*([45]\d\d)|\(([45]\d\d)\)/iu,
-  );
-  const providerStatusCode = statusCodeMatch
-    ? Number.parseInt(statusCodeMatch[1] ?? statusCodeMatch[2], 10)
-    : undefined;
-  const retryAfterMatch = message.match(/retry-after[:\s-]*(\d+)/iu);
-  const retryAfterSeconds = retryAfterMatch
-    ? Number.parseInt(retryAfterMatch[1], 10)
-    : undefined;
-  if (
-    providerStatusCode === 400 ||
-    providerStatusCode === 401 ||
-    providerStatusCode === 403 ||
-    providerStatusCode === 404 ||
-    providerStatusCode === 422
-  ) {
-    return {
-      failureKind: "permanent",
-      retryable: false,
-      providerStatusCode,
-      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
-    };
-  }
-  if (
-    providerStatusCode === 429 ||
-    providerStatusCode === 500 ||
-    providerStatusCode === 502 ||
-    providerStatusCode === 503 ||
-    providerStatusCode === 504
-  ) {
-    return {
-      failureKind: "transient",
-      retryable: true,
-      providerStatusCode,
-      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
-    };
-  }
-  const transient =
-    message.includes("concurrency limit") ||
-    message.includes("rate limit") ||
-    message.includes("temporarily unavailable") ||
-    message.includes("timeout") ||
-    message.includes("(429)") ||
-    message.includes("(500)") ||
-    message.includes("(502)") ||
-    message.includes("(503)") ||
-    message.includes("(504)") ||
-    message.includes("status 429") ||
-    message.includes("status 500") ||
-    message.includes("status 502") ||
-    message.includes("status 503") ||
-    message.includes("status 504");
-  if (transient) {
-    return {
-      failureKind: "transient",
-      retryable: true,
-      ...(providerStatusCode ? { providerStatusCode } : {}),
-      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
-    };
-  }
-  return {
-    failureKind: "unknown",
-    retryable: false,
-    ...(providerStatusCode ? { providerStatusCode } : {}),
-    ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
-  };
 }
 
 function sleep(ms) {
@@ -537,7 +484,16 @@ function makeManifest(items) {
 
 function loadManifest(items) {
   if (existsSync(manifestPath)) {
-    return BatchRunManifestSchema.parse(readJson(manifestPath));
+    const manifest = BatchRunManifestSchema.parse(readJson(manifestPath));
+    manifest.sourceRootName = basename(sourceDir);
+    manifest.stateRootLocator = relative(root, stateRoot);
+    manifest.qmdIndexLocator = relative(root, qmdIndexPath);
+    manifest.configLocator = relative(root, configPath);
+    manifest.totalItems = items.length;
+    manifest.itemIds = items.map((item) => item.itemId);
+    manifest.expectedCommandCheckCount = expectedCommandCheckCount;
+    manifest.maxCommandAttempts = maxCommandAttempts;
+    return manifest;
   }
   const manifest = makeManifest(items);
   return writeTypedJson(manifestPath, BatchRunManifestSchema, manifest);
@@ -592,26 +548,20 @@ function defaultCheckpoint(item, completedSeed = new Map()) {
 }
 
 function hydrateCheckpoint(item, checkpoint) {
-  const failureText = [
-    checkpoint.errorSummary,
-    ...(checkpoint.commandChecks ?? []).map((check) => check.errorSummary),
-  ].filter(Boolean).join("\n");
-  const inferredFailure = checkpoint.status === "failed"
-    ? classifyFailure(failureText)
-    : null;
+  const hydrated = hydrateBatchCheckpoint({
+    item,
+    checkpoint,
+    expectedCommandCheckCount,
+    maxCommandAttempts,
+    defaultBookId: defaultBookIdFor(item.sourceHash),
+  });
   return {
-    ...checkpoint,
-    sourceHash: checkpoint.sourceHash ?? item.sourceHash,
-    bookId: checkpoint.bookId ?? item.bookId ?? defaultBookIdFor(item.sourceHash),
-    expectedCommandCheckCount:
-      checkpoint.expectedCommandCheckCount ?? expectedCommandCheckCount,
-    maxCommandAttempts: checkpoint.maxCommandAttempts ?? maxCommandAttempts,
-    failureKind: checkpoint.failureKind ?? inferredFailure?.failureKind,
-    retryable: checkpoint.retryable ?? inferredFailure?.retryable,
-    retryExhausted: checkpoint.retryExhausted ??
-      (checkpoint.status === "failed" ? true : undefined),
-    recoveryDecision: checkpoint.recoveryDecision ??
-      (inferredFailure?.retryable ? "retry_same_run_id" : "none"),
+    ...hydrated,
+    errorSummary: hydrated.errorSummary ? redacted(hydrated.errorSummary) : undefined,
+    commandChecks: (hydrated.commandChecks ?? []).map((check) => ({
+      ...check,
+      errorSummary: check.errorSummary ? redacted(check.errorSummary) : undefined,
+    })),
   };
 }
 
@@ -622,7 +572,7 @@ function loadCheckpoint(item, completedSeed) {
     return writeTypedJson(path, BatchItemCheckpointSchema, checkpoint);
   }
   const checkpoint = hydrateCheckpoint(item, readJson(path));
-  return BatchItemCheckpointSchema.parse(checkpoint);
+  return writeTypedJson(path, BatchItemCheckpointSchema, checkpoint);
 }
 
 function saveCheckpoint(item, checkpoint) {
@@ -630,6 +580,8 @@ function saveCheckpoint(item, checkpoint) {
 }
 
 function updateManifest(manifest, checkpoints) {
+  manifest.totalItems = checkpoints.length;
+  manifest.itemIds = checkpoints.map((item) => item.itemId);
   const pending = checkpoints.filter((item) => item.status === "pending").length;
   const running = checkpoints.filter((item) => item.status === "running").length;
   const completed = checkpoints.filter((item) => item.status === "completed").length;
@@ -675,6 +627,102 @@ function recoveryDecisionForBatch(checkpoints) {
     return "stop_until_fixed";
   }
   return "none";
+}
+
+function migrateEventLog(checkpoints) {
+  if (!existsSync(eventsPath)) return;
+  const byItemId = new Map(checkpoints.map((item) => [item.itemId, item]));
+  const lines = readFileSync(eventsPath, "utf8")
+    .split(/\r?\n/u)
+    .filter((line) => line.trim().length > 0);
+  const migrated = lines.map((line) => {
+    const item = BatchEventLogSchema.parse(JSON.parse(line));
+    const checkpoint = item.itemId ? byItemId.get(item.itemId) : undefined;
+    const check = checkpoint?.commandChecks?.find((value) =>
+      value.status === "failed" && (!item.command || value.name === item.command),
+    );
+    const isFailureEvent = [
+      "command_failed",
+      "command_retry_exhausted",
+      "item_failed",
+    ].includes(item.event);
+    if (!isFailureEvent || !checkpoint) return item;
+    const retryable = item.retryable ?? check?.retryable ?? checkpoint.retryable;
+    const failureKind = item.failureKind ?? check?.failureKind ?? checkpoint.failureKind;
+    const failedStage = item.failedStage ?? check?.name ?? checkpoint.failedStage;
+    return BatchEventLogSchema.parse({
+      ...item,
+      message: item.message ? redacted(item.message) : undefined,
+      failureKind,
+      retryable,
+      retryAfterSeconds: item.retryAfterSeconds ?? check?.retryAfterSeconds,
+      attemptExhausted: item.attemptExhausted ??
+        (item.event === "command_failed" && typeof item.metadata?.attempt === "number"
+          ? item.metadata.attempt >= (check?.attempts ?? maxCommandAttempts)
+          : check?.attemptExhausted ?? checkpoint.retryExhausted),
+      providerStatusCode: item.providerStatusCode ?? check?.providerStatusCode,
+      recoveryDecision: item.recoveryDecision ??
+        (retryable ? "retry_same_run_id" : "stop_until_fixed"),
+      failedStage,
+    });
+  });
+  const exhaustedEvents = new Set(migrated
+    .filter((item) => item.event === "command_retry_exhausted")
+    .map((item) => `${item.itemId ?? ""}:${item.command ?? ""}`));
+  for (const checkpoint of checkpoints) {
+    if (checkpoint.status !== "failed") continue;
+    for (const check of checkpoint.commandChecks ?? []) {
+      if (check.status !== "failed" || !check.attemptExhausted) continue;
+      const key = `${checkpoint.itemId}:${check.name}`;
+      if (exhaustedEvents.has(key)) continue;
+      migrated.push(BatchEventLogSchema.parse({
+        schemaVersion: SchemaVersion,
+        runId,
+        itemId: checkpoint.itemId,
+        event: "command_retry_exhausted",
+        command: check.name,
+        failureKind: check.failureKind ?? checkpoint.failureKind,
+        retryable: check.retryable ?? checkpoint.retryable,
+        retryAfterSeconds: check.retryAfterSeconds,
+        attemptExhausted: true,
+        providerStatusCode: check.providerStatusCode,
+        recoveryDecision: (check.retryable ?? checkpoint.retryable)
+          ? "retry_same_run_id"
+          : "stop_until_fixed",
+        failedStage: check.name,
+        at: checkpoint.failedAt ?? check.completedAt ?? now(),
+        message: check.errorSummary ?? checkpoint.errorSummary,
+        metadata: { migratedFromCheckpoint: true },
+      }));
+      exhaustedEvents.add(key);
+    }
+  }
+  writeFileSync(
+    eventsPath,
+    migrated.map((item) => JSON.stringify(item)).join("\n") + "\n",
+    "utf8",
+  );
+}
+
+function migrateGraphVaultRawLogs() {
+  const reportsDir = join(stateRoot, "reports");
+  if (!existsSync(reportsDir)) return;
+  const targetDir = join(logRoot, "graph_vault_reports");
+  mkdirSync(targetDir, { recursive: true });
+  for (const name of readdirSync(reportsDir)) {
+    if (!name.endsWith(".log")) continue;
+    const source = join(reportsDir, name);
+    const target = join(targetDir, `${Date.now()}-${name}`);
+    renameSync(source, target);
+    event({
+      event: "raw_log_migrated",
+      metadata: {
+        sourceLocator: `graph_vault/reports/${name}`,
+        targetLogRootName: basename(logRoot),
+        targetFileName: basename(target),
+      },
+    });
+  }
 }
 
 function qmdRunner() {
@@ -754,6 +802,8 @@ function runCommand(item, name, command, args, options = {}) {
       retryAfterSeconds: check.retryAfterSeconds,
       attemptExhausted: check.attemptExhausted,
       providerStatusCode: check.providerStatusCode,
+      recoveryDecision: check.retryable ? "retry_same_run_id" : "stop_until_fixed",
+      failedStage: name,
       metadata: { attempt, exitCode: result.status },
     });
     if (attempt >= attempts || !check.retryable) break;
@@ -785,6 +835,7 @@ function runCommand(item, name, command, args, options = {}) {
       attemptExhausted: true,
       providerStatusCode: last.check.providerStatusCode,
       recoveryDecision: last.check.retryable ? "retry_same_run_id" : "stop_until_fixed",
+      failedStage: name,
       message: last.check.errorSummary,
     });
   }
@@ -1056,6 +1107,29 @@ function runCliChecks(item) {
 }
 
 function runItem(item, checkpoint) {
+  normalizeEpubToMarkdown(item);
+  runGraphResume(item);
+  const commandChecks = runCliChecks(item);
+  const completed = {
+    ...checkpoint,
+    status: "completed",
+    bookId: parseBookIdFromResume(item) ?? checkpoint.bookId,
+    completedAt: now(),
+    failedAt: undefined,
+    errorSummary: undefined,
+    failureKind: undefined,
+    retryable: undefined,
+    retryExhausted: undefined,
+    recoveryDecision: "none",
+    failedStage: undefined,
+    commandChecks,
+  };
+  saveCheckpoint(item, completed);
+  event({ itemId: item.itemId, event: "item_completed", status: "completed" });
+  return completed;
+}
+
+function markItemRunning(item, checkpoint, checkpoints, manifest) {
   const startedAt = now();
   const running = {
     ...checkpoint,
@@ -1073,28 +1147,10 @@ function runItem(item, checkpoint) {
     maxCommandAttempts,
   };
   saveCheckpoint(item, running);
+  checkpoints.set(item.itemId, running);
+  updateManifest(manifest, Array.from(checkpoints.values()));
   event({ itemId: item.itemId, event: "item_start", status: "running" });
-
-  normalizeEpubToMarkdown(item);
-  runGraphResume(item);
-  const commandChecks = runCliChecks(item);
-  const completed = {
-    ...running,
-    status: "completed",
-    bookId: parseBookIdFromResume(item) ?? running.bookId,
-    completedAt: now(),
-    failedAt: undefined,
-    errorSummary: undefined,
-    failureKind: undefined,
-    retryable: undefined,
-    retryExhausted: undefined,
-    recoveryDecision: "none",
-    failedStage: undefined,
-    commandChecks,
-  };
-  saveCheckpoint(item, completed);
-  event({ itemId: item.itemId, event: "item_completed", status: "completed" });
-  return completed;
+  return running;
 }
 
 function main() {
@@ -1113,6 +1169,22 @@ function main() {
     loadCheckpoint(item, completedSeed),
   ]));
   manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+  if (migrateOnly) {
+    migrateEventLog(Array.from(checkpoints.values()));
+    migrateGraphVaultRawLogs();
+    event({
+      event: "batch_state_migrated",
+      recoveryDecision: recoveryDecisionForBatch(Array.from(checkpoints.values())),
+      metadata: {
+        pendingItems: manifest.pendingItems,
+        runningItems: manifest.runningItems,
+        completedItems: manifest.completedItems,
+        skippedItems: manifest.skippedItems,
+        failedItems: manifest.failedItems,
+      },
+    });
+    return;
+  }
 
   for (const item of items) {
     const checkpoint = checkpoints.get(item.itemId);
@@ -1155,7 +1227,9 @@ function main() {
     }
 
     try {
-      const completed = runItem(item, checkpoint ?? defaultCheckpoint(item, completedSeed));
+      const starting = checkpoint ?? defaultCheckpoint(item, completedSeed);
+      const running = markItemRunning(item, starting, checkpoints, manifest);
+      const completed = runItem(item, running);
       checkpoints.set(item.itemId, completed);
       manifest = updateManifest(manifest, Array.from(checkpoints.values()));
     } catch (error) {
@@ -1202,6 +1276,7 @@ function main() {
     }
   }
 
+  migrateGraphVaultRawLogs();
   manifest = updateManifest(manifest, Array.from(checkpoints.values()));
   if (manifest.status === "completed") {
     event({ event: "batch_completed", status: "completed" });

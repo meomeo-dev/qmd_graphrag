@@ -26,6 +26,7 @@ contract_artifacts:
       - BatchRunStatusSchema
       - BatchFailureKindSchema
       - BatchRecoveryDecisionSchema
+      - BatchProjectRelativeLocatorSchema
       - BatchItemCheckpointInputSchema
       - BatchItemCheckpointSchema
       - BatchItemCheckpointEnvelopeSchema
@@ -307,6 +308,7 @@ typed_buses:
         envelope: src/contracts/batch-run.ts#BatchRunManifestEnvelopeSchema
         storage: graph_vault/catalog/batch-runs/<run_id>/manifest.json
         producers:
+          - scripts/graphrag/batch-epub-workflow.mjs#loadManifest
           - scripts/graphrag/batch-epub-workflow.mjs#updateManifest
         consumers:
           - scripts/graphrag/batch-epub-workflow.mjs#loadManifest
@@ -315,6 +317,7 @@ typed_buses:
         envelope: src/contracts/batch-run.ts#BatchItemCheckpointEnvelopeSchema
         storage: graph_vault/catalog/batch-runs/<run_id>/items/<item_id>.json
         producers:
+          - scripts/graphrag/batch-epub-workflow.mjs#loadCheckpoint
           - scripts/graphrag/batch-epub-workflow.mjs#saveCheckpoint
         consumers:
           - scripts/graphrag/batch-epub-workflow.mjs#loadCheckpoint
@@ -325,7 +328,7 @@ typed_buses:
         producers:
           - scripts/graphrag/batch-epub-workflow.mjs#event
         consumers:
-          - scripts/graphrag/batch-epub-workflow.mjs#main
+          - test/integrations/contracts.test.ts#batchEventLogEnvelopeFixture
 
   corpus_bus:
     role: Whole-corpus ingestion and document identity.

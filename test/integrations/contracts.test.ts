@@ -65,8 +65,10 @@ import {
   BookJobRunRecordEnvelopeSchema,
 } from "../../src/contracts/book-job.js";
 import {
+  BatchEventLogSchema,
   BatchItemCheckpointInputSchema,
   BatchItemCheckpointSchema,
+  BatchRunManifestSchema,
   parseBatchItemCheckpoint,
 } from "../../src/contracts/batch-run.js";
 import {
@@ -80,6 +82,7 @@ import { restoreFromVault } from "../../src/vault/restore.js";
 import { createStore, hashContent } from "../../src/store.js";
 import { hashLanceDbDirectoryContents } from "../../src/job-state/artifact-validation.js";
 import { hashFile } from "../../src/job-state/fingerprint.js";
+import { hydrateBatchCheckpoint } from "../../scripts/graphrag/batch-checkpoint-hydration.mjs";
 
 type TypeDdPayload = {
   name: string;
@@ -180,6 +183,100 @@ async function expectLocalRefExists(ref: string): Promise<void> {
       `${ref} is declared in catalog but ${symbol} is missing from ${filePath}`,
     ).toMatch(declaration);
   }
+}
+
+export function batchRunManifestEnvelopeFixture() {
+  return {
+    schemaVersion: SchemaVersion,
+    kind: "qmd.batch_run.manifest",
+    payload: {
+      schemaVersion: SchemaVersion,
+      runId: "run-fixture",
+      status: "running",
+      sourceRootName: "books",
+      stateRootLocator: "graph_vault",
+      qmdIndexLocator: ".qmd/index.sqlite",
+      configLocator: ".qmd/index.yml",
+      totalItems: 1,
+      pendingItems: 0,
+      runningItems: 1,
+      completedItems: 0,
+      skippedItems: 0,
+      importedCompletedItems: 0,
+      failedItems: 0,
+      expectedCommandCheckCount: 27,
+      maxCommandAttempts: 3,
+      startedAt: "2026-05-23T00:00:00.000Z",
+      updatedAt: "2026-05-23T00:01:00.000Z",
+      itemIds: ["item-fixture"],
+    },
+  };
+}
+
+export function batchItemCheckpointEnvelopeFixture() {
+  return {
+    schemaVersion: SchemaVersion,
+    kind: "qmd.batch_run.item_checkpoint",
+    payload: {
+      schemaVersion: SchemaVersion,
+      itemId: "item-fixture",
+      runId: "run-fixture",
+      status: "failed",
+      sourceName: "Book.epub",
+      sourceRelativePath: "inbox/books/Book.epub",
+      sourceHash: "sha256:source",
+      normalizedPath: "graph_vault/input/book.md",
+      bookId: "book-fixture",
+      attempts: 1,
+      expectedCommandCheckCount: 27,
+      maxCommandAttempts: 3,
+      failureKind: "transient",
+      retryable: true,
+      retryExhausted: true,
+      recoveryDecision: "retry_same_run_id",
+      failedStage: "resume-book-1",
+      failedAt: "2026-05-23T00:02:00.000Z",
+      errorSummary: "Error code: 503 - Service temporarily unavailable",
+      commandChecks: [{
+        name: "resume-book-1",
+        status: "failed",
+        attempts: 3,
+        exitCode: 1,
+        stdoutBytes: 0,
+        stderrBytes: 64,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        completedAt: "2026-05-23T00:02:00.000Z",
+        failureKind: "transient",
+        retryable: true,
+        attemptExhausted: true,
+        providerStatusCode: 503,
+        errorSummary: "Error code: 503 - Service temporarily unavailable",
+      }],
+    },
+  };
+}
+
+export function batchEventLogEnvelopeFixture() {
+  return {
+    schemaVersion: SchemaVersion,
+    kind: "qmd.batch_run.event_log",
+    payload: {
+      schemaVersion: SchemaVersion,
+      runId: "run-fixture",
+      itemId: "item-fixture",
+      event: "command_failed",
+      status: "failed",
+      command: "resume-book-1",
+      failureKind: "transient",
+      retryable: true,
+      attemptExhausted: false,
+      providerStatusCode: 503,
+      recoveryDecision: "retry_same_run_id",
+      failedStage: "resume-book-1",
+      at: "2026-05-23T00:01:00.000Z",
+      message: "Error code: 503 - Service temporarily unavailable",
+    },
+  };
 }
 
 async function writeCompleteLanceDbFixture(root: string): Promise<void> {
@@ -1220,6 +1317,78 @@ describe("Data bus contracts", () => {
     expect(parsed.sourceHash).toBe("sha256:legacy-source");
     expect(parsed.bookId).toBe("book-legacy");
     expect(parsed.commandChecks[0]?.name).toBe("resume-book-1");
+
+    const hydrated = hydrateBatchCheckpoint({
+      item: {
+        sourceHash: "sha256:legacy-source",
+        bookId: "book-legacy",
+      },
+      checkpoint: legacy,
+      expectedCommandCheckCount: 27,
+      maxCommandAttempts: 3,
+      defaultBookId: "book-legacy",
+    });
+    expect(hydrated).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+      retryExhausted: true,
+      recoveryDecision: "retry_same_run_id",
+      failedStage: "resume-book-1",
+      expectedCommandCheckCount: 27,
+      maxCommandAttempts: 3,
+    });
+    expect(hydrated.commandChecks[0]).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+      attemptExhausted: true,
+      providerStatusCode: 503,
+    });
+  });
+
+  test("accepts batch execution bus envelopes with real schemas", () => {
+    const manifestEnvelope = DataBusEnvelopeSchema.parse(
+      batchRunManifestEnvelopeFixture(),
+    );
+    const checkpointEnvelope = DataBusEnvelopeSchema.parse(
+      batchItemCheckpointEnvelopeFixture(),
+    );
+    const eventEnvelope = DataBusEnvelopeSchema.parse(batchEventLogEnvelopeFixture());
+
+    expect(manifestEnvelope.kind).toBe("qmd.batch_run.manifest");
+    expect(BatchRunManifestSchema.parse(manifestEnvelope.payload).runningItems)
+      .toBe(1);
+    expect(checkpointEnvelope.kind).toBe("qmd.batch_run.item_checkpoint");
+    expect(BatchItemCheckpointSchema.parse(checkpointEnvelope.payload).retryable)
+      .toBe(true);
+    expect(eventEnvelope.kind).toBe("qmd.batch_run.event_log");
+    expect(BatchEventLogSchema.parse(eventEnvelope.payload).failedStage)
+      .toBe("resume-book-1");
+  });
+
+  test("rejects non-portable batch locators", () => {
+    const manifest = batchRunManifestEnvelopeFixture().payload;
+    const checkpoint = batchItemCheckpointEnvelopeFixture().payload;
+
+    expect(() => BatchRunManifestSchema.parse({
+      ...manifest,
+      stateRootLocator: "/Users/jin/projects/qmd_graphrag/graph_vault",
+    })).toThrow(/project-relative/);
+    expect(() => BatchRunManifestSchema.parse({
+      ...manifest,
+      qmdIndexLocator: "../outside/index.sqlite",
+    })).toThrow(/project-relative/);
+    expect(() => BatchItemCheckpointSchema.parse({
+      ...checkpoint,
+      normalizedPath: "file:///tmp/book.md",
+    })).toThrow(/project-relative/);
+    expect(() => BatchItemCheckpointSchema.parse({
+      ...checkpoint,
+      sourceRelativePath: "C:/outside/book.epub",
+    })).toThrow(/project-relative/);
+    expect(() => BatchItemCheckpointSchema.parse({
+      ...checkpoint,
+      normalizedPath: "C:\\outside\\book.md",
+    })).toThrow(/project-relative/);
   });
 
   test("keeps Type DD payload ownership aligned with catalog inventory", async () => {

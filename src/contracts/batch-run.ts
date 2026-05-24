@@ -34,6 +34,17 @@ export const BatchRecoveryDecisionSchema = z.enum([
   "stop_until_fixed",
 ]);
 
+export const BatchProjectRelativeLocatorSchema = z.string().min(1).refine(
+  (value) => {
+    if (value.includes("\0")) return false;
+    if (value.startsWith("/") || value.startsWith("\\")) return false;
+    if (/^[A-Za-z]:[\\/]/u.test(value)) return false;
+    if (/^[A-Za-z][A-Za-z0-9+.-]*:/u.test(value)) return false;
+    return !value.split(/[\\/]+/u).some((part) => part === "" || part === "..");
+  },
+  "path must be project-relative and portable",
+);
+
 export const BatchCommandCheckSchema = z.object({
   name: z.string().min(1),
   status: z.enum(["passed", "failed"]),
@@ -57,9 +68,9 @@ export const BatchItemCheckpointSchema = z.object({
   runId: z.string().min(1),
   status: BatchItemStatusSchema,
   sourceName: z.string().min(1),
-  sourceRelativePath: z.string().min(1),
+  sourceRelativePath: BatchProjectRelativeLocatorSchema,
   sourceHash: z.string().min(1),
-  normalizedPath: z.string().min(1),
+  normalizedPath: BatchProjectRelativeLocatorSchema,
   bookId: z.string().min(1),
   attempts: z.number().int().nonnegative(),
   expectedCommandCheckCount: z.number().int().positive().optional(),
@@ -82,9 +93,9 @@ export const BatchRunManifestSchema = z.object({
   runId: z.string().min(1),
   status: BatchRunStatusSchema,
   sourceRootName: z.string().min(1),
-  stateRootLocator: z.string().min(1),
-  qmdIndexLocator: z.string().min(1),
-  configLocator: z.string().min(1),
+  stateRootLocator: BatchProjectRelativeLocatorSchema,
+  qmdIndexLocator: BatchProjectRelativeLocatorSchema,
+  configLocator: BatchProjectRelativeLocatorSchema,
   totalItems: z.number().int().nonnegative(),
   pendingItems: z.number().int().nonnegative().default(0),
   runningItems: z.number().int().nonnegative().default(0),
@@ -157,6 +168,9 @@ export type BatchItemStatus = z.infer<typeof BatchItemStatusSchema>;
 export type BatchRunStatus = z.infer<typeof BatchRunStatusSchema>;
 export type BatchFailureKind = z.infer<typeof BatchFailureKindSchema>;
 export type BatchRecoveryDecision = z.infer<typeof BatchRecoveryDecisionSchema>;
+export type BatchProjectRelativeLocator = z.infer<
+  typeof BatchProjectRelativeLocatorSchema
+>;
 export type BatchCommandCheck = z.infer<typeof BatchCommandCheckSchema>;
 export type BatchItemCheckpointInput = z.infer<typeof BatchItemCheckpointInputSchema>;
 export type BatchItemCheckpoint = z.infer<typeof BatchItemCheckpointSchema>;

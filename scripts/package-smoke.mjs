@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
@@ -40,6 +40,22 @@ run("AST grammar runtime packages", process.execPath, ["scripts/check-package-gr
 
 for (const entry of pkg.files ?? []) {
   assertPath(entry.replace(/\/$/, ""), `package.json files[] entry ${entry}`);
+}
+
+const packageFiles = new Set(pkg.files ?? []);
+for (const entry of pkg.files ?? []) {
+  if (!entry.endsWith(".mjs")) continue;
+  const source = readFileSync(join(root, entry), "utf8");
+  const imports = [...source.matchAll(/\bimport\s+(?:[^"']+\s+from\s+)?["'](\.[^"']+)["']/g)]
+    .map((match) => normalize(join(dirname(entry), match[1])));
+  for (const imported of imports) {
+    if (!packageFiles.has(imported)) {
+      console.error(
+        `Package smoke failed: ${entry} imports ${imported} outside files[]`,
+      );
+      process.exit(1);
+    }
+  }
 }
 
 for (const [name, binPath] of Object.entries(pkg.bin ?? {})) {

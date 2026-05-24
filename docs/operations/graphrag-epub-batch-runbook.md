@@ -71,10 +71,9 @@ graph_vault/catalog/batch-runs/<runId>/
 - `rate limit`
 - `timeout`
 - HTTP `429`
-- HTTP `500`
-- HTTP `502`
-- HTTP `503`
-- HTTP `504`
+- HTTP `5xx`
+
+除 `429` 外的 HTTP `4xx` 归类为 permanent failure，不自动重试。
 
 批量执行器对 transient failure 做有限重试和退避。重试耗尽后：
 
@@ -95,10 +94,77 @@ npm run batch:epub -- \
   --state-root <same-state-root> \
   --qmd-index-path <same-qmd-index-path> \
   --config <same-config> \
-  --log-root /tmp/qmd-<same-run-id>/logs
+  --log-root /tmp/qmd-<same-run-id>/logs \
+  --max-command-attempts <same-value>
 ```
 
 执行器跳过 completed item，只重试 retryable failed item 和继续 pending item。
+
+恢复前执行安全状态迁移：
+
+```bash
+npm run batch:epub -- \
+  --run-id <same-run-id> \
+  --source-dir <same-source-dir> \
+  --state-root <same-state-root> \
+  --qmd-index-path <same-qmd-index-path> \
+  --config <same-config> \
+  --log-root /tmp/qmd-<same-run-id>/logs \
+  --max-command-attempts <same-value> \
+  --migrate-only
+```
+
+`--migrate-only` 只读取并重写 manifest/checkpoint，使旧状态满足当前 schema。
+该模式不执行 EPUB 规范化、GraphRAG stage、OpenAI Responses、Jina 或 qmd CLI
+子命令。
+
+## 只读验证命令
+
+恢复前后使用只读命令验证 manifest 与 item checkpoint：
+
+```bash
+node - <runId> <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const runId = process.argv[2];
+const root = path.join("graph_vault", "catalog", "batch-runs", runId);
+const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
+const itemDir = path.join(root, "items");
+const items = fs.readdirSync(itemDir)
+  .filter((name) => name.endsWith(".json"))
+  .map((name) => JSON.parse(fs.readFileSync(path.join(itemDir, name), "utf8")));
+const required = [
+  "qmd-version", "qmd-status", "qmd-doctor-json", "qmd-pull", "qmd-update",
+  "qmd-embed", "qmd-ls-books", "qmd-search-json", "qmd-search-csv",
+  "qmd-search-md", "qmd-search-xml", "qmd-search-files", "qmd-vsearch-json",
+  "qmd-query-json", "qmd-query-auto-json", "qmd-query-graphrag-json",
+  "qmd-get-book", "qmd-multi-get-json", "qmd-collection-list",
+  "qmd-collection-show-books", "qmd-context-list", "qmd-skills-list-json",
+  "qmd-skills-get-json", "qmd-skills-path-json", "qmd-skill-show",
+  "qmd-dspy-status-json", "qmd-cleanup",
+];
+const counts = items.reduce((acc, item) => {
+  acc[item.status] = (acc[item.status] || 0) + 1;
+  return acc;
+}, {});
+for (const item of items.filter((value) => value.status === "completed")) {
+  const names = (item.commandChecks || []).map((check) => check.name).sort();
+  if (names.length !== required.length) throw new Error(`${item.itemId}: bad check count`);
+  if (names.join("\n") !== [...required].sort().join("\n")) {
+    throw new Error(`${item.itemId}: bad command check names`);
+  }
+  if (item.commandChecks.some((check) => check.status !== "passed")) {
+    throw new Error(`${item.itemId}: command check failed`);
+  }
+}
+for (const item of items.filter((value) => value.status === "failed")) {
+  for (const key of ["failureKind", "retryable", "recoveryDecision", "failedStage"]) {
+    if (item[key] == null) throw new Error(`${item.itemId}: missing ${key}`);
+  }
+}
+console.log(JSON.stringify({ manifest, counts, itemCount: items.length }, null, 2));
+NODE
+```
 
 ## 子命令检查
 
@@ -146,7 +212,7 @@ rerank 或 GraphRAG provider。
 - provider 名称。
 - status code 或错误分类。
 - redacted message。
-- 文件 basename 或 vault-relative locator。
+- 文件 basename 或 project-relative portable locator。
 
 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`JINA_API_KEY` 等值不得写入
 `graph_vault`、stdout、stderr、manifest 或 event log。

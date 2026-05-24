@@ -17,10 +17,11 @@ import {
   unlinkSync,
 } from "fs";
 import { tmpdir } from "os";
-import { join, dirname } from "path";
+import { join, dirname, relative } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
+import { createHash } from "crypto";
 import YAML from "yaml";
 import {
   buildEditorUri,
@@ -38,6 +39,7 @@ import {
   JINA_MULTIMODAL_RERANK_MODEL,
 } from "../src/llm.ts";
 import { setConfigSource } from "../src/collections.ts";
+import { classifyFailure } from "../scripts/graphrag/batch-failure-classifier.mjs";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -1020,6 +1022,12 @@ describe("CLI Search Command", () => {
 });
 
 describe("GraphRAG EPUB batch runner", () => {
+  async function mkProjectTmpDir(prefix: string): Promise<string> {
+    const root = join(projectRoot, ".tmp-tests");
+    await mkdir(root, { recursive: true });
+    return mkdtemp(join(root, prefix));
+  }
+
   test("keeps batch state typed and raw logs outside graph_vault", () => {
     const script = readFileSync(
       join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
@@ -1042,8 +1050,11 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(contract).toContain("expectedCommandCheckCount");
     expect(script).toContain("\"completed-manifest\"");
     expect(script).toContain("\"fail-fast\"");
+    expect(script).toContain("\"migrate-only\"");
+    expect(script).toContain("batch_state_migrated");
+    expect(script).toContain("raw_log_migrated");
     expect(script).toContain("BatchRunManifestSchema.parse");
-    expect(script).toContain("BatchItemCheckpointSchema.parse");
+    expect(script).toContain("writeTypedJson(path, BatchItemCheckpointSchema");
     expect(script).toContain("BatchEventLogSchema.parse");
     expect(script).toContain("command_retry_exhausted");
     expect(script).toContain("batch_incomplete");
@@ -1119,7 +1130,7 @@ describe("GraphRAG EPUB batch runner", () => {
   });
 
   test("records completed-manifest items as typed skipped checkpoints", async () => {
-    const tmpRoot = await mkdtemp(join(tmpdir(), "qmd-batch-skipped-"));
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-skipped-");
     const sourceDir = join(tmpRoot, "source");
     const stateRoot = join(tmpRoot, "graph_vault");
     const logRoot = join(tmpRoot, "logs");
@@ -1218,19 +1229,218 @@ describe("GraphRAG EPUB batch runner", () => {
       "utf8",
     );
 
-    expect(script.indexOf("providerStatusCode === 400")).toBeGreaterThan(0);
-    expect(script.indexOf("providerStatusCode === 400"))
-      .toBeLessThan(script.indexOf("const transient ="));
-    expect(script).toContain("providerStatusCode === 429");
-    expect(script).toContain("providerStatusCode === 503");
+    expect(classifyFailure("HTTP 400 timeout")).toMatchObject({
+      failureKind: "permanent",
+      retryable: false,
+      providerStatusCode: 400,
+    });
+    expect(classifyFailure("HTTP 409 conflict")).toMatchObject({
+      failureKind: "permanent",
+      retryable: false,
+      providerStatusCode: 409,
+    });
+    expect(classifyFailure("HTTP 429 retry-after: 7")).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+      providerStatusCode: 429,
+      retryAfterSeconds: 7,
+    });
+    expect(classifyFailure("HTTP 500")).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+      providerStatusCode: 500,
+    });
+    expect(classifyFailure("HTTP 599")).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+      providerStatusCode: 599,
+    });
+    expect(classifyFailure("status code: 429")).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+      providerStatusCode: 429,
+    });
+    expect(classifyFailure("error code: 500")).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+      providerStatusCode: 500,
+    });
+    expect(classifyFailure("(599)")).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+      providerStatusCode: 599,
+    });
+    expect(classifyFailure("timeout without status")).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+    });
     expect(script).not.toContain("function isTransient(");
     expect(script).toContain("function recoveryDecisionForBatch(checkpoints)");
     expect(script).toContain("item.status === \"failed\" && item.retryable === true");
     expect(script).toContain("checkpoint?.status === \"failed\" && checkpoint.retryable === false");
+    expect(script).toContain("failedStage: name");
+    expect(script).toContain("markItemRunning(item, starting, checkpoints, manifest)");
+  });
+
+  test("migrate-only backfills typed fields into legacy failure events", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-migrate-events-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "migrate-events-fixture";
+    const sourceBytes = "legacy failed event";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    await mkdir(join(stateRoot, "reports"), { recursive: true });
+    const sourcePath = join(sourceDir, "Book.epub");
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    await writeFile(join(stateRoot, "reports", "query.log"), "raw provider log");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        completedItems: 0,
+        failedItems: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "failed",
+        sourceName: "Book.epub",
+        sourceRelativePath,
+        normalizedPath: join(
+          ".tmp-tests",
+          "graph_vault",
+          "input",
+          "book.md",
+        ),
+        attempts: 1,
+        failedAt: "2026-05-23T00:01:00.000Z",
+        errorSummary: "HTTP 503 Service temporarily unavailable",
+        commandChecks: [{
+          name: "resume-book-1",
+          status: "failed",
+          attempts: 3,
+          exitCode: 1,
+          stdoutBytes: 0,
+          stderrBytes: 12,
+          startedAt: "2026-05-23T00:00:00.000Z",
+          completedAt: "2026-05-23T00:01:00.000Z",
+          errorSummary: "HTTP 503 Service temporarily unavailable",
+        }],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        itemId,
+        event: "command_failed",
+        command: "resume-book-1",
+        at: "2026-05-23T00:01:00.000Z",
+        message: "HTTP 503 Service temporarily unavailable",
+        metadata: { attempt: 3, exitCode: 1 },
+      }) + "\n",
+    );
+
+    const result = await new Promise<{ stderr: string; exitCode: number | null }>(
+      (resolveResult) => {
+        const proc = spawn(process.execPath, [
+          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+          "--source-dir",
+          sourceDir,
+          "--state-root",
+          stateRoot,
+          "--log-root",
+          logRoot,
+          "--config",
+          join(configDir, "index.yml"),
+          "--qmd-index-path",
+          join(tmpRoot, "index.sqlite"),
+          "--run-id",
+          runId,
+          "--skip-dotenv",
+          "--migrate-only",
+        ]);
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => {
+          stderr += String(chunk);
+        });
+        proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+      },
+    );
+
+    const eventLines = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
+      "utf8",
+    ).trim().split("\n").map((line) => JSON.parse(line));
+    const migrated = eventLines.find((event) => event.event === "command_failed");
+    const exhausted = eventLines.find(
+      (event) => event.event === "command_retry_exhausted",
+    );
+    const rawLogEvent = eventLines.find((event) => event.event === "raw_log_migrated");
+    const remainingRawLogs = readdirSync(join(stateRoot, "reports"))
+      .filter((name) => name.endsWith(".log"));
+    const movedRawLogs = readdirSync(join(logRoot, "graph_vault_reports"))
+      .filter((name) => name.endsWith("query.log"));
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(migrated).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+      attemptExhausted: true,
+      providerStatusCode: 503,
+      recoveryDecision: "retry_same_run_id",
+      failedStage: "resume-book-1",
+    });
+    expect(exhausted).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+      attemptExhausted: true,
+      providerStatusCode: 503,
+      recoveryDecision: "retry_same_run_id",
+      failedStage: "resume-book-1",
+      metadata: { migratedFromCheckpoint: true },
+    });
+    expect(rawLogEvent).toMatchObject({
+      event: "raw_log_migrated",
+      metadata: {
+        sourceLocator: "graph_vault/reports/query.log",
+        targetLogRootName: "logs",
+      },
+    });
+    expect(remainingRawLogs).toEqual([]);
+    expect(movedRawLogs).toHaveLength(1);
   });
 
   test("keeps checkpoints unique for duplicate EPUB content", async () => {
-    const tmpRoot = await mkdtemp(join(tmpdir(), "qmd-batch-duplicate-"));
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-duplicate-");
     const sourceDir = join(tmpRoot, "source");
     const stateRoot = join(tmpRoot, "graph_vault");
     const logRoot = join(tmpRoot, "logs");
@@ -1301,6 +1511,101 @@ describe("GraphRAG EPUB batch runner", () => {
     });
     expect(checkpoints).toHaveLength(2);
     expect(new Set(checkpoints).size).toBe(2);
+  });
+
+  test("reconciles an existing manifest when source EPUBs grow", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-grow-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "grow-fixture";
+    const { createHash } = await import("crypto");
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId), { recursive: true });
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    await writeFile(join(sourceDir, "A.epub"), "book-a");
+    await writeFile(join(sourceDir, "B.epub"), "book-b");
+    const hashA = createHash("sha256").update("book-a").digest("hex");
+    const hashB = createHash("sha256").update("book-b").digest("hex");
+    const completedManifest = join(tmpRoot, "completed.json");
+    await writeFile(
+      completedManifest,
+      JSON.stringify([
+        { source: "A.epub", sourceHash: hashA },
+        { source: "B.epub", sourceHash: hashB },
+      ]),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "completed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/old/graph_vault",
+        qmdIndexLocator: ".tmp-tests/old/index.sqlite",
+        configLocator: ".tmp-tests/old/config/index.yml",
+        totalItems: 1,
+        pendingItems: 0,
+        runningItems: 0,
+        completedItems: 1,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 0,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        completedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: ["stale-item"],
+      }),
+    );
+
+    const result = await new Promise<{ stderr: string; exitCode: number | null }>(
+      (resolveResult) => {
+        const proc = spawn(process.execPath, [
+          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+          "--source-dir",
+          sourceDir,
+          "--state-root",
+          stateRoot,
+          "--log-root",
+          logRoot,
+          "--config",
+          join(configDir, "index.yml"),
+          "--qmd-index-path",
+          join(tmpRoot, "index.sqlite"),
+          "--completed-manifest",
+          completedManifest,
+          "--run-id",
+          runId,
+          "--skip-dotenv",
+        ]);
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => {
+          stderr += String(chunk);
+        });
+        proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+      },
+    );
+
+    const manifest = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      "utf8",
+    ));
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toBe("");
+    expect(manifest).toMatchObject({
+      status: "incomplete",
+      totalItems: 2,
+      completedItems: 0,
+      skippedItems: 2,
+      importedCompletedItems: 2,
+      failedItems: 0,
+    });
+    expect(manifest.itemIds).toHaveLength(2);
+    expect(manifest.itemIds).not.toContain("stale-item");
   });
 
   test("redacts exact environment values from preflight errors", async () => {
