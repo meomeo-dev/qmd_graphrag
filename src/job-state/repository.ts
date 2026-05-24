@@ -676,6 +676,7 @@ function buildResumePlan(
       state = {
         stage,
         checkpointStatus: checkpoint.status,
+        runId: checkpoint.runId,
         expectedFingerprint,
         actualFingerprint,
         isSatisfied: false,
@@ -685,6 +686,7 @@ function buildResumePlan(
       state = {
         stage,
         checkpointStatus: checkpoint.status,
+        runId: checkpoint.runId,
         expectedFingerprint,
         actualFingerprint,
         isSatisfied: false,
@@ -698,6 +700,7 @@ function buildResumePlan(
       state = {
         stage,
         checkpointStatus: checkpoint.status,
+        runId: checkpoint.runId,
         expectedFingerprint,
         actualFingerprint,
         isSatisfied: false,
@@ -711,6 +714,7 @@ function buildResumePlan(
       state = {
         stage,
         checkpointStatus: checkpoint.status,
+        runId: checkpoint.runId,
         expectedFingerprint,
         actualFingerprint,
         isSatisfied: false,
@@ -722,6 +726,7 @@ function buildResumePlan(
         state = {
           stage,
           checkpointStatus: checkpoint.status,
+          runId: checkpoint.runId,
           expectedFingerprint,
           actualFingerprint,
           isSatisfied: false,
@@ -740,6 +745,7 @@ function buildResumePlan(
       state = {
         stage,
         checkpointStatus: checkpoint.status,
+        runId: checkpoint.runId,
         expectedFingerprint,
         actualFingerprint,
         isSatisfied: true,

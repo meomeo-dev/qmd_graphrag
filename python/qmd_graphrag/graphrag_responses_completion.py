@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import random
+import re
+import time
+from contextlib import asynccontextmanager, contextmanager
 from copy import deepcopy
 from collections.abc import AsyncIterator, Iterator, Sequence
+from threading import BoundedSemaphore, Lock
 from typing import Any, cast
 
 from openai import AsyncOpenAI, OpenAI
@@ -39,6 +45,53 @@ _RESPONSE_STREAM_FAILURE_EVENT_TYPES = {
 _GRAPHRAG_COMPLETION_RESPONSE_OBJECT = "chat.completion"
 _GRAPHRAG_COMPLETION_CHUNK_OBJECT = "chat.completion.chunk"
 _GRAPHRAG_COMPLETION_MIDDLEWARE_REQUEST_TYPE = "chat"
+_DEFAULT_RESPONSES_MAX_CONCURRENCY = 5
+_DEFAULT_RESPONSES_RETRY_MAX_RETRIES = 12
+_DEFAULT_RESPONSES_RETRY_BASE_DELAY = 2.0
+_DEFAULT_RESPONSES_RETRY_MAX_DELAY = 120.0
+_DEFAULT_RESPONSES_RETRY_JITTER = True
+_TRANSIENT_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+_TRANSIENT_MESSAGE_FRAGMENTS = (
+    "concurrency limit",
+    "rate limit",
+    "temporarily unavailable",
+    "timeout",
+    "timed out",
+    "connection error",
+    "connection reset",
+    "server error",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "(408)",
+    "(409)",
+    "(425)",
+    "(429)",
+    "(500)",
+    "(502)",
+    "(503)",
+    "(504)",
+)
+_RESPONSES_GATE_LOCK = Lock()
+_RESPONSES_GATES: dict[tuple[str, str, int], "_ResponsesConcurrencyGate"] = {}
+
+
+class OpenAIResponsesTransientError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        message: str,
+        kind: str = "transient",
+        status_code: int | None = None,
+    ) -> None:
+        self.kind = kind
+        self.status_code = status_code
+        status = status_code if status_code is not None else "unknown"
+        safe_message = _sanitize_error_message(message)
+        super().__init__(
+            f"Responses API transient error kind={kind} "
+            f"status_code={status}: {safe_message}"
+        )
 
 
 def _normalize_api_base(api_base: str | None) -> str | None:
@@ -246,6 +299,221 @@ def _stream_error_message(event: Any) -> str:
     return str(error)
 
 
+def _sanitize_error_message(message: Any) -> str:
+    text = str(message)
+    replacements = [
+        (r"(?i)(api[_-]?key|authorization|bearer)\s*[:=]\s*[^\s,;]+", r"\1=[redacted]"),
+        (r"(?i)(base[_-]?url)\s*[:=]\s*[^\s,;]+", r"\1=[redacted]"),
+        (r"https?://[^\s,;)]+", "[redacted-url]"),
+        (r"(?i)\bsk-[A-Za-z0-9_-]{8,}\b", "[redacted-key]"),
+    ]
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text)
+    return text
+
+
+def _stream_error_status_code(event: Any) -> int | None:
+    for candidate in (
+        getattr(event, "status_code", None),
+        getattr(event, "code", None),
+    ):
+        try:
+            parsed = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+
+    response = getattr(event, "response", None)
+    error = getattr(response, "error", None)
+    for candidate in (
+        getattr(response, "status_code", None),
+        getattr(error, "status_code", None),
+        getattr(error, "code", None),
+    ):
+        try:
+            parsed = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+
+    return None
+
+
+def _raise_stream_failure(event: Any) -> None:
+    message = _stream_error_message(event)
+    status_code = _stream_error_status_code(event)
+    error = OpenAIResponsesTransientError(
+        message=message,
+        status_code=status_code,
+    )
+    if _is_transient_responses_error(error):
+        raise error
+    raise RuntimeError(message)
+
+
+def _positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _positive_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _bool_value(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
+class _ResponsesRetryPolicy:
+    def __init__(
+        self,
+        *,
+        max_retries: int = _DEFAULT_RESPONSES_RETRY_MAX_RETRIES,
+        base_delay: float = _DEFAULT_RESPONSES_RETRY_BASE_DELAY,
+        max_delay: float = _DEFAULT_RESPONSES_RETRY_MAX_DELAY,
+        jitter: bool = _DEFAULT_RESPONSES_RETRY_JITTER,
+    ) -> None:
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.jitter = jitter
+
+    def sleep_seconds(self, attempt: int) -> float:
+        delay = min(self.max_delay, self.base_delay * (2 ** max(0, attempt - 1)))
+        if self.jitter:
+            delay += random.uniform(0, min(1.0, delay * 0.1))  # noqa: S311
+        return min(self.max_delay, delay)
+
+
+class _ResponsesConcurrencyGate:
+    def __init__(self, limit: int) -> None:
+        self._sync = BoundedSemaphore(limit)
+        self._async = asyncio.BoundedSemaphore(limit)
+
+    @contextmanager
+    def sync_slot(self) -> Iterator[None]:
+        self._sync.acquire()
+        try:
+            yield
+        finally:
+            self._sync.release()
+
+    @asynccontextmanager
+    async def async_slot(self) -> AsyncIterator[None]:
+        await self._async.acquire()
+        try:
+            yield
+        finally:
+            self._async.release()
+
+
+def _responses_gate_for(
+    *,
+    api_base: str | None,
+    model: str,
+    limit: int,
+) -> _ResponsesConcurrencyGate:
+    key = (api_base or "", model, limit)
+    with _RESPONSES_GATE_LOCK:
+        gate = _RESPONSES_GATES.get(key)
+        if gate is None:
+            gate = _ResponsesConcurrencyGate(limit)
+            _RESPONSES_GATES[key] = gate
+        return gate
+
+
+def _is_transient_responses_error(error: BaseException) -> bool:
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, int) and status_code in _TRANSIENT_STATUS_CODES:
+        return True
+
+    message = str(error).lower()
+    if any(fragment in message for fragment in _TRANSIENT_MESSAGE_FRAGMENTS):
+        return True
+
+    body = getattr(error, "body", None)
+    if body is not None:
+        body_message = str(body).lower()
+        return any(
+            fragment in body_message
+            for fragment in _TRANSIENT_MESSAGE_FRAGMENTS
+        )
+
+    return False
+
+
+def _retry_exhausted_message(error: BaseException, attempts: int) -> str:
+    return (
+        f"Responses API transient failure after {attempts} attempts: "
+        f"{type(error).__name__}: {_sanitize_error_message(error)}"
+    )
+
+
+def _run_with_responses_recovery(
+    func: Any,
+    *,
+    gate: _ResponsesConcurrencyGate,
+    retry_policy: _ResponsesRetryPolicy,
+) -> Any:
+    attempts = retry_policy.max_retries + 1
+    last_error: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with gate.sync_slot():
+                return func()
+        except Exception as error:
+            if not _is_transient_responses_error(error):
+                raise
+            last_error = error
+            if attempt >= attempts:
+                raise RuntimeError(_retry_exhausted_message(error, attempt)) from error
+            time.sleep(retry_policy.sleep_seconds(attempt))
+
+    if last_error is not None:
+        raise RuntimeError(_retry_exhausted_message(last_error, attempts)) from last_error
+    raise RuntimeError("unreachable Responses API retry state")
+
+
+async def _run_with_responses_recovery_async(
+    func: Any,
+    *,
+    gate: _ResponsesConcurrencyGate,
+    retry_policy: _ResponsesRetryPolicy,
+) -> Any:
+    attempts = retry_policy.max_retries + 1
+    last_error: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            async with gate.async_slot():
+                return await func()
+        except Exception as error:
+            if not _is_transient_responses_error(error):
+                raise
+            last_error = error
+            if attempt >= attempts:
+                raise RuntimeError(_retry_exhausted_message(error, attempt)) from error
+            await asyncio.sleep(retry_policy.sleep_seconds(attempt))
+
+    if last_error is not None:
+        raise RuntimeError(_retry_exhausted_message(last_error, attempts)) from last_error
+    raise RuntimeError("unreachable Responses API retry state")
+
+
 def _completed_response_output_text(response: Any) -> str:
     return str(getattr(response, "output_text", "") or "")
 
@@ -272,7 +540,7 @@ def _collect_response_stream(
             completed_response = getattr(event, "response", None)
             continue
         if event_type in _RESPONSE_STREAM_FAILURE_EVENT_TYPES:
-            raise RuntimeError(_stream_error_message(event))
+            _raise_stream_failure(event)
 
     output_text = "".join(text_parts)
     if completed_response is not None:
@@ -312,7 +580,7 @@ async def _collect_response_stream_async(
             completed_response = getattr(event, "response", None)
             continue
         if event_type in _RESPONSE_STREAM_FAILURE_EVENT_TYPES:
-            raise RuntimeError(_stream_error_message(event))
+            _raise_stream_failure(event)
 
     output_text = "".join(text_parts)
     if completed_response is not None:
@@ -365,7 +633,7 @@ def _iter_response_chunks(
             )
             continue
         if event_type in _RESPONSE_STREAM_FAILURE_EVENT_TYPES:
-            raise RuntimeError(_stream_error_message(event))
+            _raise_stream_failure(event)
 
 
 async def _iter_response_chunks_async(
@@ -403,7 +671,7 @@ async def _iter_response_chunks_async(
             )
             continue
         if event_type in _RESPONSE_STREAM_FAILURE_EVENT_TYPES:
-            raise RuntimeError(_stream_error_message(event))
+            _raise_stream_failure(event)
 
 
 def _translate_call_args(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -497,6 +765,33 @@ class OpenAIResponsesCompletion(LLMCompletion):
         )
 
         model_name = model_config.azure_deployment_name or model_config.model
+        call_args_config = dict(model_config.call_args or {})
+        retry_policy = _ResponsesRetryPolicy(
+            max_retries=_positive_int(
+                call_args_config.get("qmd_responses_retry_max_retries"),
+                _DEFAULT_RESPONSES_RETRY_MAX_RETRIES,
+            ),
+            base_delay=_positive_float(
+                call_args_config.get("qmd_responses_retry_base_delay"),
+                _DEFAULT_RESPONSES_RETRY_BASE_DELAY,
+            ),
+            max_delay=_positive_float(
+                call_args_config.get("qmd_responses_retry_max_delay"),
+                _DEFAULT_RESPONSES_RETRY_MAX_DELAY,
+            ),
+            jitter=_bool_value(
+                call_args_config.get("qmd_responses_retry_jitter"),
+                _DEFAULT_RESPONSES_RETRY_JITTER,
+            ),
+        )
+        concurrency_gate = _responses_gate_for(
+            api_base=base_url,
+            model=model_name,
+            limit=_positive_int(
+                call_args_config.get("qmd_responses_max_concurrency"),
+                _DEFAULT_RESPONSES_MAX_CONCURRENCY,
+            ),
+        )
 
         def _base_completion(
             **kwargs: Any,
@@ -527,12 +822,33 @@ class OpenAIResponsesCompletion(LLMCompletion):
                 "stream": True,
                 **call_args,
             }
-            response_stream = client.responses.create(
-                **{k: v for k, v in create_args.items() if v is not None},
-            )
             if stream:
-                return _iter_response_chunks(response_stream, model=model_name)
-            return _collect_response_stream(response_stream, model=model_name)
+                def collect_chunks() -> list[LLMCompletionChunk]:
+                    response_stream = client.responses.create(
+                        **{k: v for k, v in create_args.items() if v is not None},
+                    )
+                    return list(
+                        _iter_response_chunks(response_stream, model=model_name)
+                    )
+
+                chunks = _run_with_responses_recovery(
+                    collect_chunks,
+                    gate=concurrency_gate,
+                    retry_policy=retry_policy,
+                )
+                return iter(chunks)
+
+            def collect_response() -> LLMCompletionResponse:
+                response_stream = client.responses.create(
+                    **{k: v for k, v in create_args.items() if v is not None},
+                )
+                return _collect_response_stream(response_stream, model=model_name)
+
+            return _run_with_responses_recovery(
+                collect_response,
+                gate=concurrency_gate,
+                retry_policy=retry_policy,
+            )
 
         async def _base_completion_async(
             **kwargs: Any,
@@ -563,14 +879,44 @@ class OpenAIResponsesCompletion(LLMCompletion):
                 "stream": True,
                 **call_args,
             }
-            response_stream = await async_client.responses.create(
-                **{k: v for k, v in create_args.items() if v is not None},
-            )
             if stream:
-                return _iter_response_chunks_async(response_stream, model=model_name)
-            return await _collect_response_stream_async(
-                response_stream,
-                model=model_name,
+                async def collect_chunks() -> list[LLMCompletionChunk]:
+                    response_stream = await async_client.responses.create(
+                        **{k: v for k, v in create_args.items() if v is not None},
+                    )
+                    chunks: list[LLMCompletionChunk] = []
+                    async for chunk in _iter_response_chunks_async(
+                        response_stream,
+                        model=model_name,
+                    ):
+                        chunks.append(chunk)
+                    return chunks
+
+                chunks = await _run_with_responses_recovery_async(
+                    collect_chunks,
+                    gate=concurrency_gate,
+                    retry_policy=retry_policy,
+                )
+
+                async def replay_chunks() -> AsyncIterator[LLMCompletionChunk]:
+                    for chunk in chunks:
+                        yield chunk
+
+                return replay_chunks()
+
+            async def collect_response() -> LLMCompletionResponse:
+                response_stream = await async_client.responses.create(
+                    **{k: v for k, v in create_args.items() if v is not None},
+                )
+                return await _collect_response_stream_async(
+                    response_stream,
+                    model=model_name,
+                )
+
+            return await _run_with_responses_recovery_async(
+                collect_response,
+                gate=concurrency_gate,
+                retry_policy=retry_policy,
             )
 
         self._completion, self._completion_async = with_middleware_pipeline(

@@ -117,6 +117,20 @@ function stageWorkflows(stage) {
   );
 }
 
+function reusableRunIdForStage(sync, stage) {
+  const checkpoint = sync.resumePlan.stageStates
+    .find((item) => item.stage === stage);
+  const runId = checkpoint?.checkpointStatus === "failed" ||
+      checkpoint?.checkpointStatus === "running" ||
+      checkpoint?.checkpointStatus === "pending"
+    ? checkpoint?.runId
+    : undefined;
+  if (typeof runId === "string" && runId.length > 0) {
+    return runId;
+  }
+  return null;
+}
+
 function indexScopeFromSync(sync) {
   return {
     bookId: sync.job.bookId,
@@ -347,7 +361,8 @@ async function run() {
       sync,
       scopedOutputDir,
     );
-    const runId = runtimeApi.createRunId(nextStage);
+    const runId = reusableRunIdForStage(sync, nextStage) ??
+      runtimeApi.createRunId(nextStage);
     await runtimeApi.writeGraphRagOutputProducerManifest({
       outputDir: scopedOutputDir,
       bookId: sync.job.bookId,
@@ -416,7 +431,8 @@ async function run() {
     );
   }
 
-  const runId = runtimeApi.createRunId(nextStage);
+  const runId = reusableRunIdForStage(sync, nextStage) ??
+    runtimeApi.createRunId(nextStage);
   const inputFingerprint = sync.stageFingerprints[nextStage];
 
   await repo.startStage({

@@ -1336,6 +1336,18 @@ describe("GraphRAG EPUB batch runner", () => {
       failureKind: "transient",
       retryable: true,
     });
+    expect(classifyFailure(
+      "Responses API transient error kind=server_error status_code=unknown",
+    )).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+    });
+    expect(classifyFailure(
+      "Responses API transient error kind=rate_limit_exceeded status_code=unknown",
+    )).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+    });
     expect(classifyFailure("GraphRAG stage report partial-output failure")).toMatchObject({
       failureKind: "transient",
       retryable: true,
@@ -1516,7 +1528,7 @@ describe("GraphRAG EPUB batch runner", () => {
         maxCommandAttempts: 3,
         maxTransientCommandAttempts: 12,
         retryBudgetSeconds: 7200,
-        commandTimeoutSeconds: 1800,
+        commandTimeoutSeconds: 5400,
       },
     });
     expect(recoverySummary.items[0]).toMatchObject({

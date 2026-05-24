@@ -185,6 +185,7 @@ export const BookJobRunCatalogSchema = z.object({
 export const BookResumeStageStateSchema = z.object({
   stage: BookStageSchema,
   checkpointStatus: StageCheckpointStatusSchema.nullable(),
+  runId: z.string().min(1).optional(),
   expectedFingerprint: z.string().min(1).optional(),
   actualFingerprint: z.string().min(1).optional(),
   isSatisfied: z.boolean(),

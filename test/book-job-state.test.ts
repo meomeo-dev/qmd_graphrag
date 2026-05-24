@@ -801,6 +801,9 @@ describe("FileBookJobStateRepository", () => {
       expect(
         plan.stageStates.find((item) => item.stage === "graph_extract")?.reason,
       ).toBe("failed");
+      expect(
+        plan.stageStates.find((item) => item.stage === "graph_extract")?.runId,
+      ).toBe("run-extract-1");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1288,6 +1291,7 @@ describe("FileBookJobStateRepository", () => {
       );
       expect(plan.nextStage).toBe("normalize");
       expect(normalizeState?.reason).toBe("artifact_missing");
+      expect(normalizeState?.runId).toBe("run-normalize-1");
       expect(normalizeState?.missingArtifactIds).toEqual([artifact.artifactId]);
       expect(normalizeState?.missingArtifactKinds).toEqual(["normalized_markdown"]);
     } finally {
@@ -1339,6 +1343,7 @@ describe("FileBookJobStateRepository", () => {
       const embedState = plan.stageStates.find((item) => item.stage === "embed");
 
       expect(embedState?.reason).toBe("artifact_missing");
+      expect(embedState?.runId).toBe("run-embed-1");
       expect(embedState?.missingArtifactIds).toEqual([artifact?.artifactId]);
     } finally {
       await rm(root, { recursive: true, force: true });

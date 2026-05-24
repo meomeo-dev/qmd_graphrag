@@ -146,6 +146,15 @@ describe("syncGraphRagBookWorkspace", () => {
       },
     });
     expect(projection.settings.concurrent_requests).toBe(4);
+    expect(projection.settings).toMatchObject({
+      completion_models: {
+        default_chat_model: {
+          call_args: {
+            qmd_responses_max_concurrency: 4,
+          },
+        },
+      },
+    });
   });
 
   test("defaults GraphRAG concurrent requests to API supported value", () => {
@@ -157,6 +166,15 @@ describe("syncGraphRagBookWorkspace", () => {
       },
     });
     expect(projection.settings.concurrent_requests).toBe(5);
+    expect(projection.settings).toMatchObject({
+      completion_models: {
+        default_chat_model: {
+          call_args: {
+            qmd_responses_max_concurrency: 5,
+          },
+        },
+      },
+    });
   });
 
   test("rejects invalid OpenAI Responses projection settings before runtime", () => {

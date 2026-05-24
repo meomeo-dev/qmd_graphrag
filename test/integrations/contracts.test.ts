@@ -310,7 +310,7 @@ export function batchRecoverySummaryEnvelopeFixture() {
         retryBaseDelaySeconds: 30,
         retryMaxDelaySeconds: 300,
         retryBudgetSeconds: 7200,
-        commandTimeoutSeconds: 1800,
+        commandTimeoutSeconds: 5400,
       },
       recoveryDecision: "retry_same_run_id",
       retryableItemCount: 1,

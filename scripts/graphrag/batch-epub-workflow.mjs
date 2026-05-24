@@ -56,7 +56,7 @@ const { values } = parseArgs({
     "retry-base-delay-seconds": { type: "string", default: "30" },
     "retry-max-delay-seconds": { type: "string", default: "300" },
     "retry-budget-seconds": { type: "string", default: "7200" },
-    "command-timeout-seconds": { type: "string", default: "1800" },
+    "command-timeout-seconds": { type: "string", default: "5400" },
     "completed-manifest": { type: "string" },
     "migrate-only": { type: "boolean", default: false },
     "status-json": { type: "boolean", default: false },
@@ -104,7 +104,7 @@ const retryBudgetSeconds = Math.max(
 );
 const commandTimeoutSeconds = Math.max(
   1,
-  Number.parseInt(String(values["command-timeout-seconds"]), 10) || 1800,
+  Number.parseInt(String(values["command-timeout-seconds"]), 10) || 5400,
 );
 const runnerHost = hostname();
 const runnerPid = process.pid;
@@ -494,6 +494,14 @@ function isoAfterSeconds(seconds) {
   return new Date(Date.now() + seconds * 1000).toISOString();
 }
 
+function jitteredDelaySeconds(seconds, attempt) {
+  if (seconds <= 1) return seconds;
+  const stableSeed = sha256Text(`${runId}:${attempt}:${Date.now()}`);
+  const value = Number.parseInt(stableSeed.slice(0, 8), 16) / 0xffffffff;
+  const jitterWindow = Math.max(1, Math.floor(Math.min(seconds * 0.2, 30)));
+  return Math.min(retryMaxDelaySeconds, seconds + Math.floor(value * jitterWindow));
+}
+
 function withoutUndefined(value) {
   if (Array.isArray(value)) {
     return value
@@ -512,7 +520,7 @@ function withoutUndefined(value) {
 
 function retryDelaySecondsForAttempt(attempt) {
   const exponential = retryBaseDelaySeconds * 2 ** Math.max(0, attempt - 1);
-  return Math.min(retryMaxDelaySeconds, exponential);
+  return jitteredDelaySeconds(Math.min(retryMaxDelaySeconds, exponential), attempt);
 }
 
 function elapsedRetrySeconds(checkpoint) {
@@ -1561,7 +1569,9 @@ function updateManifest(manifest, checkpoints) {
     delete manifest.completedAt;
     delete manifest.failedAt;
   }
-  return writeTypedJson(manifestPath, BatchRunManifestSchema, manifest);
+  const parsed = writeTypedJson(manifestPath, BatchRunManifestSchema, manifest);
+  writeRecoverySummary(parsed, checkpoints);
+  return parsed;
 }
 
 function buildRecoverySummary(manifest, checkpoints) {

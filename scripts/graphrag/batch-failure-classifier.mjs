@@ -40,6 +40,9 @@ export function classifyFailure(text) {
     message.includes("graphrag stage report") ||
     message.includes("rate limit") ||
     message.includes("temporarily unavailable") ||
+    message.includes("kind=server_error") ||
+    message.includes("kind=rate_limit_exceeded") ||
+    message.includes("kind=timeout") ||
     message.includes("timeout") ||
     message.includes("timed out") ||
     message.includes("service unavailable") ||
