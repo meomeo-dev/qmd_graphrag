@@ -69,10 +69,11 @@ export const BatchCommandCheckSchema = z.object({
   retryAfterSeconds: z.number().int().nonnegative().optional(),
   attemptExhausted: z.boolean().optional(),
   providerStatusCode: z.number().int().positive().optional(),
+  recoveryDecision: BatchRecoveryDecisionSchema.optional(),
   errorSummary: z.string().max(1000).optional(),
 });
 
-export const BatchItemCheckpointSchema = z.object({
+const BatchItemCheckpointObjectSchema = z.object({
   schemaVersion: z.literal(SchemaVersion),
   itemId: z.string().min(1),
   runId: z.string().min(1),
@@ -113,6 +114,41 @@ export const BatchItemCheckpointSchema = z.object({
   commandChecks: z.array(BatchCommandCheckSchema).default([]),
   metadata: z.record(z.string(), JsonValueSchema).optional(),
 });
+
+export const BatchItemCheckpointSchema =
+  BatchItemCheckpointObjectSchema.superRefine((value, ctx) => {
+    if (value.status === "running") {
+      for (const field of [
+        "runnerSessionId",
+        "runnerHost",
+        "runnerPid",
+        "runnerHeartbeatAt",
+      ] as const) {
+        if (value[field] == null) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `running checkpoint requires ${field}`,
+            path: [field],
+          });
+        }
+      }
+    }
+    if (
+      value.retryExhausted === true &&
+      (
+        value.retryable !== false ||
+        value.recoveryDecision !== "stop_until_fixed"
+      )
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "retryExhausted checkpoint requires retryable=false and " +
+          "recoveryDecision=stop_until_fixed",
+        path: ["retryExhausted"],
+      });
+    }
+  });
 
 export const BatchRunManifestSchema = z.object({
   schemaVersion: z.literal(SchemaVersion),
@@ -170,21 +206,14 @@ export const BatchRecoverySummaryItemSchema = z.object({
   bookId: z.string().min(1),
   status: BatchItemStatusSchema,
   attempts: z.number().int().nonnegative(),
-  qmdBuildStatus: z.union([
-    BatchBuildStatusSchema.shape.status,
-    z.literal("unknown"),
-  ]),
-  graphBuildStatus: z.union([
-    BatchBuildStatusSchema.shape.status,
-    z.literal("unknown"),
-  ]),
-  graphStage: z.string().min(1).optional(),
-  graphReason: z.string().min(1).optional(),
+  qmdBuildStatus: BatchBuildStatusSchema,
+  graphBuildStatus: BatchBuildStatusSchema,
   failureKind: BatchFailureKindSchema.optional(),
   retryable: z.boolean().optional(),
   retryExhausted: z.boolean().optional(),
   recoveryDecision: BatchRecoveryDecisionSchema.optional(),
   failedStage: z.string().min(1).optional(),
+  providerStatusCode: z.number().int().positive().optional(),
   nextRetryAt: z.string().datetime().optional(),
   retryDelaySeconds: z.number().int().nonnegative().optional(),
   retryBudgetSeconds: z.number().int().positive().optional(),
@@ -229,7 +258,7 @@ export const BatchRecoverySummarySchema = z.object({
   items: z.array(BatchRecoverySummaryItemSchema),
 });
 
-export const BatchItemCheckpointInputSchema = BatchItemCheckpointSchema.extend({
+export const BatchItemCheckpointInputSchema = BatchItemCheckpointObjectSchema.extend({
   sourceHash: z.string().min(1).optional(),
   bookId: z.string().min(1).optional(),
 });

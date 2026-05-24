@@ -26,12 +26,17 @@ contract_artifacts:
       - BatchRunStatusSchema
       - BatchFailureKindSchema
       - BatchRecoveryDecisionSchema
+      - BatchBuildStatusSchema
       - BatchProjectRelativeLocatorSchema
+      - BatchCommandCheckSchema
       - BatchItemCheckpointInputSchema
       - BatchItemCheckpointSchema
       - BatchItemCheckpointEnvelopeSchema
       - BatchEventLogSchema
       - BatchEventLogEnvelopeSchema
+      - BatchRecoverySummaryItemSchema
+      - BatchRecoverySummarySchema
+      - BatchRecoverySummaryEnvelopeSchema
       - parseBatchItemCheckpoint
   corpus:
     path: src/contracts/corpus.ts
@@ -329,6 +334,12 @@ typed_buses:
           - scripts/graphrag/batch-epub-workflow.mjs#event
         consumers:
           - test/integrations/contracts.test.ts#batchEventLogEnvelopeFixture
+        required_observability_fields:
+          - failureKind
+          - retryable
+          - providerStatusCode
+          - recoveryDecision
+          - failedStage
       - name: batch_recovery_summary
         schema: src/contracts/batch-run.ts#BatchRecoverySummarySchema
         envelope: src/contracts/batch-run.ts#BatchRecoverySummaryEnvelopeSchema
@@ -339,6 +350,12 @@ typed_buses:
         consumers:
           - scripts/graphrag/batch-epub-workflow.mjs#printStatusAndExit
           - test/integrations/contracts.test.ts#batchRecoverySummaryEnvelopeFixture
+        required_observability_fields:
+          - qmdBuildStatus
+          - graphBuildStatus
+          - providerStatusCode
+          - recoveryDecision
+          - failedStage
 
   corpus_bus:
     role: Whole-corpus ingestion and document identity.
@@ -576,10 +593,12 @@ typed_buses:
         storage_contract:
           input_dir: graph_vault/books/<book_id>/input
           data_dir: graph_vault/books/<book_id>/output
+          report_dir: <log_root>/graphrag-reports/<book_id>/<stage>
           bridge_projection: >-
             inputDir and dataDir become GraphRAG input_storage,
-            output_storage, reporting, cache, and LanceDB vector_store
-            overrides without mutating vendor code.
+            output_storage, cache, and LanceDB vector_store overrides.
+            reportDir becomes the GraphRAG reporting target under logRoot
+            without mutating vendor code.
           producer_manifest: >-
             qmd_output_manifest.json is written after the real GraphRAG
             index call returns successfully.
@@ -1514,13 +1533,47 @@ state_and_recovery:
       other item can run.
     runner_ownership_rule: >-
       Running checkpoints carry runnerSessionId, runnerHost, runnerPid, and
-      runnerHeartbeatAt. Missing ownership, dead local runner PIDs, or host
-      mismatch after graph_vault migration are recovered to pending with
-      recoveryDecision=retry_same_run_id.
+      runnerHeartbeatAt. Fresh remote ownership is observed but not stolen.
+      Missing ownership, expired heartbeats, or dead local runner PIDs are
+      recovered to pending with recoveryDecision=retry_same_run_id.
+    status_json_projection_rule: >-
+      --status-json is a read-only projection. It recomputes recovery decisions,
+      qmdBuildStatus, and graphBuildStatus for stdout without writing manifest,
+      item checkpoints, events, or producer manifests.
     command_timeout_rule: >-
       Every spawned command has commandTimeoutSeconds. Timeout failures are
       classified as transient and enter the same bounded retry path as provider
       rate limits and 5xx errors.
+    stage_report_health_rule: >-
+      A GraphRAG stage is completed only when the stage-scoped
+      indexing-engine.log segment contains no provider transient error and no
+      partial-output signal such as missing community reports. Stage health is
+      checked before producer manifests and checkpoints are published. The log
+      remains runtime health evidence and is not registered as a query-ready
+      graph artifact.
+    producer_manifest_portability_rule: >-
+      qmd_output_manifest.json stores graph output location as the vault-relative
+      locator books/<book_id>/output and records stageProducerRunIds so one
+      stage run cannot claim artifacts created by another stage.
+    producer_lineage_rule: >-
+      GraphRAG build success requires qmd_output_manifest.json, high-cost stage
+      checkpoints, and high-cost artifacts to agree on bookId, sourceHash,
+      documentId, contentHash, providerFingerprint, stageFingerprints, and
+      stageProducerRunIds. Host absolute outputDir values are stale.
+    query_ready_scope_rule: >-
+      query_ready checkpoints publish graph capabilities only from book-scoped
+      GraphRAG artifacts under books/<book_id>/output. Shared graph_vault/output
+      artifacts are invalid for query_ready capability publication.
+    running_ownership_rule: >-
+      A fresh running checkpoint owned by another runner session is observed but
+      not stolen. Only missing, expired, or dead runner ownership is downgraded
+      to pending recovery.
+    retry_exhaustion_rule: >-
+      A transient item whose book-level retry budget is exhausted is terminal
+      within the same run. The item is marked retryable=false,
+      retryExhausted=true, and recoveryDecision=stop_until_fixed. Command-level
+      attemptExhausted does not by itself exhaust the book-level recovery
+      budget.
     completed_item_rule: completed items are not reprocessed by the same run.
     completion_rule: >-
       A batch run is completed only when completedItems equals totalItems.
@@ -1528,12 +1581,20 @@ state_and_recovery:
       satisfy the book closed-loop acceptance gate.
     command_check_rule: >-
       Every completed item has exactly 27 required commandChecks and every
-      commandCheck status is passed.
+      commandCheck status is passed. Persisted qmdBuildStatus is never trusted
+      without recomputing it from commandChecks.
+    command_check_failure_rule: >-
+      Failed commandChecks carry failureKind, retryable, providerStatusCode
+      when available, attemptExhausted, the failed command name, and
+      recoveryDecision. Command retry exhaustion is always
+      recoveryDecision=stop_until_fixed at command level; book-level recovery
+      remains represented on the item checkpoint.
     transient_failure_policy: >-
       429, concurrency limit, timeout, and 5xx provider failures are retried
       with bounded backoff before the current item is marked failed with
-      failureKind=transient, retryable=true, retryExhausted=true, and
-      recoveryDecision=retry_same_run_id. The batch continues pending items.
+      failureKind=transient, retryable=true, retryExhausted=false, and
+      recoveryDecision=retry_same_run_id while the book-level retry budget
+      remains available. The batch continues pending items.
     permanent_failure_policy: >-
       Permanent failed items remain failed with retryable=false and
       recoveryDecision=stop_until_fixed. They do not block other pending items.

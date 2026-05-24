@@ -59,8 +59,9 @@ types:
     storage: graph_vault/catalog/batch-runs/<run_id>/events.jsonl
     notes:
       - stores redacted event summaries
-      - records failureKind, retryable, failedStage, and recoveryDecision
-      - raw stdout and stderr stay in temporary run logs
+      - records failureKind, retryable, failedStage, providerStatusCode, and
+        recoveryDecision
+      - raw stdout, stderr, and GraphRAG report logs stay in temporary run logs
       - operators and audits consume this JSONL as a persisted record
 
   - name: batch_recovery_summary
@@ -79,6 +80,11 @@ types:
       - exposes retry policy, nextRetryAt, retryable item count, and item
         qmd/GraphRAG build status
       - exposes runner ownership and orphan recovery state for running items
+      - reports qmd build status recomputed from 27 fixed command checks
+      - reports GraphRAG build status from book-scoped producer lineage rather
+        than persisted status strings
+      - exposes providerStatusCode when the failed command came from an
+        upstream provider or gateway response
       - status-json emits the same typed payload without running work
 
   - name: source_document
@@ -432,8 +438,11 @@ types:
     notes:
       - inputDir must resolve to `graph_vault/books/<book_id>/input`
       - dataDir must resolve to `graph_vault/books/<book_id>/output`
+      - reportDir must resolve under the batch logRoot and is runtime
+        observability output, not portable graph_vault state
       - Python bridge projects inputDir/dataDir into GraphRAG storage
-        overrides instead of mutating vendor code
+        overrides and projects reportDir into GraphRAG reporting output
+        instead of mutating vendor code
       - output producer manifest is written only after the real GraphRAG
         index call returns successfully
       - supports `skipValidation` for gateways whose connectivity checks differ

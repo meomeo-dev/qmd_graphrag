@@ -663,10 +663,19 @@ GraphRAG capability。
 - 批量恢复时先读取 batch manifest，再读取单书 `BookResumePlan.nextStage`。
 - 已 `completed` 的批量 item 不重跑；单书 checkpoint 不完整时以
   `BookResumePlan.nextStage` 继续，不从第一本或第一阶段重跑。
+- 加载 `completed` checkpoint 时必须重新计算 qmd/GraphRAG 闭环证据。
+  `qmdBuildStatus` 不能替代 27 个固定 command checks。GraphRAG producer
+  manifest、stage checkpoint 与 artifact 的 producer run、fingerprint 和
+  provider identity 必须一致。
+- 非孤儿 `running` checkpoint 表示其他 runner 拥有当前 item；正式运行和
+  `--status-json` 都只观测该 item，不抢占、不重写 attempts。
 - Provider 429、concurrency limit、timeout、502、503、504 属于 transient
-  failure。批量执行器对 transient failure 做有限重试；重试耗尽后标记当前
-  item failed，写入 `failureKind=transient`、`retryable=true`、
-  `recoveryDecision=retry_same_run_id`，并继续处理后续 pending item。
+  failure。批量执行器对 transient failure 做有限重试；book-level retry budget
+  仍可用时，item 保持 `retryable=true` 和
+  `recoveryDecision=retry_same_run_id`。book-level retry budget 耗尽时，当前
+  item 在同一 run 内终止为 failed，写入 `failureKind=transient`、
+  `retryable=false`、`retryExhausted=true` 和
+  `recoveryDecision=stop_until_fixed`，并继续处理后续 pending item。
 - `failed` item 只有 `retryable=true` 时由同一 `runId` 自动重试；permanent
   failed item 保持 failed，不阻塞其他 pending item。
 - 批次完成条件只接受 `completedItems == totalItems`。`skippedItems` 和
