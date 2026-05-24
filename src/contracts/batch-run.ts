@@ -62,6 +62,8 @@ export const BatchCommandCheckSchema = z.object({
   stderrBytes: z.number().int().nonnegative(),
   startedAt: z.string().datetime(),
   completedAt: z.string().datetime(),
+  nextRetryAt: z.string().datetime().optional(),
+  retryDelaySeconds: z.number().int().nonnegative().optional(),
   failureKind: BatchFailureKindSchema.optional(),
   retryable: z.boolean().optional(),
   retryAfterSeconds: z.number().int().nonnegative().optional(),
@@ -83,6 +85,20 @@ export const BatchItemCheckpointSchema = z.object({
   attempts: z.number().int().nonnegative(),
   expectedCommandCheckCount: z.number().int().positive().optional(),
   maxCommandAttempts: z.number().int().positive().optional(),
+  maxTransientCommandAttempts: z.number().int().positive().optional(),
+  maxResumePasses: z.number().int().positive().optional(),
+  retryBaseDelaySeconds: z.number().int().positive().optional(),
+  retryMaxDelaySeconds: z.number().int().positive().optional(),
+  retryBudgetSeconds: z.number().int().positive().optional(),
+  commandTimeoutSeconds: z.number().int().positive().optional(),
+  retryStartedAt: z.string().datetime().optional(),
+  runnerSessionId: z.string().min(1).optional(),
+  runnerHost: z.string().min(1).optional(),
+  runnerPid: z.number().int().positive().optional(),
+  runnerHeartbeatAt: z.string().datetime().optional(),
+  orphanedRunnerDetectedAt: z.string().datetime().optional(),
+  nextRetryAt: z.string().datetime().optional(),
+  retryDelaySeconds: z.number().int().nonnegative().optional(),
   failureKind: BatchFailureKindSchema.optional(),
   retryable: z.boolean().optional(),
   retryExhausted: z.boolean().optional(),
@@ -115,6 +131,12 @@ export const BatchRunManifestSchema = z.object({
   failedItems: z.number().int().nonnegative(),
   expectedCommandCheckCount: z.number().int().positive().optional(),
   maxCommandAttempts: z.number().int().positive().optional(),
+  maxTransientCommandAttempts: z.number().int().positive().optional(),
+  maxResumePasses: z.number().int().positive().optional(),
+  retryBaseDelaySeconds: z.number().int().positive().optional(),
+  retryMaxDelaySeconds: z.number().int().positive().optional(),
+  retryBudgetSeconds: z.number().int().positive().optional(),
+  commandTimeoutSeconds: z.number().int().positive().optional(),
   startedAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
   completedAt: z.string().datetime().optional(),
@@ -140,6 +162,71 @@ export const BatchEventLogSchema = z.object({
   at: z.string().datetime(),
   message: z.string().max(1000).optional(),
   metadata: z.record(z.string(), JsonValueSchema).optional(),
+});
+
+export const BatchRecoverySummaryItemSchema = z.object({
+  itemId: z.string().min(1),
+  sourceName: z.string().min(1),
+  bookId: z.string().min(1),
+  status: BatchItemStatusSchema,
+  attempts: z.number().int().nonnegative(),
+  qmdBuildStatus: z.union([
+    BatchBuildStatusSchema.shape.status,
+    z.literal("unknown"),
+  ]),
+  graphBuildStatus: z.union([
+    BatchBuildStatusSchema.shape.status,
+    z.literal("unknown"),
+  ]),
+  graphStage: z.string().min(1).optional(),
+  graphReason: z.string().min(1).optional(),
+  failureKind: BatchFailureKindSchema.optional(),
+  retryable: z.boolean().optional(),
+  retryExhausted: z.boolean().optional(),
+  recoveryDecision: BatchRecoveryDecisionSchema.optional(),
+  failedStage: z.string().min(1).optional(),
+  nextRetryAt: z.string().datetime().optional(),
+  retryDelaySeconds: z.number().int().nonnegative().optional(),
+  retryBudgetSeconds: z.number().int().positive().optional(),
+  runnerSessionId: z.string().min(1).optional(),
+  runnerHost: z.string().min(1).optional(),
+  runnerPid: z.number().int().positive().optional(),
+  runnerHeartbeatAt: z.string().datetime().optional(),
+  orphanedRunnerDetectedAt: z.string().datetime().optional(),
+  waitingForProviderRecovery: z.boolean().optional(),
+  errorSummary: z.string().max(1000).optional(),
+});
+
+export const BatchRecoverySummarySchema = z.object({
+  schemaVersion: z.literal(SchemaVersion),
+  runId: z.string().min(1),
+  generatedAt: z.string().datetime(),
+  manifest: z.object({
+    status: BatchRunStatusSchema,
+    totalItems: z.number().int().nonnegative(),
+    pendingItems: z.number().int().nonnegative(),
+    runningItems: z.number().int().nonnegative(),
+    completedItems: z.number().int().nonnegative(),
+    skippedItems: z.number().int().nonnegative(),
+    failedItems: z.number().int().nonnegative(),
+    updatedAt: z.string().datetime(),
+    completedAt: z.string().datetime().optional(),
+    failedAt: z.string().datetime().optional(),
+  }),
+  counts: z.record(z.string(), z.number().int().nonnegative()),
+  retryPolicy: z.object({
+    maxCommandAttempts: z.number().int().positive(),
+    maxTransientCommandAttempts: z.number().int().positive(),
+    maxResumePasses: z.number().int().positive(),
+    retryBaseDelaySeconds: z.number().int().positive(),
+    retryMaxDelaySeconds: z.number().int().positive(),
+    retryBudgetSeconds: z.number().int().positive(),
+    commandTimeoutSeconds: z.number().int().positive(),
+  }),
+  recoveryDecision: BatchRecoveryDecisionSchema,
+  retryableItemCount: z.number().int().nonnegative(),
+  nextRetryAt: z.string().datetime().optional(),
+  items: z.array(BatchRecoverySummaryItemSchema),
 });
 
 export const BatchItemCheckpointInputSchema = BatchItemCheckpointSchema.extend({
@@ -174,6 +261,11 @@ export const BatchEventLogEnvelopeSchema = buildEnvelopeSchema(
   BatchEventLogSchema,
 );
 
+export const BatchRecoverySummaryEnvelopeSchema = buildEnvelopeSchema(
+  "qmd.batch_run.recovery_summary",
+  BatchRecoverySummarySchema,
+);
+
 export type BatchItemStatus = z.infer<typeof BatchItemStatusSchema>;
 export type BatchRunStatus = z.infer<typeof BatchRunStatusSchema>;
 export type BatchFailureKind = z.infer<typeof BatchFailureKindSchema>;
@@ -187,3 +279,7 @@ export type BatchItemCheckpointInput = z.infer<typeof BatchItemCheckpointInputSc
 export type BatchItemCheckpoint = z.infer<typeof BatchItemCheckpointSchema>;
 export type BatchRunManifest = z.infer<typeof BatchRunManifestSchema>;
 export type BatchEventLog = z.infer<typeof BatchEventLogSchema>;
+export type BatchRecoverySummaryItem = z.infer<
+  typeof BatchRecoverySummaryItemSchema
+>;
+export type BatchRecoverySummary = z.infer<typeof BatchRecoverySummarySchema>;

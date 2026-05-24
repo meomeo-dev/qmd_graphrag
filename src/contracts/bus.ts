@@ -6,6 +6,7 @@ import {
 import {
   BatchEventLogEnvelopeSchema,
   BatchItemCheckpointEnvelopeSchema,
+  BatchRecoverySummaryEnvelopeSchema,
   BatchRunManifestEnvelopeSchema,
 } from "./batch-run.js";
 import {
@@ -101,6 +102,7 @@ export const DataBusEnvelopeSchema = z.union([
   BatchRunManifestEnvelopeSchema,
   BatchItemCheckpointEnvelopeSchema,
   BatchEventLogEnvelopeSchema,
+  BatchRecoverySummaryEnvelopeSchema,
   SourceDocumentEnvelopeSchema,
   SourceDocumentCatalogEnvelopeSchema,
   CorpusDocumentEnvelopeSchema,

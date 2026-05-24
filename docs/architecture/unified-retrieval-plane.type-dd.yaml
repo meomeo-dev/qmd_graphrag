@@ -329,6 +329,16 @@ typed_buses:
           - scripts/graphrag/batch-epub-workflow.mjs#event
         consumers:
           - test/integrations/contracts.test.ts#batchEventLogEnvelopeFixture
+      - name: batch_recovery_summary
+        schema: src/contracts/batch-run.ts#BatchRecoverySummarySchema
+        envelope: src/contracts/batch-run.ts#BatchRecoverySummaryEnvelopeSchema
+        storage: graph_vault/catalog/batch-runs/<run_id>/recovery-summary.json
+        producers:
+          - scripts/graphrag/batch-epub-workflow.mjs#buildRecoverySummary
+          - scripts/graphrag/batch-epub-workflow.mjs#writeRecoverySummary
+        consumers:
+          - scripts/graphrag/batch-epub-workflow.mjs#printStatusAndExit
+          - test/integrations/contracts.test.ts#batchRecoverySummaryEnvelopeFixture
 
   corpus_bus:
     role: Whole-corpus ingestion and document identity.
@@ -1492,11 +1502,25 @@ state_and_recovery:
     manifest_schema: BatchRunManifest
     item_checkpoint_schema: BatchItemCheckpoint
     event_log_schema: BatchEventLog
+    recovery_summary_schema: BatchRecoverySummary
     storage_root: graph_vault/catalog/batch-runs/<run_id>
     runner: scripts/graphrag/batch-epub-workflow.mjs
     resume_rule: >-
       Batch resume reads item checkpoints first and then delegates each
       unfinished item to the existing BookResumePlan nextStage calculation.
+    retry_window_rule: >-
+      Items with future nextRetryAt are deferred while other runnable items
+      continue. The runner waits for the earliest retry window only when no
+      other item can run.
+    runner_ownership_rule: >-
+      Running checkpoints carry runnerSessionId, runnerHost, runnerPid, and
+      runnerHeartbeatAt. Missing ownership, dead local runner PIDs, or host
+      mismatch after graph_vault migration are recovered to pending with
+      recoveryDecision=retry_same_run_id.
+    command_timeout_rule: >-
+      Every spawned command has commandTimeoutSeconds. Timeout failures are
+      classified as transient and enter the same bounded retry path as provider
+      rate limits and 5xx errors.
     completed_item_rule: completed items are not reprocessed by the same run.
     completion_rule: >-
       A batch run is completed only when completedItems equals totalItems.

@@ -68,6 +68,7 @@ import {
   BatchEventLogSchema,
   BatchItemCheckpointInputSchema,
   BatchItemCheckpointSchema,
+  BatchRecoverySummarySchema,
   BatchRunManifestSchema,
   parseBatchItemCheckpoint,
 } from "../../src/contracts/batch-run.js";
@@ -275,6 +276,62 @@ export function batchEventLogEnvelopeFixture() {
       failedStage: "resume-book-1",
       at: "2026-05-23T00:01:00.000Z",
       message: "Error code: 503 - Service temporarily unavailable",
+    },
+  };
+}
+
+export function batchRecoverySummaryEnvelopeFixture() {
+  return {
+    schemaVersion: SchemaVersion,
+    kind: "qmd.batch_run.recovery_summary",
+    payload: {
+      schemaVersion: SchemaVersion,
+      runId: "run-fixture",
+      generatedAt: "2026-05-23T00:03:00.000Z",
+      manifest: {
+        status: "running",
+        totalItems: 2,
+        pendingItems: 1,
+        runningItems: 0,
+        completedItems: 1,
+        skippedItems: 0,
+        failedItems: 0,
+        updatedAt: "2026-05-23T00:02:00.000Z",
+      },
+      counts: {
+        completed: 1,
+        pending: 1,
+      },
+      retryPolicy: {
+        maxCommandAttempts: 3,
+        maxTransientCommandAttempts: 12,
+        maxResumePasses: 24,
+        retryBaseDelaySeconds: 30,
+        retryMaxDelaySeconds: 300,
+        retryBudgetSeconds: 7200,
+        commandTimeoutSeconds: 1800,
+      },
+      recoveryDecision: "retry_same_run_id",
+      retryableItemCount: 1,
+      nextRetryAt: "2026-05-23T00:05:00.000Z",
+      items: [{
+        itemId: "item-fixture",
+        sourceName: "Book.epub",
+        bookId: "book-fixture",
+        status: "pending",
+        attempts: 1,
+        qmdBuildStatus: "unknown",
+        graphBuildStatus: "unknown",
+        failureKind: "transient",
+        retryable: true,
+        recoveryDecision: "retry_same_run_id",
+        failedStage: "resume-book-1",
+        nextRetryAt: "2026-05-23T00:05:00.000Z",
+        retryDelaySeconds: 180,
+        retryBudgetSeconds: 7200,
+        waitingForProviderRecovery: true,
+        errorSummary: "Error code: 503 - Service temporarily unavailable",
+      }],
     },
   };
 }
@@ -1353,6 +1410,9 @@ describe("Data bus contracts", () => {
       batchItemCheckpointEnvelopeFixture(),
     );
     const eventEnvelope = DataBusEnvelopeSchema.parse(batchEventLogEnvelopeFixture());
+    const recoverySummaryEnvelope = DataBusEnvelopeSchema.parse(
+      batchRecoverySummaryEnvelopeFixture(),
+    );
 
     expect(manifestEnvelope.kind).toBe("qmd.batch_run.manifest");
     expect(BatchRunManifestSchema.parse(manifestEnvelope.payload).runningItems)
@@ -1363,6 +1423,9 @@ describe("Data bus contracts", () => {
     expect(eventEnvelope.kind).toBe("qmd.batch_run.event_log");
     expect(BatchEventLogSchema.parse(eventEnvelope.payload).failedStage)
       .toBe("resume-book-1");
+    expect(recoverySummaryEnvelope.kind).toBe("qmd.batch_run.recovery_summary");
+    expect(BatchRecoverySummarySchema.parse(recoverySummaryEnvelope.payload)
+      .recoveryDecision).toBe("retry_same_run_id");
   });
 
   test("rejects non-portable batch locators", () => {

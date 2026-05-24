@@ -63,6 +63,24 @@ types:
       - raw stdout and stderr stay in temporary run logs
       - operators and audits consume this JSONL as a persisted record
 
+  - name: batch_recovery_summary
+    schema: src/contracts/batch-run.ts#BatchRecoverySummarySchema
+    envelope: src/contracts/batch-run.ts#BatchRecoverySummaryEnvelopeSchema
+    contract_level: required
+    producers:
+      - scripts/graphrag/batch-epub-workflow.mjs#buildRecoverySummary
+      - scripts/graphrag/batch-epub-workflow.mjs#writeRecoverySummary
+    consumers:
+      - scripts/graphrag/batch-epub-workflow.mjs#printStatusAndExit
+      - test/integrations/contracts.test.ts#batchRecoverySummaryEnvelopeFixture
+    storage: graph_vault/catalog/batch-runs/<run_id>/recovery-summary.json
+    notes:
+      - records operator-facing recovery state without provider secrets
+      - exposes retry policy, nextRetryAt, retryable item count, and item
+        qmd/GraphRAG build status
+      - exposes runner ownership and orphan recovery state for running items
+      - status-json emits the same typed payload without running work
+
   - name: source_document
     schema: src/contracts/corpus.ts#SourceDocumentSchema
     envelope: src/contracts/corpus.ts#SourceDocumentEnvelopeSchema
@@ -1101,6 +1119,7 @@ buses:
       - batch_run_manifest
       - batch_item_checkpoint
       - batch_event_log
+      - batch_recovery_summary
 
   - name: corpus_bus
     description: Typed ingestion bus for whole-corpus source and identity maps.

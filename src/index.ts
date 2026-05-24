@@ -91,6 +91,8 @@ import type {
   BatchItemStatus,
   BatchProjectRelativeLocator,
   BatchRecoveryDecision,
+  BatchRecoverySummary,
+  BatchRecoverySummaryItem,
   BatchRunManifest,
   BatchRunStatus,
 } from "./contracts/batch-run.js";
@@ -280,6 +282,8 @@ export type {
   BatchItemStatus,
   BatchProjectRelativeLocator,
   BatchRecoveryDecision,
+  BatchRecoverySummary,
+  BatchRecoverySummaryItem,
   BatchRunManifest,
   BatchRunStatus,
   GraphRagIndexMethod,
@@ -446,6 +450,9 @@ export {
   BatchRunManifestEnvelopeSchema,
   BatchItemCheckpointEnvelopeSchema,
   BatchEventLogEnvelopeSchema,
+  BatchRecoverySummaryItemSchema,
+  BatchRecoverySummarySchema,
+  BatchRecoverySummaryEnvelopeSchema,
   parseBatchItemCheckpoint,
 } from "./contracts/batch-run.js";
 export {
@@ -673,6 +680,7 @@ export {
 export {
   graphRagBookInputDir,
   graphRagBookOutputDir,
+  assertGraphRagStageArtifactsReady,
   readGraphTextUnitIdentity,
   syncGraphRagBookWorkspace,
   writeGraphRagOutputProducerManifest,
