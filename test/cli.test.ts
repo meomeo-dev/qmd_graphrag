@@ -1508,7 +1508,10 @@ describe("GraphRAG EPUB batch runner", () => {
     const sourcePath = join(sourceDir, "Book.epub");
     await writeFile(sourcePath, sourceBytes);
     await writeFile(join(configDir, "index.yml"), "collections: {}\n");
-    await writeFile(join(stateRoot, "reports", "query.log"), "raw provider log");
+    const leakedReportText =
+      "raw https://user:password@gateway.example/responses?api_key=raw-key" +
+      " Bearer raw-token sk-raw-secret /var/tmp/qmd-secret/query.log";
+    await writeFile(join(stateRoot, "reports", "query.log"), leakedReportText);
     await writeFile(join(stateRoot, "reports", "report.txt"), "raw provider report");
     const sourceRelativePath = relative(projectRoot, sourcePath);
     const itemId = `item-${sourceHash.slice(0, 12)}-${
@@ -1620,7 +1623,6 @@ describe("GraphRAG EPUB batch runner", () => {
     const rawLogEvent = eventLines.find((event) => event.event === "raw_log_migrated");
     const remainingRawReports = readdirSync(join(stateRoot, "reports"));
     const movedRawReports = readdirSync(join(logRoot, "graph_vault_reports"));
-    await rm(tmpRoot, { recursive: true, force: true });
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toBe("");
     expect(migrated).toMatchObject({
@@ -1665,6 +1667,23 @@ describe("GraphRAG EPUB batch runner", () => {
       .toHaveLength(1);
     expect(movedRawReports.filter((name) => name.endsWith("report.txt")))
       .toHaveLength(1);
+    const movedQueryLogName = movedRawReports.find((name) => name.endsWith("query.log"));
+    expect(movedQueryLogName).toBeDefined();
+    const movedQueryLog = readFileSync(
+      join(logRoot, "graph_vault_reports", movedQueryLogName ?? ""),
+      "utf8",
+    );
+    expect(movedQueryLog).toContain("//[REDACTED]@");
+    expect(movedQueryLog).toContain("api_key=[REDACTED]");
+    expect(movedQueryLog).toContain("Bearer [REDACTED]");
+    expect(movedQueryLog).toContain("sk-[REDACTED]");
+    expect(movedQueryLog).toContain("[ABS_PATH]");
+    expect(movedQueryLog).not.toContain("user:password");
+    expect(movedQueryLog).not.toContain("raw-key");
+    expect(movedQueryLog).not.toContain("raw-token");
+    expect(movedQueryLog).not.toContain("sk-raw-secret");
+    expect(movedQueryLog).not.toContain(tmpRoot);
+    await rm(tmpRoot, { recursive: true, force: true });
   });
 
   test("status-json emits recovery summary without running work", async () => {

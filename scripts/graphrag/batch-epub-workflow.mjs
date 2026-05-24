@@ -8,12 +8,13 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
-  renameSync,
   openSync,
+  rmSync,
   statSync,
   closeSync,
   readSync,
   writeFileSync,
+  unlinkSync,
 } from "node:fs";
 import {
   basename,
@@ -2128,21 +2129,41 @@ function migrateEventLog(checkpoints) {
 
 function migrateGraphVaultRawLogs() {
   const targetDir = join(logRoot, "graph_vault_reports");
+  const migratedAt = Date.now();
+  const migrateEntry = (source, target, sourceLocator) => {
+    const stat = statSync(source);
+    if (stat.isDirectory()) {
+      for (const child of readdirSync(source)) {
+        migrateEntry(
+          join(source, child),
+          join(target, child),
+          `${sourceLocator}/${child}`,
+        );
+      }
+      rmSync(source, { recursive: true, force: true });
+      return;
+    }
+    if (!stat.isFile()) return;
+    mkdirSync(dirname(target), { recursive: true });
+    const rawLog = readFileSync(source, "utf8");
+    writeFileSync(target, redactLog(rawLog), "utf8");
+    unlinkSync(source);
+    event({
+      event: "raw_log_migrated",
+      metadata: {
+        sourceLocator,
+        targetLogRootName: basename(logRoot),
+        targetFileName: relative(targetDir, target),
+      },
+    });
+  };
   const migrateDir = (reportsDir, sourceLocatorPrefix) => {
     if (!existsSync(reportsDir)) return;
     mkdirSync(targetDir, { recursive: true });
     for (const name of readdirSync(reportsDir)) {
       const source = join(reportsDir, name);
-      const target = join(targetDir, `${Date.now()}-${name}`);
-      renameSync(source, target);
-      event({
-        event: "raw_log_migrated",
-        metadata: {
-          sourceLocator: `${sourceLocatorPrefix}/${name}`,
-          targetLogRootName: basename(logRoot),
-          targetFileName: basename(target),
-        },
-      });
+      const target = join(targetDir, `${migratedAt}-${name}`);
+      migrateEntry(source, target, `${sourceLocatorPrefix}/${name}`);
     }
   };
   migrateDir(join(stateRoot, "reports"), "graph_vault/reports");
