@@ -551,6 +551,7 @@ describe("CLI Init Command", () => {
     expect(initConfig.graphrag).toMatchObject({
       enabled: repositoryConfig.graphrag.enabled,
       vault: repositoryConfig.graphrag.vault,
+      concurrent_requests: repositoryConfig.graphrag.concurrent_requests,
       default_method: repositoryConfig.graphrag.default_method,
       default_response_type: repositoryConfig.graphrag.default_response_type,
     });
@@ -1048,9 +1049,23 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(contract).toContain("runningItems");
     expect(contract).toContain("skippedItems");
     expect(contract).toContain("expectedCommandCheckCount");
+    expect(contract).toContain("maxResumePasses");
+    expect(contract).toContain("nextRetryAt");
+    expect(contract).toContain("retryBudgetSeconds");
+    expect(contract).toContain("commandTimeoutSeconds");
+    expect(contract).toContain("runnerSessionId");
     expect(script).toContain("\"completed-manifest\"");
     expect(script).toContain("\"fail-fast\"");
     expect(script).toContain("\"migrate-only\"");
+    expect(script).toContain("\"status-json\"");
+    expect(script).toContain("\"max-resume-passes\"");
+    expect(script).toContain("\"max-transient-command-attempts\"");
+    expect(script).toContain("\"command-timeout-seconds\"");
+    expect(script).toContain("recovery-summary.json");
+    expect(script).toContain("item_retry_deferred");
+    expect(script).toContain("item_retry_window_deferred");
+    expect(script).toContain("batch_wait_retry_window");
+    expect(script).toContain("item_running_recovered");
     expect(script).toContain("batch_state_migrated");
     expect(script).toContain("raw_log_migrated");
     expect(script).toContain("BatchRunManifestSchema.parse");
@@ -1276,7 +1291,8 @@ describe("GraphRAG EPUB batch runner", () => {
     });
     expect(script).not.toContain("function isTransient(");
     expect(script).toContain("function recoveryDecisionForBatch(checkpoints)");
-    expect(script).toContain("item.status === \"failed\" && item.retryable === true");
+    expect(script).toContain("item.status !== \"completed\"");
+    expect(script).toContain("item.recoveryDecision === \"retry_same_run_id\"");
     expect(script).toContain("checkpoint?.status === \"failed\" && checkpoint.retryable === false");
     expect(script).toContain("failedStage: name");
     expect(script).toContain("markItemRunning(item, starting, checkpoints, manifest)");
@@ -1399,6 +1415,10 @@ describe("GraphRAG EPUB batch runner", () => {
       join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
       "utf8",
     ).trim().split("\n").map((line) => JSON.parse(line));
+    const recoverySummary = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "recovery-summary.json"),
+      "utf8",
+    ));
     const migrated = eventLines.find((event) => event.event === "command_failed");
     const exhausted = eventLines.find(
       (event) => event.event === "command_retry_exhausted",
@@ -1428,6 +1448,24 @@ describe("GraphRAG EPUB batch runner", () => {
       failedStage: "resume-book-1",
       metadata: { migratedFromCheckpoint: true },
     });
+    expect(recoverySummary).toMatchObject({
+      schemaVersion: SchemaVersion,
+      runId,
+      recoveryDecision: "retry_same_run_id",
+      retryPolicy: {
+        maxCommandAttempts: 3,
+        maxTransientCommandAttempts: 12,
+        retryBudgetSeconds: 7200,
+        commandTimeoutSeconds: 1800,
+      },
+    });
+    expect(recoverySummary.items[0]).toMatchObject({
+      status: "failed",
+      failureKind: "transient",
+      retryable: true,
+      recoveryDecision: "retry_same_run_id",
+      failedStage: "resume-book-1",
+    });
     expect(rawLogEvent).toMatchObject({
       event: "raw_log_migrated",
       metadata: {
@@ -1437,6 +1475,369 @@ describe("GraphRAG EPUB batch runner", () => {
     });
     expect(remainingRawLogs).toEqual([]);
     expect(movedRawLogs).toHaveLength(1);
+  });
+
+  test("status-json emits recovery summary without running work", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-status-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "status-json-fixture";
+    const sourceBytes = "status only";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    await writeFile(join(sourceDir, "Book.epub"), sourceBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sourceRelativePath = relative(projectRoot, join(sourceDir, "Book.epub"));
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "running",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        pendingItems: 1,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 0,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "pending",
+        sourceName: "Book.epub",
+        sourceRelativePath,
+        sourceHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        bookId: `book-${sourceHash.slice(0, 12)}`,
+        attempts: 1,
+        recoveryDecision: "retry_same_run_id",
+        failureKind: "transient",
+        retryable: true,
+        nextRetryAt: "2026-05-23T00:05:00.000Z",
+        retryDelaySeconds: 240,
+        commandChecks: [],
+      }),
+    );
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--status-json",
+      ]);
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+      proc.stderr.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary).toMatchObject({
+      schemaVersion: SchemaVersion,
+      runId,
+      recoveryDecision: "retry_same_run_id",
+      retryableItemCount: 1,
+      nextRetryAt: "2026-05-23T00:05:00.000Z",
+    });
+    expect(summary.items[0]).toMatchObject({
+      status: "pending",
+      failureKind: "transient",
+      retryable: true,
+      nextRetryAt: "2026-05-23T00:05:00.000Z",
+    });
+  });
+
+  test("status-json continues pending items when another item is permanent failed", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-status-mixed-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "status-json-mixed-failure";
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sources = [
+      ["Failed.epub", "permanent failure"],
+      ["Pending.epub", "still pending"],
+    ];
+    const itemIds: string[] = [];
+    for (const [name, body] of sources) {
+      const sourcePath = join(sourceDir, name);
+      const sourceHash = createHash("sha256").update(body).digest("hex");
+      const sourceRelativePath = relative(projectRoot, sourcePath);
+      const itemId = `item-${sourceHash.slice(0, 12)}-${
+        createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+      }`;
+      await writeFile(sourcePath, body);
+      itemIds.push(itemId);
+      await writeFile(
+        join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+        JSON.stringify({
+          schemaVersion: SchemaVersion,
+          itemId,
+          runId,
+          status: name === "Failed.epub" ? "failed" : "pending",
+          sourceName: name,
+          sourceRelativePath,
+          sourceHash,
+          normalizedPath: join(".tmp-tests", "graph_vault", "input", `${name}.md`),
+          bookId: `book-${sourceHash.slice(0, 12)}`,
+          attempts: name === "Failed.epub" ? 1 : 0,
+          ...(name === "Failed.epub"
+            ? {
+                failureKind: "permanent",
+                retryable: false,
+                recoveryDecision: "stop_until_fixed",
+                failedStage: "graphrag-build",
+                errorSummary: "HTTP 400 invalid request",
+              }
+            : { recoveryDecision: "none" }),
+          commandChecks: [],
+        }),
+      );
+    }
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 2,
+        pendingItems: 1,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds,
+      }),
+    );
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--status-json",
+      ]);
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+      proc.stderr.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary.recoveryDecision).toBe("continue_pending");
+    expect(summary.counts).toMatchObject({ failed: 1, pending: 1 });
+  });
+
+  test("status-json recovers orphaned running item to retryable pending", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-orphan-running-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "orphan-running-fixture";
+    const sourceBytes = "orphaned running";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    const sourcePath = join(sourceDir, "Book.epub");
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "running",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        pendingItems: 0,
+        runningItems: 1,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 0,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "running",
+        sourceName: "Book.epub",
+        sourceRelativePath,
+        sourceHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        bookId: `book-${sourceHash.slice(0, 12)}`,
+        attempts: 1,
+        runnerSessionId: "dead-session",
+        runnerHost: "definitely-not-this-host",
+        runnerPid: 999999,
+        runnerHeartbeatAt: "2026-05-23T00:01:00.000Z",
+        commandChecks: [],
+      }),
+    );
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--status-json",
+      ]);
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+      proc.stderr.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    const eventLines = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
+      "utf8",
+    ).trim().split("\n").map((line) => JSON.parse(line));
+    const checkpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      "utf8",
+    ));
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary.recoveryDecision).toBe("retry_same_run_id");
+    expect(summary.counts).toMatchObject({ pending: 1 });
+    expect(summary.items[0]).toMatchObject({
+      status: "pending",
+      failureKind: "transient",
+      retryable: true,
+      recoveryDecision: "retry_same_run_id",
+      failedStage: "runner_orphaned",
+    });
+    expect(checkpoint).toMatchObject({
+      status: "pending",
+      retryable: true,
+      recoveryDecision: "retry_same_run_id",
+      failedStage: "runner_orphaned",
+    });
+    expect(eventLines.at(-1)).toMatchObject({
+      event: "item_running_recovered",
+      recoveryDecision: "retry_same_run_id",
+    });
   });
 
   test("migrate-only reopens completed items without real GraphRAG evidence", async () => {
@@ -1524,6 +1925,7 @@ describe("GraphRAG EPUB batch runner", () => {
         attempts: 1,
         expectedCommandCheckCount: 27,
         maxCommandAttempts: 3,
+        maxResumePasses: 8,
         completedAt: "2026-05-23T00:01:00.000Z",
         commandChecks,
       }),

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -21,6 +21,7 @@ import {
   sep,
 } from "node:path";
 import { fileURLToPath } from "node:url";
+import { hostname } from "node:os";
 import { parseArgs } from "node:util";
 
 import YAML from "yaml";
@@ -50,8 +51,15 @@ const { values } = parseArgs({
       default: "How does this book explain software design complexity?",
     },
     "max-command-attempts": { type: "string", default: "3" },
+    "max-transient-command-attempts": { type: "string", default: "12" },
+    "max-resume-passes": { type: "string", default: "24" },
+    "retry-base-delay-seconds": { type: "string", default: "30" },
+    "retry-max-delay-seconds": { type: "string", default: "300" },
+    "retry-budget-seconds": { type: "string", default: "7200" },
+    "command-timeout-seconds": { type: "string", default: "1800" },
     "completed-manifest": { type: "string" },
     "migrate-only": { type: "boolean", default: false },
+    "status-json": { type: "boolean", default: false },
     "skip-dotenv": { type: "boolean", default: false },
     "fail-fast": { type: "boolean", default: false },
     verbose: { type: "boolean", default: true },
@@ -74,13 +82,42 @@ const maxCommandAttempts = Math.max(
   1,
   Number.parseInt(String(values["max-command-attempts"]), 10) || 3,
 );
+const maxTransientCommandAttempts = Math.max(
+  maxCommandAttempts,
+  Number.parseInt(String(values["max-transient-command-attempts"]), 10) || 12,
+);
+const maxResumePasses = Math.max(
+  1,
+  Number.parseInt(String(values["max-resume-passes"]), 10) || 24,
+);
+const retryBaseDelaySeconds = Math.max(
+  1,
+  Number.parseInt(String(values["retry-base-delay-seconds"]), 10) || 30,
+);
+const retryMaxDelaySeconds = Math.max(
+  retryBaseDelaySeconds,
+  Number.parseInt(String(values["retry-max-delay-seconds"]), 10) || 300,
+);
+const retryBudgetSeconds = Math.max(
+  retryMaxDelaySeconds,
+  Number.parseInt(String(values["retry-budget-seconds"]), 10) || 7200,
+);
+const commandTimeoutSeconds = Math.max(
+  1,
+  Number.parseInt(String(values["command-timeout-seconds"]), 10) || 1800,
+);
+const runnerHost = hostname();
+const runnerPid = process.pid;
+const runnerSessionId = randomUUID();
 const failFast = Boolean(values["fail-fast"]);
 const migrateOnly = Boolean(values["migrate-only"]);
+const statusJson = Boolean(values["status-json"]);
 
 const batchRoot = join(stateRoot, "catalog", "batch-runs", runId);
 const itemRoot = join(batchRoot, "items");
 const eventsPath = join(batchRoot, "events.jsonl");
 const manifestPath = join(batchRoot, "manifest.json");
+const recoverySummaryPath = join(batchRoot, "recovery-summary.json");
 const requiredCommandCheckNames = [
   "qmd-version",
   "qmd-status",
@@ -163,6 +200,8 @@ const BatchCommandCheckSchema = z.object({
   stderrBytes: z.number().int().nonnegative(),
   startedAt: z.string().datetime(),
   completedAt: z.string().datetime(),
+  nextRetryAt: z.string().datetime().optional(),
+  retryDelaySeconds: z.number().int().nonnegative().optional(),
   failureKind: BatchFailureKindSchema.optional(),
   retryable: z.boolean().optional(),
   retryAfterSeconds: z.number().int().nonnegative().optional(),
@@ -190,6 +229,20 @@ const BatchItemCheckpointSchema = z.object({
   attempts: z.number().int().nonnegative(),
   expectedCommandCheckCount: z.number().int().positive().optional(),
   maxCommandAttempts: z.number().int().positive().optional(),
+  maxTransientCommandAttempts: z.number().int().positive().optional(),
+  maxResumePasses: z.number().int().positive().optional(),
+  retryBaseDelaySeconds: z.number().int().positive().optional(),
+  retryMaxDelaySeconds: z.number().int().positive().optional(),
+  retryBudgetSeconds: z.number().int().positive().optional(),
+  commandTimeoutSeconds: z.number().int().positive().optional(),
+  retryStartedAt: z.string().datetime().optional(),
+  runnerSessionId: z.string().min(1).optional(),
+  runnerHost: z.string().min(1).optional(),
+  runnerPid: z.number().int().positive().optional(),
+  runnerHeartbeatAt: z.string().datetime().optional(),
+  orphanedRunnerDetectedAt: z.string().datetime().optional(),
+  nextRetryAt: z.string().datetime().optional(),
+  retryDelaySeconds: z.number().int().nonnegative().optional(),
   failureKind: BatchFailureKindSchema.optional(),
   retryable: z.boolean().optional(),
   retryExhausted: z.boolean().optional(),
@@ -221,6 +274,12 @@ const BatchRunManifestSchema = z.object({
   failedItems: z.number().int().nonnegative(),
   expectedCommandCheckCount: z.number().int().positive().optional(),
   maxCommandAttempts: z.number().int().positive().optional(),
+  maxTransientCommandAttempts: z.number().int().positive().optional(),
+  maxResumePasses: z.number().int().positive().optional(),
+  retryBaseDelaySeconds: z.number().int().positive().optional(),
+  retryMaxDelaySeconds: z.number().int().positive().optional(),
+  retryBudgetSeconds: z.number().int().positive().optional(),
+  commandTimeoutSeconds: z.number().int().positive().optional(),
   startedAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
   completedAt: z.string().datetime().optional(),
@@ -246,9 +305,126 @@ const BatchEventLogSchema = z.object({
   message: z.string().max(1000).optional(),
   metadata: z.record(z.string(), JsonValueSchema).optional(),
 });
+const BatchRecoverySummaryItemSchema = z.object({
+  itemId: z.string().min(1),
+  sourceName: z.string().min(1),
+  bookId: z.string().min(1),
+  status: BatchItemStatusSchema,
+  attempts: z.number().int().nonnegative(),
+  qmdBuildStatus: z.union([BatchBuildStatusSchema.shape.status, z.literal("unknown")]),
+  graphBuildStatus: z.union([
+    BatchBuildStatusSchema.shape.status,
+    z.literal("unknown"),
+  ]),
+  graphStage: z.string().min(1).optional(),
+  graphReason: z.string().min(1).optional(),
+  failureKind: BatchFailureKindSchema.optional(),
+  retryable: z.boolean().optional(),
+  retryExhausted: z.boolean().optional(),
+  recoveryDecision: BatchRecoveryDecisionSchema.optional(),
+  failedStage: z.string().min(1).optional(),
+  nextRetryAt: z.string().datetime().optional(),
+  retryDelaySeconds: z.number().int().nonnegative().optional(),
+  retryBudgetSeconds: z.number().int().positive().optional(),
+  runnerSessionId: z.string().min(1).optional(),
+  runnerHost: z.string().min(1).optional(),
+  runnerPid: z.number().int().positive().optional(),
+  runnerHeartbeatAt: z.string().datetime().optional(),
+  orphanedRunnerDetectedAt: z.string().datetime().optional(),
+  waitingForProviderRecovery: z.boolean().optional(),
+  errorSummary: z.string().max(1000).optional(),
+});
+const BatchRecoverySummarySchema = z.object({
+  schemaVersion: z.literal(SchemaVersion),
+  runId: z.string().min(1),
+  generatedAt: z.string().datetime(),
+  manifest: z.object({
+    status: BatchRunStatusSchema,
+    totalItems: z.number().int().nonnegative(),
+    pendingItems: z.number().int().nonnegative(),
+    runningItems: z.number().int().nonnegative(),
+    completedItems: z.number().int().nonnegative(),
+    skippedItems: z.number().int().nonnegative(),
+    failedItems: z.number().int().nonnegative(),
+    updatedAt: z.string().datetime(),
+    completedAt: z.string().datetime().optional(),
+    failedAt: z.string().datetime().optional(),
+  }),
+  counts: z.record(z.string(), z.number().int().nonnegative()),
+  retryPolicy: z.object({
+    maxCommandAttempts: z.number().int().positive(),
+    maxTransientCommandAttempts: z.number().int().positive(),
+    maxResumePasses: z.number().int().positive(),
+    retryBaseDelaySeconds: z.number().int().positive(),
+    retryMaxDelaySeconds: z.number().int().positive(),
+    retryBudgetSeconds: z.number().int().positive(),
+    commandTimeoutSeconds: z.number().int().positive(),
+  }),
+  recoveryDecision: BatchRecoveryDecisionSchema,
+  retryableItemCount: z.number().int().nonnegative(),
+  nextRetryAt: z.string().datetime().optional(),
+  items: z.array(BatchRecoverySummaryItemSchema),
+});
 
 function now() {
   return new Date().toISOString();
+}
+
+function epochMs(iso) {
+  const value = Date.parse(String(iso ?? ""));
+  return Number.isFinite(value) ? value : 0;
+}
+
+function isoAfterSeconds(seconds) {
+  return new Date(Date.now() + seconds * 1000).toISOString();
+}
+
+function withoutUndefined(value) {
+  if (Array.isArray(value)) {
+    return value
+      .filter((item) => item !== undefined)
+      .map((item) => withoutUndefined(item));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, item]) => item !== undefined)
+        .map(([key, item]) => [key, withoutUndefined(item)]),
+    );
+  }
+  return value;
+}
+
+function retryDelaySecondsForAttempt(attempt) {
+  const exponential = retryBaseDelaySeconds * 2 ** Math.max(0, attempt - 1);
+  return Math.min(retryMaxDelaySeconds, exponential);
+}
+
+function elapsedRetrySeconds(checkpoint) {
+  const start = epochMs(checkpoint.retryStartedAt ?? checkpoint.startedAt);
+  if (start === 0) return 0;
+  return Math.max(0, Math.floor((Date.now() - start) / 1000));
+}
+
+function transientBudgetAvailable(checkpoint) {
+  return elapsedRetrySeconds(checkpoint) < retryBudgetSeconds;
+}
+
+function processAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function runningCheckpointIsOrphaned(checkpoint) {
+  if (checkpoint.status !== "running") return false;
+  if (checkpoint.runnerHost == null || checkpoint.runnerPid == null) return true;
+  if (checkpoint.runnerHost !== runnerHost) return true;
+  return !processAlive(checkpoint.runnerPid);
 }
 
 function sha256File(path) {
@@ -373,13 +549,13 @@ function event(payload) {
     schemaVersion: SchemaVersion,
     runId,
     at: now(),
-    ...payload,
+    ...withoutUndefined(payload),
   });
   writeFileSync(eventsPath, JSON.stringify(item) + "\n", {
     flag: "a",
     encoding: "utf8",
   });
-  if (values.verbose) {
+  if (values.verbose && !statusJson) {
     const parts = [item.event, item.itemId, item.command, item.status]
       .filter(Boolean)
       .join(" ");
@@ -392,7 +568,7 @@ function readJson(path) {
 }
 
 function writeTypedJson(path, schema, value) {
-  const parsed = schema.parse(value);
+  const parsed = schema.parse(withoutUndefined(value));
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(parsed, null, 2) + "\n", "utf8");
   return parsed;
@@ -482,6 +658,12 @@ function makeManifest(items) {
     failedItems: 0,
     expectedCommandCheckCount,
     maxCommandAttempts,
+    maxTransientCommandAttempts,
+    maxResumePasses,
+    retryBaseDelaySeconds,
+    retryMaxDelaySeconds,
+    retryBudgetSeconds,
+    commandTimeoutSeconds,
     startedAt: now(),
     updatedAt: now(),
     itemIds: items.map((item) => item.itemId),
@@ -502,6 +684,12 @@ function loadManifest(items) {
     manifest.itemIds = items.map((item) => item.itemId);
     manifest.expectedCommandCheckCount = expectedCommandCheckCount;
     manifest.maxCommandAttempts = maxCommandAttempts;
+    manifest.maxTransientCommandAttempts = maxTransientCommandAttempts;
+    manifest.maxResumePasses = maxResumePasses;
+    manifest.retryBaseDelaySeconds = retryBaseDelaySeconds;
+    manifest.retryMaxDelaySeconds = retryMaxDelaySeconds;
+    manifest.retryBudgetSeconds = retryBudgetSeconds;
+    manifest.commandTimeoutSeconds = commandTimeoutSeconds;
     return manifest;
   }
   const manifest = makeManifest(items);
@@ -530,6 +718,12 @@ function defaultCheckpoint(item, completedSeed = new Map()) {
       attempts: 0,
       expectedCommandCheckCount,
       maxCommandAttempts,
+      maxTransientCommandAttempts,
+      maxResumePasses,
+      retryBaseDelaySeconds,
+      retryMaxDelaySeconds,
+      retryBudgetSeconds,
+      commandTimeoutSeconds,
       recoveryDecision: "none",
       commandChecks: [],
       metadata: {
@@ -551,6 +745,12 @@ function defaultCheckpoint(item, completedSeed = new Map()) {
     attempts: 0,
     expectedCommandCheckCount,
     maxCommandAttempts,
+    maxTransientCommandAttempts,
+    maxResumePasses,
+    retryBaseDelaySeconds,
+    retryMaxDelaySeconds,
+    retryBudgetSeconds,
+    commandTimeoutSeconds,
     recoveryDecision: "none",
     commandChecks: [],
   };
@@ -562,6 +762,12 @@ function hydrateCheckpoint(item, checkpoint) {
     checkpoint,
     expectedCommandCheckCount,
     maxCommandAttempts,
+    maxTransientCommandAttempts,
+    maxResumePasses,
+    retryBaseDelaySeconds,
+    retryMaxDelaySeconds,
+    retryBudgetSeconds,
+    commandTimeoutSeconds,
     defaultBookId: defaultBookIdFor(item.sourceHash),
   });
   return {
@@ -580,10 +786,11 @@ function loadCheckpoint(item, completedSeed) {
     const checkpoint = defaultCheckpoint(item, completedSeed);
     return writeTypedJson(path, BatchItemCheckpointSchema, checkpoint);
   }
-  const checkpoint = downgradeCompletedIfClosedLoopInvalid(
+  const hydrated = hydrateCheckpoint(item, readJson(path));
+  const checkpoint = recoverOrphanedRunningCheckpoint(item, downgradeCompletedIfClosedLoopInvalid(
     item,
-    hydrateCheckpoint(item, readJson(path)),
-  );
+    hydrated,
+  ));
   return writeTypedJson(path, BatchItemCheckpointSchema, checkpoint);
 }
 
@@ -841,6 +1048,49 @@ function downgradeCompletedIfClosedLoopInvalid(item, checkpoint) {
   };
 }
 
+function recoverOrphanedRunningCheckpoint(item, checkpoint) {
+  if (!runningCheckpointIsOrphaned(checkpoint)) return checkpoint;
+  const detectedAt = now();
+  const recovered = {
+    ...checkpoint,
+    status: "pending",
+    failedAt: undefined,
+    errorSummary: checkpoint.errorSummary ?? "runner process is not alive",
+    failureKind: "transient",
+    retryable: true,
+    retryExhausted: false,
+    recoveryDecision: "retry_same_run_id",
+    failedStage: checkpoint.failedStage ?? "runner_orphaned",
+    nextRetryAt: undefined,
+    retryDelaySeconds: undefined,
+    orphanedRunnerDetectedAt: detectedAt,
+    metadata: {
+      ...(checkpoint.metadata ?? {}),
+      orphanedRunnerRecovered: true,
+      orphanedRunnerHost: checkpoint.runnerHost ?? "unknown",
+      orphanedRunnerPid: checkpoint.runnerPid ?? "unknown",
+      orphanedRunnerDetectedAt: detectedAt,
+    },
+  };
+  event({
+    itemId: item.itemId,
+    event: "item_running_recovered",
+    status: "pending",
+    message: recovered.errorSummary,
+    failureKind: recovered.failureKind,
+    retryable: true,
+    recoveryDecision: "retry_same_run_id",
+    failedStage: recovered.failedStage,
+    metadata: {
+      runnerHost: checkpoint.runnerHost,
+      runnerPid: checkpoint.runnerPid,
+      runnerHeartbeatAt: checkpoint.runnerHeartbeatAt,
+      orphanedRunnerDetectedAt: detectedAt,
+    },
+  });
+  return recovered;
+}
+
 function updateManifest(manifest, checkpoints) {
   manifest.totalItems = checkpoints.length;
   manifest.itemIds = checkpoints.map((item) => item.itemId);
@@ -857,6 +1107,12 @@ function updateManifest(manifest, checkpoints) {
   manifest.failedItems = failed;
   manifest.expectedCommandCheckCount = expectedCommandCheckCount;
   manifest.maxCommandAttempts = maxCommandAttempts;
+  manifest.maxTransientCommandAttempts = maxTransientCommandAttempts;
+  manifest.maxResumePasses = maxResumePasses;
+  manifest.retryBaseDelaySeconds = retryBaseDelaySeconds;
+  manifest.retryMaxDelaySeconds = retryMaxDelaySeconds;
+  manifest.retryBudgetSeconds = retryBudgetSeconds;
+  manifest.commandTimeoutSeconds = commandTimeoutSeconds;
   manifest.updatedAt = now();
   if (failed > 0) {
     manifest.status = "failed";
@@ -878,8 +1134,95 @@ function updateManifest(manifest, checkpoints) {
   return writeTypedJson(manifestPath, BatchRunManifestSchema, manifest);
 }
 
+function buildRecoverySummary(manifest, checkpoints) {
+  const items = checkpoints.map((item) => withoutUndefined({
+    itemId: item.itemId,
+    sourceName: item.sourceName,
+    bookId: item.bookId,
+    status: item.status,
+    attempts: item.attempts,
+    qmdBuildStatus: item.qmdBuildStatus?.status ?? "unknown",
+    graphBuildStatus: item.graphBuildStatus?.status ?? "unknown",
+    graphStage: item.graphBuildStatus?.stage,
+    graphReason: item.graphBuildStatus?.reason,
+    failureKind: item.failureKind,
+    retryable: item.retryable,
+    retryExhausted: item.retryExhausted,
+    recoveryDecision: item.recoveryDecision,
+    failedStage: item.failedStage,
+    nextRetryAt: item.nextRetryAt,
+    retryDelaySeconds: item.retryDelaySeconds,
+    retryBudgetSeconds: item.retryBudgetSeconds,
+    runnerSessionId: item.runnerSessionId,
+    runnerHost: item.runnerHost,
+    runnerPid: item.runnerPid,
+    runnerHeartbeatAt: item.runnerHeartbeatAt,
+    orphanedRunnerDetectedAt: item.orphanedRunnerDetectedAt,
+    waitingForProviderRecovery:
+      item.metadata?.waitingForProviderRecovery === true,
+    errorSummary: item.errorSummary,
+  }));
+  const counts = items.reduce((acc, item) => {
+    acc[item.status] = (acc[item.status] ?? 0) + 1;
+    return acc;
+  }, {});
+  const retryableItems = items.filter((item) =>
+    item.retryable === true && item.status !== "completed"
+  );
+  return BatchRecoverySummarySchema.parse(withoutUndefined({
+    schemaVersion: SchemaVersion,
+    runId,
+    generatedAt: now(),
+    manifest: {
+      status: manifest.status,
+      totalItems: manifest.totalItems,
+      pendingItems: manifest.pendingItems,
+      runningItems: manifest.runningItems,
+      completedItems: manifest.completedItems,
+      skippedItems: manifest.skippedItems,
+      failedItems: manifest.failedItems,
+      updatedAt: manifest.updatedAt,
+      completedAt: manifest.completedAt,
+      failedAt: manifest.failedAt,
+    },
+    counts,
+    retryPolicy: {
+      maxCommandAttempts,
+      maxTransientCommandAttempts,
+      maxResumePasses,
+      retryBaseDelaySeconds,
+      retryMaxDelaySeconds,
+      retryBudgetSeconds,
+      commandTimeoutSeconds,
+    },
+    recoveryDecision: recoveryDecisionForBatch(checkpoints),
+    retryableItemCount: retryableItems.length,
+    nextRetryAt: retryableItems
+      .map((item) => item.nextRetryAt)
+      .filter(Boolean)
+      .sort()[0],
+    items,
+  }));
+}
+
+function writeRecoverySummary(manifest, checkpoints) {
+  const summary = buildRecoverySummary(manifest, checkpoints);
+  writeTypedJson(recoverySummaryPath, BatchRecoverySummarySchema, summary);
+  return summary;
+}
+
+function printStatusAndExit(manifest, checkpoints) {
+  process.stdout.write(
+    JSON.stringify(buildRecoverySummary(manifest, checkpoints), null, 2) + "\n",
+  );
+}
+
 function recoveryDecisionForBatch(checkpoints) {
-  if (checkpoints.some((item) => item.status === "failed" && item.retryable === true)) {
+  if (checkpoints.some((item) =>
+    item.status !== "completed" &&
+    item.status !== "skipped" &&
+    (item.retryable === true || item.recoveryDecision === "retry_same_run_id")
+  )) {
     return "retry_same_run_id";
   }
   if (checkpoints.some((item) => item.status === "pending" || item.status === "running")) {
@@ -1001,7 +1344,10 @@ function resumeRunnerArgs() {
 }
 
 function runCommand(item, name, command, args, options = {}) {
-  const attempts = options.attempts ?? 1;
+  const baseAttempts = options.attempts ?? 1;
+  const attempts = options.allowTransientBudget
+    ? Math.max(baseAttempts, maxTransientCommandAttempts)
+    : baseAttempts;
   let last = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const startedAt = now();
@@ -1016,6 +1362,7 @@ function runCommand(item, name, command, args, options = {}) {
       encoding: "utf8",
       maxBuffer: options.maxBuffer ?? 128 * 1024 * 1024,
       shell: process.platform === "win32",
+      timeout: commandTimeoutSeconds * 1000,
       env: {
         ...process.env,
         INDEX_PATH: qmdIndexPath,
@@ -1030,8 +1377,20 @@ function runCommand(item, name, command, args, options = {}) {
     const stderr = result.stderr ?? "";
     writeFileSync(join(logRoot, `${item.itemId}-${name}.out`), redactLog(stdout));
     writeFileSync(join(logRoot, `${item.itemId}-${name}.err`), redactLog(stderr));
-    const failureText = stderr || stdout || result.error?.message || "";
+    const timeoutMessage =
+      result.error?.code === "ETIMEDOUT"
+        ? `command timed out after ${commandTimeoutSeconds} seconds`
+        : "";
+    const failureText = timeoutMessage || stderr || stdout || result.error?.message || "";
     const failure = result.status === 0 ? null : classifyFailure(failureText);
+    const retryDelaySeconds = failure?.retryAfterSeconds ??
+      retryDelaySecondsForAttempt(attempt);
+    const shouldRetry =
+      result.status !== 0 &&
+      Boolean(failure?.retryable) &&
+      attempt < attempts &&
+      (!options.allowTransientBudget || transientBudgetAvailable(options.checkpoint));
+    const nextRetryAt = shouldRetry ? isoAfterSeconds(retryDelaySeconds) : undefined;
     const check = {
       name,
       status: result.status === 0 ? "passed" : "failed",
@@ -1045,7 +1404,9 @@ function runCommand(item, name, command, args, options = {}) {
         ? {}
         : {
             ...failure,
-            attemptExhausted: attempt >= attempts || !failure?.retryable,
+            nextRetryAt,
+            retryDelaySeconds,
+            attemptExhausted: !shouldRetry,
             errorSummary: redacted(failureText),
           }),
     };
@@ -1066,13 +1427,21 @@ function runCommand(item, name, command, args, options = {}) {
       providerStatusCode: check.providerStatusCode,
       recoveryDecision: check.retryable ? "retry_same_run_id" : "stop_until_fixed",
       failedStage: name,
-      metadata: { attempt, exitCode: result.status },
+      metadata: {
+        attempt,
+        exitCode: result.status,
+        maxAttempts: attempts,
+        retryBudgetSeconds,
+        commandTimeoutSeconds,
+        retryDelaySeconds: check.retryDelaySeconds,
+        elapsedRetrySeconds: options.checkpoint
+          ? elapsedRetrySeconds(options.checkpoint)
+          : undefined,
+        nextRetryAt,
+      },
     });
-    if (attempt >= attempts || !check.retryable) break;
-    const delayMs = Math.max(
-      (check.retryAfterSeconds ?? 0) * 1000,
-      1000 * 2 ** (attempt - 1),
-    );
+    if (!shouldRetry) break;
+    const delayMs = retryDelaySeconds * 1000;
     event({
       itemId: item.itemId,
       event: "command_retry_scheduled",
@@ -1081,7 +1450,14 @@ function runCommand(item, name, command, args, options = {}) {
       retryable: check.retryable,
       retryAfterSeconds: check.retryAfterSeconds,
       recoveryDecision: "retry_same_run_id",
-      metadata: { attempt, nextAttempt: attempt + 1, delayMs },
+      metadata: {
+        attempt,
+        nextAttempt: attempt + 1,
+        delayMs,
+        nextRetryAt,
+        retryBudgetSeconds,
+        commandTimeoutSeconds,
+      },
     });
     sleep(delayMs);
   }
@@ -1099,6 +1475,13 @@ function runCommand(item, name, command, args, options = {}) {
       recoveryDecision: last.check.retryable ? "retry_same_run_id" : "stop_until_fixed",
       failedStage: name,
       message: last.check.errorSummary,
+      metadata: {
+        nextRetryAt: last.check.nextRetryAt,
+        retryDelaySeconds: last.check.retryDelaySeconds,
+        maxAttempts: attempts,
+        retryBudgetSeconds,
+        commandTimeoutSeconds,
+      },
     });
   }
   throw Object.assign(new Error(summary), { commandCheck: last?.check });
@@ -1245,9 +1628,8 @@ with open(output_path, "w", encoding="utf-8") as handle:
   ]);
 }
 
-function runGraphResume(item) {
+function runGraphResume(item, checkpoint) {
   requirePath(pythonBin, "GraphRAG Python");
-  const maxResumePasses = 8;
   let lastResult = null;
   for (let pass = 1; pass <= maxResumePasses; pass += 1) {
     const result = runCommand(item, `resume-book-${pass}`, process.execPath, [
@@ -1270,7 +1652,11 @@ function runGraphResume(item) {
       query,
       "--query-method",
       "local",
-    ], { attempts: maxCommandAttempts });
+    ], {
+      attempts: maxCommandAttempts,
+      allowTransientBudget: true,
+      checkpoint,
+    });
     lastResult = result;
 
     let resume;
@@ -1375,7 +1761,7 @@ function runCliChecks(item) {
 
 function runItem(item, checkpoint) {
   normalizeEpubToMarkdown(item);
-  const resolvedBookId = runGraphResume(item) ?? checkpoint.bookId;
+  const resolvedBookId = runGraphResume(item, checkpoint) ?? checkpoint.bookId;
   const resolvedItem = { ...item, bookId: resolvedBookId };
   const commandChecks = runCliChecks(resolvedItem);
   const qmdBuildStatus = qmdBuildEvidence({ commandChecks });
@@ -1421,10 +1807,42 @@ function runItem(item, checkpoint) {
     qmdBuildStatus,
     graphBuildStatus,
     commandChecks,
+    runnerHeartbeatAt: now(),
   };
   saveCheckpoint(item, completed);
   event({ itemId: item.itemId, event: "item_completed", status: "completed" });
   return completed;
+}
+
+function buildRecoverableTransientCheckpoint({ item, running, commandCheck, error }) {
+  const retryDelaySeconds =
+    commandCheck?.retryDelaySeconds ?? retryDelaySecondsForAttempt(running.attempts);
+  const nextRetryAt = commandCheck?.nextRetryAt ?? isoAfterSeconds(retryDelaySeconds);
+  return {
+    ...running,
+    status: "pending",
+    failedAt: undefined,
+    errorSummary: redacted(error instanceof Error ? error.message : String(error)),
+    failureKind: commandCheck?.failureKind ?? "transient",
+    retryable: true,
+    retryExhausted: false,
+    recoveryDecision: "retry_same_run_id",
+    failedStage: commandCheck?.name,
+    retryStartedAt: running.retryStartedAt ?? running.startedAt ?? now(),
+    nextRetryAt,
+    retryDelaySeconds,
+    runnerHeartbeatAt: now(),
+    commandChecks: commandCheck
+      ? [...(running.commandChecks ?? []), commandCheck]
+      : (running.commandChecks ?? []),
+    metadata: {
+      ...(running.metadata ?? {}),
+      waitingForProviderRecovery: true,
+      lastRetryableFailureAt: now(),
+      retryBudgetSeconds,
+      sourceName: item.sourceName,
+    },
+  };
 }
 
 function markItemRunning(item, checkpoint, checkpoints, manifest) {
@@ -1434,6 +1852,9 @@ function markItemRunning(item, checkpoint, checkpoints, manifest) {
     status: "running",
     attempts: checkpoint.attempts + 1,
     startedAt: checkpoint.startedAt ?? startedAt,
+    retryStartedAt: checkpoint.retryStartedAt ?? startedAt,
+    nextRetryAt: undefined,
+    retryDelaySeconds: undefined,
     failedAt: undefined,
     errorSummary: undefined,
     failureKind: undefined,
@@ -1443,12 +1864,77 @@ function markItemRunning(item, checkpoint, checkpoints, manifest) {
     failedStage: undefined,
     expectedCommandCheckCount,
     maxCommandAttempts,
+    maxTransientCommandAttempts,
+    maxResumePasses,
+    retryBaseDelaySeconds,
+    retryMaxDelaySeconds,
+    retryBudgetSeconds,
+    runnerSessionId,
+    runnerHost,
+    runnerPid,
+    runnerHeartbeatAt: startedAt,
   };
   saveCheckpoint(item, running);
   checkpoints.set(item.itemId, running);
   updateManifest(manifest, Array.from(checkpoints.values()));
   event({ itemId: item.itemId, event: "item_start", status: "running" });
   return running;
+}
+
+function retryWindowDelayMs(checkpoint) {
+  if (checkpoint?.nextRetryAt == null) return 0;
+  return Math.max(0, epochMs(checkpoint.nextRetryAt) - Date.now());
+}
+
+function eventRetryWindowDeferred(item, checkpoint, delayMs) {
+  if (delayMs <= 0) return;
+  event({
+    itemId: item.itemId,
+    event: "item_retry_window_deferred",
+    status: "pending",
+    failureKind: checkpoint.failureKind,
+    retryable: checkpoint.retryable,
+    recoveryDecision: checkpoint.recoveryDecision,
+    failedStage: checkpoint.failedStage,
+    metadata: {
+      nextRetryAt: checkpoint.nextRetryAt,
+      delayMs,
+      retryDelaySeconds: checkpoint.retryDelaySeconds,
+      retryBudgetSeconds,
+    },
+  });
+}
+
+function waitForNextRetryWindow(items, checkpoints) {
+  const waiting = items
+    .map((item) => ({ item, checkpoint: checkpoints.get(item.itemId) }))
+    .filter(({ checkpoint }) =>
+      checkpoint?.status === "pending" &&
+      checkpoint.retryable === true &&
+      retryWindowDelayMs(checkpoint) > 0
+    )
+    .sort((a, b) => epochMs(a.checkpoint.nextRetryAt) - epochMs(b.checkpoint.nextRetryAt));
+  const next = waiting[0];
+  if (!next) return false;
+  const delayMs = retryWindowDelayMs(next.checkpoint);
+  event({
+    itemId: next.item.itemId,
+    event: "batch_wait_retry_window",
+    status: "pending",
+    failureKind: next.checkpoint.failureKind,
+    retryable: next.checkpoint.retryable,
+    recoveryDecision: next.checkpoint.recoveryDecision,
+    failedStage: next.checkpoint.failedStage,
+    metadata: {
+      waitingItemCount: waiting.length,
+      nextRetryAt: next.checkpoint.nextRetryAt,
+      delayMs,
+      retryDelaySeconds: next.checkpoint.retryDelaySeconds,
+      retryBudgetSeconds,
+    },
+  });
+  sleep(delayMs);
+  return true;
 }
 
 function main() {
@@ -1467,9 +1953,17 @@ function main() {
     loadCheckpoint(item, completedSeed),
   ]));
   manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+  if (statusJson) {
+    printStatusAndExit(manifest, Array.from(checkpoints.values()));
+    return;
+  }
   if (migrateOnly) {
     migrateEventLog(Array.from(checkpoints.values()));
     migrateGraphVaultRawLogs();
+    const summary = writeRecoverySummary(
+      manifest,
+      Array.from(checkpoints.values()),
+    );
     event({
       event: "batch_state_migrated",
       recoveryDecision: recoveryDecisionForBatch(Array.from(checkpoints.values())),
@@ -1479,103 +1973,158 @@ function main() {
         completedItems: manifest.completedItems,
         skippedItems: manifest.skippedItems,
         failedItems: manifest.failedItems,
+        retryableItemCount: summary.retryableItemCount,
       },
     });
     return;
   }
 
-  for (const item of items) {
-    const checkpoint = checkpoints.get(item.itemId);
-    if (checkpoint?.status === "completed") {
-      event({ itemId: item.itemId, event: "item_skip_completed", status: "completed" });
-      continue;
-    }
-    if (checkpoint?.status === "skipped") {
-      event({
-        itemId: item.itemId,
-        event: "item_skipped",
-        status: "skipped",
-        metadata: checkpoint.metadata,
-      });
-      continue;
-    }
-    if (checkpoint?.status === "failed" && checkpoint.retryable === false) {
-      event({
-        itemId: item.itemId,
-        event: "item_failed_not_retryable",
-        status: "failed",
-        failureKind: checkpoint.failureKind ?? "unknown",
-        retryable: false,
-        recoveryDecision: "stop_until_fixed",
-        failedStage: checkpoint.failedStage,
-        message: checkpoint.errorSummary,
-      });
-      continue;
-    }
-    if (checkpoint?.status === "failed" && checkpoint.retryable === true) {
-      event({
-        itemId: item.itemId,
-        event: "item_retry_same_run_id",
-        status: "running",
-        failureKind: checkpoint.failureKind ?? "transient",
-        retryable: true,
-        recoveryDecision: "retry_same_run_id",
-        failedStage: checkpoint.failedStage,
-      });
-    }
-
-    try {
-      const starting = checkpoint ?? defaultCheckpoint(item, completedSeed);
-      const running = markItemRunning(item, starting, checkpoints, manifest);
-      const completed = runItem(item, running);
-      checkpoints.set(item.itemId, completed);
-      manifest = updateManifest(manifest, Array.from(checkpoints.values()));
-    } catch (error) {
-      const running = existsSync(itemPath(item))
-        ? loadCheckpoint(item, completedSeed)
-        : checkpoint ?? defaultCheckpoint(item, completedSeed);
-      const commandCheck = error?.commandCheck;
-      const failureKind = commandCheck?.failureKind ?? "unknown";
-      const retryable = commandCheck?.retryable ?? false;
-      const failed = {
-        ...running,
-        status: "failed",
-        failedAt: now(),
-        errorSummary: redacted(error instanceof Error ? error.message : String(error)),
-        failureKind,
-        retryable,
-        retryExhausted: Boolean(commandCheck?.attemptExhausted),
-        recoveryDecision: retryable ? "retry_same_run_id" : "stop_until_fixed",
-        failedStage: commandCheck?.name,
-      };
-      if (commandCheck) {
-        failed.commandChecks = [
-          ...(failed.commandChecks ?? []),
-          commandCheck,
-        ];
+  let processedInPass = true;
+  while (processedInPass) {
+    processedInPass = false;
+    let deferredForRetryWindow = false;
+    for (const item of items) {
+      const checkpoint = checkpoints.get(item.itemId);
+      if (checkpoint?.status === "completed") {
+        event({ itemId: item.itemId, event: "item_skip_completed", status: "completed" });
+        continue;
       }
-      saveCheckpoint(item, failed);
-      checkpoints.set(item.itemId, failed);
-      manifest = updateManifest(manifest, Array.from(checkpoints.values()));
-      event({
-        itemId: item.itemId,
-        event: "item_failed",
-        status: "failed",
-        message: failed.errorSummary,
-        failureKind: failed.failureKind,
-        retryable: failed.retryable,
-        attemptExhausted: failed.retryExhausted,
-        providerStatusCode: commandCheck?.providerStatusCode,
-        retryAfterSeconds: commandCheck?.retryAfterSeconds,
-        recoveryDecision: failed.recoveryDecision,
-        failedStage: failed.failedStage,
-      });
-      if (failFast) throw error;
+      if (checkpoint?.status === "skipped") {
+        event({
+          itemId: item.itemId,
+          event: "item_skipped",
+          status: "skipped",
+          metadata: checkpoint.metadata,
+        });
+        continue;
+      }
+      if (checkpoint?.status === "failed" && checkpoint.retryable === false) {
+        event({
+          itemId: item.itemId,
+          event: "item_failed_not_retryable",
+          status: "failed",
+          failureKind: checkpoint.failureKind ?? "unknown",
+          retryable: false,
+          recoveryDecision: "stop_until_fixed",
+          failedStage: checkpoint.failedStage,
+          message: checkpoint.errorSummary,
+        });
+        continue;
+      }
+      if (checkpoint?.status === "failed" && checkpoint.retryable === true) {
+        event({
+          itemId: item.itemId,
+          event: "item_retry_same_run_id",
+          status: "running",
+          failureKind: checkpoint.failureKind ?? "transient",
+          retryable: true,
+          recoveryDecision: "retry_same_run_id",
+          failedStage: checkpoint.failedStage,
+        });
+      }
+
+      try {
+        const starting = checkpoint ?? defaultCheckpoint(item, completedSeed);
+        const retryWindowDelay = retryWindowDelayMs(starting);
+        if (retryWindowDelay > 0) {
+          eventRetryWindowDeferred(item, starting, retryWindowDelay);
+          deferredForRetryWindow = true;
+          continue;
+        }
+        const running = markItemRunning(item, starting, checkpoints, manifest);
+        const completed = runItem(item, running);
+        checkpoints.set(item.itemId, completed);
+        manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+        processedInPass = true;
+      } catch (error) {
+        const running = existsSync(itemPath(item))
+          ? loadCheckpoint(item, completedSeed)
+          : checkpoint ?? defaultCheckpoint(item, completedSeed);
+        const commandCheck = error?.commandCheck;
+        const failureKind = commandCheck?.failureKind ?? "unknown";
+        const retryable = commandCheck?.retryable ?? false;
+        const canRecoverInThisRun =
+          retryable && failureKind === "transient" && transientBudgetAvailable(running);
+        if (canRecoverInThisRun && !failFast) {
+          const recoverable = buildRecoverableTransientCheckpoint({
+            item,
+            running,
+            commandCheck,
+            error,
+          });
+          saveCheckpoint(item, recoverable);
+          checkpoints.set(item.itemId, recoverable);
+          manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+          event({
+            itemId: item.itemId,
+            event: "item_retry_deferred",
+            status: "pending",
+            message: recoverable.errorSummary,
+            failureKind: recoverable.failureKind,
+            retryable: true,
+            attemptExhausted: false,
+            providerStatusCode: commandCheck?.providerStatusCode,
+            retryAfterSeconds: commandCheck?.retryAfterSeconds,
+            recoveryDecision: "retry_same_run_id",
+            failedStage: recoverable.failedStage,
+            metadata: {
+              nextRetryAt: recoverable.nextRetryAt,
+              retryDelaySeconds: recoverable.retryDelaySeconds,
+              retryBudgetSeconds,
+              elapsedRetrySeconds: elapsedRetrySeconds(recoverable),
+            },
+          });
+          processedInPass = true;
+          continue;
+        }
+        const failed = {
+          ...running,
+          status: "failed",
+          failedAt: now(),
+          errorSummary: redacted(error instanceof Error ? error.message : String(error)),
+          failureKind,
+          retryable,
+          retryExhausted: Boolean(commandCheck?.attemptExhausted),
+          recoveryDecision: retryable ? "retry_same_run_id" : "stop_until_fixed",
+    failedStage: commandCheck?.name,
+    nextRetryAt: commandCheck?.nextRetryAt,
+    retryDelaySeconds: commandCheck?.retryDelaySeconds,
+    runnerHeartbeatAt: now(),
+  };
+        if (commandCheck) {
+          failed.commandChecks = [
+            ...(failed.commandChecks ?? []),
+            commandCheck,
+          ];
+        }
+        saveCheckpoint(item, failed);
+        checkpoints.set(item.itemId, failed);
+        manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+        event({
+          itemId: item.itemId,
+          event: "item_failed",
+          status: "failed",
+          message: failed.errorSummary,
+          failureKind: failed.failureKind,
+          retryable: failed.retryable,
+          attemptExhausted: failed.retryExhausted,
+          providerStatusCode: commandCheck?.providerStatusCode,
+          retryAfterSeconds: commandCheck?.retryAfterSeconds,
+          recoveryDecision: failed.recoveryDecision,
+          failedStage: failed.failedStage,
+        });
+        if (failFast) throw error;
+        processedInPass = true;
+      }
+    }
+    if (!processedInPass && deferredForRetryWindow) {
+      processedInPass = waitForNextRetryWindow(items, checkpoints);
     }
   }
 
   migrateGraphVaultRawLogs();
   manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+  const summary = writeRecoverySummary(manifest, Array.from(checkpoints.values()));
   if (manifest.status === "completed") {
     event({ event: "batch_completed", status: "completed" });
     return;
@@ -1590,6 +2139,8 @@ function main() {
       completedItems: manifest.completedItems,
       skippedItems: manifest.skippedItems,
       failedItems: manifest.failedItems,
+      retryableItemCount: summary.retryableItemCount,
+      nextRetryAt: summary.nextRetryAt,
     },
   });
   process.exitCode = 1;

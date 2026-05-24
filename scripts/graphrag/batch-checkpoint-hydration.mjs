@@ -5,6 +5,12 @@ export function hydrateBatchCheckpoint({
   checkpoint,
   expectedCommandCheckCount,
   maxCommandAttempts,
+  maxTransientCommandAttempts,
+  maxResumePasses,
+  retryBaseDelaySeconds,
+  retryMaxDelaySeconds,
+  retryBudgetSeconds,
+  commandTimeoutSeconds,
   defaultBookId,
 }) {
   const commandChecks = (checkpoint.commandChecks ?? []).map((check) => {
@@ -34,6 +40,14 @@ export function hydrateBatchCheckpoint({
     expectedCommandCheckCount:
       checkpoint.expectedCommandCheckCount ?? expectedCommandCheckCount,
     maxCommandAttempts: checkpoint.maxCommandAttempts ?? maxCommandAttempts,
+    maxTransientCommandAttempts:
+      checkpoint.maxTransientCommandAttempts ?? maxTransientCommandAttempts,
+    maxResumePasses: checkpoint.maxResumePasses ?? maxResumePasses,
+    retryBaseDelaySeconds:
+      checkpoint.retryBaseDelaySeconds ?? retryBaseDelaySeconds,
+    retryMaxDelaySeconds: checkpoint.retryMaxDelaySeconds ?? retryMaxDelaySeconds,
+    retryBudgetSeconds: checkpoint.retryBudgetSeconds ?? retryBudgetSeconds,
+    commandTimeoutSeconds: checkpoint.commandTimeoutSeconds ?? commandTimeoutSeconds,
     failureKind: checkpoint.failureKind ?? inferredFailure?.failureKind,
     retryable: checkpoint.retryable ?? inferredFailure?.retryable,
     retryExhausted: checkpoint.retryExhausted ??

@@ -34,7 +34,21 @@ export function classifyFailure(text) {
     message.includes("concurrency limit") ||
     message.includes("rate limit") ||
     message.includes("temporarily unavailable") ||
-    message.includes("timeout");
+    message.includes("timeout") ||
+    message.includes("timed out") ||
+    message.includes("service unavailable") ||
+    message.includes("gateway timeout") ||
+    message.includes("bad gateway") ||
+    message.includes("network error") ||
+    message.includes("fetch failed") ||
+    message.includes("connection reset") ||
+    message.includes("connection aborted") ||
+    message.includes("connection refused") ||
+    message.includes("socket hang up") ||
+    message.includes("econnreset") ||
+    message.includes("econnrefused") ||
+    message.includes("etimedout") ||
+    message.includes("eai_again");
   if (transient) {
     return {
       failureKind: "transient",
