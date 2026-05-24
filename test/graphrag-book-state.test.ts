@@ -618,6 +618,21 @@ describe("syncGraphRagBookWorkspace", () => {
         logPath,
         "2026-05-24 INFO old stage completed\n" +
           "2026-05-24 ERROR old Concurrency limit exceeded for user\n" +
+          "2026-05-24 07:22:39.0811 - DEBUG - graphrag.api.index - " +
+          "[{'text':'This book discusses timeout and connection reset errors'}]\n",
+        "utf8",
+      );
+      health = await checkGraphRagStageReportHealth({
+        outputDir,
+        stage: "graph_extract",
+        logStartOffset: offset,
+      });
+      expect(health.healthy).toBe(true);
+
+      await writeFile(
+        logPath,
+        "2026-05-24 INFO old stage completed\n" +
+          "2026-05-24 ERROR old Concurrency limit exceeded for user\n" +
           "2026-05-24 ERROR Community Report Extraction Error\n" +
           "2026-05-24 WARNING No report found for community: 16\n",
         "utf8",

@@ -173,14 +173,26 @@ const GRAPH_RAG_STAGE_TRANSIENT_LOG_PATTERN =
   /concurrency limit exceeded|rate limit|temporarily unavailable|timeout|timed out|service unavailable|gateway timeout|bad gateway|connection reset|socket hang up|econnreset|etimedout|eai_again|HTTP\s+(429|5\d\d)|status\s+code[:\s-]*(429|5\d\d)|openai\.APIError/iu;
 const GRAPH_RAG_COMMUNITY_PARTIAL_LOG_PATTERN =
   /Community Report Extraction Error|error generating community report|No report found for community/iu;
+const GRAPH_RAG_ACTIONABLE_LOG_LEVEL_PATTERN =
+  /(?:\s-\s|\b)(?:WARNING|ERROR|CRITICAL|EXCEPTION)(?:\s-\s|\b)/iu;
+const GRAPH_RAG_NON_ACTIONABLE_LOG_LEVEL_PATTERN =
+  /(?:\s-\s|\b)(?:DEBUG|INFO)(?:\s-\s|\b)/iu;
+
+function isActionableGraphRagLogLine(line: string): boolean {
+  return GRAPH_RAG_ACTIONABLE_LOG_LEVEL_PATTERN.test(line) &&
+    !GRAPH_RAG_NON_ACTIONABLE_LOG_LEVEL_PATTERN.test(line);
+}
 
 function stageHealthEvidence(text: string, stage: BookStage): GraphRagStageReportHealth {
   const evidence = text
     .split(/\r?\n/u)
     .filter((line) =>
-      GRAPH_RAG_STAGE_TRANSIENT_LOG_PATTERN.test(line) ||
+      isActionableGraphRagLogLine(line) &&
+      (
+        GRAPH_RAG_STAGE_TRANSIENT_LOG_PATTERN.test(line) ||
       (stage === "community_report" &&
-        GRAPH_RAG_COMMUNITY_PARTIAL_LOG_PATTERN.test(line))
+          GRAPH_RAG_COMMUNITY_PARTIAL_LOG_PATTERN.test(line))
+      )
     )
     .slice(0, 20);
 
