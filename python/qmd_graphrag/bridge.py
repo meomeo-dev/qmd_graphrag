@@ -155,6 +155,41 @@ def _ensure_graphrag_prompt_assets(root_dir: Path) -> None:
         _write_text_if_missing(prompts_dir / name, content)
 
 
+def _scoped_storage_overrides(
+    *,
+    input_dir: str | None = None,
+    output_dir: str | None = None,
+) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    if input_dir:
+        overrides["input_storage"] = {
+            "type": "file",
+            "base_dir": str(Path(input_dir).resolve()),
+        }
+    if output_dir:
+        resolved_output = Path(output_dir).resolve()
+        overrides["output_storage"] = {
+            "type": "file",
+            "base_dir": str(resolved_output),
+        }
+        overrides["reporting"] = {
+            "type": "file",
+            "base_dir": str(resolved_output / "reports"),
+        }
+        overrides["cache"] = {
+            "type": "json",
+            "storage": {
+                "type": "file",
+                "base_dir": str(resolved_output / "cache"),
+            },
+        }
+        overrides["vector_store"] = {
+            "type": "lancedb",
+            "db_uri": str(resolved_output / "lancedb"),
+        }
+    return overrides
+
+
 def _register_qmd_completion_providers() -> None:
     from graphrag_llm.completion import register_completion
 
@@ -1065,9 +1100,7 @@ async def _run_graphrag_query(request: dict[str, Any]) -> dict[str, Any]:
 
     _ensure_graphrag_prompt_assets(root_dir)
 
-    cli_overrides: dict[str, Any] = {}
-    if data_dir:
-        cli_overrides["output_storage"] = {"base_dir": str(Path(data_dir).resolve())}
+    cli_overrides = _scoped_storage_overrides(output_dir=data_dir)
 
     config = load_config(root_dir=root_dir, cli_overrides=cli_overrides)
     evidence_scope: list[dict[str, Any]]
@@ -1218,6 +1251,8 @@ async def _run_graphrag_index(request: dict[str, Any]) -> dict[str, Any]:
     from graphrag.index.validate_config import validate_config_names  # type: ignore
 
     root_dir = Path(request["rootDir"]).resolve()
+    input_dir = request.get("inputDir")
+    data_dir = request.get("dataDir")
     method = request["method"]
     verbose = bool(request.get("verbose", False))
     skip_validation = bool(request.get("skipValidation", False))
@@ -1230,7 +1265,10 @@ async def _run_graphrag_index(request: dict[str, Any]) -> dict[str, Any]:
 
     _ensure_graphrag_prompt_assets(root_dir)
 
-    cli_overrides: dict[str, Any] = {}
+    cli_overrides = _scoped_storage_overrides(
+        input_dir=input_dir,
+        output_dir=data_dir,
+    )
     if workflows:
         cli_overrides["workflows"] = workflows
 

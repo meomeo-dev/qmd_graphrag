@@ -1439,6 +1439,158 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(movedRawLogs).toHaveLength(1);
   });
 
+  test("migrate-only reopens completed items without real GraphRAG evidence", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-reopen-completed-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "reopen-completed-fixture";
+    const sourceBytes = "legacy completed item";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    const bookId = `book-${sourceHash.slice(0, 12)}`;
+    const sourcePath = join(sourceDir, "Book.epub");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const commandChecks = [
+      "qmd-version", "qmd-status", "qmd-doctor-json", "qmd-pull", "qmd-update",
+      "qmd-embed", "qmd-ls-books", "qmd-search-json", "qmd-search-csv",
+      "qmd-search-md", "qmd-search-xml", "qmd-search-files", "qmd-vsearch-json",
+      "qmd-query-json", "qmd-query-auto-json", "qmd-query-graphrag-json",
+      "qmd-get-book", "qmd-multi-get-json", "qmd-collection-list",
+      "qmd-collection-show-books", "qmd-context-list", "qmd-skills-list-json",
+      "qmd-skills-get-json", "qmd-skills-path-json", "qmd-skill-show",
+      "qmd-dspy-status-json", "qmd-cleanup",
+    ].map((name) => ({
+      name,
+      status: "passed",
+      attempts: 1,
+      exitCode: 0,
+      stdoutBytes: 1,
+      stderrBytes: 0,
+      startedAt: "2026-05-23T00:00:00.000Z",
+      completedAt: "2026-05-23T00:00:01.000Z",
+    }));
+
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "completed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        pendingItems: 0,
+        runningItems: 0,
+        completedItems: 1,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 0,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        completedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "completed",
+        sourceName: "Book.epub",
+        sourceRelativePath,
+        sourceHash,
+        normalizedPath: join(
+          ".tmp-tests",
+          "graph_vault",
+          "input",
+          "book.md",
+        ),
+        bookId,
+        attempts: 1,
+        expectedCommandCheckCount: 27,
+        maxCommandAttempts: 3,
+        completedAt: "2026-05-23T00:01:00.000Z",
+        commandChecks,
+      }),
+    );
+
+    const result = await new Promise<{ stderr: string; exitCode: number | null }>(
+      (resolveResult) => {
+        const proc = spawn(process.execPath, [
+          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+          "--source-dir",
+          sourceDir,
+          "--state-root",
+          stateRoot,
+          "--log-root",
+          logRoot,
+          "--config",
+          join(configDir, "index.yml"),
+          "--qmd-index-path",
+          join(tmpRoot, "index.sqlite"),
+          "--run-id",
+          runId,
+          "--skip-dotenv",
+          "--migrate-only",
+        ]);
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => {
+          stderr += String(chunk);
+        });
+        proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+      },
+    );
+
+    const batchRoot = join(stateRoot, "catalog", "batch-runs", runId);
+    const manifest = JSON.parse(readFileSync(join(batchRoot, "manifest.json"), "utf8"));
+    const checkpoint = JSON.parse(
+      readFileSync(join(batchRoot, "items", `${itemId}.json`), "utf8"),
+    );
+    const events = readFileSync(join(batchRoot, "events.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(manifest).toMatchObject({
+      status: "running",
+      pendingItems: 1,
+      completedItems: 0,
+      failedItems: 0,
+    });
+    expect(checkpoint).toMatchObject({
+      status: "pending",
+      recoveryDecision: "continue_pending",
+      qmdBuildStatus: { status: "succeeded" },
+      graphBuildStatus: {
+        status: "pending",
+        stage: "graph_extract",
+        reason: "real_graphrag_stage_missing",
+      },
+      metadata: {
+        reopenedFromCompleted: true,
+      },
+    });
+    expect(events.some((event) => event.event === "item_completed_reopened"))
+      .toBe(true);
+  });
+
   test("keeps checkpoints unique for duplicate EPUB content", async () => {
     const tmpRoot = await mkProjectTmpDir("qmd-batch-duplicate-");
     const sourceDir = join(tmpRoot, "source");

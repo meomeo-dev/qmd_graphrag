@@ -83,6 +83,7 @@ import {
 import { createQmdGraphRagRuntime, type QmdGraphRagRuntime } from "./runtime.js";
 import type {
   BatchCommandCheck,
+  BatchBuildStatus,
   BatchEventLog,
   BatchFailureKind,
   BatchItemCheckpoint,
@@ -224,19 +225,21 @@ import type {
   BookStage,
   StageCheckpointStatus,
 } from "./contracts/book-job.js";
-import {
-  FileBookJobStateRepository,
-  type BuildGraphEnhancementRequestInput,
-  type CompleteStageInput,
-  type FailStageInput,
-  type RecordArtifactInput,
-  type RegisterBookSourceInput,
-  type StageArtifactRequirementMap,
-  type StageFingerprintMap,
-  type StartStageInput,
+import type {
+  BuildGraphEnhancementRequestInput,
+  CompleteStageInput,
+  FailStageInput,
+  RecordArtifactInput,
+  RegisterBookSourceInput,
+  StageArtifactRequirementMap,
+  StageFingerprintMap,
+  StartStageInput,
 } from "./job-state/repository.js";
-import {
-  syncGraphRagBookWorkspace,
+import type {
+  GraphRagBookWorkspacePaths,
+  GraphRagBookWorkspaceState,
+  GraphRagTextUnitIdentity,
+  SyncGraphRagBookWorkspaceInput,
 } from "./job-state/graphrag-book.js";
 import type {
   BuildUnifiedAnswerInput,
@@ -269,6 +272,7 @@ export type {
   NamedCollection,
   ContextMap,
   BatchCommandCheck,
+  BatchBuildStatus,
   BatchEventLog,
   BatchFailureKind,
   BatchItemCheckpoint,
@@ -372,6 +376,10 @@ export type {
   BuildUnifiedAnswerInput,
   DecideRouteInput,
   RouteQueryServices,
+  GraphRagBookWorkspacePaths,
+  GraphRagBookWorkspaceState,
+  GraphRagTextUnitIdentity,
+  SyncGraphRagBookWorkspaceInput,
   DataBusEnvelope,
   QueryExpansionItem,
   QueryKind,
@@ -428,6 +436,7 @@ export {
   BatchRunStatusSchema,
   BatchFailureKindSchema,
   BatchRecoveryDecisionSchema,
+  BatchBuildStatusSchema,
   BatchProjectRelativeLocatorSchema,
   BatchCommandCheckSchema,
   BatchItemCheckpointInputSchema,
@@ -662,8 +671,11 @@ export {
   type StartStageInput,
 } from "./job-state/repository.js";
 export {
+  graphRagBookInputDir,
+  graphRagBookOutputDir,
   readGraphTextUnitIdentity,
   syncGraphRagBookWorkspace,
+  writeGraphRagOutputProducerManifest,
 } from "./job-state/graphrag-book.js";
 export {
   loadGraphCapabilities,
@@ -685,12 +697,6 @@ export {
 export {
   restoreFromVault,
 } from "./vault/restore.js";
-export type {
-  GraphRagBookWorkspacePaths,
-  GraphRagBookWorkspaceState,
-  GraphRagTextUnitIdentity,
-  SyncGraphRagBookWorkspaceInput,
-} from "./job-state/graphrag-book.js";
 export {
   isJinaRerankModel,
 } from "./llm.js";

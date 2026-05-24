@@ -281,6 +281,8 @@ export async function runGraphRagIndex(
     model: parsed.method,
     request: {
       method: parsed.method,
+      inputDir: parsed.inputDir ?? null,
+      dataDir: parsed.dataDir ?? null,
       skipValidation: parsed.skipValidation,
       workflows: parsed.workflows ?? null,
       indexScope: parsed.indexScope ?? null,

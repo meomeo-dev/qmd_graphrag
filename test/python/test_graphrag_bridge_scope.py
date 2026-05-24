@@ -333,6 +333,8 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                     _run_graphrag_index(
                         {
                             "rootDir": str(root),
+                            "inputDir": str(root / "books" / "book-1" / "input"),
+                            "dataDir": str(root / "books" / "book-1" / "output"),
                             "method": "standard",
                             "skipValidation": True,
                             "workflows": ["load_input_documents"],
@@ -342,7 +344,38 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
 
         self.assertEqual(
             calls["cli_overrides"],
-            {"workflows": ["load_input_documents"]},
+            {
+                "input_storage": {
+                    "type": "file",
+                    "base_dir": str((root / "books" / "book-1" / "input").resolve()),
+                },
+                "output_storage": {
+                    "type": "file",
+                    "base_dir": str((root / "books" / "book-1" / "output").resolve()),
+                },
+                "reporting": {
+                    "type": "file",
+                    "base_dir": str(
+                        (root / "books" / "book-1" / "output" / "reports").resolve()
+                    ),
+                },
+                "cache": {
+                    "type": "json",
+                    "storage": {
+                        "type": "file",
+                        "base_dir": str(
+                            (root / "books" / "book-1" / "output" / "cache").resolve()
+                        ),
+                    },
+                },
+                "vector_store": {
+                    "type": "lancedb",
+                    "db_uri": str(
+                        (root / "books" / "book-1" / "output" / "lancedb").resolve()
+                    ),
+                },
+                "workflows": ["load_input_documents"],
+            },
         )
         self.assertNotIn("validated", calls)
         self.assertEqual(calls["build_index"]["method"], "standard")

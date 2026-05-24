@@ -702,6 +702,19 @@ function buildResumePlan(
         isSatisfied: false,
         reason: "stale",
       };
+    } else if (
+      HIGH_COST_STAGES.has(stage) &&
+      checkpoint.metadata?.bootstrap === true
+    ) {
+      staleStages.add(stage);
+      state = {
+        stage,
+        checkpointStatus: checkpoint.status,
+        expectedFingerprint,
+        actualFingerprint,
+        isSatisfied: false,
+        reason: "stale",
+      };
     } else {
       const validity = artifactValidity.get(stage);
       if (validity != null && !validity.isSatisfied) {

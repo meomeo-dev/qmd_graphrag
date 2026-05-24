@@ -170,6 +170,13 @@ const BatchCommandCheckSchema = z.object({
   providerStatusCode: z.number().int().positive().optional(),
   errorSummary: z.string().max(1000).optional(),
 });
+const BatchBuildStatusSchema = z.object({
+  status: z.enum(["pending", "running", "succeeded", "failed", "stale"]),
+  checkedAt: z.string().datetime().optional(),
+  stage: z.string().min(1).optional(),
+  reason: z.string().min(1).optional(),
+  artifactIds: z.array(z.string().min(1)).default([]),
+});
 const BatchItemCheckpointSchema = z.object({
   schemaVersion: z.literal(SchemaVersion),
   itemId: z.string().min(1),
@@ -188,6 +195,8 @@ const BatchItemCheckpointSchema = z.object({
   retryExhausted: z.boolean().optional(),
   recoveryDecision: BatchRecoveryDecisionSchema.optional(),
   failedStage: z.string().min(1).optional(),
+  qmdBuildStatus: BatchBuildStatusSchema.optional(),
+  graphBuildStatus: BatchBuildStatusSchema.optional(),
   startedAt: z.string().datetime().optional(),
   completedAt: z.string().datetime().optional(),
   failedAt: z.string().datetime().optional(),
@@ -571,12 +580,265 @@ function loadCheckpoint(item, completedSeed) {
     const checkpoint = defaultCheckpoint(item, completedSeed);
     return writeTypedJson(path, BatchItemCheckpointSchema, checkpoint);
   }
-  const checkpoint = hydrateCheckpoint(item, readJson(path));
+  const checkpoint = downgradeCompletedIfClosedLoopInvalid(
+    item,
+    hydrateCheckpoint(item, readJson(path)),
+  );
   return writeTypedJson(path, BatchItemCheckpointSchema, checkpoint);
 }
 
 function saveCheckpoint(item, checkpoint) {
   return writeTypedJson(itemPath(item), BatchItemCheckpointSchema, checkpoint);
+}
+
+function readYamlFileIfExists(path) {
+  if (!existsSync(path)) return null;
+  return YAML.parse(readFileSync(path, "utf8")) ?? null;
+}
+
+const graphStageArtifactKinds = {
+  graph_extract: [
+    "graphrag_documents_parquet",
+    "graphrag_text_units_parquet",
+    "graphrag_entities_parquet",
+    "graphrag_relationships_parquet",
+    "graphrag_communities_parquet",
+    "graphrag_context_json",
+    "graphrag_stats_json",
+  ],
+  community_report: ["graphrag_community_reports_parquet"],
+  embed: ["lancedb_index"],
+  query_ready: ["graphrag_community_reports_parquet", "lancedb_index"],
+};
+
+function checkpointArtifactIds(checkpoint) {
+  return Array.isArray(checkpoint?.artifactIds)
+    ? checkpoint.artifactIds.map(String)
+    : [];
+}
+
+function artifactExistsForBook(artifact, bookId) {
+  if (!artifact || artifact.bookId !== bookId || typeof artifact.path !== "string") {
+    return false;
+  }
+  return existsSync(join(stateRoot, artifact.path));
+}
+
+function validateGraphStageEvidence({ item, stage, checkpoint, artifacts }) {
+  if (
+    checkpoint?.stage !== stage ||
+    checkpoint?.status !== "succeeded" ||
+    checkpoint?.metadata?.bootstrap === true
+  ) {
+    return {
+      ok: false,
+      reason: checkpoint?.metadata?.bootstrap === true
+        ? "bootstrap_stage_requires_real_rebuild"
+        : "real_graphrag_stage_missing",
+      artifactIds: checkpointArtifactIds(checkpoint),
+    };
+  }
+
+  const artifactIds = checkpointArtifactIds(checkpoint);
+  if (artifactIds.length === 0) {
+    return {
+      ok: false,
+      reason: "stage_artifact_missing",
+      artifactIds,
+    };
+  }
+
+  const stageArtifacts = artifactIds
+    .map((artifactId) => artifacts.find((artifact) =>
+      String(artifact?.artifactId) === artifactId
+    ))
+    .filter((artifact) => artifactExistsForBook(artifact, item.bookId));
+  const artifactKinds = new Set(stageArtifacts.map((artifact) => artifact.kind));
+  const missingKind = graphStageArtifactKinds[stage].find((kind) =>
+    !artifactKinds.has(kind)
+  );
+  if (missingKind) {
+    return {
+      ok: false,
+      reason: `stage_artifact_kind_missing:${missingKind}`,
+      artifactIds,
+    };
+  }
+
+  const invalidPath = stageArtifacts.find((artifact) =>
+    stage === "embed"
+      ? artifact.path !== `books/${item.bookId}/output/lancedb`
+      : !artifact.path.startsWith(`books/${item.bookId}/output/`)
+  );
+  if (invalidPath) {
+    return {
+      ok: false,
+      reason: "stage_artifact_not_book_scoped",
+      artifactIds,
+    };
+  }
+
+  return { ok: true, artifactIds };
+}
+
+function graphBuildEvidence(item) {
+  const checkedAt = now();
+  const checkpointCatalog = readYamlFileIfExists(
+    join(stateRoot, "books", item.bookId, "checkpoints.yaml"),
+  );
+  const artifactCatalog = readYamlFileIfExists(
+    join(stateRoot, "books", item.bookId, "artifacts.yaml"),
+  );
+  const checkpoints = Array.isArray(checkpointCatalog?.items)
+    ? checkpointCatalog.items
+    : [];
+  const artifacts = Array.isArray(artifactCatalog?.items) ? artifactCatalog.items : [];
+
+  for (const stage of [
+    "graph_extract",
+    "community_report",
+    "embed",
+    "query_ready",
+  ]) {
+    const stageEvidence = validateGraphStageEvidence({
+      item,
+      stage,
+      checkpoint: checkpoints.find((checkpoint) => checkpoint?.stage === stage),
+      artifacts,
+    });
+    if (!stageEvidence.ok) {
+      return {
+        status: stageEvidence.reason === "real_graphrag_stage_missing"
+          ? "pending"
+          : "stale",
+        checkedAt,
+        stage,
+        reason: stageEvidence.reason,
+        artifactIds: stageEvidence.artifactIds,
+      };
+    }
+  }
+
+  const producerManifestPath = join(
+    stateRoot,
+    "books",
+    item.bookId,
+    "output",
+    "qmd_output_manifest.json",
+  );
+  const producer = existsSync(producerManifestPath)
+    ? readJson(producerManifestPath)
+    : null;
+  if (
+    producer?.bookId !== item.bookId ||
+    producer?.sourceHash !== item.sourceHash ||
+    producer?.outputDir !== join(stateRoot, "books", item.bookId, "output")
+  ) {
+    return {
+      status: "stale",
+      checkedAt,
+      stage: "query_ready",
+      reason: "graph_output_producer_manifest_missing_or_mismatched",
+      artifactIds: checkpointArtifactIds(
+        checkpoints.find((checkpoint) => checkpoint?.stage === "query_ready"),
+      ),
+    };
+  }
+
+  const queryReady = checkpoints.find((checkpoint) =>
+    checkpoint?.stage === "query_ready" && checkpoint?.status === "succeeded"
+  );
+  return {
+    status: "succeeded",
+    checkedAt,
+    stage: "query_ready",
+    artifactIds: checkpointArtifactIds(queryReady),
+  };
+}
+
+function qmdBuildEvidence(checkpoint) {
+  const checkedAt = now();
+  const checks = checkpoint.commandChecks ?? [];
+  const names = new Set(checks.map((check) => check.name));
+  const qmdRequired = [
+    "qmd-update",
+    "qmd-embed",
+    "qmd-search-json",
+    "qmd-vsearch-json",
+    "qmd-query-json",
+  ];
+  const missing = qmdRequired.find((name) => !names.has(name));
+  if (missing) {
+    return {
+      status: "pending",
+      checkedAt,
+      stage: missing,
+      reason: "qmd_build_check_missing",
+      artifactIds: [],
+    };
+  }
+  const failed = checks.find((check) =>
+    qmdRequired.includes(check.name) && check.status !== "passed"
+  );
+  if (failed) {
+    return {
+      status: "failed",
+      checkedAt,
+      stage: failed.name,
+      reason: "qmd_build_check_failed",
+      artifactIds: [],
+    };
+  }
+  return {
+    status: "succeeded",
+    checkedAt,
+    stage: "qmd-query-json",
+    artifactIds: [],
+  };
+}
+
+function downgradeCompletedIfClosedLoopInvalid(item, checkpoint) {
+  if (checkpoint.status !== "completed") return checkpoint;
+  const qmdBuildStatus = checkpoint.qmdBuildStatus ?? qmdBuildEvidence(checkpoint);
+  const graphBuildStatus = graphBuildEvidence(item);
+  if (
+    qmdBuildStatus.status === "succeeded" &&
+    graphBuildStatus.status === "succeeded"
+  ) {
+    return {
+      ...checkpoint,
+      qmdBuildStatus,
+      graphBuildStatus,
+    };
+  }
+  event({
+    itemId: item.itemId,
+    event: "item_completed_reopened",
+    status: "pending",
+    recoveryDecision: "continue_pending",
+    failedStage: graphBuildStatus.status === "succeeded"
+      ? qmdBuildStatus.stage
+      : graphBuildStatus.stage,
+    metadata: {
+      qmdBuildStatus,
+      graphBuildStatus,
+    },
+  });
+  return {
+    ...checkpoint,
+    status: "pending",
+    completedAt: undefined,
+    recoveryDecision: "continue_pending",
+    qmdBuildStatus,
+    graphBuildStatus,
+    metadata: {
+      ...(checkpoint.metadata ?? {}),
+      reopenedFromCompleted: true,
+      reopenReason: graphBuildStatus.status === "succeeded"
+        ? qmdBuildStatus.reason
+        : graphBuildStatus.reason,
+    },
+  };
 }
 
 function updateManifest(manifest, checkpoints) {
@@ -1028,7 +1290,7 @@ function runGraphResume(item) {
         nextStage: resume.nextStage,
       },
     });
-    if (resume.status === "ready" && resume.nextStage == null) return;
+    if (resume.status === "ready" && resume.nextStage == null) return resume.bookId;
   }
 
   throw Object.assign(
@@ -1090,7 +1352,12 @@ function runCliChecks(item) {
   record(qmd(item, "qmd-vsearch-json", ["vsearch", "--json", "software design complexity"], maxCommandAttempts));
   record(qmd(item, "qmd-query-json", ["query", "--json", query], maxCommandAttempts));
   record(qmd(item, "qmd-query-auto-json", ["query", "--mode", "auto", "--json", query], maxCommandAttempts));
-  record(qmd(item, "qmd-query-graphrag-json", ["query", "--graphrag", "--json", query], maxCommandAttempts));
+  record(qmd(
+    item,
+    "qmd-query-graphrag-json",
+    ["query", "--graphrag", "--graph-book-id", item.bookId, "--json", query],
+    maxCommandAttempts,
+  ));
   record(qmd(item, "qmd-get-book", ["get", `qmd://books/${basename(item.normalizedPath)}`, "-l", "5"]));
   record(qmd(item, "qmd-multi-get-json", ["multi-get", "books/*.md", "-l", "1", "--json"]));
   record(qmd(item, "qmd-collection-list", ["collection", "list"]));
@@ -1108,12 +1375,41 @@ function runCliChecks(item) {
 
 function runItem(item, checkpoint) {
   normalizeEpubToMarkdown(item);
-  runGraphResume(item);
-  const commandChecks = runCliChecks(item);
+  const resolvedBookId = runGraphResume(item) ?? checkpoint.bookId;
+  const resolvedItem = { ...item, bookId: resolvedBookId };
+  const commandChecks = runCliChecks(resolvedItem);
+  const qmdBuildStatus = qmdBuildEvidence({ commandChecks });
+  const graphBuildStatus = graphBuildEvidence(resolvedItem);
+  if (qmdBuildStatus.status !== "succeeded") {
+    throw Object.assign(new Error(`qmd build did not succeed: ${qmdBuildStatus.reason}`), {
+      commandCheck: commandChecks.find((check) => check.name === qmdBuildStatus.stage),
+    });
+  }
+  if (graphBuildStatus.status !== "succeeded") {
+    throw Object.assign(
+      new Error(`GraphRAG build did not succeed: ${graphBuildStatus.reason}`),
+      {
+        commandCheck: {
+          name: graphBuildStatus.stage ?? "graphrag-build",
+          status: "failed",
+          attempts: 1,
+          exitCode: 1,
+          stdoutBytes: 0,
+          stderrBytes: 0,
+          startedAt: graphBuildStatus.checkedAt ?? now(),
+          completedAt: now(),
+          failureKind: "permanent",
+          retryable: false,
+          attemptExhausted: true,
+          errorSummary: graphBuildStatus.reason,
+        },
+      },
+    );
+  }
   const completed = {
     ...checkpoint,
     status: "completed",
-    bookId: parseBookIdFromResume(item) ?? checkpoint.bookId,
+    bookId: resolvedBookId,
     completedAt: now(),
     failedAt: undefined,
     errorSummary: undefined,
@@ -1122,6 +1418,8 @@ function runItem(item, checkpoint) {
     retryExhausted: undefined,
     recoveryDecision: "none",
     failedStage: undefined,
+    qmdBuildStatus,
+    graphBuildStatus,
     commandChecks,
   };
   saveCheckpoint(item, completed);

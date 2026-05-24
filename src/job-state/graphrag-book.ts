@@ -1,6 +1,13 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { copyFile, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  mkdir,
+  readFile,
+  rename,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
 
 import YAML from "yaml";
@@ -12,6 +19,7 @@ import type {
   BookResumePlan,
   BookStage,
 } from "../contracts/book-job.js";
+import { BookStageOrder } from "../contracts/book-job.js";
 import type { CollectionConfig } from "../collections.js";
 import type { JsonValue } from "../contracts/common.js";
 import {
@@ -99,6 +107,32 @@ export type GraphRagTextUnitIdentity = {
   normalizedPath: string;
   graphDocumentId: string;
   graphTextUnitIds: string[];
+};
+
+export function graphRagBookInputDir(input: {
+  stateRootDir: string;
+  bookId: string;
+}): string {
+  return join(resolve(input.stateRootDir), "books", input.bookId, "input");
+}
+
+export function graphRagBookOutputDir(input: {
+  stateRootDir: string;
+  bookId: string;
+}): string {
+  return join(resolve(input.stateRootDir), "books", input.bookId, "output");
+}
+
+type GraphRagOutputProducerManifest = {
+  schemaVersion: "1.0.0";
+  bookId: string;
+  sourceHash: string;
+  documentId: string;
+  contentHash: string;
+  stageFingerprints: Record<BookStage, string>;
+  providerFingerprint: string;
+  outputDir: string;
+  producerRunId: string;
 };
 
 function stripKnownBookExtension(path: string): string {
@@ -680,11 +714,13 @@ async function collectWorkspaceArtifacts(
   producerRunId: string,
   stageFingerprints: Record<BookStage, string>,
   providerFingerprint: string,
+  expectedOutputProducer: GraphRagOutputProducerManifest | null,
 ) {
   const normalizedPath = resolve(paths.normalizedPath);
   const outputDir = resolve(paths.outputDir);
   const stageRunId = (stage: BookStage) => `${producerRunId}-${stage}`;
 
+  const canUseGraphOutput = expectedOutputProducer != null;
   const artifacts = await Promise.all([
     artifactForFile(
       vaultSourcePath,
@@ -702,93 +738,190 @@ async function collectWorkspaceArtifacts(
       stageFingerprints.normalize,
       providerFingerprint,
     ),
-    maybeArtifactForPath(
-      join(outputDir, "documents.parquet"),
-      "graph_extract",
-      "graphrag_documents_parquet",
-      stageRunId("graph_extract"),
-      stageFingerprints.graph_extract,
-      providerFingerprint,
-    ),
-    maybeArtifactForPath(
-      join(outputDir, "text_units.parquet"),
-      "graph_extract",
-      "graphrag_text_units_parquet",
-      stageRunId("graph_extract"),
-      stageFingerprints.graph_extract,
-      providerFingerprint,
-    ),
-    maybeArtifactForPath(
-      join(outputDir, "entities.parquet"),
-      "graph_extract",
-      "graphrag_entities_parquet",
-      stageRunId("graph_extract"),
-      stageFingerprints.graph_extract,
-      providerFingerprint,
-    ),
-    maybeArtifactForPath(
-      join(outputDir, "relationships.parquet"),
-      "graph_extract",
-      "graphrag_relationships_parquet",
-      stageRunId("graph_extract"),
-      stageFingerprints.graph_extract,
-      providerFingerprint,
-    ),
-    maybeArtifactForPath(
-      join(outputDir, "communities.parquet"),
-      "graph_extract",
-      "graphrag_communities_parquet",
-      stageRunId("graph_extract"),
-      stageFingerprints.graph_extract,
-      providerFingerprint,
-    ),
-    maybeArtifactForPath(
-      join(outputDir, "context.json"),
-      "graph_extract",
-      "graphrag_context_json",
-      stageRunId("graph_extract"),
-      stageFingerprints.graph_extract,
-      providerFingerprint,
-    ),
-    maybeArtifactForPath(
-      join(outputDir, "stats.json"),
-      "graph_extract",
-      "graphrag_stats_json",
-      stageRunId("graph_extract"),
-      stageFingerprints.graph_extract,
-      providerFingerprint,
-    ),
-    maybeArtifactForPath(
-      join(outputDir, "community_reports.parquet"),
-      "community_report",
-      "graphrag_community_reports_parquet",
-      stageRunId("community_report"),
-      stageFingerprints.community_report,
-      providerFingerprint,
-    ),
-    isCompleteLanceDbDirectory(join(outputDir, "lancedb")).then((isComplete) =>
-      isComplete
-        ? maybeArtifactForDirectory(
-            join(outputDir, "lancedb"),
-            "embed",
-            "lancedb_index",
-            stageRunId("embed"),
-            stageFingerprints.embed,
-            providerFingerprint,
-          )
-        : null,
-    ),
-    maybeArtifactForPath(
-      join(resolve(paths.stateRootDir), "reports", "indexing-engine.log"),
-      "graph_extract",
-      "index_log",
-      stageRunId("graph_extract"),
-      stageFingerprints.graph_extract,
-      providerFingerprint,
-    ),
+    canUseGraphOutput
+      ? maybeArtifactForPath(
+          join(outputDir, "documents.parquet"),
+          "graph_extract",
+          "graphrag_documents_parquet",
+          stageRunId("graph_extract"),
+          stageFingerprints.graph_extract,
+          providerFingerprint,
+        )
+      : null,
+    canUseGraphOutput
+      ? maybeArtifactForPath(
+          join(outputDir, "text_units.parquet"),
+          "graph_extract",
+          "graphrag_text_units_parquet",
+          stageRunId("graph_extract"),
+          stageFingerprints.graph_extract,
+          providerFingerprint,
+        )
+      : null,
+    canUseGraphOutput
+      ? maybeArtifactForPath(
+          join(outputDir, "entities.parquet"),
+          "graph_extract",
+          "graphrag_entities_parquet",
+          stageRunId("graph_extract"),
+          stageFingerprints.graph_extract,
+          providerFingerprint,
+        )
+      : null,
+    canUseGraphOutput
+      ? maybeArtifactForPath(
+          join(outputDir, "relationships.parquet"),
+          "graph_extract",
+          "graphrag_relationships_parquet",
+          stageRunId("graph_extract"),
+          stageFingerprints.graph_extract,
+          providerFingerprint,
+        )
+      : null,
+    canUseGraphOutput
+      ? maybeArtifactForPath(
+          join(outputDir, "communities.parquet"),
+          "graph_extract",
+          "graphrag_communities_parquet",
+          stageRunId("graph_extract"),
+          stageFingerprints.graph_extract,
+          providerFingerprint,
+        )
+      : null,
+    canUseGraphOutput
+      ? maybeArtifactForPath(
+          join(outputDir, "context.json"),
+          "graph_extract",
+          "graphrag_context_json",
+          stageRunId("graph_extract"),
+          stageFingerprints.graph_extract,
+          providerFingerprint,
+        )
+      : null,
+    canUseGraphOutput
+      ? maybeArtifactForPath(
+          join(outputDir, "stats.json"),
+          "graph_extract",
+          "graphrag_stats_json",
+          stageRunId("graph_extract"),
+          stageFingerprints.graph_extract,
+          providerFingerprint,
+        )
+      : null,
+    canUseGraphOutput
+      ? maybeArtifactForPath(
+          join(outputDir, "community_reports.parquet"),
+          "community_report",
+          "graphrag_community_reports_parquet",
+          stageRunId("community_report"),
+          stageFingerprints.community_report,
+          providerFingerprint,
+        )
+      : null,
+    canUseGraphOutput
+      ? isCompleteLanceDbDirectory(join(outputDir, "lancedb")).then((isComplete) =>
+          isComplete
+            ? maybeArtifactForDirectory(
+                join(outputDir, "lancedb"),
+                "embed",
+                "lancedb_index",
+                stageRunId("embed"),
+                stageFingerprints.embed,
+                providerFingerprint,
+              )
+            : null
+        )
+      : null,
+    canUseGraphOutput
+      ? maybeArtifactForPath(
+          join(outputDir, "reports", "indexing-engine.log"),
+          "graph_extract",
+          "index_log",
+          stageRunId("graph_extract"),
+          stageFingerprints.graph_extract,
+          providerFingerprint,
+        )
+      : null,
   ]);
 
   return artifacts.filter((item) => item != null);
+}
+
+async function readOutputProducerManifest(
+  outputDir: string,
+): Promise<GraphRagOutputProducerManifest | null> {
+  try {
+    const raw = await readFile(join(outputDir, "qmd_output_manifest.json"), "utf8");
+    const parsed = JSON.parse(raw) as Partial<GraphRagOutputProducerManifest>;
+    if (
+      parsed.schemaVersion !== "1.0.0" ||
+      typeof parsed.bookId !== "string" ||
+      typeof parsed.sourceHash !== "string" ||
+      typeof parsed.documentId !== "string" ||
+      typeof parsed.contentHash !== "string" ||
+      typeof parsed.providerFingerprint !== "string" ||
+      typeof parsed.outputDir !== "string" ||
+      typeof parsed.producerRunId !== "string" ||
+      parsed.stageFingerprints == null
+    ) {
+      return null;
+    }
+    return parsed as GraphRagOutputProducerManifest;
+  } catch {
+    return null;
+  }
+}
+
+function outputProducerMatches(input: {
+  manifest: GraphRagOutputProducerManifest | null;
+  bookId: string;
+  sourceHash: string;
+  documentId: string;
+  contentHash: string;
+  stageFingerprints: Record<BookStage, string>;
+  providerFingerprint: string;
+  outputDir: string;
+}): boolean {
+  const manifest = input.manifest;
+  if (manifest == null) return false;
+  return manifest.bookId === input.bookId &&
+    manifest.sourceHash === input.sourceHash &&
+    manifest.documentId === input.documentId &&
+    manifest.contentHash === input.contentHash &&
+    manifest.providerFingerprint === input.providerFingerprint &&
+    resolve(manifest.outputDir) === resolve(input.outputDir) &&
+    BookStageOrder.every((stage) =>
+      manifest.stageFingerprints?.[stage] === input.stageFingerprints[stage]
+    );
+}
+
+export async function writeGraphRagOutputProducerManifest(input: {
+  outputDir: string;
+  bookId: string;
+  sourceHash: string;
+  documentId: string;
+  contentHash: string;
+  stageFingerprints: Record<BookStage, string>;
+  providerFingerprint: string;
+  producerRunId: string;
+}): Promise<void> {
+  const manifest: GraphRagOutputProducerManifest = {
+    schemaVersion: "1.0.0",
+    bookId: input.bookId,
+    sourceHash: input.sourceHash,
+    documentId: input.documentId,
+    contentHash: input.contentHash,
+    stageFingerprints: input.stageFingerprints,
+    providerFingerprint: input.providerFingerprint,
+    outputDir: resolve(input.outputDir),
+    producerRunId: input.producerRunId,
+  };
+  await mkdir(input.outputDir, { recursive: true });
+  await writeFile(
+    join(input.outputDir, "qmd_output_manifest.json"),
+    JSON.stringify(manifest, null, 2),
+    "utf8",
+  );
 }
 
 function groupArtifactsByStage(artifacts: BookArtifactManifest[]) {
@@ -815,6 +948,7 @@ async function bootstrapRecoveredStages(input: {
   stageFingerprints: StageFingerprintMap;
   artifacts: BookArtifactManifest[];
   bootstrapRunId: string;
+  highCostStages: boolean;
 }) {
   const byStage = groupArtifactsByStage(input.artifacts);
   const existing = new Map(
@@ -867,27 +1001,29 @@ async function bootstrapRecoveredStages(input: {
 
   await maybeComplete("ingest", (byStage.get("ingest")?.length ?? 0) > 0);
   await maybeComplete("normalize", (byStage.get("normalize")?.length ?? 0) > 0);
-  await maybeComplete(
-    "graph_extract",
-    hasKinds(byStage.get("graph_extract") ?? [], GRAPH_EXTRACT_KINDS),
-  );
-  await maybeComplete(
-    "community_report",
-    hasKinds(byStage.get("community_report") ?? [], [
-      "graphrag_community_reports_parquet",
-    ]),
-  );
-  await maybeComplete("embed", hasKinds(byStage.get("embed") ?? [], ["lancedb_index"]));
-  await maybeComplete(
-    "query_ready",
-    hasKinds(byStage.get("community_report") ?? [], [
-      "graphrag_community_reports_parquet",
-    ]) && hasKinds(byStage.get("embed") ?? [], ["lancedb_index"]),
-    [
-      ...(byStage.get("community_report") ?? []),
-      ...(byStage.get("embed") ?? []),
-    ].map((artifact) => artifact.artifactId),
-  );
+  if (input.highCostStages) {
+    await maybeComplete(
+      "graph_extract",
+      hasKinds(byStage.get("graph_extract") ?? [], GRAPH_EXTRACT_KINDS),
+    );
+    await maybeComplete(
+      "community_report",
+      hasKinds(byStage.get("community_report") ?? [], [
+        "graphrag_community_reports_parquet",
+      ]),
+    );
+    await maybeComplete("embed", hasKinds(byStage.get("embed") ?? [], ["lancedb_index"]));
+    await maybeComplete(
+      "query_ready",
+      hasKinds(byStage.get("community_report") ?? [], [
+        "graphrag_community_reports_parquet",
+      ]) && hasKinds(byStage.get("embed") ?? [], ["lancedb_index"]),
+      [
+        ...(byStage.get("community_report") ?? []),
+        ...(byStage.get("embed") ?? []),
+      ].map((artifact) => artifact.artifactId),
+    );
+  }
 }
 
 export async function syncGraphRagBookWorkspace(
@@ -1001,14 +1137,32 @@ export async function syncGraphRagBookWorkspace(
     });
   }
 
-  await writeLanceDbRowCountSidecars(join(resolve(input.outputDir), "lancedb"));
+  const outputDir = graphRagBookOutputDir({
+    stateRootDir: input.stateRootDir,
+    bookId: job.bookId,
+  });
+  await writeLanceDbRowCountSidecars(join(outputDir, "lancedb"));
+  const outputProducerManifest = await readOutputProducerManifest(outputDir);
+  const expectedOutputProducer = outputProducerMatches({
+    manifest: outputProducerManifest,
+    bookId: job.bookId,
+    sourceHash,
+    documentId: job.documentId,
+    contentHash: normalizedContentHash,
+    stageFingerprints,
+    providerFingerprint: settings.providerBoundaryFingerprint,
+    outputDir,
+  })
+    ? outputProducerManifest
+    : null;
 
   const artifacts = await collectWorkspaceArtifacts(
-    input,
+    { ...input, outputDir },
     vaultSourcePath,
     bootstrapRunId,
     stageFingerprints,
     settings.providerBoundaryFingerprint,
+    expectedOutputProducer,
   );
   const recordedArtifacts = await repo.recordArtifacts(job.bookId, artifacts);
   const byStage = groupArtifactsByStage(recordedArtifacts);
@@ -1024,7 +1178,7 @@ export async function syncGraphRagBookWorkspace(
     repo,
     job,
     normalizedPath: repo.relativePath(normalizedPath),
-    outputDir: resolve(input.outputDir),
+    outputDir,
     required: hasQueryReadyArtifacts,
   });
 
@@ -1035,6 +1189,7 @@ export async function syncGraphRagBookWorkspace(
       stageFingerprints,
       artifacts: recordedArtifacts,
       bootstrapRunId,
+      highCostStages: false,
     });
   }
 

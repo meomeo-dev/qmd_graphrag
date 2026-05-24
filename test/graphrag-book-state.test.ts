@@ -10,8 +10,10 @@ import YAML from "yaml";
 import {
   buildGraphRagRuntimeSettingsProjection,
   FileBookJobStateRepository,
+  graphRagBookOutputDir,
   SchemaVersion,
   syncGraphRagBookWorkspace,
+  writeGraphRagOutputProducerManifest,
   writeManagedGraphRagSettings,
 } from "../src/index.js";
 import type { CollectionConfig } from "../src/collections.js";
@@ -28,6 +30,44 @@ const lanceDbTest = HasLanceDbPython ? test : test.skip;
 
 async function createWorkspace(): Promise<string> {
   return mkdtemp(join(tmpdir(), "qmd-graphrag-workspace-"));
+}
+
+async function writeMinimalGraphOutput(outputDir: string): Promise<void> {
+  await mkdir(outputDir, { recursive: true });
+  const parquetScript = [
+    "import pandas as pd, sys",
+    "output_dir = sys.argv[1]",
+    "pd.DataFrame([{'id':'graph-doc-1','title':'book.md','text_unit_ids':['tu-1','tu-2']}]).to_parquet(f'{output_dir}/documents.parquet')",
+    "pd.DataFrame([{'id':'tu-1','document_id':'graph-doc-1'},{'id':'tu-2','document_id':'graph-doc-1'}]).to_parquet(f'{output_dir}/text_units.parquet')",
+    "pd.DataFrame([{'community':'0','title':'report','full_content':'report'}]).to_parquet(f'{output_dir}/community_reports.parquet')",
+    "for name in ['entities', 'relationships', 'communities']:",
+    "    pd.DataFrame([{'id': f'{name}-1'}]).to_parquet(f'{output_dir}/{name}.parquet')",
+  ].join("\n");
+  const result = spawnSync(TestPythonBin, ["-c", parquetScript, outputDir], {
+    encoding: "utf8",
+  });
+  expect(result.status, result.stderr).toBe(0);
+  await writeFile(join(outputDir, "context.json"), '{"records":[]}', "utf8");
+  await writeFile(join(outputDir, "stats.json"), '{"workflows":{}}', "utf8");
+}
+
+async function writeCompleteLanceDbSidecars(outputDir: string): Promise<void> {
+  for (const tableName of [
+    "entity_description.lance",
+    "community_full_content.lance",
+    "text_unit_text.lance",
+  ]) {
+    const tableDir = join(outputDir, "lancedb", tableName);
+    await mkdir(join(tableDir, "data"), { recursive: true });
+    await mkdir(join(tableDir, "_versions"), { recursive: true });
+    await writeFile(join(tableDir, "data", "part-1.lance"), "rows", "utf8");
+    await writeFile(join(tableDir, "_versions", "1.manifest"), "part-1.lance", "utf8");
+    await writeFile(
+      join(tableDir, "qmd_row_count.json"),
+      JSON.stringify({ schemaVersion: SchemaVersion, rowCount: 1 }),
+      "utf8",
+    );
+  }
 }
 
 describe("syncGraphRagBookWorkspace", () => {
@@ -324,7 +364,7 @@ describe("syncGraphRagBookWorkspace", () => {
       )) {
         expect(item.providerFingerprint).toBe(recovered.job.providerFingerprint);
       }
-      expect(recovered.resumePlan.nextStage).toBe("community_report");
+      expect(recovered.resumePlan.nextStage).toBe("graph_extract");
       expect(jobRaw).not.toContain("opaque-redaction-marker");
       expect(jobRaw).not.toContain(root);
       expect(jobRaw).toContain("providerBoundaryFingerprint");
@@ -333,7 +373,7 @@ describe("syncGraphRagBookWorkspace", () => {
     }
   });
 
-  test("bootstraps recovered stages from a partial GraphRAG workspace", async () => {
+  test("does not bootstrap GraphRAG stages from shared output", async () => {
     const root = await createWorkspace();
     try {
       const graphVault = join(root, "graph_vault");
@@ -412,11 +452,10 @@ describe("syncGraphRagBookWorkspace", () => {
         qmdIndexPath: join(root, ".qmd", "index.sqlite"),
       });
 
-      expect(state.resumePlan.nextStage).toBe("community_report");
+      expect(state.resumePlan.nextStage).toBe("graph_extract");
       expect(state.resumePlan.completedStages).toEqual([
         "ingest",
         "normalize",
-        "graph_extract",
       ]);
 
       const repo = new FileBookJobStateRepository(graphVault);
@@ -433,7 +472,6 @@ describe("syncGraphRagBookWorkspace", () => {
       expect(checkpoints.map((item) => item.stage)).toEqual([
         "ingest",
         "normalize",
-        "graph_extract",
       ]);
       const records = await repo.listRunRecords(state.job.bookId);
       for (const checkpoint of checkpoints) {
@@ -528,28 +566,38 @@ describe("syncGraphRagBookWorkspace", () => {
 
       const sourcePath = join(root, "book.epub");
       const normalizedPath = join(graphVault, "input", "book.md");
-      const documentsPath = join(graphVault, "output", "documents.parquet");
-      const textUnitsPath = join(graphVault, "output", "text_units.parquet");
 
       await writeFile(sourcePath, "epub-bytes", "utf8");
       await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
       await writeFile(join(graphVault, "settings.yaml"), "vector_store: {}\n", "utf8");
       await writeFile(join(graphVault, "prompts", "extract_graph.txt"), "prompt", "utf8");
 
-      const parquetScript = [
-        "import pandas as pd, sys",
-        "documents_path, text_units_path = sys.argv[1:3]",
-        "pd.DataFrame([{'id':'graph-doc-1','title':'book.md','text_unit_ids':['tu-1','tu-2']}]).to_parquet(documents_path)",
-        "pd.DataFrame([{'id':'tu-1','document_id':'graph-doc-1'},{'id':'tu-2','document_id':'graph-doc-1'}]).to_parquet(text_units_path)",
-      ].join("\n");
-      const result = spawnSync(TestPythonBin, [
-        "-c",
-        parquetScript,
-        documentsPath,
-        textUnitsPath,
-      ], { encoding: "utf8" });
-      expect(result.status, result.stderr).toBe(0);
-
+      const initial = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        recordRecoveredStages: false,
+      });
+      const outputDir = graphRagBookOutputDir({
+        stateRootDir: graphVault,
+        bookId: initial.job.bookId,
+      });
+      await writeMinimalGraphOutput(outputDir);
+      await writeCompleteLanceDbSidecars(outputDir);
+      await writeGraphRagOutputProducerManifest({
+        outputDir,
+        bookId: initial.job.bookId,
+        sourceHash: initial.job.sourceHash,
+        documentId: initial.job.documentId,
+        contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+        stageFingerprints: initial.stageFingerprints,
+        providerFingerprint: initial.job.providerFingerprint!,
+        producerRunId: "real-test-run",
+      });
       const state = await syncGraphRagBookWorkspace({
         stateRootDir: graphVault,
         sourcePath,
@@ -557,6 +605,7 @@ describe("syncGraphRagBookWorkspace", () => {
         settingsPath: join(graphVault, "settings.yaml"),
         promptsDir: join(graphVault, "prompts"),
         outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
         recordRecoveredStages: false,
       });
 
@@ -579,67 +628,106 @@ describe("syncGraphRagBookWorkspace", () => {
     }
   });
 
-  test("bootstraps query-ready from validated community-report and embed artifacts", async () => {
+  test("publishes query-ready from book-scoped validated artifacts", async () => {
     const root = await createWorkspace();
     try {
       const graphVault = join(root, "graph_vault");
       await mkdir(join(graphVault, "input"), { recursive: true });
       await mkdir(join(graphVault, "prompts"), { recursive: true });
       await mkdir(join(graphVault, "output"), { recursive: true });
-      await mkdir(join(graphVault, "reports"), { recursive: true });
 
       const sourcePath = join(root, "book.epub");
       const normalizedPath = join(graphVault, "input", "book.md");
-      const documentsPath = join(graphVault, "output", "documents.parquet");
-      const textUnitsPath = join(graphVault, "output", "text_units.parquet");
-      const reportsPath = join(graphVault, "output", "community_reports.parquet");
       await writeFile(sourcePath, "epub-bytes", "utf8");
       await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
       await writeManagedGraphRagSettings({ config: projectConfig, graphVault });
       await writeFile(join(graphVault, "prompts", "extract_graph.txt"), "prompt", "utf8");
 
-      const parquetScript = [
-        "import pandas as pd, sys",
-        "documents_path, text_units_path, reports_path = sys.argv[1:4]",
-        "pd.DataFrame([{'id':'graph-doc-1','title':'book.md','text_unit_ids':['tu-1']}]).to_parquet(documents_path)",
-        "pd.DataFrame([{'id':'tu-1','document_id':'graph-doc-1'}]).to_parquet(text_units_path)",
-        "pd.DataFrame([{'community':'0','title':'report','full_content':'report'}]).to_parquet(reports_path)",
-      ].join("\n");
-      const result = spawnSync(TestPythonBin, [
-        "-c",
-        parquetScript,
-        documentsPath,
-        textUnitsPath,
-        reportsPath,
-      ], { encoding: "utf8" });
-      expect(result.status, result.stderr).toBe(0);
+      const initial = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig,
+      });
+      const outputDir = graphRagBookOutputDir({
+        stateRootDir: graphVault,
+        bookId: initial.job.bookId,
+      });
+      await writeMinimalGraphOutput(outputDir);
+      await writeCompleteLanceDbSidecars(outputDir);
+      await writeGraphRagOutputProducerManifest({
+        outputDir,
+        bookId: initial.job.bookId,
+        sourceHash: initial.job.sourceHash,
+        documentId: initial.job.documentId,
+        contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+        stageFingerprints: initial.stageFingerprints,
+        providerFingerprint: initial.job.providerFingerprint!,
+        producerRunId: "real-test-run",
+      });
 
-      for (const file of [
-        "entities.parquet",
-        "relationships.parquet",
-        "communities.parquet",
-      ]) {
-        await writeFile(join(graphVault, "output", file), file, "utf8");
-      }
-      await writeFile(join(graphVault, "output", "context.json"), '{"records":[]}', "utf8");
-      await writeFile(join(graphVault, "output", "stats.json"), '{"workflows":{}}', "utf8");
-      for (const tableName of [
-        "entity_description.lance",
-        "community_full_content.lance",
-        "text_unit_text.lance",
-      ]) {
-        const tableDir = join(graphVault, "output", "lancedb", tableName);
-        await mkdir(join(tableDir, "data"), { recursive: true });
-        await mkdir(join(tableDir, "_versions"), { recursive: true });
-        await writeFile(join(tableDir, "data", "part-1.lance"), "rows", "utf8");
-        await writeFile(join(tableDir, "_versions", "1.manifest"), "part-1.lance", "utf8");
-        await writeFile(
-          join(tableDir, "qmd_row_count.json"),
-          JSON.stringify({ schemaVersion: SchemaVersion, rowCount: 1 }),
-          "utf8",
-        );
-      }
-
+      const syncedArtifacts = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig,
+        recordRecoveredStages: false,
+      });
+      const repo = new FileBookJobStateRepository(graphVault);
+      await repo.completeStage({
+        bookId: syncedArtifacts.job.bookId,
+        stage: "graph_extract",
+        runId: "real-graph-extract",
+        inputFingerprint: syncedArtifacts.stageFingerprints.graph_extract,
+        stageFingerprint: syncedArtifacts.stageFingerprints.graph_extract,
+        providerFingerprint: syncedArtifacts.job.providerFingerprint,
+        artifactIds: syncedArtifacts.artifacts
+          .filter((item) => item.stage === "graph_extract")
+          .map((item) => item.artifactId),
+      });
+      await repo.completeStage({
+        bookId: syncedArtifacts.job.bookId,
+        stage: "community_report",
+        runId: "real-community-report",
+        inputFingerprint: syncedArtifacts.stageFingerprints.community_report,
+        stageFingerprint: syncedArtifacts.stageFingerprints.community_report,
+        providerFingerprint: syncedArtifacts.job.providerFingerprint,
+        artifactIds: syncedArtifacts.artifacts
+          .filter((item) => item.stage === "community_report")
+          .map((item) => item.artifactId),
+      });
+      await repo.completeStage({
+        bookId: syncedArtifacts.job.bookId,
+        stage: "embed",
+        runId: "real-embed",
+        inputFingerprint: syncedArtifacts.stageFingerprints.embed,
+        stageFingerprint: syncedArtifacts.stageFingerprints.embed,
+        providerFingerprint: syncedArtifacts.job.providerFingerprint,
+        artifactIds: syncedArtifacts.artifacts
+          .filter((item) => item.stage === "embed")
+          .map((item) => item.artifactId),
+      });
+      await repo.completeStage({
+        bookId: syncedArtifacts.job.bookId,
+        stage: "query_ready",
+        runId: "real-query-ready",
+        inputFingerprint: syncedArtifacts.stageFingerprints.query_ready,
+        stageFingerprint: syncedArtifacts.stageFingerprints.query_ready,
+        providerFingerprint: syncedArtifacts.job.providerFingerprint,
+        artifactIds: syncedArtifacts.artifacts
+          .filter((item) =>
+            item.stage === "community_report" || item.stage === "embed"
+          )
+          .map((item) => item.artifactId),
+      });
       const state = await syncGraphRagBookWorkspace({
         stateRootDir: graphVault,
         sourcePath,
@@ -649,6 +737,7 @@ describe("syncGraphRagBookWorkspace", () => {
         outputDir: join(graphVault, "output"),
         qmdIndexPath: join(root, ".qmd", "index.sqlite"),
         projectConfig,
+        recordRecoveredStages: false,
       });
       const capabilities = await new FileBookJobStateRepository(graphVault)
         .listStageCheckpoints(state.job.bookId);
@@ -670,7 +759,6 @@ describe("syncGraphRagBookWorkspace", () => {
       }
       expect(state.artifacts.find((item) => item.kind === "lancedb_index")?.stage)
         .toBe("embed");
-      const repo = new FileBookJobStateRepository(graphVault);
       const checkpoints = await repo.listStageCheckpoints(state.job.bookId);
       const records = await repo.listRunRecords(state.job.bookId);
       for (const checkpoint of checkpoints) {
@@ -711,6 +799,23 @@ describe("syncGraphRagBookWorkspace", () => {
           "utf8",
         );
 
+        const initial = await syncGraphRagBookWorkspace({
+          stateRootDir: graphVault,
+          sourcePath,
+          normalizedPath,
+          settingsPath: join(graphVault, "settings.yaml"),
+          promptsDir: join(graphVault, "prompts"),
+          outputDir: join(graphVault, "output"),
+          qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+          projectConfig,
+          recordRecoveredStages: false,
+        });
+        const outputDir = graphRagBookOutputDir({
+          stateRootDir: graphVault,
+          bookId: initial.job.bookId,
+        });
+        await mkdir(outputDir, { recursive: true });
+
         const setupScript = [
           "import lancedb, pandas as pd, sys",
           "output_dir, lancedb_dir = sys.argv[1:3]",
@@ -727,20 +832,30 @@ describe("syncGraphRagBookWorkspace", () => {
         const setup = spawnSync(TestPythonBin, [
           "-c",
           setupScript,
-          join(graphVault, "output"),
-          join(graphVault, "output", "lancedb"),
+          outputDir,
+          join(outputDir, "lancedb"),
         ], { encoding: "utf8" });
         expect(setup.status, setup.stderr).toBe(0);
         await writeFile(
-          join(graphVault, "output", "context.json"),
+          join(outputDir, "context.json"),
           '{"records":[]}',
           "utf8",
         );
         await writeFile(
-          join(graphVault, "output", "stats.json"),
+          join(outputDir, "stats.json"),
           '{"workflows":{}}',
           "utf8",
         );
+        await writeGraphRagOutputProducerManifest({
+          outputDir,
+          bookId: initial.job.bookId,
+          sourceHash: initial.job.sourceHash,
+          documentId: initial.job.documentId,
+          contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+          stageFingerprints: initial.stageFingerprints,
+          providerFingerprint: initial.job.providerFingerprint!,
+          producerRunId: "real-lancedb-test-run",
+        });
 
         const state = await syncGraphRagBookWorkspace({
           stateRootDir: graphVault,
@@ -754,8 +869,7 @@ describe("syncGraphRagBookWorkspace", () => {
         });
         const rowCountRaw = await readFile(
           join(
-            graphVault,
-            "output",
+            outputDir,
             "lancedb",
             "entity_description.lance",
             "qmd_row_count.json",
@@ -765,7 +879,7 @@ describe("syncGraphRagBookWorkspace", () => {
         const rowCount = JSON.parse(rowCountRaw) as { rowCount?: number };
 
         expect(rowCount.rowCount).toBe(1);
-        expect(state.resumePlan.canQuery).toBe(true);
+        expect(state.resumePlan.nextStage).toBe("graph_extract");
         expect(state.artifacts.some((item) => item.kind === "lancedb_index"))
           .toBe(true);
       } finally {
@@ -949,13 +1063,28 @@ describe("syncGraphRagBookWorkspace", () => {
 
       const sourcePath = join(root, "book.epub");
       const normalizedPath = join(graphVault, "input", "book.md");
-      const documentsPath = join(graphVault, "output", "documents.parquet");
-      const textUnitsPath = join(graphVault, "output", "text_units.parquet");
-      const reportsPath = join(graphVault, "output", "community_reports.parquet");
       await writeFile(sourcePath, "epub-bytes", "utf8");
       await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
       await writeFile(join(graphVault, "settings.yaml"), "vector_store: {}\n", "utf8");
       await writeFile(join(graphVault, "prompts", "extract_graph.txt"), "prompt", "utf8");
+
+      const initial = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        recordRecoveredStages: false,
+      });
+      const outputDir = graphRagBookOutputDir({
+        stateRootDir: graphVault,
+        bookId: initial.job.bookId,
+      });
+      const documentsPath = join(outputDir, "documents.parquet");
+      const textUnitsPath = join(outputDir, "text_units.parquet");
+      const reportsPath = join(outputDir, "community_reports.parquet");
+      await mkdir(outputDir, { recursive: true });
 
       const parquetScript = [
         "import pandas as pd, sys",
@@ -973,22 +1102,19 @@ describe("syncGraphRagBookWorkspace", () => {
       ], { encoding: "utf8" });
       expect(result.status, result.stderr).toBe(0);
 
-      for (const tableName of [
-        "entity_description.lance",
-        "community_full_content.lance",
-        "text_unit_text.lance",
-      ]) {
-        const tableDir = join(graphVault, "output", "lancedb", tableName);
-        await mkdir(join(tableDir, "data"), { recursive: true });
-        await mkdir(join(tableDir, "_versions"), { recursive: true });
-        await writeFile(join(tableDir, "data", "part-1.lance"), "rows", "utf8");
-        await writeFile(join(tableDir, "_versions", "1.manifest"), "part-1.lance", "utf8");
-        await writeFile(
-          join(tableDir, "qmd_row_count.json"),
-          JSON.stringify({ schemaVersion: SchemaVersion, rowCount: 1 }),
-          "utf8",
-        );
-      }
+      await writeFile(join(outputDir, "context.json"), '{"records":[]}', "utf8");
+      await writeFile(join(outputDir, "stats.json"), '{"workflows":{}}', "utf8");
+      await writeCompleteLanceDbSidecars(outputDir);
+      await writeGraphRagOutputProducerManifest({
+        outputDir,
+        bookId: initial.job.bookId,
+        sourceHash: initial.job.sourceHash,
+        documentId: initial.job.documentId,
+        contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+        stageFingerprints: initial.stageFingerprints,
+        providerFingerprint: initial.job.providerFingerprint!,
+        producerRunId: "real-query-ready-test-run",
+      });
 
       await expect(syncGraphRagBookWorkspace({
         stateRootDir: graphVault,

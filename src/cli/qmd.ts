@@ -3205,6 +3205,9 @@ async function graphRagQuerySearch(
     config.graphrag?.default_response_type ||
     "multiple paragraphs",
   );
+  const graphBookId = values["graph-book-id"] == null
+    ? null
+    : String(values["graph-book-id"]);
   const communityLevel = values["community-level"] == null
     ? undefined
     : parseInt(String(values["community-level"]), 10);
@@ -3231,14 +3234,21 @@ async function graphRagQuerySearch(
         graphVault,
       },
     )).qmdResult,
-    resolveGraphScopeCapabilities: async () =>
-      loadGraphQueryCapabilities({ graphVault }),
+    resolveGraphScopeCapabilities: async () => {
+      const capabilities = await loadGraphQueryCapabilities({ graphVault });
+      return graphBookId == null
+        ? capabilities
+        : capabilities.filter((capability) => capability.bookId === graphBookId);
+    },
     resolveGraphCapabilities: async (candidates) =>
       resolveCandidateGraphCapabilities({ graphVault, candidates }),
     queryGraphRag: async (request, decision) => {
       const runtime = createQmdGraphRagRuntime();
       return runtime.graphQuery({
         rootDir: graphVault,
+        dataDir: decision.selectedBookIds.length === 1
+          ? pathResolve(graphVault, "books", decision.selectedBookIds[0]!, "output")
+          : undefined,
         method: GraphRagSearchMethodSchema.parse(request.method ?? method),
         query: request.query,
         responseType,
@@ -3734,6 +3744,7 @@ function parseCLI() {
       "no-gpu": { type: "boolean", default: false },
       graphrag: { type: "boolean", default: false },
       "graph-vault": { type: "string" },
+      "graph-book-id": { type: "string" },
       mode: { type: "string" },
       "query-method": { type: "string" },
       "response-type": { type: "string" },
@@ -4348,6 +4359,7 @@ function showHelp(): void {
   console.log("  --mode <qmd|auto>             - Query route selector (default qmd)");
   console.log("  --graphrag                    - Use qmd graph-enhanced query over graph_vault");
   console.log("  --graph-vault <path>          - GraphRAG vault root (default ./graph_vault)");
+  console.log("  --graph-book-id <bookId>      - Restrict GraphRAG query to one graph-ready book");
   console.log("  --query-method <method>       - GraphRAG method: local, global, drift, or basic");
   console.log("  --response-type <text>        - GraphRAG response type (default multiple paragraphs)");
   console.log("  --community-level <n>         - GraphRAG community level override");

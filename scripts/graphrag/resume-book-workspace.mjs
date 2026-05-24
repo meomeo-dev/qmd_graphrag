@@ -2,7 +2,7 @@
 
 import { cwd } from "node:process";
 import { basename, resolve } from "node:path";
-import { readFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { parseArgs } from "node:util";
 
@@ -30,8 +30,11 @@ async function importRuntime() {
     createQmdGraphRagRuntime: indexModule.createQmdGraphRagRuntime,
     createRunId: indexModule.createRunId,
     GraphRagWorkflowNameSchema: indexModule.GraphRagWorkflowNameSchema,
+    graphRagBookInputDir: indexModule.graphRagBookInputDir,
+    graphRagBookOutputDir: indexModule.graphRagBookOutputDir,
     loadGraphQueryCapabilities: indexModule.loadGraphQueryCapabilities,
     syncGraphRagBookWorkspace: indexModule.syncGraphRagBookWorkspace,
+    writeGraphRagOutputProducerManifest: indexModule.writeGraphRagOutputProducerManifest,
     writeManagedGraphRagSettings: indexModule.writeManagedGraphRagSettings,
     loadConfig: collectionsModule.loadConfig,
     setConfigSource: collectionsModule.setConfigSource,
@@ -199,20 +202,20 @@ async function resolveWorkspaceInputs() {
   };
 }
 
-async function run() {
-  const runtimeApi = await importRuntime();
-  GraphRagWorkflowNameSchemaRef = runtimeApi.GraphRagWorkflowNameSchema;
-  const runtime = runtimeApi.createQmdGraphRagRuntime();
-  const repo = new runtimeApi.FileBookJobStateRepository(stateRoot);
+async function materializeScopedGraphInput(inputDir, normalizedPath) {
+  await mkdir(inputDir, { recursive: true });
+  const target = resolve(inputDir, basename(normalizedPath));
+  await copyFile(normalizedPath, target);
+  return target;
+}
 
-  runtimeApi.setConfigSource({ configPath });
-  const projectConfig = runtimeApi.loadConfig();
-  await runtimeApi.writeManagedGraphRagSettings({
-    config: projectConfig,
-    graphVault: stateRoot,
-  });
-  const { sourcePath, sourceIdentityPath, normalizedPath } =
-    await resolveWorkspaceInputs();
+async function syncCurrentBook(
+  runtimeApi,
+  projectConfig,
+  sourcePath,
+  sourceIdentityPath,
+  normalizedPath,
+) {
   const sync = await runtimeApi.syncGraphRagBookWorkspace({
     stateRootDir: stateRoot,
     sourcePath,
@@ -227,6 +230,43 @@ async function run() {
       smoke: true,
     },
   });
+  const scopedInputDir = runtimeApi.graphRagBookInputDir({
+    stateRootDir: stateRoot,
+    bookId: sync.job.bookId,
+  });
+  await materializeScopedGraphInput(scopedInputDir, normalizedPath);
+  const scopedOutputDir = runtimeApi.graphRagBookOutputDir({
+    stateRootDir: stateRoot,
+    bookId: sync.job.bookId,
+  });
+  return { sync, scopedInputDir, scopedOutputDir };
+}
+
+async function run() {
+  const runtimeApi = await importRuntime();
+  GraphRagWorkflowNameSchemaRef = runtimeApi.GraphRagWorkflowNameSchema;
+  const runtime = runtimeApi.createQmdGraphRagRuntime();
+  const repo = new runtimeApi.FileBookJobStateRepository(stateRoot);
+
+  runtimeApi.setConfigSource({ configPath });
+  const projectConfig = runtimeApi.loadConfig();
+  await runtimeApi.writeManagedGraphRagSettings({
+    config: projectConfig,
+    graphVault: stateRoot,
+  });
+  const { sourcePath, sourceIdentityPath, normalizedPath } =
+    await resolveWorkspaceInputs();
+  const {
+    sync,
+    scopedInputDir,
+    scopedOutputDir,
+  } = await syncCurrentBook(
+    runtimeApi,
+    projectConfig,
+    sourcePath,
+    sourceIdentityPath,
+    normalizedPath,
+  );
 
   const nextStage = sync.resumePlan.nextStage;
   if (nextStage == null) {
@@ -234,6 +274,7 @@ async function run() {
     if (values.query) {
       queryResult = await runtime.graphQuery({
         rootDir: stateRoot,
+        dataDir: scopedOutputDir,
         method: values["query-method"],
         query: values.query,
         responseType: "multiple paragraphs",
@@ -260,20 +301,32 @@ async function run() {
   }
 
   if (nextStage === "query_ready") {
-    const refreshed = await runtimeApi.syncGraphRagBookWorkspace({
-      stateRootDir: stateRoot,
+    const runId = runtimeApi.createRunId(nextStage);
+    await repo.completeStage({
+      bookId: sync.job.bookId,
+      stage: nextStage,
+      runId,
+      inputFingerprint: sync.stageFingerprints[nextStage],
+      contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
+      stageFingerprint: sync.stageFingerprints[nextStage],
+      providerFingerprint: sync.job.providerFingerprint,
+      artifactIds: sync.artifacts
+        .filter((artifact) =>
+          artifact.stage === "community_report" || artifact.stage === "embed"
+        )
+        .map((artifact) => artifact.artifactId),
+      metadata: {
+        graphWorkspace: "book_scoped",
+        readinessSource: "real_stage_checkpoints",
+      },
+    });
+    const { sync: refreshed } = await syncCurrentBook(
+      runtimeApi,
+      projectConfig,
       sourcePath,
       sourceIdentityPath,
       normalizedPath,
-      settingsPath: resolve(stateRoot, "settings.yaml"),
-      promptsDir: resolve(stateRoot, "prompts"),
-      outputDir: resolve(stateRoot, "output"),
-      qmdIndexPath,
-      projectConfig,
-      metadata: {
-        smoke: true,
-      },
-    });
+    );
 
     printJson({
       status: refreshed.resumePlan.nextStage == null ? "ready" : "blocked",
@@ -323,6 +376,8 @@ async function run() {
   try {
     const indexResult = await runtime.graphIndex({
       rootDir: stateRoot,
+      inputDir: scopedInputDir,
+      dataDir: scopedOutputDir,
       method: "standard",
       indexScope: indexScopeFromSync(sync),
       skipValidation: true,
@@ -334,25 +389,56 @@ async function run() {
       },
     });
 
-    const refreshed = await runtimeApi.syncGraphRagBookWorkspace({
-      stateRootDir: stateRoot,
+    await runtimeApi.writeGraphRagOutputProducerManifest({
+      outputDir: scopedOutputDir,
+      bookId: sync.job.bookId,
+      sourceHash: sync.job.sourceHash,
+      documentId: sync.job.documentId,
+      contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
+      stageFingerprints: sync.stageFingerprints,
+      providerFingerprint: sync.job.providerFingerprint,
+      producerRunId: runId,
+    });
+
+    const { sync: stageSynced } = await syncCurrentBook(
+      runtimeApi,
+      projectConfig,
       sourcePath,
       sourceIdentityPath,
       normalizedPath,
-      settingsPath: resolve(stateRoot, "settings.yaml"),
-      promptsDir: resolve(stateRoot, "prompts"),
-      outputDir: resolve(stateRoot, "output"),
-      qmdIndexPath,
-      projectConfig,
+    );
+    const stageArtifactIds = stageSynced.artifacts
+      .filter((artifact) => artifact.stage === nextStage)
+      .map((artifact) => artifact.artifactId);
+    await repo.completeStage({
+      bookId: sync.job.bookId,
+      stage: nextStage,
+      runId,
+      inputFingerprint,
+      contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
+      stageFingerprint: sync.stageFingerprints[nextStage],
+      providerFingerprint: sync.job.providerFingerprint,
+      artifactIds: stageArtifactIds,
       metadata: {
-        smoke: true,
+        workflows,
+        resumedFrom: nextStage,
+        graphWorkspace: "book_scoped",
       },
     });
+
+    const { sync: refreshed } = await syncCurrentBook(
+      runtimeApi,
+      projectConfig,
+      sourcePath,
+      sourceIdentityPath,
+      normalizedPath,
+    );
 
     let queryResult = null;
     if (values.query && refreshed.resumePlan.nextStage == null) {
       queryResult = await runtime.graphQuery({
         rootDir: stateRoot,
+        dataDir: scopedOutputDir,
         method: values["query-method"],
         query: values.query,
         responseType: "multiple paragraphs",

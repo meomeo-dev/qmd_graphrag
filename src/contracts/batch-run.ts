@@ -34,6 +34,14 @@ export const BatchRecoveryDecisionSchema = z.enum([
   "stop_until_fixed",
 ]);
 
+export const BatchBuildStatusSchema = z.object({
+  status: z.enum(["pending", "running", "succeeded", "failed", "stale"]),
+  checkedAt: z.string().datetime().optional(),
+  stage: z.string().min(1).optional(),
+  reason: z.string().min(1).optional(),
+  artifactIds: z.array(z.string().min(1)).default([]),
+});
+
 export const BatchProjectRelativeLocatorSchema = z.string().min(1).refine(
   (value) => {
     if (value.includes("\0")) return false;
@@ -80,6 +88,8 @@ export const BatchItemCheckpointSchema = z.object({
   retryExhausted: z.boolean().optional(),
   recoveryDecision: BatchRecoveryDecisionSchema.optional(),
   failedStage: z.string().min(1).optional(),
+  qmdBuildStatus: BatchBuildStatusSchema.optional(),
+  graphBuildStatus: BatchBuildStatusSchema.optional(),
   startedAt: z.string().datetime().optional(),
   completedAt: z.string().datetime().optional(),
   failedAt: z.string().datetime().optional(),
@@ -168,6 +178,7 @@ export type BatchItemStatus = z.infer<typeof BatchItemStatusSchema>;
 export type BatchRunStatus = z.infer<typeof BatchRunStatusSchema>;
 export type BatchFailureKind = z.infer<typeof BatchFailureKindSchema>;
 export type BatchRecoveryDecision = z.infer<typeof BatchRecoveryDecisionSchema>;
+export type BatchBuildStatus = z.infer<typeof BatchBuildStatusSchema>;
 export type BatchProjectRelativeLocator = z.infer<
   typeof BatchProjectRelativeLocatorSchema
 >;
