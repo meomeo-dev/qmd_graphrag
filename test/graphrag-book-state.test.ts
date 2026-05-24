@@ -9,6 +9,7 @@ import YAML from "yaml";
 
 import {
   buildGraphRagRuntimeSettingsProjection,
+  assertGraphRagStageArtifactsReady,
   FileBookJobStateRepository,
   graphRagBookOutputDir,
   SchemaVersion,
@@ -109,6 +110,7 @@ describe("syncGraphRagBookWorkspace", () => {
     graphrag: {
       enabled: true,
       vault: "graph_vault",
+      concurrent_requests: 5,
       default_method: "local",
       default_response_type: "multiple paragraphs",
     },
@@ -121,6 +123,38 @@ describe("syncGraphRagBookWorkspace", () => {
       },
     },
   };
+
+  test("projects GraphRAG text input to include normalized markdown", () => {
+    const projection = buildGraphRagRuntimeSettingsProjection(projectConfig);
+    expect(projection.settings).toMatchObject({
+      input: {
+        type: "text",
+        file_pattern: ".*\\.(md|markdown|txt)",
+      },
+    });
+  });
+
+  test("projects GraphRAG concurrent requests from project config", () => {
+    const projection = buildGraphRagRuntimeSettingsProjection({
+      ...projectConfig,
+      graphrag: {
+        ...projectConfig.graphrag,
+        concurrent_requests: 4,
+      },
+    });
+    expect(projection.settings.concurrent_requests).toBe(4);
+  });
+
+  test("defaults GraphRAG concurrent requests to API supported value", () => {
+    const projection = buildGraphRagRuntimeSettingsProjection({
+      ...projectConfig,
+      graphrag: {
+        ...projectConfig.graphrag,
+        concurrent_requests: undefined,
+      },
+    });
+    expect(projection.settings.concurrent_requests).toBe(5);
+  });
 
   test("rejects invalid OpenAI Responses projection settings before runtime", () => {
     const invalidEndpoint: CollectionConfig = {
@@ -1124,6 +1158,50 @@ describe("syncGraphRagBookWorkspace", () => {
         promptsDir: join(graphVault, "prompts"),
         outputDir: join(graphVault, "output"),
       })).rejects.toThrow("qmd corpus registration is required");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("requires current producer artifacts before completing GraphRAG stages", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "books", "book-1", "output"), {
+        recursive: true,
+      });
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await repo.registerBookSource({
+        sourcePath,
+        sourceIdentityPath: "book.epub",
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+        stageFingerprints: { graph_extract: "fp-graph" },
+        providerFingerprint: "provider-1",
+        normalizedContentHash: "content-1",
+      });
+      const [oldArtifact] = await repo.recordArtifacts("book-1", [
+        {
+          stage: "graph_extract",
+          kind: "graphrag_documents_parquet",
+          path: join(graphVault, "books", "book-1", "output", "missing.parquet"),
+          contentHash: "missing-hash",
+          stageFingerprint: "fp-graph",
+          providerFingerprint: "provider-1",
+          producerRunId: "old-run",
+        },
+      ]);
+
+      await expect(assertGraphRagStageArtifactsReady({
+        stateRootDir: graphVault,
+        bookId: "book-1",
+        stage: "graph_extract",
+        producerRunId: "new-run",
+        artifacts: [oldArtifact!],
+      })).rejects.toThrow("GraphRAG stage did not produce valid book-scoped artifacts");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

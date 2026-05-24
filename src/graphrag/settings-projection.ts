@@ -15,6 +15,7 @@ const ManagedBy = "qmd_graphrag";
 const ResponsesEndpoint = "/responses";
 const DocumentEmbeddingModelId = "default_embedding_model";
 const QueryEmbeddingModelId = "query_embedding_model";
+const DefaultConcurrentRequests = 5;
 
 export type GraphRagRuntimeSettingsProjection = {
   sourceFingerprint: string;
@@ -74,6 +75,11 @@ export function buildGraphRagRuntimeSettingsProjection(
   const jina = config.providers?.jina ?? {};
   const profileName = jina.embedding_profile ?? DEFAULT_JINA_EMBEDDING_PROFILE;
   const profile = JINA_EMBEDDING_PROFILES[profileName];
+  const concurrentRequests =
+    config.graphrag?.concurrent_requests ?? DefaultConcurrentRequests;
+  if (!Number.isInteger(concurrentRequests) || concurrentRequests < 1) {
+    throw new Error("graphrag.concurrent_requests must be a positive integer");
+  }
   const settings = {
     qmd_graphrag: {
       managed_by: ManagedBy,
@@ -115,7 +121,7 @@ export function buildGraphRagRuntimeSettingsProjection(
         },
       },
     },
-    concurrent_requests: 2,
+    concurrent_requests: concurrentRequests,
     embedding_models: {
       [DocumentEmbeddingModelId]: {
         type: "litellm",
@@ -150,7 +156,10 @@ export function buildGraphRagRuntimeSettingsProjection(
         },
       },
     },
-    input: { type: "text" },
+    input: {
+      type: "text",
+      file_pattern: ".*\\.(md|markdown|txt)",
+    },
     input_storage: { type: "file", base_dir: "./input" },
     output_storage: { type: "file", base_dir: "./output" },
     reporting: { type: "file", base_dir: "./reports" },

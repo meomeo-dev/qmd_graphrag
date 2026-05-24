@@ -81,6 +81,7 @@ export interface GraphRagConfig {
   enabled?: boolean;
   vault?: string;
   python_bin?: string;
+  concurrent_requests?: number;
   default_method?: "local" | "global" | "drift" | "basic";
   default_response_type?: string;
   enhanced_collections?: string[];

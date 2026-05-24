@@ -80,6 +80,7 @@ import {
 } from "../vault/path.js";
 import {
   QUERY_READY_ARTIFACT_KINDS,
+  validateArtifact,
   validateBookArtifactSet,
 } from "./artifact-validation.js";
 import {
@@ -1682,9 +1683,16 @@ export class FileBookJobStateRepository {
         .filter((item) => SINGLETON_ARTIFACT_KINDS.has(item.kind))
         .map((item) => createArtifactLogicalKey(item)),
     );
-    const retained = existing.filter(
-      (item) => !singletonKeys.has(createArtifactLogicalKey(item)),
-    );
+    const retained = [];
+    for (const item of existing) {
+      if (singletonKeys.has(createArtifactLogicalKey(item))) {
+        continue;
+      }
+      const validation = await validateArtifact(this.rootDir, item);
+      if (validation.valid) {
+        retained.push(item);
+      }
+    }
     const merged = dedupeArtifacts([...retained, ...recorded]);
     await writeYamlFile(this.artifactManifestPath(bookId), {
       schemaVersion: SchemaVersion,

@@ -32,6 +32,7 @@ async function importRuntime() {
     GraphRagWorkflowNameSchema: indexModule.GraphRagWorkflowNameSchema,
     graphRagBookInputDir: indexModule.graphRagBookInputDir,
     graphRagBookOutputDir: indexModule.graphRagBookOutputDir,
+    assertGraphRagStageArtifactsReady: indexModule.assertGraphRagStageArtifactsReady,
     loadGraphQueryCapabilities: indexModule.loadGraphQueryCapabilities,
     syncGraphRagBookWorkspace: indexModule.syncGraphRagBookWorkspace,
     writeGraphRagOutputProducerManifest: indexModule.writeGraphRagOutputProducerManifest,
@@ -407,9 +408,13 @@ async function run() {
       sourceIdentityPath,
       normalizedPath,
     );
-    const stageArtifactIds = stageSynced.artifacts
-      .filter((artifact) => artifact.stage === nextStage)
-      .map((artifact) => artifact.artifactId);
+    const stageArtifactIds = await runtimeApi.assertGraphRagStageArtifactsReady({
+      stateRootDir: stateRoot,
+      bookId: sync.job.bookId,
+      stage: nextStage,
+      producerRunId: runId,
+      artifacts: stageSynced.artifacts,
+    });
     await repo.completeStage({
       bookId: sync.job.bookId,
       stage: nextStage,

@@ -43,6 +43,7 @@ import {
   hashDirectoryContents,
   hashLanceDbDirectoryContents,
   isCompleteLanceDbDirectory,
+  validateBookArtifactSet,
 } from "./artifact-validation.js";
 import {
   FileBookJobStateRepository,
@@ -719,6 +720,8 @@ async function collectWorkspaceArtifacts(
   const normalizedPath = resolve(paths.normalizedPath);
   const outputDir = resolve(paths.outputDir);
   const stageRunId = (stage: BookStage) => `${producerRunId}-${stage}`;
+  const outputRunId = (stage: BookStage) =>
+    expectedOutputProducer?.producerRunId ?? stageRunId(stage);
 
   const canUseGraphOutput = expectedOutputProducer != null;
   const artifacts = await Promise.all([
@@ -743,7 +746,7 @@ async function collectWorkspaceArtifacts(
           join(outputDir, "documents.parquet"),
           "graph_extract",
           "graphrag_documents_parquet",
-          stageRunId("graph_extract"),
+          outputRunId("graph_extract"),
           stageFingerprints.graph_extract,
           providerFingerprint,
         )
@@ -753,7 +756,7 @@ async function collectWorkspaceArtifacts(
           join(outputDir, "text_units.parquet"),
           "graph_extract",
           "graphrag_text_units_parquet",
-          stageRunId("graph_extract"),
+          outputRunId("graph_extract"),
           stageFingerprints.graph_extract,
           providerFingerprint,
         )
@@ -763,7 +766,7 @@ async function collectWorkspaceArtifacts(
           join(outputDir, "entities.parquet"),
           "graph_extract",
           "graphrag_entities_parquet",
-          stageRunId("graph_extract"),
+          outputRunId("graph_extract"),
           stageFingerprints.graph_extract,
           providerFingerprint,
         )
@@ -773,7 +776,7 @@ async function collectWorkspaceArtifacts(
           join(outputDir, "relationships.parquet"),
           "graph_extract",
           "graphrag_relationships_parquet",
-          stageRunId("graph_extract"),
+          outputRunId("graph_extract"),
           stageFingerprints.graph_extract,
           providerFingerprint,
         )
@@ -783,7 +786,7 @@ async function collectWorkspaceArtifacts(
           join(outputDir, "communities.parquet"),
           "graph_extract",
           "graphrag_communities_parquet",
-          stageRunId("graph_extract"),
+          outputRunId("graph_extract"),
           stageFingerprints.graph_extract,
           providerFingerprint,
         )
@@ -793,7 +796,7 @@ async function collectWorkspaceArtifacts(
           join(outputDir, "context.json"),
           "graph_extract",
           "graphrag_context_json",
-          stageRunId("graph_extract"),
+          outputRunId("graph_extract"),
           stageFingerprints.graph_extract,
           providerFingerprint,
         )
@@ -803,7 +806,7 @@ async function collectWorkspaceArtifacts(
           join(outputDir, "stats.json"),
           "graph_extract",
           "graphrag_stats_json",
-          stageRunId("graph_extract"),
+          outputRunId("graph_extract"),
           stageFingerprints.graph_extract,
           providerFingerprint,
         )
@@ -813,7 +816,7 @@ async function collectWorkspaceArtifacts(
           join(outputDir, "community_reports.parquet"),
           "community_report",
           "graphrag_community_reports_parquet",
-          stageRunId("community_report"),
+          outputRunId("community_report"),
           stageFingerprints.community_report,
           providerFingerprint,
         )
@@ -825,7 +828,7 @@ async function collectWorkspaceArtifacts(
                 join(outputDir, "lancedb"),
                 "embed",
                 "lancedb_index",
-                stageRunId("embed"),
+                outputRunId("embed"),
                 stageFingerprints.embed,
                 providerFingerprint,
               )
@@ -837,7 +840,7 @@ async function collectWorkspaceArtifacts(
           join(outputDir, "reports", "indexing-engine.log"),
           "graph_extract",
           "index_log",
-          stageRunId("graph_extract"),
+          outputRunId("graph_extract"),
           stageFingerprints.graph_extract,
           providerFingerprint,
         )
@@ -1024,6 +1027,51 @@ async function bootstrapRecoveredStages(input: {
       ].map((artifact) => artifact.artifactId),
     );
   }
+}
+
+function artifactsForProducerRun(
+  artifacts: readonly BookArtifactManifest[],
+  stage: BookStage,
+  producerRunId: string,
+): BookArtifactManifest[] {
+  return artifacts.filter((artifact) =>
+    artifact.stage === stage && artifact.producerRunId === producerRunId
+  );
+}
+
+export async function assertGraphRagStageArtifactsReady(input: {
+  stateRootDir: string;
+  bookId: string;
+  stage: BookStage;
+  producerRunId: string;
+  artifacts: readonly BookArtifactManifest[];
+}): Promise<string[]> {
+  const requiredKinds = GRAPH_RAG_STAGE_ARTIFACT_REQUIREMENTS[input.stage] ?? [];
+  const stageArtifacts = artifactsForProducerRun(
+    input.artifacts,
+    input.stage,
+    input.producerRunId,
+  );
+  const validation = await validateBookArtifactSet({
+    graphVault: input.stateRootDir,
+    bookId: input.bookId,
+    artifactIds: stageArtifacts.map((artifact) => artifact.artifactId),
+    artifacts: input.artifacts,
+    requiredKinds,
+  });
+  if (!validation.isSatisfied) {
+    throw new Error(
+      "GraphRAG stage did not produce valid book-scoped artifacts: " +
+        JSON.stringify({
+          bookId: input.bookId,
+          stage: input.stage,
+          producerRunId: input.producerRunId,
+          missingArtifactIds: validation.missingArtifactIds,
+          missingArtifactKinds: validation.missingArtifactKinds,
+        }),
+    );
+  }
+  return validation.validArtifacts.map((artifact) => artifact.artifactId);
 }
 
 export async function syncGraphRagBookWorkspace(

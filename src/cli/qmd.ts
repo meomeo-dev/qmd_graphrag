@@ -699,6 +699,7 @@ function ensureRuntimeConfigForCli(): CollectionConfig {
     graphrag: {
       enabled: true,
       vault: "graph_vault",
+      concurrent_requests: 5,
       default_method: "local",
       default_response_type: "multiple paragraphs",
       ...(config.graphrag ?? {}),

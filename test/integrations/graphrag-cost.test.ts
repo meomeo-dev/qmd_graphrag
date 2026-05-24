@@ -402,4 +402,25 @@ describe("GraphRAG provider cost accounting", () => {
       }),
     }));
   });
+
+  test("rejects GraphRAG index responses with workflow errors", async () => {
+    const graphVault = await mkdtemp(join(tmpdir(), "qmd-graphrag-cost-index-"));
+    mockedBridge.mockResolvedValueOnce({
+      schemaVersion: SchemaVersion,
+      method: "standard",
+      outputs: [{
+        workflow: "load_input_documents",
+        hasError: true,
+        errorMessage: "Error reading documents, please see logs.",
+        stateKeys: [],
+      }],
+    });
+
+    await expect(runGraphRagIndex({
+      rootDir: graphVault,
+      method: "standard",
+      skipValidation: true,
+      workflows: ["load_input_documents"],
+    })).rejects.toThrow("GraphRAG index workflow failed");
+  });
 });

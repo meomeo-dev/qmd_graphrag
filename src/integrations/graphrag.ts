@@ -219,6 +219,18 @@ function indexCostLineage(scope: GraphRagIndexScope | undefined): {
   };
 }
 
+function assertGraphRagIndexSucceeded(response: GraphRagIndexResponse): void {
+  const failedOutputs = response.outputs.filter((output) => output.hasError);
+  if (failedOutputs.length === 0) return;
+  throw new Error(
+    "GraphRAG index workflow failed: " +
+      JSON.stringify(failedOutputs.map((output) => ({
+        workflow: output.workflow,
+        errorMessage: output.errorMessage ?? "unknown",
+      }))),
+  );
+}
+
 export async function runGraphRagQuery(
   request: GraphRagQueryRequest,
 ): Promise<GraphRagQueryResponse> {
@@ -296,6 +308,7 @@ export async function runGraphRagIndex(
     request: parsed,
     responseSchema: GraphRagIndexResponseSchema,
   });
+  assertGraphRagIndexSucceeded(response);
   const lineage = indexCostLineage(parsed.indexScope);
   await recordGraphRagCost({
     rootDir: parsed.rootDir,

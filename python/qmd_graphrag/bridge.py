@@ -162,6 +162,10 @@ def _scoped_storage_overrides(
 ) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
     if input_dir:
+        overrides["input"] = {
+            "type": "text",
+            "file_pattern": ".*\\.(md|markdown|txt)",
+        }
         overrides["input_storage"] = {
             "type": "file",
             "base_dir": str(Path(input_dir).resolve()),

@@ -349,6 +349,10 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                     "type": "file",
                     "base_dir": str((root / "books" / "book-1" / "input").resolve()),
                 },
+                "input": {
+                    "type": "text",
+                    "file_pattern": ".*\\.(md|markdown|txt)",
+                },
                 "output_storage": {
                     "type": "file",
                     "base_dir": str((root / "books" / "book-1" / "output").resolve()),
