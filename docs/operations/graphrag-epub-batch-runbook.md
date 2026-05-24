@@ -73,8 +73,10 @@ graph_vault/catalog/batch-runs/<runId>/
 批量审计记录，但单书仍由 `BookResumePlan.nextStage` 防止重复高成本 stage。
 
 从临时批次迁移到正式批次时，可用 `--completed-manifest <path>` 导入调度种子。
-导入只产生 `skipped` checkpoint 和 `importedCompletedItems` 统计，不产生
-`completed` item。真实准入批次必须让每本 EPUB 形成 `completed` checkpoint。
+普通运行中导入只写入 checkpoint metadata 和 `importedCompletedItems` 统计，
+item 仍保持 `pending` 并真实执行 qmd 与 GraphRAG 闭环。只有 `--migrate-only`
+使用该种子生成 `skipped` checkpoint，用于只读迁移审计，不产生 `completed`
+item。真实准入批次必须让每本 EPUB 形成 `completed` checkpoint。
 
 旧 `completed` checkpoint 在加载时必须重新校验闭环证据。`qmdBuildStatus`
 不得作为信任源；批量执行器必须从 `commandChecks` 重新计算 qmd 构建状态。
@@ -152,15 +154,15 @@ transient failure 发生后：
 
 重试预算耗尽后：
 
-- 当前 item 标记为 failed。
-- checkpoint 写入 `failureKind=transient`、`retryable=false`、
-  `retryExhausted=true`、`recoveryDecision=stop_until_fixed` 和 `failedStage`。
+- 当前 item 进入 provider recovery wait，状态保持 `pending`。
+- checkpoint 写入 `failureKind=transient`、`retryable=true`、
+  `retryExhausted=false`、`recoveryDecision=retry_same_run_id`、`failedStage`、
+  `nextRetryAt`、`retryDelaySeconds` 和 `waitingForProviderRecovery=true`。
 - `events.jsonl` 写入 redacted error summary、provider status code、
   retryable 标记和恢复决策。
 - 默认继续处理后续 pending item。使用 `--fail-fast` 时在当前 item 失败后停止。
 - 已 completed item 保持 completed，不回滚。
-- 同一 `runId` 不再自动重试该 item；操作者修复 provider 或配置后新建
-  `runId`，或按审计要求显式迁移状态。
+- 同一 `runId` 到达 `nextRetryAt` 后继续该 item；不要求操作者新建 runId。
 
 GraphRAG 输出生产者 manifest 必须保存在每本书的 book-scoped output 目录：
 
@@ -340,5 +342,7 @@ rerank 或 GraphRAG provider。
 - redacted message。
 - 文件 basename 或 project-relative portable locator。
 
-`OPENAI_API_KEY`、`OPENAI_BASE_URL`、`JINA_API_KEY` 等值不得写入
-`graph_vault`、stdout、stderr、manifest 或 event log。
+`OPENAI_API_KEY`、`OPENAI_BASE_URL`、`JINA_API_KEY`、URL userinfo 和 URL query
+credential 等值不得写入 `graph_vault`、stdout、stderr、manifest 或 event log。
+redaction 覆盖 `api_key`、`token`、`access_token`、`sig`、`signature`、
+`secret`、`password`、`credential` 和 `client_secret`。

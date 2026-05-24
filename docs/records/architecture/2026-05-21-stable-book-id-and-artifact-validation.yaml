@@ -44,7 +44,10 @@ decision:
     - checkpoint 引用的 artifactId 在 manifest 中不存在时视为不可满足。
     - manifest 中 artifact 路径不可访问时视为不可满足。
     - manifest 中 artifact 内容哈希与当前文件或目录内容不一致时视为不可满足。
-    - LanceDB artifact 必须包含必需表、非空 data fragment 和 manifest 引用。
+    - LanceDB artifact 必须包含必需表、非空 data fragment 和正数
+      `qmd_row_count.json` sidecar；vendor manifest 不作为通过条件。
+    - GraphRAG Parquet artifact 必须通过 magic、footer metadata 和正数
+      row count 校验。
     - GraphRAG JSON artifact 必须是可解析 JSON object。
     - `query_ready` checkpoint 必须同时引用已验证的 community report 与
       LanceDB index artifact；artifact stage 保持真实 producer stage。

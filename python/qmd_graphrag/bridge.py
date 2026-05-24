@@ -834,7 +834,7 @@ def _is_valid_parquet_file(path: Path) -> bool:
             metadata = pq.ParquetFile(path).metadata
             return metadata is not None and metadata.num_rows > 0
         except Exception:  # noqa: BLE001
-            return True
+            return False
     except OSError:
         return False
 

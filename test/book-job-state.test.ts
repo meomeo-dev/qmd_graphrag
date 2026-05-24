@@ -9,7 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { describe, expect, test } from "vitest";
 import YAML from "yaml";
@@ -30,6 +30,11 @@ import {
   SourceDocumentSchema,
 } from "../src/contracts/corpus.js";
 import { hashLanceDbDirectoryContents } from "../src/job-state/artifact-validation.js";
+
+const MinimalParquetFixture = Buffer.from(
+  "UEFSMRUEFRIVFkwVAhUAEgAACSAFAAAAcm93LTEVABUSFRYsFQIVEBUGFQYcNgAoBXJvdy0xGAVyb3ctMRERAAAACSACAAAAAgEBAgAVBBksNQAYBnNjaGVtYRUCABUMJQIYAmlkJQBMHAAAABYCGRwZHCYAHBUMGTUABhAZGAJpZBUCFgIWigEWkgEmOiYIHDYAKAVyb3ctMRgFcm93LTEREQAZLBUEFQAVAgAVABUQFQIAPBYKGQYZJgACAAAAFooBFgImCBaSAQAZHBgMQVJST1c6c2NoZW1hGKABLy8vLy8zQUFBQUFRQUFBQUFBQUtBQXdBQmdBRkFBZ0FDZ0FBQUFBQkJBQU1BQUFBQ0FBSUFBQUFCQUFJQUFBQUJBQUFBQUVBQUFBVUFBQUFFQUFVQUFnQUJnQUhBQXdBQUFBUUFCQUFBQUFBQUFFRkVBQUFBQmdBQUFBRUFBQUFBQUFBQUFJQUFBQnBaQUFBQkFBRUFBUUFBQUFBQUFBQQAYIHBhcnF1ZXQtY3BwLWFycm93IHZlcnNpb24gMjIuMC4wGRwcAAAAWgEAAFBBUjE=",
+  "base64",
+);
 
 async function createFixtureDir(): Promise<string> {
   return mkdtemp(join(tmpdir(), "qmd-graphrag-book-state-"));
@@ -59,7 +64,7 @@ async function writeCompleteLanceDbFixture(root: string): Promise<void> {
 }
 
 async function writeMinimalParquetFixture(path: string): Promise<void> {
-  await writeFile(path, Buffer.from("PAR1fixturePAR1", "ascii"));
+  await writeFile(path, MinimalParquetFixture);
 }
 
 function bookScopedOutputDir(graphVault: string, bookId: string): string {
@@ -1298,6 +1303,86 @@ describe("FileBookJobStateRepository", () => {
       expect(normalizeState?.runId).toBe("run-normalize-1");
       expect(normalizeState?.missingArtifactIds).toEqual([artifact.artifactId]);
       expect(normalizeState?.missingArtifactKinds).toEqual(["normalized_markdown"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects fake Parquet artifacts with only PAR1 magic bytes", async () => {
+    const root = await createFixtureDir();
+    try {
+      const repo = new FileBookJobStateRepository(join(root, "graph_vault"));
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "fixture epub content", "utf8");
+      const job = await repo.registerBookSource({
+        sourcePath,
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+      });
+      const artifactPath = join(
+        root,
+        "graph_vault",
+        "books",
+        job.bookId,
+        "output",
+        "community_reports.parquet",
+      );
+      const lancedbPath = join(
+        root,
+        "graph_vault",
+        "books",
+        job.bookId,
+        "output",
+        "lancedb",
+      );
+      await mkdir(dirname(artifactPath), { recursive: true });
+      await writeFile(artifactPath, Buffer.from("PAR1fixturePAR1", "ascii"));
+      await writeCompleteLanceDbFixture(lancedbPath);
+      const [artifact, lancedbArtifact] = await repo.recordArtifacts(job.bookId, [
+        {
+          stage: "community_report",
+          kind: "graphrag_community_reports_parquet",
+          path: artifactPath,
+          contentHash: await hashFile(artifactPath),
+          producerRunId: "run-community-report",
+          stageFingerprint: "fp-community-report",
+          providerFingerprint: "provider-fp",
+          metadata: { corpusContentHash: job.normalizedContentHash },
+        },
+        {
+          stage: "embed",
+          kind: "lancedb_index",
+          path: lancedbPath,
+          contentHash: await hashLanceDbDirectoryContents(lancedbPath),
+          producerRunId: "run-embed",
+          stageFingerprint: "fp-embed",
+          providerFingerprint: "provider-fp",
+          metadata: { corpusContentHash: job.normalizedContentHash },
+        },
+      ]);
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "community_report",
+        runId: "run-community-report",
+        inputFingerprint: "fp-community-report",
+        artifactIds: [artifact!.artifactId],
+      });
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "embed",
+        runId: "run-embed",
+        inputFingerprint: "fp-embed",
+        artifactIds: [lancedbArtifact!.artifactId],
+      });
+
+      await expect(repo.completeStage({
+        bookId: job.bookId,
+        stage: "query_ready",
+        runId: "run-query-ready",
+        inputFingerprint: "fp-query-ready",
+        artifactIds: [artifact!.artifactId, lancedbArtifact!.artifactId],
+      })).rejects.toThrow(/valid GraphRAG query artifacts/u);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -1567,8 +1567,9 @@ state_and_recovery:
       or sourceHash. query_ready validation checks both hashes.
     parquet_validation_rule: >-
       GraphRAG parquet artifacts must be non-empty Parquet files with valid
-      PAR1 magic. Python query bridge validates pyarrow metadata and positive
-      row count when pyarrow is available.
+      PAR1 magic, footer metadata, and positive row count. Python query bridge
+      performs fail-closed pyarrow metadata and row-count validation when
+      pyarrow is available.
     query_ready_scope_rule: >-
       query_ready checkpoints publish graph capabilities only from book-scoped
       GraphRAG artifacts under books/<book_id>/output. Shared graph_vault/output
@@ -1589,6 +1590,10 @@ state_and_recovery:
       A batch run is completed only when completedItems equals totalItems.
       skippedItems and importedCompletedItems are scheduling facts and do not
       satisfy the book closed-loop acceptance gate.
+    completed_manifest_rule: >-
+      completed-manifest seeds only annotate pending work during normal runs.
+      They produce skipped checkpoints only under migrate-only, and skipped
+      checkpoints never satisfy closed-loop acceptance.
     command_check_rule: >-
       Every completed item has exactly 27 required commandChecks and every
       commandCheck status is passed. Persisted qmdBuildStatus is never trusted
@@ -1726,6 +1731,23 @@ security_contract:
     - secret_values
     - provider_authorization_headers
     - raw_provider_error_payloads
+    - url_userinfo
+    - url_query_credentials
+  url_query_credential_keys:
+    - api_key
+    - key
+    - token
+    - access_token
+    - refresh_token
+    - id_token
+    - authorization
+    - auth
+    - sig
+    - signature
+    - secret
+    - password
+    - credential
+    - client_secret
     - host_absolute_paths_as_identity
     - unsanitized_metadata_keys_or_values
   covered_payloads:

@@ -28,6 +28,11 @@ import {
   loadDocumentIdentitiesFromGraphVault,
   toQmdRetrievalCandidates,
 } from "../src/query/qmd-candidates.js";
+
+const MinimalParquetFixture = Buffer.from(
+  "UEFSMRUEFRIVFkwVAhUAEgAACSAFAAAAcm93LTEVABUSFRYsFQIVEBUGFQYcNgAoBXJvdy0xGAVyb3ctMRERAAAACSACAAAAAgEBAgAVBBksNQAYBnNjaGVtYRUCABUMJQIYAmlkJQBMHAAAABYCGRwZHCYAHBUMGTUABhAZGAJpZBUCFgIWigEWkgEmOiYIHDYAKAVyb3ctMRgFcm93LTEREQAZLBUEFQAVAgAVABUQFQIAPBYKGQYZJgACAAAAFooBFgImCBaSAQAZHBgMQVJST1c6c2NoZW1hGKABLy8vLy8zQUFBQUFRQUFBQUFBQUtBQXdBQmdBRkFBZ0FDZ0FBQUFBQkJBQU1BQUFBQ0FBSUFBQUFCQUFJQUFBQUJBQUFBQUVBQUFBVUFBQUFFQUFVQUFnQUJnQUhBQXdBQUFBUUFCQUFBQUFBQUFFRkVBQUFBQmdBQUFBRUFBQUFBQUFBQUFJQUFBQnBaQUFBQkFBRUFBUUFBQUFBQUFBQQAYIHBhcnF1ZXQtY3BwLWFycm93IHZlcnNpb24gMjIuMC4wGRwcAAAAWgEAAFBBUjE=",
+  "base64",
+);
 import { hashFile } from "../src/job-state/fingerprint.js";
 
 function request(overrides: Partial<UnifiedQueryRequest> = {}): UnifiedQueryRequest {
@@ -211,7 +216,7 @@ items:
   );
   await writeFile(
     join(root, "books", bookId, "output", "community_reports.parquet"),
-    Buffer.from("PAR1fixturePAR1", "ascii"),
+    MinimalParquetFixture,
   );
   const lancedbPath = join(root, "books", bookId, "output", "lancedb");
   await writeCompleteLanceDbFixture(lancedbPath);

@@ -615,8 +615,24 @@ function slugify(name) {
     .replace(/^-|-$/g, "") || "book";
 }
 
+const UrlCredentialKeyPattern =
+  /^(?:api[_-]?key|key|token|access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|auth|sig|signature|secret|password|credential|client[_-]?secret)$/iu;
+
+function redactUrlCredentials(message) {
+  return String(message).replace(
+    /\bhttps?:\/\/[^\s"'`),\]}]+/giu,
+    (url) => url
+      .replace(/\/\/[^/?#\s@]+@/u, "//[REDACTED]@")
+      .replace(/([?&;])([^=#&;\s]+)=([^&#;\s]*)/gu, (match, sep, key) =>
+        UrlCredentialKeyPattern.test(key)
+          ? `${sep}${key}=[REDACTED]`
+          : match
+      ),
+  );
+}
+
 function redacted(message) {
-  return redactExactEnvValues(String(message))
+  return redactUrlCredentials(redactExactEnvValues(String(message)))
     .split(root).join("[PROJECT_ROOT]")
     .replace(
       /(?:\/Users|\/home|\/var|\/tmp|\/private|\/Volumes|\/mnt|\/opt|\/srv|\/data)\/[^\s"'`),\]}]+/g,
@@ -631,7 +647,7 @@ function redacted(message) {
 }
 
 function redactLog(text) {
-  return redactExactEnvValues(String(text))
+  return redactUrlCredentials(redactExactEnvValues(String(text)))
     .split(root).join("[PROJECT_ROOT]")
     .replace(
       /(?:\/Users|\/home|\/var|\/tmp|\/private|\/Volumes|\/mnt|\/opt|\/srv|\/data)\/[^\s"'`),\]}]+/g,
@@ -934,40 +950,12 @@ function itemPath(item) {
 function defaultCheckpoint(item, completedSeed = new Map()) {
   const seed = completedSeed.get(item.sourceName);
   const seedHash = typeof seed?.sourceHash === "string" ? seed.sourceHash : undefined;
-  const shouldSkip = seed && (seedHash == null || seedHash === item.sourceHash);
-  if (shouldSkip) {
-    return {
-      schemaVersion: SchemaVersion,
-      itemId: item.itemId,
-      runId,
-      status: "skipped",
-      sourceName: item.sourceName,
-      sourceRelativePath: item.sourceRelativePath,
-      sourceHash: item.sourceHash,
-      normalizedPath: item.normalizedRel,
-      bookId: item.bookId,
-      attempts: 0,
-      expectedCommandCheckCount,
-      maxCommandAttempts,
-      maxTransientCommandAttempts,
-      maxResumePasses,
-      retryBaseDelaySeconds,
-      retryMaxDelaySeconds,
-      retryBudgetSeconds,
-      commandTimeoutSeconds,
-      recoveryDecision: "none",
-      commandChecks: [],
-      metadata: {
-        seededFromCompletedManifest: basename(completedManifestPath),
-        seedMatchMode: seedHash == null ? "source_name_only" : "source_name_and_hash",
-      },
-    };
-  }
+  const seedMatches = seed && (seedHash == null || seedHash === item.sourceHash);
   return {
     schemaVersion: SchemaVersion,
     itemId: item.itemId,
     runId,
-    status: "pending",
+    status: seedMatches && migrateOnly ? "skipped" : "pending",
     sourceName: item.sourceName,
     sourceRelativePath: item.sourceRelativePath,
     sourceHash: item.sourceHash,
@@ -984,6 +972,13 @@ function defaultCheckpoint(item, completedSeed = new Map()) {
     commandTimeoutSeconds,
     recoveryDecision: "none",
     commandChecks: [],
+    metadata: seedMatches
+      ? {
+          seededFromCompletedManifest: basename(completedManifestPath),
+          seedMatchMode: seedHash == null ? "source_name_only" : "source_name_and_hash",
+          importedCompletedMode: migrateOnly ? "skip_for_migration" : "audit_only",
+        }
+      : undefined,
   };
 }
 
@@ -1885,11 +1880,14 @@ function updateManifest(manifest, checkpoints) {
   const completed = checkpoints.filter((item) => item.status === "completed").length;
   const skipped = checkpoints.filter((item) => item.status === "skipped").length;
   const failed = checkpoints.filter((item) => item.status === "failed").length;
+  const importedCompleted = checkpoints.filter((item) =>
+    item.metadata?.seededFromCompletedManifest != null
+  ).length;
   manifest.pendingItems = pending;
   manifest.runningItems = running;
   manifest.completedItems = completed;
   manifest.skippedItems = skipped;
-  manifest.importedCompletedItems = skipped;
+  manifest.importedCompletedItems = importedCompleted;
   manifest.failedItems = failed;
   manifest.expectedCommandCheckCount = expectedCommandCheckCount;
   manifest.maxCommandAttempts = maxCommandAttempts;
@@ -2016,12 +2014,15 @@ function printStatusAndExit(manifest, checkpoints) {
 function recoveryDecisionForBatch(checkpoints) {
   if (checkpoints.some((item) =>
     item.status !== "completed" &&
-    item.status !== "skipped" &&
     (item.retryable === true || item.recoveryDecision === "retry_same_run_id")
   )) {
     return "retry_same_run_id";
   }
-  if (checkpoints.some((item) => item.status === "pending" || item.status === "running")) {
+  if (checkpoints.some((item) =>
+    item.status === "pending" ||
+    item.status === "running" ||
+    item.status === "skipped"
+  )) {
     return "continue_pending";
   }
   if (checkpoints.some((item) => item.status === "failed")) {

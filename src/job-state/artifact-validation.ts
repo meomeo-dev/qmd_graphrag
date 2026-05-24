@@ -213,15 +213,182 @@ async function validateParquetFile(
   try {
     const header = Buffer.alloc(4);
     const footer = Buffer.alloc(4);
+    const footerLengthBytes = Buffer.alloc(4);
     await handle.read(header, 0, 4, 0);
+    await handle.read(footerLengthBytes, 0, 4, size - 8);
     await handle.read(footer, 0, 4, size - 4);
     if (header.toString("ascii") !== "PAR1" || footer.toString("ascii") !== "PAR1") {
       return { valid: false, reason: "parquet_magic_mismatch" };
+    }
+    const footerLength = footerLengthBytes.readUInt32LE(0);
+    if (footerLength <= 0 || footerLength > size - 12) {
+      return { valid: false, reason: "parquet_footer_length_invalid" };
+    }
+    const metadata = Buffer.alloc(footerLength);
+    await handle.read(metadata, 0, footerLength, size - 8 - footerLength);
+    const numRows = readParquetMetadataNumRows(metadata);
+    if (numRows == null) {
+      return { valid: false, reason: "parquet_metadata_unreadable" };
+    }
+    if (numRows <= 0n) {
+      return { valid: false, reason: "parquet_row_count_empty" };
     }
     return { valid: true };
   } finally {
     await handle.close();
   }
+}
+
+function readParquetMetadataNumRows(metadata: Buffer): bigint | null {
+  let offset = 0;
+  let fieldId = 0;
+  while (offset < metadata.length) {
+    const header = readCompactVarInt(metadata, offset);
+    if (header == null) return null;
+    offset = header.offset;
+    const type = header.value & 0x0f;
+    const fieldDelta = header.value >> 4;
+    if (type === 0) return null;
+    if (fieldDelta > 0) {
+      fieldId += fieldDelta;
+    } else {
+      const explicitFieldId = readCompactZigZagInt(metadata, offset);
+      if (explicitFieldId == null) return null;
+      offset = explicitFieldId.offset;
+      fieldId = explicitFieldId.value;
+    }
+    if (fieldId === 3 && type === 6) {
+      const numRows = readCompactZigZagLong(metadata, offset);
+      return numRows?.value ?? null;
+    }
+    const skipped = skipCompactThriftValue(metadata, offset, type);
+    if (skipped == null) return null;
+    offset = skipped;
+  }
+  return null;
+}
+
+function readCompactVarInt(
+  buffer: Buffer,
+  offset: number,
+): { value: number; offset: number } | null {
+  let result = 0;
+  let shift = 0;
+  let cursor = offset;
+  while (cursor < buffer.length && shift <= 28) {
+    const byte = buffer[cursor]!;
+    cursor += 1;
+    result |= (byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) return { value: result >>> 0, offset: cursor };
+    shift += 7;
+  }
+  return null;
+}
+
+function readCompactZigZagInt(
+  buffer: Buffer,
+  offset: number,
+): { value: number; offset: number } | null {
+  const raw = readCompactVarInt(buffer, offset);
+  if (raw == null) return null;
+  return { value: (raw.value >>> 1) ^ -(raw.value & 1), offset: raw.offset };
+}
+
+function readCompactZigZagLong(
+  buffer: Buffer,
+  offset: number,
+): { value: bigint; offset: number } | null {
+  let result = 0n;
+  let shift = 0n;
+  let cursor = offset;
+  while (cursor < buffer.length && shift <= 63n) {
+    const byte = BigInt(buffer[cursor]!);
+    cursor += 1;
+    result |= (byte & 0x7fn) << shift;
+    if ((byte & 0x80n) === 0n) {
+      const value = (result >> 1n) ^ -(result & 1n);
+      return { value, offset: cursor };
+    }
+    shift += 7n;
+  }
+  return null;
+}
+
+function skipCompactThriftValue(
+  buffer: Buffer,
+  offset: number,
+  type: number,
+): number | null {
+  if (type === 1 || type === 2) return offset;
+  if (type === 3) return offset + 1 <= buffer.length ? offset + 1 : null;
+  if (type === 4 || type === 5 || type === 6) {
+    return readCompactVarInt(buffer, offset)?.offset ?? null;
+  }
+  if (type === 7) return offset + 8 <= buffer.length ? offset + 8 : null;
+  if (type === 8) {
+    const length = readCompactVarInt(buffer, offset);
+    if (length == null) return null;
+    const next = length.offset + length.value;
+    return next <= buffer.length ? next : null;
+  }
+  if (type === 9 || type === 10) {
+    const header = readCompactVarInt(buffer, offset);
+    if (header == null) return null;
+    const elementType = header.value & 0x0f;
+    const size = header.value >> 4;
+    let cursor = header.offset;
+    const actualSize = size === 15
+      ? readCompactVarInt(buffer, cursor)
+      : { value: size, offset: cursor };
+    if (actualSize == null) return null;
+    cursor = actualSize.offset;
+    for (let index = 0; index < actualSize.value; index += 1) {
+      const skipped = skipCompactThriftValue(buffer, cursor, elementType);
+      if (skipped == null) return null;
+      cursor = skipped;
+    }
+    return cursor;
+  }
+  if (type === 11) {
+    const size = readCompactVarInt(buffer, offset);
+    if (size == null) return null;
+    let cursor = size.offset;
+    if (size.value === 0) return cursor;
+    if (cursor >= buffer.length) return null;
+    const typeByte = buffer[cursor]!;
+    cursor += 1;
+    const keyType = typeByte >> 4;
+    const valueType = typeByte & 0x0f;
+    for (let index = 0; index < size.value; index += 1) {
+      const keySkipped = skipCompactThriftValue(buffer, cursor, keyType);
+      if (keySkipped == null) return null;
+      const valueSkipped = skipCompactThriftValue(buffer, keySkipped, valueType);
+      if (valueSkipped == null) return null;
+      cursor = valueSkipped;
+    }
+    return cursor;
+  }
+  if (type === 12) {
+    let cursor = offset;
+    while (cursor < buffer.length) {
+      const header = readCompactVarInt(buffer, cursor);
+      if (header == null) return null;
+      cursor = header.offset;
+      const nestedType = header.value & 0x0f;
+      if (nestedType === 0) return cursor;
+      if ((header.value >> 4) === 0) {
+        const fieldId = readCompactZigZagInt(buffer, cursor);
+        if (fieldId == null) return null;
+        cursor = fieldId.offset;
+      }
+      const skipped = skipCompactThriftValue(buffer, cursor, nestedType);
+      if (skipped == null) return null;
+      cursor = skipped;
+    }
+    return null;
+  }
+  if (type === 13) return offset + 4 <= buffer.length ? offset + 4 : null;
+  return null;
 }
 
 async function validateJsonObject(path: string): Promise<ArtifactValidationResult> {

@@ -26,7 +26,7 @@ completion_models:
       reasoning_effort: medium
       max_completion_tokens: 4096
 
-concurrent_requests: 2
+concurrent_requests: 5
 
 embedding_models:
   default_embedding_model:

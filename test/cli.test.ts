@@ -46,6 +46,11 @@ import {
 import { hashFile } from "../src/job-state/fingerprint.ts";
 import { sanitizeVaultText } from "../src/vault/metadata.ts";
 
+const MinimalParquetFixture = Buffer.from(
+  "UEFSMRUEFRIVFkwVAhUAEgAACSAFAAAAcm93LTEVABUSFRYsFQIVEBUGFQYcNgAoBXJvdy0xGAVyb3ctMRERAAAACSACAAAAAgEBAgAVBBksNQAYBnNjaGVtYRUCABUMJQIYAmlkJQBMHAAAABYCGRwZHCYAHBUMGTUABhAZGAJpZBUCFgIWigEWkgEmOiYIHDYAKAVyb3ctMRgFcm93LTEREQAZLBUEFQAVAgAVABUQFQIAPBYKGQYZJgACAAAAFooBFgImCBaSAQAZHBgMQVJST1c6c2NoZW1hGKABLy8vLy8zQUFBQUFRQUFBQUFBQUtBQXdBQmdBRkFBZ0FDZ0FBQUFBQkJBQU1BQUFBQ0FBSUFBQUFCQUFJQUFBQUJBQUFBQUVBQUFBVUFBQUFFQUFVQUFnQUJnQUhBQXdBQUFBUUFCQUFBQUFBQUFFRkVBQUFBQmdBQUFBRUFBQUFBQUFBQUFJQUFBQnBaQUFBQkFBRUFBUUFBQUFBQUFBQQAYIHBhcnF1ZXQtY3BwLWFycm93IHZlcnNpb24gMjIuMC4wGRwcAAAAWgEAAFBBUjE=",
+  "base64",
+);
+
 // Test fixtures directory and database path
 let testDir: string;
 let testDbPath: string;
@@ -1078,7 +1083,7 @@ describe("GraphRAG EPUB batch runner", () => {
   }
 
   async function writeMinimalParquetFixture(path: string): Promise<void> {
-    await writeFile(path, Buffer.from("PAR1fixturePAR1", "ascii"));
+    await writeFile(path, MinimalParquetFixture);
   }
 
   async function writeCompleteLanceDbFixture(root: string): Promise<void> {
@@ -1215,6 +1220,7 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(script).toContain("qmd-query-graphrag-json");
     expect(script).toContain("redactLog(stdout)");
     expect(script).toContain("redactLog(stderr)");
+    expect(script).toContain("redactUrlCredentials");
     expect(script).toContain("console.error(redactLog");
     expect(script).not.toContain("metadata: {\\n      logRoot,");
   });
@@ -1303,7 +1309,7 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(result.stderr).toContain("--log-root must be outside graph_vault");
   });
 
-  test("records completed-manifest items as typed skipped checkpoints", async () => {
+  test("completed-manifest annotates default work but does not skip real builds", async () => {
     const tmpRoot = await mkProjectTmpDir("qmd-batch-skipped-");
     const sourceDir = join(tmpRoot, "source");
     const stateRoot = join(tmpRoot, "graph_vault");
@@ -1312,7 +1318,7 @@ describe("GraphRAG EPUB batch runner", () => {
     const runId = "skipped-fixture";
     await mkdir(sourceDir, { recursive: true });
     await mkdir(configDir, { recursive: true });
-    const sourceBytes = "not read when skipped";
+    const sourceBytes = "still processed when seeded";
     await writeFile(join(sourceDir, "Book.epub"), sourceBytes);
     await writeFile(join(configDir, "index.yml"), "collections: {}\n");
     const completedManifest = join(tmpRoot, "completed.json");
@@ -1368,32 +1374,34 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(manifest).toMatchObject({
       schemaVersion: SchemaVersion,
       runId,
-      status: "incomplete",
+      status: "failed",
       totalItems: 1,
       pendingItems: 0,
       runningItems: 0,
       completedItems: 0,
-      skippedItems: 1,
+      skippedItems: 0,
       importedCompletedItems: 1,
-      failedItems: 0,
+      failedItems: 1,
       expectedCommandCheckCount: 27,
     });
     expect(checkpoint).toMatchObject({
       schemaVersion: SchemaVersion,
       runId,
-      status: "skipped",
+      status: "failed",
       sourceName: "Book.epub",
       sourceHash,
       bookId: `book-${sourceHash.slice(0, 12)}`,
       expectedCommandCheckCount: 27,
       metadata: {
         seedMatchMode: "source_name_and_hash",
+        importedCompletedMode: "audit_only",
       },
     });
-    expect(eventLines.some((event) => event.event === "item_skipped")).toBe(true);
+    expect(eventLines.some((event) => event.event === "item_skipped")).toBe(false);
+    expect(eventLines.some((event) => event.event === "command_start")).toBe(true);
     expect(eventLines.at(-1)).toMatchObject({
       event: "batch_incomplete",
-      recoveryDecision: "none",
+      recoveryDecision: "stop_until_fixed",
     });
   });
 
@@ -3645,14 +3653,14 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toBe("");
     expect(manifest).toMatchObject({
-      status: "incomplete",
+      status: "failed",
       totalItems: 2,
       pendingItems: 0,
       runningItems: 0,
       completedItems: 0,
-      skippedItems: 2,
+      skippedItems: 0,
       importedCompletedItems: 2,
-      failedItems: 0,
+      failedItems: 2,
       expectedCommandCheckCount: 27,
     });
     expect(checkpoints).toHaveLength(2);
@@ -3743,12 +3751,13 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toBe("");
     expect(manifest).toMatchObject({
-      status: "incomplete",
+      status: "failed",
       totalItems: 2,
+      pendingItems: 0,
       completedItems: 0,
-      skippedItems: 2,
+      skippedItems: 0,
       importedCompletedItems: 2,
-      failedItems: 0,
+      failedItems: 2,
     });
     expect(manifest.itemIds).toHaveLength(2);
     expect(manifest.itemIds).not.toContain("stale-item");
@@ -3791,6 +3800,147 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).not.toContain(secretBase);
     expect(result.stderr).toContain("[REDACTED:OPENAI_BASE_URL]");
+  });
+
+  test("redacts URL credentials from batch logs and recovery summaries", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-url-redact-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "url-redact-fixture";
+    const sourceBytes = "url secret redaction";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    const sourcePath = join(sourceDir, "Book.epub");
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const leakedUrl =
+      "https://gateway.example/responses?api_key=url-secret&token=tok-secret&safe=ok";
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        pendingItems: 0,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "failed",
+        sourceName: "Book.epub",
+        sourceRelativePath,
+        sourceHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        bookId: `book-${sourceHash.slice(0, 12)}`,
+        attempts: 1,
+        failedAt: "2026-05-23T00:01:00.000Z",
+        failureKind: "permanent",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "qmd-query-graphrag-json",
+        errorSummary: `provider leaked ${leakedUrl}`,
+        commandChecks: [{
+          name: "qmd-query-graphrag-json",
+          status: "failed",
+          attempts: 1,
+          exitCode: 1,
+          stdoutBytes: 0,
+          stderrBytes: 12,
+          startedAt: "2026-05-23T00:00:00.000Z",
+          completedAt: "2026-05-23T00:01:00.000Z",
+          failureKind: "permanent",
+          retryable: false,
+          errorSummary: `stderr ${leakedUrl}`,
+        }],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        itemId,
+        event: "command_failed",
+        command: "qmd-query-graphrag-json",
+        at: "2026-05-23T00:01:00.000Z",
+        message: `event ${leakedUrl}`,
+        metadata: { requestUrl: leakedUrl },
+      }) + "\n",
+    );
+
+    const result = await new Promise<{ stderr: string; exitCode: number | null }>(
+      (resolveResult) => {
+        const proc = spawn(process.execPath, [
+          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+          "--source-dir",
+          sourceDir,
+          "--state-root",
+          stateRoot,
+          "--log-root",
+          logRoot,
+          "--config",
+          join(configDir, "index.yml"),
+          "--qmd-index-path",
+          join(tmpRoot, "index.sqlite"),
+          "--run-id",
+          runId,
+          "--skip-dotenv",
+          "--migrate-only",
+        ]);
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => {
+          stderr += String(chunk);
+        });
+        proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+      },
+    );
+
+    const eventRaw = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
+      "utf8",
+    );
+    const summaryRaw = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "recovery-summary.json"),
+      "utf8",
+    );
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    for (const raw of [eventRaw, summaryRaw]) {
+      expect(raw).not.toContain("url-secret");
+      expect(raw).not.toContain("tok-secret");
+      expect(raw).toContain("api_key=[REDACTED]");
+      expect(raw).toContain("token=[REDACTED]");
+      expect(raw).toContain("safe=ok");
+    }
   });
 
   test("sanitizes vault text secrets, urls, and absolute paths", () => {

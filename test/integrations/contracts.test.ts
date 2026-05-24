@@ -85,6 +85,11 @@ import { hashLanceDbDirectoryContents } from "../../src/job-state/artifact-valid
 import { hashFile } from "../../src/job-state/fingerprint.js";
 import { hydrateBatchCheckpoint } from "../../scripts/graphrag/batch-checkpoint-hydration.mjs";
 
+const MinimalParquetFixture = Buffer.from(
+  "UEFSMRUEFRIVFkwVAhUAEgAACSAFAAAAcm93LTEVABUSFRYsFQIVEBUGFQYcNgAoBXJvdy0xGAVyb3ctMRERAAAACSACAAAAAgEBAgAVBBksNQAYBnNjaGVtYRUCABUMJQIYAmlkJQBMHAAAABYCGRwZHCYAHBUMGTUABhAZGAJpZBUCFgIWigEWkgEmOiYIHDYAKAVyb3ctMRgFcm93LTEREQAZLBUEFQAVAgAVABUQFQIAPBYKGQYZJgACAAAAFooBFgImCBaSAQAZHBgMQVJST1c6c2NoZW1hGKABLy8vLy8zQUFBQUFRQUFBQUFBQUtBQXdBQmdBRkFBZ0FDZ0FBQUFBQkJBQU1BQUFBQ0FBSUFBQUFCQUFJQUFBQUJBQUFBQUVBQUFBVUFBQUFFQUFVQUFnQUJnQUhBQXdBQUFBUUFCQUFBQUFBQUFFRkVBQUFBQmdBQUFBRUFBQUFBQUFBQUFJQUFBQnBaQUFBQkFBRUFBUUFBQUFBQUFBQQAYIHBhcnF1ZXQtY3BwLWFycm93IHZlcnNpb24gMjIuMC4wGRwcAAAAWgEAAFBBUjE=",
+  "base64",
+);
+
 type TypeDdPayload = {
   name: string;
   schema: string;
@@ -2524,8 +2529,7 @@ items:
     });
     await writeFile(
       join(graphVault, "books", "book-123", "output", "community_reports.parquet"),
-      "reports",
-      "utf8",
+      MinimalParquetFixture,
     );
     const reportHash = await hashFile(
       join(graphVault, "books", "book-123", "output", "community_reports.parquet"),
@@ -2587,6 +2591,8 @@ items:
     stageFingerprint: stage-community-report
     providerFingerprint: provider-openai-responses-jina
     producerRunId: run-1
+    metadata:
+      corpusContentHash: ${contentHash}
     createdAt: 2026-05-21T00:00:00.000Z
   - schemaVersion: ${SchemaVersion}
     artifactId: artifact-2
@@ -2598,6 +2604,8 @@ items:
     stageFingerprint: stage-embed
     providerFingerprint: provider-openai-responses-jina
     producerRunId: run-2
+    metadata:
+      corpusContentHash: ${contentHash}
     createdAt: 2026-05-21T00:00:00.000Z
 `);
     await writeFile(join(graphVault, "catalog", "document-identity-map.yaml"), `
@@ -2699,8 +2707,7 @@ items:
     await writeCompleteLanceDbFixture(lancedbPath);
     await writeFile(
       join(graphVault, "books", "book-123", "output", "community_reports.parquet"),
-      "reports",
-      "utf8",
+      MinimalParquetFixture,
     );
     const reportHash = await hashFile(
       join(graphVault, "books", "book-123", "output", "community_reports.parquet"),
@@ -2768,6 +2775,8 @@ items:
     stageFingerprint: stage-community-report
     providerFingerprint: provider-openai-responses-jina
     producerRunId: run-community-report
+    metadata:
+      corpusContentHash: ${contentHash}
     createdAt: 2026-05-21T00:00:00.000Z
   - schemaVersion: ${SchemaVersion}
     artifactId: artifact-2
@@ -2779,6 +2788,8 @@ items:
     stageFingerprint: stage-embed
     providerFingerprint: provider-openai-responses-jina
     producerRunId: run-embed
+    metadata:
+      corpusContentHash: ${contentHash}
     createdAt: 2026-05-21T00:00:00.000Z
 `,
       "utf8",

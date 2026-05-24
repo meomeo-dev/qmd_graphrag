@@ -615,6 +615,9 @@ query:
   stdout tail、stderr tail 和 error summary 不保存密钥值。
 - 持久化 metadata 在写入前完成净化，敏感 key、密钥值和宿主机绝对路径值
   不进入 `graph_vault`。
+- batch event、command log 和 recovery summary 的 redaction 覆盖 URL userinfo
+  与 URL query credential，包括 `api_key`、`token`、`access_token`、`sig`、
+  `signature`、`secret`、`password`、`credential` 和 `client_secret`。
 - redaction 在持久化前执行，不能只依赖展示层遮盖。
 
 GraphRAG runtime config 是 qmd project config 的投影（projection）。投影文件
@@ -705,8 +708,8 @@ validated checkpoint
 kind-specific validators 包括：
 
 - parquet content hash 校验。
-- parquet 文件必须通过 magic 校验；Python bridge 在 pyarrow 可用时校验
-  metadata 与 `row_count > 0`。
+- parquet 文件必须通过 `PAR1` magic、footer metadata 和 `row_count > 0`
+  校验；Python bridge 在 pyarrow 可用时执行 fail-closed metadata 校验。
 - LanceDB required table 与非空 data fragment 校验。
 - LanceDB `qmd_row_count.json` 正行数校验。
 - `lancedb_index` artifact content hash 只覆盖 required table 的

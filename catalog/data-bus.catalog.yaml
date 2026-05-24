@@ -60,6 +60,7 @@ types:
     storage: graph_vault/catalog/batch-runs/<run_id>/events.jsonl
     notes:
       - stores redacted event summaries
+      - redacts URL userinfo and URL query credentials before persistence
       - records failureKind, retryable, failedStage, providerStatusCode, and
         recoveryDecision
       - raw stdout, stderr, and GraphRAG report logs stay in temporary run logs
@@ -989,7 +990,7 @@ types:
       - GraphRAG and LanceDB artifacts store `metadata.corpusContentHash` so
         consumers can bind artifact bytes to the producing book content
       - GraphRAG parquet artifacts require non-empty Parquet validation with
-        `PAR1` magic
+        `PAR1` magic, footer metadata, and positive row count
       - high-cost GraphRAG artifacts are accepted only from
         `books/<book_id>/output`
       - shared `graph_vault/output` is not a valid producer for per-book
