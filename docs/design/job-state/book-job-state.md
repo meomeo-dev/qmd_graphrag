@@ -118,6 +118,18 @@
 validator 必须拒绝缺少该 sidecar 或 `rowCount <= 0` 的表。LanceDB
 manifest 内容不是 qmd_graphrag 的稳定契约，不作为通过条件。
 
+GraphRAG 高成本产物必须按书隔离（book-scoped）。单本书的 GraphRAG 输入
+位于 `graph_vault/books/<book_id>/input`，GraphRAG 输出位于
+`graph_vault/books/<book_id>/output`。共享 `graph_vault/output` 不作为任何
+单本书 `graph_extract`、`community_report`、`embed` 或 `query_ready`
+成功的证据。
+
+书级输出目录必须包含 `qmd_output_manifest.json`。该 producer manifest 绑定
+`bookId`、`sourceHash`、`documentId`、`contentHash`、各 stage fingerprint、
+`providerFingerprint`、`outputDir` 和真实 producer runId。同步层只接受与当前书籍
+身份、内容、provider 边界和书级输出目录完全匹配的 manifest；不匹配的输出视为
+stale，不得提升高成本 stage。
+
 ## 一致性策略
 
 一致性边界为：
@@ -155,6 +167,12 @@ manifest 内容不是 qmd_graphrag 的稳定契约，不作为通过条件。
 - `configFingerprint` 变化：按受影响 stage 失效。
 - 必需 artifact 在 manifest 或磁盘中缺失：对应 stage 失效。
 - 半成品 LanceDB 目录不得满足 `lancedb_index` 需求。
+- 高成本 stage 的 bootstrap checkpoint 不满足恢复计划；`graph_extract`、
+  `community_report`、`embed` 和 `query_ready` 必须来自真实 stage run。
+- 高成本 GraphRAG artifact 必须位于 `books/<book_id>/output/`。`lancedb_index`
+  必须位于 `books/<book_id>/output/lancedb`。
+- `query_ready` 必须引用已验证的 community report 与 LanceDB index artifact，
+  且 qmd corpus registration 已完成。
 
 `bookId` 是稳定身份，格式为
 `book-<first_12_hex_chars_of_source_hash>`，只由源文件内容哈希派生，
@@ -198,15 +216,23 @@ graph_vault/
       source.epub
   books/
     <book_id>/
-      source/
-      artifacts/
-        ingest/
-        normalize/
-        graph_extract/
-        community_report/
-        embed/
-        query_ready/
-      cache/
+      input/
+        <normalized>.md
+      output/
+        qmd_output_manifest.json
+        documents.parquet
+        text_units.parquet
+        entities.parquet
+        relationships.parquet
+        communities.parquet
+        community_reports.parquet
+        context.json
+        stats.json
+        lancedb/
+        reports/
+        cache/
+      artifacts.yaml
+      checkpoints.yaml
       runs/
   catalog/
     books.yaml
@@ -236,7 +262,10 @@ graph_vault/
 - `settings.yaml` 内部路径保持相对路径。
 - `source_epub` artifact 指向 `sources/<book_id>/...`。
 - `normalized_markdown` artifact 指向 `input/...`。
-- `lancedb_index` artifact 指向 `output/lancedb`。
+- GraphRAG 高成本 artifact 指向 `books/<book_id>/output/...`。
+- `lancedb_index` artifact 指向 `books/<book_id>/output/lancedb`。
+- `qmd_output_manifest.json` 的 `outputDir` 必须解析为当前书的
+  `books/<book_id>/output`。
 - 状态判断只读取 vault-relative artifact，不读取原始 inbox。
 - `BookJob.metadata` 不保存原始设备上的绝对路径。
 - `books/` 与 `sources/` 的 active 区只保留 canonical `book-<sourceHash>`

@@ -48,6 +48,15 @@ decision:
     - GraphRAG JSON artifact 必须是可解析 JSON object。
     - `query_ready` checkpoint 必须同时引用已验证的 community report 与
       LanceDB index artifact；artifact stage 保持真实 producer stage。
+    - GraphRAG 高成本 artifact 必须位于
+      `graph_vault/books/<book_id>/output`。
+    - `graph_vault/output` 只作为 legacy 或 shared workspace，不作为单书
+      `graph_extract`、`community_report`、`embed` 或 `query_ready` 的
+      成功证据。
+    - `qmd_output_manifest.json` 必须证明输出目录 producer 与当前书籍身份、
+      normalized content、stage fingerprint 和 provider fingerprint 一致。
+    - 高成本 stage 的 `metadata.bootstrap=true` checkpoint 在恢复计划中视为
+      stale，必须由真实 stage run 替换。
 
 legacy_migration:
   rule: >-
@@ -76,3 +85,5 @@ validation:
     - content-hash mismatch makes the stage unsatisfied
     - partial LanceDB does not mark embed complete
     - single-book failure does not roll back another book capability
+    - shared GraphRAG output does not bootstrap high-cost stages
+    - legacy completed batch item reopens when real GraphRAG evidence is absent

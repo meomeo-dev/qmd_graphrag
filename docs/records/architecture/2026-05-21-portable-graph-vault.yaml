@@ -76,7 +76,15 @@ invariants:
   - artifact manifest 的 `path` 字段必须可由 `graph_vault` 根目录解析。
   - `source_epub` artifact 必须指向 `sources/<book_id>/...`。
   - `normalized_markdown` artifact 必须指向 `input/...`。
-  - `lancedb_index` artifact 必须指向 `output/lancedb`。
+  - GraphRAG 高成本 artifact 必须指向
+    `books/<book_id>/output/...`。
+  - `lancedb_index` artifact 必须指向
+    `books/<book_id>/output/lancedb`。
+  - `books/<book_id>/output/qmd_output_manifest.json` 必须绑定当前
+    `bookId`、`sourceHash`、`documentId`、`contentHash`、
+    `providerFingerprint`、stage fingerprint 和 outputDir。
+  - 共享 `graph_vault/output` 不得作为单书高成本 GraphRAG stage 的
+    成功证据。
   - LanceDB 表目录使用 `<table>.lance`，行数读取使用去掉 `.lance` 后缀的
     表名，并写入 `<table>.lance/qmd_row_count.json`。
   - `lancedb_index` validator 必须校验 required table、非空 data fragment
@@ -106,6 +114,10 @@ validation:
     - catalog 已 canonical 但 active 区残留同源 legacy 目录时仍可迁移。
     - 迁移后 active `books/` 和 `sources/` 不保留同源 legacy 目录。
     - GraphRAG 生成的 `<table>.lance` 目录可写出正行数 sidecar。
+    - 共享 `graph_vault/output` 存在 GraphRAG parquet 时，不会 bootstrap
+      单书高成本 stage。
+    - `books/<book_id>/output/qmd_output_manifest.json` 不匹配当前书籍身份时，
+      不收集高成本 GraphRAG artifact。
     - 恢复计划只依赖 vault-relative artifact 可达性。
 
 implications:

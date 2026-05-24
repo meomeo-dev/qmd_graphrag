@@ -26,8 +26,8 @@ graph_vault/catalog/batch-runs/<runId>/
 - `manifest.json`：`BatchRunManifest`，记录 runId、sourceRootName、
   stateRootLocator、qmdIndexLocator、configLocator、item 计数和当前状态。
 - `items/<itemId>.json`：`BatchItemCheckpoint`，记录单本 EPUB 的 source
-  locator、normalized locator、status、attempts、bookId、errorSummary 和
-  CLI check 结果。
+  locator、normalized locator、status、attempts、bookId、errorSummary、
+  `qmdBuildStatus`、`graphBuildStatus` 和 CLI check 结果。
 - `events.jsonl`：`BatchEventLog`，逐行记录 batch/item/command 事件。
 
 状态取值：
@@ -62,6 +62,27 @@ graph_vault/catalog/batch-runs/<runId>/
 从临时批次迁移到正式批次时，可用 `--completed-manifest <path>` 导入调度种子。
 导入只产生 `skipped` checkpoint 和 `importedCompletedItems` 统计，不产生
 `completed` item。真实准入批次必须让每本 EPUB 形成 `completed` checkpoint。
+
+旧 `completed` checkpoint 在加载时必须重新校验闭环证据。缺少
+`qmdBuildStatus.status=succeeded` 或 `graphBuildStatus.status=succeeded` 的
+checkpoint 必须降级为 `pending`，写入 `item_completed_reopened` 事件，并以
+`recoveryDecision=continue_pending` 继续。该规则适用于 `--migrate-only` 和正式
+运行。
+
+`graphBuildStatus.status=succeeded` 的必要条件：
+
+- `graph_extract`、`community_report`、`embed` 和 `query_ready` 都有非
+  bootstrap 的 succeeded checkpoint。
+- 每个高成本 checkpoint 引用的 artifactId 存在于当前书的
+  `artifacts.yaml`，磁盘文件或目录存在，且路径位于
+  `books/<book_id>/output/`。
+- `graph_extract` 包含 documents、text units、entities、relationships、
+  communities、context 和 stats 产物。
+- `community_report` 包含 community reports 产物。
+- `embed` 包含 `books/<book_id>/output/lancedb`。
+- `query_ready` 同时引用 community report 与 LanceDB index artifact。
+- `books/<book_id>/output/qmd_output_manifest.json` 的 `bookId`、`sourceHash`
+  和 `outputDir` 与当前书一致。
 
 ## Provider 限流与重试
 
@@ -156,6 +177,12 @@ for (const item of items.filter((value) => value.status === "completed")) {
   if (item.commandChecks.some((check) => check.status !== "passed")) {
     throw new Error(`${item.itemId}: command check failed`);
   }
+  if (item.qmdBuildStatus?.status !== "succeeded") {
+    throw new Error(`${item.itemId}: qmd build not succeeded`);
+  }
+  if (item.graphBuildStatus?.status !== "succeeded") {
+    throw new Error(`${item.itemId}: GraphRAG build not succeeded`);
+  }
 }
 for (const item of items.filter((value) => value.status === "failed")) {
   for (const key of ["failureKind", "retryable", "recoveryDecision", "failedStage"]) {
@@ -185,7 +212,8 @@ NODE
 - `qmd-vsearch-json`：`qmd vsearch --json`
 - `qmd-query-json`：`qmd query --json`
 - `qmd-query-auto-json`：`qmd query --mode auto --json`
-- `qmd-query-graphrag-json`：`qmd query --graphrag --json`
+- `qmd-query-graphrag-json`：`qmd query --graphrag --graph-book-id <bookId>
+  --json`
 - `qmd-get-book`：`qmd get`
 - `qmd-multi-get-json`：`qmd multi-get --json`
 - `qmd-collection-list`：`qmd collection list`
@@ -200,6 +228,8 @@ NODE
 
 每个 completed checkpoint 必须包含 27 个 `commandChecks`，名称集合必须与上述检查
 集一致，且全部为 `passed`。缺项、重复项或失败项均不得写入 completed。
+每个 completed checkpoint 必须同时包含 `qmdBuildStatus.status=succeeded` 与
+`graphBuildStatus.status=succeeded`。
 
 `qmd vsearch` 是向量检索（vector search）检查，只允许 embedding/vector
 lookup，不允许 query expansion、OpenAI Responses generation、DSPy expansion、

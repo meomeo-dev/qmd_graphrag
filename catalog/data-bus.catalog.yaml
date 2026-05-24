@@ -43,6 +43,10 @@ types:
       - retryable failed items resume through the same runId
       - unfinished items delegate recovery to BookResumePlan.nextStage
       - completed items require the fixed 27-command check set
+      - completed items require qmdBuildStatus.status=succeeded
+      - completed items require graphBuildStatus.status=succeeded
+      - legacy completed items without real GraphRAG evidence are reopened as
+        pending during checkpoint load
 
   - name: batch_event_log
     schema: src/contracts/batch-run.ts#BatchEventLogSchema
@@ -347,6 +351,11 @@ types:
       - src/integrations/graphrag.ts#runGraphRagQuery
       - python/qmd_graphrag/bridge.py#_run_graphrag_query
     storage: transient
+    notes:
+      - single-book CLI queries pass dataDir as
+        `graph_vault/books/<book_id>/output`
+      - GraphRAG bridge applies dataDir to output_storage, reporting, cache,
+        and LanceDB vector_store overrides
 
   - name: graphrag_query_response
     schema: src/contracts/graphrag.ts#GraphRagQueryResponseSchema
@@ -403,6 +412,12 @@ types:
       - python/qmd_graphrag/bridge.py#_run_graphrag_index
     storage: transient
     notes:
+      - inputDir must resolve to `graph_vault/books/<book_id>/input`
+      - dataDir must resolve to `graph_vault/books/<book_id>/output`
+      - Python bridge projects inputDir/dataDir into GraphRAG storage
+        overrides instead of mutating vendor code
+      - output producer manifest is written only after the real GraphRAG
+        index call returns successfully
       - supports `skipValidation` for gateways whose connectivity checks differ
         from GraphRAG upstream validation semantics
       - supports typed workflow overrides so recovery replays only the failed
@@ -941,6 +956,10 @@ types:
       - artifact identity excludes `producerRunId` to avoid duplicate entries
         across bootstrap and resume synchronization
       - stores artifact hash and normalization policy lineage when applicable
+      - high-cost GraphRAG artifacts are accepted only from
+        `books/<book_id>/output`
+      - shared `graph_vault/output` is not a valid producer for per-book
+        GraphRAG artifacts
       - "`lancedb_index` artifact hash covers required table `data/*.lance`
         fragments and `qmd_row_count.json`; `_versions/**` and other
         vendor-volatile files do not participate in canonical hash"

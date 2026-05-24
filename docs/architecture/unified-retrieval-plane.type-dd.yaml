@@ -563,6 +563,16 @@ typed_buses:
         consumers:
           - src/integrations/graphrag.ts#runGraphRagIndex
           - python/qmd_graphrag/bridge.py#_run_graphrag_index
+        storage_contract:
+          input_dir: graph_vault/books/<book_id>/input
+          data_dir: graph_vault/books/<book_id>/output
+          bridge_projection: >-
+            inputDir and dataDir become GraphRAG input_storage,
+            output_storage, reporting, cache, and LanceDB vector_store
+            overrides without mutating vendor code.
+          producer_manifest: >-
+            qmd_output_manifest.json is written after the real GraphRAG
+            index call returns successfully.
         scope_contract: >-
           indexScope carries the current book/source/document/content identity
           for provider cost lineage. Index accounting must not aggregate
