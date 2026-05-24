@@ -34,6 +34,11 @@ export function classifyFailure(text) {
     message.includes("concurrency limit") ||
     message.includes("partial-output") ||
     message.includes("partial output") ||
+    message.includes("missingartifactkinds") ||
+    message.includes("missing artifact kinds") ||
+    message.includes("missingartifactids") ||
+    message.includes("missing artifact ids") ||
+    message.includes("did not produce valid book-scoped artifacts") ||
     message.includes("no report found for community") ||
     message.includes("community report extraction error") ||
     message.includes("error generating community report") ||

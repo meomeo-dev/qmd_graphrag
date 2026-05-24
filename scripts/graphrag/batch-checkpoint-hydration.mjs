@@ -17,14 +17,21 @@ export function hydrateBatchCheckpoint({
     if (check.status !== "failed") return check;
     const failure = classifyFailure(check.errorSummary ?? checkpoint.errorSummary ?? "");
     const attemptExhausted = check.attemptExhausted ?? true;
+    const recoverLegacyTransient =
+      failure.retryable === true &&
+      (check.retryable === false ||
+        check.failureKind === "unknown" ||
+        check.recoveryDecision === "stop_until_fixed");
     return {
       ...check,
-      failureKind: check.failureKind ?? failure.failureKind,
-      retryable: check.retryable ?? failure.retryable,
+      failureKind: recoverLegacyTransient
+        ? failure.failureKind
+        : check.failureKind ?? failure.failureKind,
+      retryable: recoverLegacyTransient ? true : check.retryable ?? failure.retryable,
       retryAfterSeconds: check.retryAfterSeconds ?? failure.retryAfterSeconds,
-      attemptExhausted,
+      attemptExhausted: recoverLegacyTransient ? false : attemptExhausted,
       providerStatusCode: check.providerStatusCode ?? failure.providerStatusCode,
-      recoveryDecision: check.recoveryDecision ??
+      recoveryDecision: recoverLegacyTransient ? "retry_same_run_id" : check.recoveryDecision ??
         (attemptExhausted ? "stop_until_fixed" :
           failure.retryable ? "retry_same_run_id" : "stop_until_fixed"),
     };
@@ -37,7 +44,14 @@ export function hydrateBatchCheckpoint({
   const inferredFailure = checkpoint.status === "failed"
     ? classifyFailure(failureText)
     : null;
-  const retryable = checkpoint.retryable ?? inferredFailure?.retryable;
+  const recoverLegacyTransient =
+    checkpoint.status === "failed" &&
+    inferredFailure?.retryable === true &&
+    (checkpoint.retryable === false ||
+      checkpoint.failureKind === "unknown" ||
+      checkpoint.recoveryDecision === "stop_until_fixed");
+  const retryable = recoverLegacyTransient ? true :
+    checkpoint.retryable ?? inferredFailure?.retryable;
   return {
     ...checkpoint,
     sourceHash: checkpoint.sourceHash ?? item.sourceHash,
@@ -53,11 +67,13 @@ export function hydrateBatchCheckpoint({
     retryMaxDelaySeconds: checkpoint.retryMaxDelaySeconds ?? retryMaxDelaySeconds,
     retryBudgetSeconds: checkpoint.retryBudgetSeconds ?? retryBudgetSeconds,
     commandTimeoutSeconds: checkpoint.commandTimeoutSeconds ?? commandTimeoutSeconds,
-    failureKind: checkpoint.failureKind ?? inferredFailure?.failureKind,
+    failureKind: recoverLegacyTransient
+      ? inferredFailure?.failureKind
+      : checkpoint.failureKind ?? inferredFailure?.failureKind,
     retryable,
-    retryExhausted: checkpoint.retryExhausted ??
+    retryExhausted: recoverLegacyTransient ? false : checkpoint.retryExhausted ??
       (checkpoint.status === "failed" && retryable === false ? true : undefined),
-    recoveryDecision: checkpoint.recoveryDecision ??
+    recoveryDecision: recoverLegacyTransient ? "retry_same_run_id" : checkpoint.recoveryDecision ??
       (checkpoint.status === "failed"
         ? (inferredFailure?.retryable ? "retry_same_run_id" : "stop_until_fixed")
         : "none"),
