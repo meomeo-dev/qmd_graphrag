@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { cwd } from "node:process";
-import { basename, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { copyFile, mkdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { parseArgs } from "node:util";
@@ -30,9 +30,11 @@ async function importRuntime() {
     createQmdGraphRagRuntime: indexModule.createQmdGraphRagRuntime,
     createRunId: indexModule.createRunId,
     GraphRagWorkflowNameSchema: indexModule.GraphRagWorkflowNameSchema,
+    assertGraphRagStageReportHealthy: indexModule.assertGraphRagStageReportHealthy,
     graphRagBookInputDir: indexModule.graphRagBookInputDir,
     graphRagBookOutputDir: indexModule.graphRagBookOutputDir,
     assertGraphRagStageArtifactsReady: indexModule.assertGraphRagStageArtifactsReady,
+    graphRagIndexLogOffset: indexModule.graphRagIndexLogOffset,
     loadGraphQueryCapabilities: indexModule.loadGraphQueryCapabilities,
     syncGraphRagBookWorkspace: indexModule.syncGraphRagBookWorkspace,
     writeGraphRagOutputProducerManifest: indexModule.writeGraphRagOutputProducerManifest,
@@ -50,6 +52,7 @@ const { values } = parseArgs({
     "qmd-index-path": { type: "string" },
     config: { type: "string" },
     "python-bin": { type: "string" },
+    "report-root": { type: "string" },
     "working-directory": { type: "string" },
     "query": { type: "string" },
     "query-method": { type: "string", default: "local" },
@@ -74,6 +77,9 @@ const qmdIndexPath = values["qmd-index-path"]
 const configPath = values.config
   ? resolve(values.config)
   : resolve(workingDirectory, ".qmd/index.yml");
+const reportRoot = values["report-root"]
+  ? resolve(values["report-root"])
+  : null;
 
 let GraphRagWorkflowNameSchemaRef;
 
@@ -243,6 +249,33 @@ async function syncCurrentBook(
   return { sync, scopedInputDir, scopedOutputDir };
 }
 
+async function refreshOutputProducerManifestFromCheckpoints(
+  runtimeApi,
+  repo,
+  sync,
+  scopedOutputDir,
+) {
+  const checkpoints = await repo.listStageCheckpoints(sync.job.bookId);
+  for (const stage of ["graph_extract", "community_report", "embed", "query_ready"]) {
+    const checkpoint = checkpoints.find((item) =>
+      item.stage === stage && item.status === "succeeded" &&
+      typeof item.runId === "string"
+    );
+    if (checkpoint == null) continue;
+    await runtimeApi.writeGraphRagOutputProducerManifest({
+      outputDir: scopedOutputDir,
+      bookId: sync.job.bookId,
+      sourceHash: sync.job.sourceHash,
+      documentId: sync.job.documentId,
+      contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
+      stageFingerprints: sync.stageFingerprints,
+      providerFingerprint: sync.job.providerFingerprint,
+      producerRunId: checkpoint.runId,
+      stage,
+    });
+  }
+}
+
 async function run() {
   const runtimeApi = await importRuntime();
   GraphRagWorkflowNameSchemaRef = runtimeApi.GraphRagWorkflowNameSchema;
@@ -271,6 +304,12 @@ async function run() {
 
   const nextStage = sync.resumePlan.nextStage;
   if (nextStage == null) {
+    await refreshOutputProducerManifestFromCheckpoints(
+      runtimeApi,
+      repo,
+      sync,
+      scopedOutputDir,
+    );
     let queryResult = null;
     if (values.query) {
       queryResult = await runtime.graphQuery({
@@ -302,7 +341,24 @@ async function run() {
   }
 
   if (nextStage === "query_ready") {
+    await refreshOutputProducerManifestFromCheckpoints(
+      runtimeApi,
+      repo,
+      sync,
+      scopedOutputDir,
+    );
     const runId = runtimeApi.createRunId(nextStage);
+    await runtimeApi.writeGraphRagOutputProducerManifest({
+      outputDir: scopedOutputDir,
+      bookId: sync.job.bookId,
+      sourceHash: sync.job.sourceHash,
+      documentId: sync.job.documentId,
+      contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
+      stageFingerprints: sync.stageFingerprints,
+      providerFingerprint: sync.job.providerFingerprint,
+      producerRunId: runId,
+      stage: nextStage,
+    });
     await repo.completeStage({
       bookId: sync.job.bookId,
       stage: nextStage,
@@ -375,10 +431,17 @@ async function run() {
   });
 
   try {
+    const stageLogStartOffset = await runtimeApi.graphRagIndexLogOffset(
+      scopedOutputDir,
+      reportRoot ? join(reportRoot, sync.job.bookId, nextStage) : undefined,
+    );
     const indexResult = await runtime.graphIndex({
       rootDir: stateRoot,
       inputDir: scopedInputDir,
       dataDir: scopedOutputDir,
+      ...(reportRoot
+        ? { reportDir: join(reportRoot, sync.job.bookId, nextStage) }
+        : {}),
       method: "standard",
       indexScope: indexScopeFromSync(sync),
       skipValidation: true,
@@ -388,6 +451,12 @@ async function run() {
         pythonBin,
         workingDirectory,
       },
+    });
+    const stageReportHealth = await runtimeApi.assertGraphRagStageReportHealthy({
+      outputDir: scopedOutputDir,
+      reportDir: reportRoot ? join(reportRoot, sync.job.bookId, nextStage) : undefined,
+      stage: nextStage,
+      logStartOffset: stageLogStartOffset,
     });
 
     await runtimeApi.writeGraphRagOutputProducerManifest({
@@ -399,6 +468,7 @@ async function run() {
       stageFingerprints: sync.stageFingerprints,
       providerFingerprint: sync.job.providerFingerprint,
       producerRunId: runId,
+      stage: nextStage,
     });
 
     const { sync: stageSynced } = await syncCurrentBook(
@@ -428,6 +498,7 @@ async function run() {
         workflows,
         resumedFrom: nextStage,
         graphWorkspace: "book_scoped",
+        stageReportHealth,
       },
     });
 

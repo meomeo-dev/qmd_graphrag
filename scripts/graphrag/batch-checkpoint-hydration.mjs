@@ -16,13 +16,17 @@ export function hydrateBatchCheckpoint({
   const commandChecks = (checkpoint.commandChecks ?? []).map((check) => {
     if (check.status !== "failed") return check;
     const failure = classifyFailure(check.errorSummary ?? checkpoint.errorSummary ?? "");
+    const attemptExhausted = check.attemptExhausted ?? true;
     return {
       ...check,
       failureKind: check.failureKind ?? failure.failureKind,
       retryable: check.retryable ?? failure.retryable,
       retryAfterSeconds: check.retryAfterSeconds ?? failure.retryAfterSeconds,
-      attemptExhausted: check.attemptExhausted ?? true,
+      attemptExhausted,
       providerStatusCode: check.providerStatusCode ?? failure.providerStatusCode,
+      recoveryDecision: check.recoveryDecision ??
+        (attemptExhausted ? "stop_until_fixed" :
+          failure.retryable ? "retry_same_run_id" : "stop_until_fixed"),
     };
   });
   const firstFailedCheck = commandChecks.find((check) => check.status === "failed");
@@ -33,6 +37,7 @@ export function hydrateBatchCheckpoint({
   const inferredFailure = checkpoint.status === "failed"
     ? classifyFailure(failureText)
     : null;
+  const retryable = checkpoint.retryable ?? inferredFailure?.retryable;
   return {
     ...checkpoint,
     sourceHash: checkpoint.sourceHash ?? item.sourceHash,
@@ -49,9 +54,9 @@ export function hydrateBatchCheckpoint({
     retryBudgetSeconds: checkpoint.retryBudgetSeconds ?? retryBudgetSeconds,
     commandTimeoutSeconds: checkpoint.commandTimeoutSeconds ?? commandTimeoutSeconds,
     failureKind: checkpoint.failureKind ?? inferredFailure?.failureKind,
-    retryable: checkpoint.retryable ?? inferredFailure?.retryable,
+    retryable,
     retryExhausted: checkpoint.retryExhausted ??
-      (checkpoint.status === "failed" ? true : undefined),
+      (checkpoint.status === "failed" && retryable === false ? true : undefined),
     recoveryDecision: checkpoint.recoveryDecision ??
       (checkpoint.status === "failed"
         ? (inferredFailure?.retryable ? "retry_same_run_id" : "stop_until_fixed")

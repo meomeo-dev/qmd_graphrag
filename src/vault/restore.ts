@@ -9,6 +9,7 @@ import {
   type BookArtifactManifest,
   BookJobCatalogSchema,
   BookJobCheckpointListSchema,
+  type BookStage,
 } from "../contracts/book-job.js";
 import {
   DocumentIdentityMapSchema,
@@ -291,6 +292,37 @@ async function validateQueryReadyArtifactsForRestore(
   bookId: string,
   artifactIds: readonly string[],
 ): Promise<boolean> {
+  const booksRaw = await readYaml(join(graphVault, "catalog", "books.yaml"));
+  const booksResult = BookJobCatalogSchema.safeParse(booksRaw);
+  if (!booksResult.success) return false;
+  const book = booksResult.data.items.find((item) => item.bookId === bookId);
+  if (
+    book == null ||
+    book.stageFingerprints == null ||
+    book.providerFingerprint == null
+  ) {
+    return false;
+  }
+
+  const checkpointsRaw = await readYaml(
+    join(graphVault, "books", bookId, "checkpoints.yaml"),
+  );
+  const checkpointsResult =
+    BookJobCheckpointListSchema.safeParse(checkpointsRaw);
+  if (!checkpointsResult.success) return false;
+  const checkpointByStage = new Map(
+    checkpointsResult.data.items
+      .filter((checkpoint) => checkpoint.status === "succeeded")
+      .map((checkpoint) => [checkpoint.stage, checkpoint]),
+  );
+  const communityReportRunId = checkpointByStage.get("community_report")?.runId;
+  const embedRunId = checkpointByStage.get("embed")?.runId;
+  if (communityReportRunId == null || embedRunId == null) return false;
+  const expectedProducerRunIds: Partial<Record<BookStage, string>> = {
+    community_report: communityReportRunId,
+    embed: embedRunId,
+  };
+
   const artifactsRaw = await readYaml(
     join(graphVault, "books", bookId, "artifacts.yaml"),
   );
@@ -312,6 +344,11 @@ async function validateQueryReadyArtifactsForRestore(
     artifactIds,
     artifacts: artifacts as BookArtifactManifest[],
     requiredKinds: QUERY_READY_ARTIFACT_KINDS,
+    allowedKinds: QUERY_READY_ARTIFACT_KINDS,
+    requireBookScopedGraphOutput: true,
+    expectedProducerRunIds,
+    expectedStageFingerprints: book.stageFingerprints,
+    expectedProviderFingerprint: book.providerFingerprint,
   });
   return validation.isSatisfied;
 }
@@ -335,6 +372,26 @@ function mergeCapabilities(
     byId.set(capability.capabilityId, capability);
   }
   return [...byId.values()];
+}
+
+async function filterRestorableExplicitCapabilities(input: {
+  graphVault: string;
+  capabilities: readonly GraphCapability[];
+  identities: readonly DocumentIdentityMap[];
+}): Promise<GraphCapability[]> {
+  const result: GraphCapability[] = [];
+  for (const capability of input.capabilities) {
+    if (
+      (await capabilitySourceMaterialFailure(
+        input.graphVault,
+        capability,
+        input.identities,
+      )) == null
+    ) {
+      result.push(capability);
+    }
+  }
+  return result;
 }
 
 export async function restoreFromVault(
@@ -387,7 +444,13 @@ export async function restoreFromVault(
   }
   const [derivedCapabilities, validatedExplicitCapabilities] = await Promise.all([
     loadGraphCapabilities({ graphVault }),
-    loadExplicitCapabilityCatalog(graphVault).catch(() => []),
+    loadExplicitCapabilityCatalog(graphVault)
+      .then((items) => filterRestorableExplicitCapabilities({
+        graphVault,
+        capabilities: items,
+        identities: documentIdentities,
+      }))
+      .catch(() => []),
   ]);
   const restorableCapabilities = mergeCapabilities([
     ...derivedCapabilities,

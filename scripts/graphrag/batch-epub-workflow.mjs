@@ -109,6 +109,7 @@ const commandTimeoutSeconds = Math.max(
 const runnerHost = hostname();
 const runnerPid = process.pid;
 const runnerSessionId = randomUUID();
+const runnerHeartbeatTtlSeconds = Math.max(commandTimeoutSeconds * 2, 3600);
 const failFast = Boolean(values["fail-fast"]);
 const migrateOnly = Boolean(values["migrate-only"]);
 const statusJson = Boolean(values["status-json"]);
@@ -207,6 +208,7 @@ const BatchCommandCheckSchema = z.object({
   retryAfterSeconds: z.number().int().nonnegative().optional(),
   attemptExhausted: z.boolean().optional(),
   providerStatusCode: z.number().int().positive().optional(),
+  recoveryDecision: BatchRecoveryDecisionSchema.optional(),
   errorSummary: z.string().max(1000).optional(),
 });
 const BatchBuildStatusSchema = z.object({
@@ -215,6 +217,91 @@ const BatchBuildStatusSchema = z.object({
   stage: z.string().min(1).optional(),
   reason: z.string().min(1).optional(),
   artifactIds: z.array(z.string().min(1)).default([]),
+});
+const BookStageSchema = z.enum([
+  "ingest",
+  "normalize",
+  "graph_extract",
+  "community_report",
+  "embed",
+  "query_ready",
+]);
+const BookJobSchema = z.object({
+  schemaVersion: z.literal(SchemaVersion),
+  bookId: z.string().min(1),
+  documentId: z.string().min(1),
+  sourcePath: BatchProjectRelativeLocatorSchema,
+  sourceHash: z.string().min(1),
+  normalizedContentHash: z.string().min(1).optional(),
+  normalizedPath: BatchProjectRelativeLocatorSchema.optional(),
+  normalizationPolicyVersion: z.string().min(1).optional(),
+  configFingerprint: z.string().min(1),
+  promptFingerprint: z.string().min(1),
+  modelFingerprint: z.string().min(1),
+  stageFingerprints: z.record(z.string(), z.string().min(1)).optional(),
+  providerFingerprint: z.string().min(1).optional(),
+  currentStage: BookStageSchema.optional(),
+  overallStatus: z.enum(["pending", "running", "partial", "succeeded", "failed"]),
+  lastSuccessRunId: z.string().min(1).optional(),
+  createdAt: z.string().min(1),
+  updatedAt: z.string().min(1),
+  metadata: z.record(z.string(), JsonValueSchema).optional(),
+});
+const BookJobCatalogSchema = z.object({
+  schemaVersion: z.literal(SchemaVersion),
+  items: z.array(BookJobSchema),
+});
+const BookJobStageCheckpointSchema = z.object({
+  schemaVersion: z.literal(SchemaVersion),
+  bookId: z.string().min(1),
+  stage: BookStageSchema,
+  status: z.enum(["pending", "running", "succeeded", "failed", "abandoned"]),
+  attemptCount: z.number().int().nonnegative(),
+  runId: z.string().min(1).optional(),
+  startedAt: z.string().min(1).optional(),
+  finishedAt: z.string().min(1).optional(),
+  inputFingerprint: z.string().min(1),
+  contentHash: z.string().min(1).optional(),
+  stageFingerprint: z.string().min(1).optional(),
+  providerFingerprint: z.string().min(1).optional(),
+  artifactIds: z.array(z.string().min(1)),
+  errorSummary: z.string().min(1).optional(),
+  metadata: z.record(z.string(), JsonValueSchema).optional(),
+});
+const BookJobCheckpointListSchema = z.object({
+  schemaVersion: z.literal(SchemaVersion),
+  items: z.array(BookJobStageCheckpointSchema),
+});
+const BookArtifactManifestSchema = z.object({
+  schemaVersion: z.literal(SchemaVersion),
+  artifactId: z.string().min(1),
+  bookId: z.string().min(1),
+  stage: BookStageSchema,
+  kind: z.string().min(1),
+  path: BatchProjectRelativeLocatorSchema,
+  contentHash: z.string().min(1),
+  stageFingerprint: z.string().min(1).optional(),
+  providerFingerprint: z.string().min(1).optional(),
+  normalizationPolicyVersion: z.string().min(1).optional(),
+  producerRunId: z.string().min(1),
+  createdAt: z.string().min(1),
+  metadata: z.record(z.string(), JsonValueSchema).optional(),
+});
+const BookArtifactManifestListSchema = z.object({
+  schemaVersion: z.literal(SchemaVersion),
+  items: z.array(BookArtifactManifestSchema),
+});
+const GraphRagOutputProducerManifestSchema = z.object({
+  schemaVersion: z.literal(SchemaVersion),
+  bookId: z.string().min(1),
+  sourceHash: z.string().min(1),
+  documentId: z.string().min(1),
+  contentHash: z.string().min(1),
+  stageFingerprints: z.record(z.string(), z.string().min(1)),
+  providerFingerprint: z.string().min(1),
+  outputDir: BatchProjectRelativeLocatorSchema,
+  producerRunId: z.string().min(1),
+  stageProducerRunIds: z.record(z.string(), z.string().min(1)).optional(),
 });
 const BatchItemCheckpointSchema = z.object({
   schemaVersion: z.literal(SchemaVersion),
@@ -256,6 +343,38 @@ const BatchItemCheckpointSchema = z.object({
   errorSummary: z.string().max(1000).optional(),
   commandChecks: z.array(BatchCommandCheckSchema).default([]),
   metadata: z.record(z.string(), JsonValueSchema).optional(),
+}).superRefine((value, ctx) => {
+  if (value.status === "running") {
+    for (const field of [
+      "runnerSessionId",
+      "runnerHost",
+      "runnerPid",
+      "runnerHeartbeatAt",
+    ]) {
+      if (value[field] == null) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `running checkpoint requires ${field}`,
+          path: [field],
+        });
+      }
+    }
+  }
+  if (
+    value.retryExhausted === true &&
+    (
+      value.retryable !== false ||
+      value.recoveryDecision !== "stop_until_fixed"
+    )
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        "retryExhausted checkpoint requires retryable=false and " +
+        "recoveryDecision=stop_until_fixed",
+      path: ["retryExhausted"],
+    });
+  }
 });
 const BatchRunManifestSchema = z.object({
   schemaVersion: z.literal(SchemaVersion),
@@ -311,18 +430,14 @@ const BatchRecoverySummaryItemSchema = z.object({
   bookId: z.string().min(1),
   status: BatchItemStatusSchema,
   attempts: z.number().int().nonnegative(),
-  qmdBuildStatus: z.union([BatchBuildStatusSchema.shape.status, z.literal("unknown")]),
-  graphBuildStatus: z.union([
-    BatchBuildStatusSchema.shape.status,
-    z.literal("unknown"),
-  ]),
-  graphStage: z.string().min(1).optional(),
-  graphReason: z.string().min(1).optional(),
+  qmdBuildStatus: BatchBuildStatusSchema,
+  graphBuildStatus: BatchBuildStatusSchema,
   failureKind: BatchFailureKindSchema.optional(),
   retryable: z.boolean().optional(),
   retryExhausted: z.boolean().optional(),
   recoveryDecision: BatchRecoveryDecisionSchema.optional(),
   failedStage: z.string().min(1).optional(),
+  providerStatusCode: z.number().int().positive().optional(),
   nextRetryAt: z.string().datetime().optional(),
   retryDelaySeconds: z.number().int().nonnegative().optional(),
   retryBudgetSeconds: z.number().int().positive().optional(),
@@ -410,6 +525,10 @@ function transientBudgetAvailable(checkpoint) {
   return elapsedRetrySeconds(checkpoint) < retryBudgetSeconds;
 }
 
+function retryBudgetExhausted(checkpoint) {
+  return !transientBudgetAvailable(checkpoint);
+}
+
 function processAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -422,8 +541,19 @@ function processAlive(pid) {
 
 function runningCheckpointIsOrphaned(checkpoint) {
   if (checkpoint.status !== "running") return false;
-  if (checkpoint.runnerHost == null || checkpoint.runnerPid == null) return true;
-  if (checkpoint.runnerHost !== runnerHost) return true;
+  if (
+    checkpoint.runnerSessionId == null ||
+    checkpoint.runnerHost == null ||
+    checkpoint.runnerPid == null ||
+    checkpoint.runnerHeartbeatAt == null
+  ) {
+    return true;
+  }
+  const heartbeatAgeSeconds =
+    Math.max(0, Math.floor((Date.now() - epochMs(checkpoint.runnerHeartbeatAt)) / 1000));
+  if (heartbeatAgeSeconds > runnerHeartbeatTtlSeconds) return true;
+  if (checkpoint.runnerHost !== runnerHost) return false;
+  if (checkpoint.runnerSessionId === runnerSessionId) return false;
   return !processAlive(checkpoint.runnerPid);
 }
 
@@ -449,6 +579,11 @@ function slugify(name) {
 function redacted(message) {
   return redactExactEnvValues(String(message))
     .split(root).join("[PROJECT_ROOT]")
+    .replace(
+      /(?:\/Users|\/home|\/var|\/tmp|\/private|\/Volumes|\/mnt|\/opt|\/srv|\/data)\/[^\s"'`),\]}]+/g,
+      "[ABS_PATH]",
+    )
+    .replace(/[A-Za-z]:\\[^\s"'`),\]}]+/g, "[ABS_PATH]")
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
     .replace(/(OPENAI_API_KEY|JINA_API_KEY)=\S+/g, "$1=[REDACTED]")
     .replace(/(OPENAI_BASE_URL|JINA_API_BASE)=\S+/g, "$1=[REDACTED]")
@@ -459,6 +594,11 @@ function redacted(message) {
 function redactLog(text) {
   return redactExactEnvValues(String(text))
     .split(root).join("[PROJECT_ROOT]")
+    .replace(
+      /(?:\/Users|\/home|\/var|\/tmp|\/private|\/Volumes|\/mnt|\/opt|\/srv|\/data)\/[^\s"'`),\]}]+/g,
+      "[ABS_PATH]",
+    )
+    .replace(/[A-Za-z]:\\[^\s"'`),\]}]+/g, "[ABS_PATH]")
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
     .replace(/(OPENAI_API_KEY|JINA_API_KEY)=\S+/g, "$1=[REDACTED]")
     .replace(/(OPENAI_BASE_URL|JINA_API_BASE)=\S+/g, "$1=[REDACTED]")
@@ -480,11 +620,51 @@ function redactExactEnvValues(text) {
   return output;
 }
 
+function redactJsonValue(value) {
+  if (typeof value === "string") return redacted(value);
+  if (Array.isArray(value)) return value.map((item) => redactJsonValue(item));
+  if (value != null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        redactJsonValue(item),
+      ]),
+    );
+  }
+  return value;
+}
+
 function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 function ensureDirs() {
+  if (statusJson) {
+    requirePath(stateRoot, "state root");
+    const relativeLogRoot = relative(stateRoot, logRoot);
+    const isInsideStateRoot =
+      relativeLogRoot === "" ||
+      (!relativeLogRoot.startsWith(`..${sep}`) &&
+        relativeLogRoot !== ".." &&
+        !isAbsolute(relativeLogRoot));
+    if (isInsideStateRoot) {
+      throw new Error("--log-root must be outside graph_vault");
+    }
+    if (existsSync(logRoot)) {
+      const realStateRoot = realpathSync(stateRoot);
+      const realLogRoot = realpathSync(logRoot);
+      const relativeRealLogRoot = relative(realStateRoot, realLogRoot);
+      const isReallyInsideStateRoot =
+        relativeRealLogRoot === "" ||
+        (!relativeRealLogRoot.startsWith(`..${sep}`) &&
+          relativeRealLogRoot !== ".." &&
+          !isAbsolute(relativeRealLogRoot));
+      if (isReallyInsideStateRoot) {
+        throw new Error("--log-root must be outside graph_vault");
+      }
+    }
+    return;
+  }
   mkdirSync(stateRoot, { recursive: true });
   const relativeLogRoot = relative(stateRoot, logRoot);
   const isInsideStateRoot =
@@ -545,12 +725,20 @@ function loadDotenv() {
 }
 
 function event(payload) {
+  const sanitizedPayload = {
+    ...payload,
+    message: payload?.message ? redacted(payload.message) : undefined,
+    metadata: payload?.metadata == null
+      ? undefined
+      : redactJsonValue(payload.metadata),
+  };
   const item = BatchEventLogSchema.parse({
     schemaVersion: SchemaVersion,
     runId,
     at: now(),
-    ...withoutUndefined(payload),
+    ...withoutUndefined(sanitizedPayload),
   });
+  if (statusJson) return item;
   writeFileSync(eventsPath, JSON.stringify(item) + "\n", {
     flag: "a",
     encoding: "utf8",
@@ -569,6 +757,7 @@ function readJson(path) {
 
 function writeTypedJson(path, schema, value) {
   const parsed = schema.parse(withoutUndefined(value));
+  if (statusJson) return parsed;
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(parsed, null, 2) + "\n", "utf8");
   return parsed;
@@ -692,6 +881,9 @@ function loadManifest(items) {
     manifest.commandTimeoutSeconds = commandTimeoutSeconds;
     return manifest;
   }
+  if (statusJson) {
+    throw new Error(`missing batch manifest for --status-json: ${manifestPath}`);
+  }
   const manifest = makeManifest(items);
   return writeTypedJson(manifestPath, BatchRunManifestSchema, manifest);
 }
@@ -773,6 +965,13 @@ function hydrateCheckpoint(item, checkpoint) {
   return {
     ...hydrated,
     errorSummary: hydrated.errorSummary ? redacted(hydrated.errorSummary) : undefined,
+    qmdBuildStatus: hydrated.qmdBuildStatus == null
+      ? undefined
+      : redactJsonValue(hydrated.qmdBuildStatus),
+    graphBuildStatus: hydrated.graphBuildStatus == null
+      ? undefined
+      : redactJsonValue(hydrated.graphBuildStatus),
+    metadata: hydrated.metadata == null ? undefined : redactJsonValue(hydrated.metadata),
     commandChecks: (hydrated.commandChecks ?? []).map((check) => ({
       ...check,
       errorSummary: check.errorSummary ? redacted(check.errorSummary) : undefined,
@@ -783,14 +982,19 @@ function hydrateCheckpoint(item, checkpoint) {
 function loadCheckpoint(item, completedSeed) {
   const path = itemPath(item);
   if (!existsSync(path)) {
+    if (statusJson) {
+      return BatchItemCheckpointSchema.parse(defaultCheckpoint(item, completedSeed));
+    }
     const checkpoint = defaultCheckpoint(item, completedSeed);
     return writeTypedJson(path, BatchItemCheckpointSchema, checkpoint);
   }
   const hydrated = hydrateCheckpoint(item, readJson(path));
-  const checkpoint = recoverOrphanedRunningCheckpoint(item, downgradeCompletedIfClosedLoopInvalid(
-    item,
-    hydrated,
-  ));
+  const checkpoint = terminalizeExhaustedRetryCheckpoint(item,
+    recoverOrphanedRunningCheckpoint(item, downgradeCompletedIfClosedLoopInvalid(
+      item,
+      hydrated,
+    )),
+  );
   return writeTypedJson(path, BatchItemCheckpointSchema, checkpoint);
 }
 
@@ -801,6 +1005,17 @@ function saveCheckpoint(item, checkpoint) {
 function readYamlFileIfExists(path) {
   if (!existsSync(path)) return null;
   return YAML.parse(readFileSync(path, "utf8")) ?? null;
+}
+
+function readYamlSchemaIfExists(path, schema) {
+  const raw = readYamlFileIfExists(path);
+  return raw == null ? null : schema.parse(raw);
+}
+
+function readJsonSchemaIfExists(path, schema) {
+  if (!existsSync(path)) return null;
+  const parsed = schema.safeParse(readJson(path));
+  return parsed.success ? parsed.data : null;
 }
 
 const graphStageArtifactKinds = {
@@ -817,11 +1032,27 @@ const graphStageArtifactKinds = {
   embed: ["lancedb_index"],
   query_ready: ["graphrag_community_reports_parquet", "lancedb_index"],
 };
+const graphProducerStages = ["graph_extract", "community_report", "embed"];
+const graphCompletionStages = [
+  "graph_extract",
+  "community_report",
+  "embed",
+  "query_ready",
+];
+const graphIdentityStages = [
+  "ingest",
+  "normalize",
+  ...graphCompletionStages,
+];
 
 function checkpointArtifactIds(checkpoint) {
   return Array.isArray(checkpoint?.artifactIds)
     ? checkpoint.artifactIds.map(String)
     : [];
+}
+
+function graphRagBookOutputLocator(bookId) {
+  return `books/${bookId}/output`;
 }
 
 function artifactExistsForBook(artifact, bookId) {
@@ -831,7 +1062,33 @@ function artifactExistsForBook(artifact, bookId) {
   return existsSync(join(stateRoot, artifact.path));
 }
 
-function validateGraphStageEvidence({ item, stage, checkpoint, artifacts }) {
+function readGraphJob(item) {
+  const catalog = readYamlSchemaIfExists(
+    join(stateRoot, "catalog", "books.yaml"),
+    BookJobCatalogSchema,
+  );
+  const jobs = catalog?.items ?? [];
+  return jobs.find((job) =>
+    job?.bookId === item.bookId && job?.sourceHash === item.sourceHash
+  ) ?? null;
+}
+
+function expectedArtifactStage(stage, artifact) {
+  if (stage !== "query_ready") return stage;
+  return artifact?.stage === "community_report" || artifact?.stage === "embed"
+    ? artifact.stage
+    : undefined;
+}
+
+function validateGraphStageEvidence({
+  item,
+  stage,
+  checkpoint,
+  artifacts,
+  expectedStageFingerprints,
+  expectedProviderFingerprint,
+  expectedProducerRunId,
+}) {
   if (
     checkpoint?.stage !== stage ||
     checkpoint?.status !== "succeeded" ||
@@ -842,6 +1099,39 @@ function validateGraphStageEvidence({ item, stage, checkpoint, artifacts }) {
       reason: checkpoint?.metadata?.bootstrap === true
         ? "bootstrap_stage_requires_real_rebuild"
         : "real_graphrag_stage_missing",
+      artifactIds: checkpointArtifactIds(checkpoint),
+    };
+  }
+
+  if (
+    expectedStageFingerprints != null &&
+    (
+      checkpoint.inputFingerprint !== expectedStageFingerprints[stage] ||
+      checkpoint.stageFingerprint !== expectedStageFingerprints[stage]
+    )
+  ) {
+    return {
+      ok: false,
+      reason: `stage_fingerprint_mismatch:${stage}`,
+      artifactIds: checkpointArtifactIds(checkpoint),
+    };
+  }
+
+  if (
+    expectedProviderFingerprint != null &&
+    checkpoint.providerFingerprint !== expectedProviderFingerprint
+  ) {
+    return {
+      ok: false,
+      reason: `provider_fingerprint_mismatch:${stage}`,
+      artifactIds: checkpointArtifactIds(checkpoint),
+    };
+  }
+
+  if (expectedProducerRunId != null && checkpoint.runId !== expectedProducerRunId) {
+    return {
+      ok: false,
+      reason: `graph_output_producer_run_mismatch:${stage}`,
       artifactIds: checkpointArtifactIds(checkpoint),
     };
   }
@@ -860,6 +1150,13 @@ function validateGraphStageEvidence({ item, stage, checkpoint, artifacts }) {
       String(artifact?.artifactId) === artifactId
     ))
     .filter((artifact) => artifactExistsForBook(artifact, item.bookId));
+  if (stageArtifacts.length !== artifactIds.length) {
+    return {
+      ok: false,
+      reason: "stage_artifact_missing",
+      artifactIds,
+    };
+  }
   const artifactKinds = new Set(stageArtifacts.map((artifact) => artifact.kind));
   const missingKind = graphStageArtifactKinds[stage].find((kind) =>
     !artifactKinds.has(kind)
@@ -870,6 +1167,56 @@ function validateGraphStageEvidence({ item, stage, checkpoint, artifacts }) {
       reason: `stage_artifact_kind_missing:${missingKind}`,
       artifactIds,
     };
+  }
+
+  const invalidArtifactStage = stageArtifacts.find((artifact) =>
+    expectedArtifactStage(stage, artifact) == null
+  );
+  if (invalidArtifactStage) {
+    return {
+      ok: false,
+      reason: `stage_artifact_stage_mismatch:${stage}`,
+      artifactIds,
+    };
+  }
+
+  const invalidArtifactProducer = stage !== "query_ready"
+    ? stageArtifacts.find((artifact) => artifact.producerRunId !== checkpoint.runId)
+    : null;
+  if (invalidArtifactProducer) {
+    return {
+      ok: false,
+      reason: `stage_artifact_producer_run_mismatch:${stage}`,
+      artifactIds,
+    };
+  }
+
+  if (expectedStageFingerprints != null) {
+    const invalidArtifactFingerprint = stageArtifacts.find((artifact) => {
+      const artifactStage = expectedArtifactStage(stage, artifact);
+      return artifactStage == null ||
+        artifact.stageFingerprint !== expectedStageFingerprints[artifactStage];
+    });
+    if (invalidArtifactFingerprint) {
+      return {
+        ok: false,
+        reason: `stage_artifact_fingerprint_mismatch:${stage}`,
+        artifactIds,
+      };
+    }
+  }
+
+  if (expectedProviderFingerprint != null) {
+    const invalidArtifactProvider = stageArtifacts.find((artifact) =>
+      artifact.providerFingerprint !== expectedProviderFingerprint
+    );
+    if (invalidArtifactProvider) {
+      return {
+        ok: false,
+        reason: `stage_artifact_provider_mismatch:${stage}`,
+        artifactIds,
+      };
+    }
   }
 
   const invalidPath = stageArtifacts.find((artifact) =>
@@ -890,28 +1237,43 @@ function validateGraphStageEvidence({ item, stage, checkpoint, artifacts }) {
 
 function graphBuildEvidence(item) {
   const checkedAt = now();
-  const checkpointCatalog = readYamlFileIfExists(
+  const checkpointCatalog = readYamlSchemaIfExists(
     join(stateRoot, "books", item.bookId, "checkpoints.yaml"),
+    BookJobCheckpointListSchema,
   );
-  const artifactCatalog = readYamlFileIfExists(
+  const artifactCatalog = readYamlSchemaIfExists(
     join(stateRoot, "books", item.bookId, "artifacts.yaml"),
+    BookArtifactManifestListSchema,
   );
-  const checkpoints = Array.isArray(checkpointCatalog?.items)
-    ? checkpointCatalog.items
-    : [];
-  const artifacts = Array.isArray(artifactCatalog?.items) ? artifactCatalog.items : [];
+  const checkpoints = checkpointCatalog?.items ?? [];
+  const artifacts = artifactCatalog?.items ?? [];
+  const producerManifestPath = join(
+    stateRoot,
+    "books",
+    item.bookId,
+    "output",
+    "qmd_output_manifest.json",
+  );
+  const producer = readJsonSchemaIfExists(
+    producerManifestPath,
+    GraphRagOutputProducerManifestSchema,
+  );
+  const job = readGraphJob(item);
+  const expectedStageFingerprints = job?.stageFingerprints ?? producer?.stageFingerprints;
+  const expectedProviderFingerprint = job?.providerFingerprint ??
+    producer?.providerFingerprint;
 
-  for (const stage of [
-    "graph_extract",
-    "community_report",
-    "embed",
-    "query_ready",
-  ]) {
+  for (const stage of graphCompletionStages) {
     const stageEvidence = validateGraphStageEvidence({
       item,
       stage,
       checkpoint: checkpoints.find((checkpoint) => checkpoint?.stage === stage),
       artifacts,
+      expectedStageFingerprints,
+      expectedProviderFingerprint,
+      expectedProducerRunId: graphProducerStages.includes(stage)
+        ? producer?.stageProducerRunIds?.[stage]
+        : undefined,
     });
     if (!stageEvidence.ok) {
       return {
@@ -926,26 +1288,47 @@ function graphBuildEvidence(item) {
     }
   }
 
-  const producerManifestPath = join(
-    stateRoot,
-    "books",
-    item.bookId,
-    "output",
-    "qmd_output_manifest.json",
+  const expectedOutputLocator = graphRagBookOutputLocator(item.bookId);
+  const expectedContentHash = job?.normalizedContentHash ?? job?.sourceHash;
+  const missingStageProducerRun = graphProducerStages.find((stage) =>
+    typeof producer?.stageProducerRunIds?.[stage] !== "string"
   );
-  const producer = existsSync(producerManifestPath)
-    ? readJson(producerManifestPath)
-    : null;
+  const mismatchedStageProducerRun = graphProducerStages.find((stage) => {
+    const stageCheckpoint = checkpoints.find((checkpoint) =>
+      checkpoint?.stage === stage && checkpoint?.status === "succeeded"
+    );
+    return producer?.stageProducerRunIds?.[stage] !== stageCheckpoint?.runId;
+  });
+  const missingStageFingerprint = graphIdentityStages.find((stage) =>
+    typeof producer?.stageFingerprints?.[stage] !== "string" ||
+    (expectedStageFingerprints != null &&
+      producer.stageFingerprints[stage] !== expectedStageFingerprints[stage])
+  );
   if (
+    job == null ||
     producer?.bookId !== item.bookId ||
     producer?.sourceHash !== item.sourceHash ||
-    producer?.outputDir !== join(stateRoot, "books", item.bookId, "output")
+    producer?.documentId !== job.documentId ||
+    producer?.contentHash !== expectedContentHash ||
+    producer?.providerFingerprint !== expectedProviderFingerprint ||
+    producer?.outputDir !== expectedOutputLocator ||
+    missingStageProducerRun != null ||
+    mismatchedStageProducerRun != null ||
+    missingStageFingerprint != null
   ) {
     return {
       status: "stale",
       checkedAt,
       stage: "query_ready",
-      reason: "graph_output_producer_manifest_missing_or_mismatched",
+      reason: job == null
+        ? "graph_job_identity_missing"
+        : missingStageProducerRun != null
+          ? `graph_output_producer_stage_missing:${missingStageProducerRun}`
+          : mismatchedStageProducerRun != null
+            ? `graph_output_producer_run_mismatch:${mismatchedStageProducerRun}`
+            : missingStageFingerprint != null
+              ? `graph_output_producer_fingerprint_mismatch:${missingStageFingerprint}`
+              : "graph_output_producer_manifest_missing_or_mismatched",
       artifactIds: checkpointArtifactIds(
         checkpoints.find((checkpoint) => checkpoint?.stage === "query_ready"),
       ),
@@ -967,14 +1350,17 @@ function qmdBuildEvidence(checkpoint) {
   const checkedAt = now();
   const checks = checkpoint.commandChecks ?? [];
   const names = new Set(checks.map((check) => check.name));
-  const qmdRequired = [
-    "qmd-update",
-    "qmd-embed",
-    "qmd-search-json",
-    "qmd-vsearch-json",
-    "qmd-query-json",
-  ];
-  const missing = qmdRequired.find((name) => !names.has(name));
+  const failed = checks.find((check) => check.status !== "passed");
+  if (failed) {
+    return {
+      status: "failed",
+      checkedAt,
+      stage: failed.name,
+      reason: "qmd_command_check_failed",
+      artifactIds: [],
+    };
+  }
+  const missing = requiredCommandCheckNames.find((name) => !names.has(name));
   if (missing) {
     return {
       status: "pending",
@@ -984,15 +1370,21 @@ function qmdBuildEvidence(checkpoint) {
       artifactIds: [],
     };
   }
-  const failed = checks.find((check) =>
-    qmdRequired.includes(check.name) && check.status !== "passed"
+  const unexpected = checks.find((check) =>
+    !requiredCommandCheckNames.includes(check.name)
   );
-  if (failed) {
+  if (
+    unexpected ||
+    checks.length !== expectedCommandCheckCount ||
+    names.size !== expectedCommandCheckCount
+  ) {
     return {
-      status: "failed",
+      status: "pending",
       checkedAt,
-      stage: failed.name,
-      reason: "qmd_build_check_failed",
+      stage: unexpected?.name ?? "qmd-command-checks",
+      reason: unexpected
+        ? "qmd_build_check_unexpected"
+        : "qmd_build_check_set_incomplete",
       artifactIds: [],
     };
   }
@@ -1006,7 +1398,7 @@ function qmdBuildEvidence(checkpoint) {
 
 function downgradeCompletedIfClosedLoopInvalid(item, checkpoint) {
   if (checkpoint.status !== "completed") return checkpoint;
-  const qmdBuildStatus = checkpoint.qmdBuildStatus ?? qmdBuildEvidence(checkpoint);
+  const qmdBuildStatus = qmdBuildEvidence(checkpoint);
   const graphBuildStatus = graphBuildEvidence(item);
   if (
     qmdBuildStatus.status === "succeeded" &&
@@ -1091,6 +1483,44 @@ function recoverOrphanedRunningCheckpoint(item, checkpoint) {
   return recovered;
 }
 
+function terminalizeExhaustedRetryCheckpoint(item, checkpoint) {
+  if (
+    !["failed", "pending"].includes(checkpoint.status) ||
+    checkpoint.retryable !== true ||
+    checkpoint.failureKind !== "transient" ||
+    !(checkpoint.retryExhausted === true || retryBudgetExhausted(checkpoint))
+  ) {
+    return checkpoint;
+  }
+  const terminal = {
+    ...checkpoint,
+    status: "failed",
+    failedAt: checkpoint.failedAt ?? now(),
+    retryable: false,
+    retryExhausted: true,
+    recoveryDecision: "stop_until_fixed",
+    nextRetryAt: undefined,
+    retryDelaySeconds: undefined,
+    runnerHeartbeatAt: now(),
+  };
+  event({
+    itemId: item.itemId,
+    event: "item_retry_exhausted",
+    status: "failed",
+    message: terminal.errorSummary,
+    failureKind: terminal.failureKind,
+    retryable: false,
+    attemptExhausted: true,
+    recoveryDecision: "stop_until_fixed",
+    failedStage: terminal.failedStage,
+    metadata: {
+      retryBudgetSeconds,
+      elapsedRetrySeconds: elapsedRetrySeconds(terminal),
+    },
+  });
+  return terminal;
+}
+
 function updateManifest(manifest, checkpoints) {
   manifest.totalItems = checkpoints.length;
   manifest.itemIds = checkpoints.map((item) => item.itemId);
@@ -1135,33 +1565,39 @@ function updateManifest(manifest, checkpoints) {
 }
 
 function buildRecoverySummary(manifest, checkpoints) {
-  const items = checkpoints.map((item) => withoutUndefined({
-    itemId: item.itemId,
-    sourceName: item.sourceName,
-    bookId: item.bookId,
-    status: item.status,
-    attempts: item.attempts,
-    qmdBuildStatus: item.qmdBuildStatus?.status ?? "unknown",
-    graphBuildStatus: item.graphBuildStatus?.status ?? "unknown",
-    graphStage: item.graphBuildStatus?.stage,
-    graphReason: item.graphBuildStatus?.reason,
-    failureKind: item.failureKind,
-    retryable: item.retryable,
-    retryExhausted: item.retryExhausted,
-    recoveryDecision: item.recoveryDecision,
-    failedStage: item.failedStage,
-    nextRetryAt: item.nextRetryAt,
-    retryDelaySeconds: item.retryDelaySeconds,
-    retryBudgetSeconds: item.retryBudgetSeconds,
-    runnerSessionId: item.runnerSessionId,
-    runnerHost: item.runnerHost,
-    runnerPid: item.runnerPid,
-    runnerHeartbeatAt: item.runnerHeartbeatAt,
-    orphanedRunnerDetectedAt: item.orphanedRunnerDetectedAt,
-    waitingForProviderRecovery:
-      item.metadata?.waitingForProviderRecovery === true,
-    errorSummary: item.errorSummary,
-  }));
+  const items = checkpoints.map((item) => {
+    const qmdStatus = qmdBuildEvidence(item);
+    const graphStatus = graphBuildEvidence(item);
+    const failedCommand = (item.commandChecks ?? []).find((check) =>
+      check.status === "failed"
+    );
+    return withoutUndefined({
+      itemId: item.itemId,
+      sourceName: item.sourceName,
+      bookId: item.bookId,
+      status: item.status,
+      attempts: item.attempts,
+      qmdBuildStatus: redactJsonValue(qmdStatus),
+      graphBuildStatus: redactJsonValue(graphStatus),
+      failureKind: item.failureKind,
+      retryable: item.retryable,
+      retryExhausted: item.retryExhausted,
+      recoveryDecision: item.recoveryDecision,
+      failedStage: item.failedStage,
+      providerStatusCode: failedCommand?.providerStatusCode,
+      nextRetryAt: item.nextRetryAt,
+      retryDelaySeconds: item.retryDelaySeconds,
+      retryBudgetSeconds: item.retryBudgetSeconds,
+      runnerSessionId: item.runnerSessionId,
+      runnerHost: item.runnerHost,
+      runnerPid: item.runnerPid,
+      runnerHeartbeatAt: item.runnerHeartbeatAt,
+      orphanedRunnerDetectedAt: item.orphanedRunnerDetectedAt,
+      waitingForProviderRecovery:
+        item.metadata?.waitingForProviderRecovery === true,
+      errorSummary: item.errorSummary ? redacted(item.errorSummary) : undefined,
+    });
+  });
   const counts = items.reduce((acc, item) => {
     acc[item.status] = (acc[item.status] ?? 0) + 1;
     return acc;
@@ -1242,32 +1678,42 @@ function migrateEventLog(checkpoints) {
     .filter((line) => line.trim().length > 0);
   const migrated = lines.map((line) => {
     const item = BatchEventLogSchema.parse(JSON.parse(line));
+    const sanitized = BatchEventLogSchema.parse({
+      ...item,
+      message: item.message ? redacted(item.message) : undefined,
+      metadata: item.metadata == null ? undefined : redactJsonValue(item.metadata),
+    });
     const checkpoint = item.itemId ? byItemId.get(item.itemId) : undefined;
     const check = checkpoint?.commandChecks?.find((value) =>
-      value.status === "failed" && (!item.command || value.name === item.command),
+      value.status === "failed" && (!sanitized.command || value.name === sanitized.command),
     );
     const isFailureEvent = [
       "command_failed",
       "command_retry_exhausted",
       "item_failed",
-    ].includes(item.event);
-    if (!isFailureEvent || !checkpoint) return item;
-    const retryable = item.retryable ?? check?.retryable ?? checkpoint.retryable;
-    const failureKind = item.failureKind ?? check?.failureKind ?? checkpoint.failureKind;
-    const failedStage = item.failedStage ?? check?.name ?? checkpoint.failedStage;
+    ].includes(sanitized.event);
+    if (!isFailureEvent || !checkpoint) return sanitized;
+    const retryable = sanitized.retryable ?? check?.retryable ?? checkpoint.retryable;
+    const failureKind = sanitized.failureKind ?? check?.failureKind ?? checkpoint.failureKind;
+    const failedStage = sanitized.failedStage ?? check?.name ?? checkpoint.failedStage;
+    const attemptExhausted = sanitized.attemptExhausted ??
+      (sanitized.event === "command_failed" &&
+        typeof sanitized.metadata?.attempt === "number"
+        ? sanitized.metadata.attempt >= (check?.attempts ?? maxCommandAttempts)
+        : check?.attemptExhausted ?? checkpoint.retryExhausted);
     return BatchEventLogSchema.parse({
-      ...item,
-      message: item.message ? redacted(item.message) : undefined,
+      ...sanitized,
       failureKind,
       retryable,
-      retryAfterSeconds: item.retryAfterSeconds ?? check?.retryAfterSeconds,
-      attemptExhausted: item.attemptExhausted ??
-        (item.event === "command_failed" && typeof item.metadata?.attempt === "number"
-          ? item.metadata.attempt >= (check?.attempts ?? maxCommandAttempts)
-          : check?.attemptExhausted ?? checkpoint.retryExhausted),
-      providerStatusCode: item.providerStatusCode ?? check?.providerStatusCode,
-      recoveryDecision: item.recoveryDecision ??
-        (retryable ? "retry_same_run_id" : "stop_until_fixed"),
+      retryAfterSeconds: sanitized.retryAfterSeconds ?? check?.retryAfterSeconds,
+      attemptExhausted,
+      providerStatusCode: sanitized.providerStatusCode ?? check?.providerStatusCode,
+      recoveryDecision: sanitized.event === "command_retry_exhausted"
+        ? "stop_until_fixed"
+        : attemptExhausted === true
+        ? "stop_until_fixed"
+        : sanitized.recoveryDecision ??
+          (retryable ? "retry_same_run_id" : "stop_until_fixed"),
       failedStage,
     });
   });
@@ -1291,9 +1737,7 @@ function migrateEventLog(checkpoints) {
         retryAfterSeconds: check.retryAfterSeconds,
         attemptExhausted: true,
         providerStatusCode: check.providerStatusCode,
-        recoveryDecision: (check.retryable ?? checkpoint.retryable)
-          ? "retry_same_run_id"
-          : "stop_until_fixed",
+        recoveryDecision: "stop_until_fixed",
         failedStage: check.name,
         at: checkpoint.failedAt ?? check.completedAt ?? now(),
         message: check.errorSummary ?? checkpoint.errorSummary,
@@ -1310,21 +1754,45 @@ function migrateEventLog(checkpoints) {
 }
 
 function migrateGraphVaultRawLogs() {
-  const reportsDir = join(stateRoot, "reports");
-  if (!existsSync(reportsDir)) return;
   const targetDir = join(logRoot, "graph_vault_reports");
-  mkdirSync(targetDir, { recursive: true });
-  for (const name of readdirSync(reportsDir)) {
-    if (!name.endsWith(".log")) continue;
-    const source = join(reportsDir, name);
-    const target = join(targetDir, `${Date.now()}-${name}`);
-    renameSync(source, target);
+  const migrateDir = (reportsDir, sourceLocatorPrefix) => {
+    if (!existsSync(reportsDir)) return;
+    mkdirSync(targetDir, { recursive: true });
+    for (const name of readdirSync(reportsDir)) {
+      const source = join(reportsDir, name);
+      if (!name.endsWith(".log")) continue;
+      const target = join(targetDir, `${Date.now()}-${name}`);
+      renameSync(source, target);
+      event({
+        event: "raw_log_migrated",
+        metadata: {
+          sourceLocator: `${sourceLocatorPrefix}/${name}`,
+          targetLogRootName: basename(logRoot),
+          targetFileName: basename(target),
+        },
+      });
+    }
+  };
+  migrateDir(join(stateRoot, "reports"), "graph_vault/reports");
+  for (const item of discoverItems()) {
+    migrateDir(
+      join(stateRoot, "books", item.bookId, "output", "reports"),
+      `graph_vault/books/${item.bookId}/output/reports`,
+    );
+  }
+}
+
+function assertNoBookScopedRawReports() {
+  for (const item of discoverItems()) {
+    const reportsDir = join(stateRoot, "books", item.bookId, "output", "reports");
+    if (!existsSync(reportsDir)) continue;
+    const logNames = readdirSync(reportsDir).filter((name) => name.endsWith(".log"));
+    if (logNames.length === 0) continue;
     event({
-      event: "raw_log_migrated",
+      event: "raw_log_residual_detected",
       metadata: {
-        sourceLocator: `graph_vault/reports/${name}`,
-        targetLogRootName: basename(logRoot),
-        targetFileName: basename(target),
+        sourceLocator: `graph_vault/books/${item.bookId}/output/reports`,
+        logCount: logNames.length,
       },
     });
   }
@@ -1390,6 +1858,9 @@ function runCommand(item, name, command, args, options = {}) {
       Boolean(failure?.retryable) &&
       attempt < attempts &&
       (!options.allowTransientBudget || transientBudgetAvailable(options.checkpoint));
+    const recoveryDecision = shouldRetry
+      ? "retry_same_run_id"
+      : "stop_until_fixed";
     const nextRetryAt = shouldRetry ? isoAfterSeconds(retryDelaySeconds) : undefined;
     const check = {
       name,
@@ -1407,6 +1878,7 @@ function runCommand(item, name, command, args, options = {}) {
             nextRetryAt,
             retryDelaySeconds,
             attemptExhausted: !shouldRetry,
+            recoveryDecision,
             errorSummary: redacted(failureText),
           }),
     };
@@ -1425,7 +1897,8 @@ function runCommand(item, name, command, args, options = {}) {
       retryAfterSeconds: check.retryAfterSeconds,
       attemptExhausted: check.attemptExhausted,
       providerStatusCode: check.providerStatusCode,
-      recoveryDecision: check.retryable ? "retry_same_run_id" : "stop_until_fixed",
+      recoveryDecision: check.recoveryDecision ??
+        (check.retryable ? "retry_same_run_id" : "stop_until_fixed"),
       failedStage: name,
       metadata: {
         attempt,
@@ -1459,6 +1932,9 @@ function runCommand(item, name, command, args, options = {}) {
         commandTimeoutSeconds,
       },
     });
+    if (options.allowTransientBudget) {
+      throw Object.assign(new Error(check.errorSummary), { commandCheck: check });
+    }
     sleep(delayMs);
   }
   const summary = last?.check?.errorSummary ?? `${name} failed`;
@@ -1472,7 +1948,7 @@ function runCommand(item, name, command, args, options = {}) {
       retryAfterSeconds: last.check.retryAfterSeconds,
       attemptExhausted: true,
       providerStatusCode: last.check.providerStatusCode,
-      recoveryDecision: last.check.retryable ? "retry_same_run_id" : "stop_until_fixed",
+      recoveryDecision: "stop_until_fixed",
       failedStage: name,
       message: last.check.errorSummary,
       metadata: {
@@ -1646,6 +2122,8 @@ function runGraphResume(item, checkpoint) {
       configPath,
       "--python-bin",
       pythonBin,
+      "--report-root",
+      join(logRoot, "graphrag-reports"),
       "--working-directory",
       root,
       "--query",
@@ -2012,6 +2490,36 @@ function main() {
         continue;
       }
       if (checkpoint?.status === "failed" && checkpoint.retryable === true) {
+        if (checkpoint.retryExhausted === true || retryBudgetExhausted(checkpoint)) {
+          event({
+            itemId: item.itemId,
+            event: "item_retry_exhausted",
+            status: "failed",
+            failureKind: checkpoint.failureKind ?? "transient",
+            retryable: false,
+            attemptExhausted: true,
+            recoveryDecision: "stop_until_fixed",
+            failedStage: checkpoint.failedStage,
+            message: checkpoint.errorSummary,
+            metadata: {
+              retryBudgetSeconds,
+              elapsedRetrySeconds: elapsedRetrySeconds(checkpoint),
+            },
+          });
+          const terminal = {
+            ...checkpoint,
+            retryable: false,
+            retryExhausted: true,
+            recoveryDecision: "stop_until_fixed",
+            nextRetryAt: undefined,
+            retryDelaySeconds: undefined,
+            runnerHeartbeatAt: now(),
+          };
+          saveCheckpoint(item, terminal);
+          checkpoints.set(item.itemId, terminal);
+          manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+          continue;
+        }
         event({
           itemId: item.itemId,
           event: "item_retry_same_run_id",
@@ -2021,6 +2529,34 @@ function main() {
           recoveryDecision: "retry_same_run_id",
           failedStage: checkpoint.failedStage,
         });
+      }
+      if (
+        checkpoint?.status === "pending" &&
+        checkpoint.retryable === true &&
+        checkpoint.failureKind === "transient" &&
+        (checkpoint.retryExhausted === true || retryBudgetExhausted(checkpoint))
+      ) {
+        const terminal = terminalizeExhaustedRetryCheckpoint(item, checkpoint);
+        saveCheckpoint(item, terminal);
+        checkpoints.set(item.itemId, terminal);
+        manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+        continue;
+      }
+      if (checkpoint?.status === "running") {
+        event({
+          itemId: item.itemId,
+          event: "item_running_observed",
+          status: "running",
+          recoveryDecision: "continue_pending",
+          metadata: {
+            runnerSessionId: checkpoint.runnerSessionId,
+            runnerHost: checkpoint.runnerHost,
+            runnerPid: checkpoint.runnerPid,
+            runnerHeartbeatAt: checkpoint.runnerHeartbeatAt,
+            runnerHeartbeatTtlSeconds,
+          },
+        });
+        continue;
       }
 
       try {
@@ -2083,18 +2619,25 @@ function main() {
           failedAt: now(),
           errorSummary: redacted(error instanceof Error ? error.message : String(error)),
           failureKind,
-          retryable,
-          retryExhausted: Boolean(commandCheck?.attemptExhausted),
-          recoveryDecision: retryable ? "retry_same_run_id" : "stop_until_fixed",
-    failedStage: commandCheck?.name,
-    nextRetryAt: commandCheck?.nextRetryAt,
-    retryDelaySeconds: commandCheck?.retryDelaySeconds,
-    runnerHeartbeatAt: now(),
-  };
+          retryable: false,
+          retryExhausted: Boolean(commandCheck?.attemptExhausted) ||
+            (retryable && failureKind === "transient"),
+          recoveryDecision: "stop_until_fixed",
+          failedStage: commandCheck?.name,
+          nextRetryAt: undefined,
+          retryDelaySeconds: undefined,
+          runnerHeartbeatAt: now(),
+        };
         if (commandCheck) {
           failed.commandChecks = [
             ...(failed.commandChecks ?? []),
-            commandCheck,
+            commandCheck.status === "failed"
+              ? {
+                  ...commandCheck,
+                  recoveryDecision: commandCheck.recoveryDecision ??
+                    failed.recoveryDecision,
+                }
+              : commandCheck,
           ];
         }
         saveCheckpoint(item, failed);
@@ -2123,6 +2666,7 @@ function main() {
   }
 
   migrateGraphVaultRawLogs();
+  assertNoBookScopedRawReports();
   manifest = updateManifest(manifest, Array.from(checkpoints.values()));
   const summary = writeRecoverySummary(manifest, Array.from(checkpoints.values()));
   if (manifest.status === "completed") {

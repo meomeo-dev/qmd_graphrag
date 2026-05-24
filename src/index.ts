@@ -240,6 +240,7 @@ import type {
 import type {
   GraphRagBookWorkspacePaths,
   GraphRagBookWorkspaceState,
+  GraphRagStageReportHealth,
   GraphRagTextUnitIdentity,
   SyncGraphRagBookWorkspaceInput,
 } from "./job-state/graphrag-book.js";
@@ -382,6 +383,7 @@ export type {
   RouteQueryServices,
   GraphRagBookWorkspacePaths,
   GraphRagBookWorkspaceState,
+  GraphRagStageReportHealth,
   GraphRagTextUnitIdentity,
   SyncGraphRagBookWorkspaceInput,
   DataBusEnvelope,
@@ -678,6 +680,9 @@ export {
   type StartStageInput,
 } from "./job-state/repository.js";
 export {
+  assertGraphRagStageReportHealthy,
+  checkGraphRagStageReportHealth,
+  graphRagIndexLogOffset,
   graphRagBookInputDir,
   graphRagBookOutputDir,
   assertGraphRagStageArtifactsReady,

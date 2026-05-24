@@ -58,6 +58,36 @@ async function writeCompleteLanceDbFixture(root: string): Promise<void> {
   }
 }
 
+function bookScopedOutputDir(graphVault: string, bookId: string): string {
+  return join(graphVault, "books", bookId, "output");
+}
+
+async function completeGraphQueryProducerStages(input: {
+  repo: FileBookJobStateRepository;
+  bookId: string;
+  reportArtifactId: string;
+  lancedbArtifactId: string;
+  communityReportRunId?: string;
+  embedRunId?: string;
+  communityReportFingerprint?: string;
+  embedFingerprint?: string;
+}): Promise<void> {
+  await input.repo.completeStage({
+    bookId: input.bookId,
+    stage: "community_report",
+    runId: input.communityReportRunId ?? "run-community-report-1",
+    inputFingerprint: input.communityReportFingerprint ?? "fp-community-report",
+    artifactIds: [input.reportArtifactId],
+  });
+  await input.repo.completeStage({
+    bookId: input.bookId,
+    stage: "embed",
+    runId: input.embedRunId ?? "run-embed-1",
+    inputFingerprint: input.embedFingerprint ?? "fp-embed",
+    artifactIds: [input.lancedbArtifactId],
+  });
+}
+
 describe("FileBookJobStateRepository", () => {
   test("registers a book and persists catalog entry", async () => {
     const root = await createFixtureDir();
@@ -134,14 +164,9 @@ describe("FileBookJobStateRepository", () => {
       const graphVault = join(root, "graph_vault");
       const repo = new FileBookJobStateRepository(graphVault);
       const sourcePath = join(root, "book.epub");
-      const reportsPath = join(graphVault, "output", "community_reports.parquet");
-      const lancedbPath = join(graphVault, "output", "lancedb");
       await mkdir(join(graphVault, "input"), { recursive: true });
-      await mkdir(join(graphVault, "output"), { recursive: true });
       await writeFile(sourcePath, "fixture epub content", "utf8");
       await writeFile(join(graphVault, "input", "book.md"), "# Book", "utf8");
-      await writeFile(reportsPath, "reports", "utf8");
-      await writeCompleteLanceDbFixture(lancedbPath);
 
       const job = await repo.registerBookSource({
         sourcePath,
@@ -162,6 +187,12 @@ describe("FileBookJobStateRepository", () => {
       expect(request.documentId).toBe(job.documentId);
       expect(request.methods).toEqual(["local"]);
 
+      const outputDir = bookScopedOutputDir(graphVault, job.bookId);
+      const reportsPath = join(outputDir, "community_reports.parquet");
+      const lancedbPath = join(outputDir, "lancedb");
+      await mkdir(outputDir, { recursive: true });
+      await writeFile(reportsPath, "reports", "utf8");
+      await writeCompleteLanceDbFixture(lancedbPath);
       const reportHash = await hashFile(reportsPath);
       const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
       const artifacts = await repo.recordArtifacts(job.bookId, [
@@ -170,16 +201,22 @@ describe("FileBookJobStateRepository", () => {
           kind: "graphrag_community_reports_parquet",
           path: reportsPath,
           contentHash: reportHash,
-          producerRunId: "run-query-ready-1",
+          producerRunId: "run-community-report-1",
         },
         {
           stage: "embed",
           kind: "lancedb_index",
           path: lancedbPath,
           contentHash: lancedbHash,
-          producerRunId: "run-query-ready-1",
+          producerRunId: "run-embed-1",
         },
       ]);
+      await completeGraphQueryProducerStages({
+        repo,
+        bookId: job.bookId,
+        reportArtifactId: artifacts[0]!.artifactId,
+        lancedbArtifactId: artifacts[1]!.artifactId,
+      });
       await repo.recordGraphTextUnitIdentity({
         schemaVersion: SchemaVersion,
         bookId: job.bookId,
@@ -223,13 +260,7 @@ describe("FileBookJobStateRepository", () => {
       const graphVault = join(root, "graph_vault");
       const repo = new FileBookJobStateRepository(graphVault);
       const sourcePath = join(root, "book.epub");
-      const reportsPath = join(graphVault, "output", "community_reports.parquet");
-      const lancedbPath = join(graphVault, "output", "lancedb");
       await writeFile(sourcePath, "fixture epub content", "utf8");
-      await writeCompleteLanceDbFixture(lancedbPath);
-      await writeFile(reportsPath, "reports", "utf8");
-      const reportHash = await hashFile(reportsPath);
-      const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
 
       const job = await repo.registerBookSource({
         sourcePath,
@@ -238,22 +269,36 @@ describe("FileBookJobStateRepository", () => {
         promptFingerprint: "prompt-1",
         modelFingerprint: "model-1",
       });
+      const outputDir = bookScopedOutputDir(graphVault, job.bookId);
+      const reportsPath = join(outputDir, "community_reports.parquet");
+      const lancedbPath = join(outputDir, "lancedb");
+      await mkdir(outputDir, { recursive: true });
+      await writeCompleteLanceDbFixture(lancedbPath);
+      await writeFile(reportsPath, "reports", "utf8");
+      const reportHash = await hashFile(reportsPath);
+      const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
       const artifacts = await repo.recordArtifacts(job.bookId, [
         {
           stage: "community_report",
           kind: "graphrag_community_reports_parquet",
           path: reportsPath,
           contentHash: reportHash,
-          producerRunId: "run-query-ready-1",
+          producerRunId: "run-community-report-1",
         },
         {
           stage: "embed",
           kind: "lancedb_index",
           path: lancedbPath,
           contentHash: lancedbHash,
-          producerRunId: "run-query-ready-1",
+          producerRunId: "run-embed-1",
         },
       ]);
+      await completeGraphQueryProducerStages({
+        repo,
+        bookId: job.bookId,
+        reportArtifactId: artifacts[0]!.artifactId,
+        lancedbArtifactId: artifacts[1]!.artifactId,
+      });
       await repo.recordGraphTextUnitIdentity({
         schemaVersion: SchemaVersion,
         bookId: job.bookId,
@@ -286,6 +331,167 @@ describe("FileBookJobStateRepository", () => {
 
       expect(state.status).toBe("not_ready");
       expect(state.capabilityIds).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("graph enhancement state rejects legacy query-ready without producer checkpoints", async () => {
+    const root = await createFixtureDir();
+    try {
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "fixture epub content", "utf8");
+
+      const job = await repo.registerBookSource({
+        sourcePath,
+        normalizedContentHash: "normalized-content-hash",
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+      });
+      const outputDir = bookScopedOutputDir(graphVault, job.bookId);
+      const reportsPath = join(outputDir, "community_reports.parquet");
+      const lancedbPath = join(outputDir, "lancedb");
+      await mkdir(outputDir, { recursive: true });
+      await writeFile(reportsPath, "reports", "utf8");
+      await writeCompleteLanceDbFixture(lancedbPath);
+      const artifacts = await repo.recordArtifacts(job.bookId, [
+        {
+          stage: "community_report",
+          kind: "graphrag_community_reports_parquet",
+          path: reportsPath,
+          contentHash: await hashFile(reportsPath),
+          producerRunId: "run-community-report-1",
+        },
+        {
+          stage: "embed",
+          kind: "lancedb_index",
+          path: lancedbPath,
+          contentHash: await hashLanceDbDirectoryContents(lancedbPath),
+          producerRunId: "run-embed-1",
+        },
+      ]);
+      await repo.recordGraphTextUnitIdentity({
+        schemaVersion: SchemaVersion,
+        bookId: job.bookId,
+        sourceId: `sha256:${job.sourceHash}`,
+        sourceHash: job.sourceHash,
+        documentId: job.documentId,
+        contentHash: "normalized-content-hash",
+        normalizedPath: "input/book.md",
+        graphDocumentId: "graph-doc-1",
+        graphTextUnitIds: ["tu-1"],
+      });
+      await repo.recordQmdCorpusRegistration({
+        documentId: job.documentId,
+        contentHash: "normalized-content-hash",
+        collection: "books",
+        relativePath: "book.md",
+      });
+      await writeFile(
+        join(graphVault, "books", job.bookId, "checkpoints.yaml"),
+        YAML.stringify({
+          schemaVersion: SchemaVersion,
+          items: [{
+            schemaVersion: SchemaVersion,
+            bookId: job.bookId,
+            stage: "query_ready",
+            status: "succeeded",
+            attemptCount: 1,
+            runId: "legacy-query-ready",
+            inputFingerprint: "fp-query-ready",
+            contentHash: "normalized-content-hash",
+            stageFingerprint: job.stageFingerprints?.query_ready,
+            providerFingerprint: job.providerFingerprint,
+            artifactIds: artifacts.map((artifact) => artifact.artifactId),
+            finishedAt: "2026-05-21T00:00:00.000Z",
+          }],
+        }),
+        "utf8",
+      );
+
+      const state = await repo.getGraphEnhancementState(job.bookId);
+
+      expect(state.status).toBe("not_ready");
+      expect(state.capabilityIds).toEqual([]);
+      expect(await loadGraphQueryCapabilities({ graphVault })).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("resume plan rejects legacy query-ready without producer checkpoints", async () => {
+    const root = await createFixtureDir();
+    try {
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "fixture epub content", "utf8");
+
+      const job = await repo.registerBookSource({
+        sourcePath,
+        normalizedContentHash: "normalized-content-hash",
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+      });
+      const outputDir = bookScopedOutputDir(graphVault, job.bookId);
+      const reportsPath = join(outputDir, "community_reports.parquet");
+      const lancedbPath = join(outputDir, "lancedb");
+      await mkdir(outputDir, { recursive: true });
+      await writeFile(reportsPath, "reports", "utf8");
+      await writeCompleteLanceDbFixture(lancedbPath);
+      const artifacts = await repo.recordArtifacts(job.bookId, [
+        {
+          stage: "community_report",
+          kind: "graphrag_community_reports_parquet",
+          path: reportsPath,
+          contentHash: await hashFile(reportsPath),
+          producerRunId: "run-community-report-1",
+        },
+        {
+          stage: "embed",
+          kind: "lancedb_index",
+          path: lancedbPath,
+          contentHash: await hashLanceDbDirectoryContents(lancedbPath),
+          producerRunId: "run-embed-1",
+        },
+      ]);
+      await writeFile(
+        join(graphVault, "books", job.bookId, "checkpoints.yaml"),
+        YAML.stringify({
+          schemaVersion: SchemaVersion,
+          items: [{
+            schemaVersion: SchemaVersion,
+            bookId: job.bookId,
+            stage: "query_ready",
+            status: "succeeded",
+            attemptCount: 1,
+            runId: "legacy-query-ready",
+            inputFingerprint: "fp-query-ready",
+            contentHash: "normalized-content-hash",
+            stageFingerprint: job.stageFingerprints?.query_ready,
+            providerFingerprint: job.providerFingerprint,
+            artifactIds: artifacts.map((artifact) => artifact.artifactId),
+            finishedAt: "2026-05-21T00:00:00.000Z",
+          }],
+        }),
+        "utf8",
+      );
+
+      const plan = await repo.getResumePlan(
+        job.bookId,
+        { query_ready: "fp-query-ready" },
+        { query_ready: ["graphrag_community_reports_parquet", "lancedb_index"] },
+      );
+      const queryReady = plan.stageStates.find((item) =>
+        item.stage === "query_ready"
+      );
+
+      expect(queryReady?.reason).toBe("artifact_missing");
+      expect(plan.completedStages).not.toContain("query_ready");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1200,10 +1406,21 @@ describe("FileBookJobStateRepository", () => {
   test("accepts LanceDB row-count sidecars without manifest files", async () => {
     const root = await createFixtureDir();
     try {
-      const repo = new FileBookJobStateRepository(join(root, "graph_vault"));
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
       const sourcePath = join(root, "book.epub");
-      const lancedbPath = join(root, "graph_vault", "output", "lancedb");
       await writeFile(sourcePath, "fixture epub content", "utf8");
+
+      const job = await repo.registerBookSource({
+        sourcePath,
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+      });
+      const lancedbPath = join(
+        bookScopedOutputDir(graphVault, job.bookId),
+        "lancedb",
+      );
       await writeCompleteLanceDbFixture(lancedbPath);
       for (const tableName of [
         "entity_description.lance",
@@ -1213,13 +1430,6 @@ describe("FileBookJobStateRepository", () => {
         await unlink(join(lancedbPath, tableName, "_versions", "1.manifest"));
       }
       const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
-
-      const job = await repo.registerBookSource({
-        sourcePath,
-        configFingerprint: "cfg-1",
-        promptFingerprint: "prompt-1",
-        modelFingerprint: "model-1",
-      });
       const [artifact] = await repo.recordArtifacts(job.bookId, [
         {
           stage: "embed",
@@ -1254,12 +1464,10 @@ describe("FileBookJobStateRepository", () => {
   test("keeps LanceDB artifact hash independent from vendor manifests", async () => {
     const root = await createFixtureDir();
     try {
-      const repo = new FileBookJobStateRepository(join(root, "graph_vault"));
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
       const sourcePath = join(root, "book.epub");
-      const lancedbPath = join(root, "graph_vault", "output", "lancedb");
       await writeFile(sourcePath, "fixture epub content", "utf8");
-      await writeCompleteLanceDbFixture(lancedbPath);
-      const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
 
       const job = await repo.registerBookSource({
         sourcePath,
@@ -1267,6 +1475,12 @@ describe("FileBookJobStateRepository", () => {
         promptFingerprint: "prompt-1",
         modelFingerprint: "model-1",
       });
+      const lancedbPath = join(
+        bookScopedOutputDir(graphVault, job.bookId),
+        "lancedb",
+      );
+      await writeCompleteLanceDbFixture(lancedbPath);
+      const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
       const [artifact] = await repo.recordArtifacts(job.bookId, [
         {
           stage: "embed",
@@ -1369,13 +1583,7 @@ describe("FileBookJobStateRepository", () => {
       const graphVault = join(root, "graph_vault");
       const repo = new FileBookJobStateRepository(graphVault);
       const sourcePath = join(root, "book.epub");
-      const reportsPath = join(graphVault, "output", "community_reports.parquet");
-      const lancedbPath = join(graphVault, "output", "lancedb");
       await writeFile(sourcePath, "fixture epub content", "utf8");
-      await writeCompleteLanceDbFixture(lancedbPath);
-      await writeFile(reportsPath, "reports", "utf8");
-      const reportHash = await hashFile(reportsPath);
-      const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
 
       const job = await repo.registerBookSource({
         sourcePath,
@@ -1384,22 +1592,36 @@ describe("FileBookJobStateRepository", () => {
         promptFingerprint: "prompt-1",
         modelFingerprint: "model-1",
       });
+      const outputDir = bookScopedOutputDir(graphVault, job.bookId);
+      const reportsPath = join(outputDir, "community_reports.parquet");
+      const lancedbPath = join(outputDir, "lancedb");
+      await mkdir(outputDir, { recursive: true });
+      await writeCompleteLanceDbFixture(lancedbPath);
+      await writeFile(reportsPath, "reports", "utf8");
+      const reportHash = await hashFile(reportsPath);
+      const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
       const artifacts = await repo.recordArtifacts(job.bookId, [
         {
           stage: "community_report",
           kind: "graphrag_community_reports_parquet",
           path: reportsPath,
           contentHash: reportHash,
-          producerRunId: "run-query-ready-1",
+          producerRunId: "run-community-report-1",
         },
         {
           stage: "embed",
           kind: "lancedb_index",
           path: lancedbPath,
           contentHash: lancedbHash,
-          producerRunId: "run-query-ready-1",
+          producerRunId: "run-embed-1",
         },
       ]);
+      await completeGraphQueryProducerStages({
+        repo,
+        bookId: job.bookId,
+        reportArtifactId: artifacts[0]!.artifactId,
+        lancedbArtifactId: artifacts[1]!.artifactId,
+      });
       await repo.recordGraphTextUnitIdentity({
         schemaVersion: SchemaVersion,
         bookId: job.bookId,
@@ -1454,6 +1676,34 @@ describe("FileBookJobStateRepository", () => {
         promptFingerprint: "prompt-1",
         modelFingerprint: "model-1",
       });
+      const outputDir = bookScopedOutputDir(graphVault, job.bookId);
+      const reportsPath = join(outputDir, "community_reports.parquet");
+      const lancedbPath = join(outputDir, "lancedb");
+      await mkdir(outputDir, { recursive: true });
+      await writeFile(reportsPath, "reports", "utf8");
+      await writeCompleteLanceDbFixture(lancedbPath);
+      const artifacts = await repo.recordArtifacts(job.bookId, [
+        {
+          stage: "community_report",
+          kind: "graphrag_community_reports_parquet",
+          path: reportsPath,
+          contentHash: await hashFile(reportsPath),
+          producerRunId: "run-community-report-1",
+        },
+        {
+          stage: "embed",
+          kind: "lancedb_index",
+          path: lancedbPath,
+          contentHash: await hashLanceDbDirectoryContents(lancedbPath),
+          producerRunId: "run-embed-1",
+        },
+      ]);
+      await completeGraphQueryProducerStages({
+        repo,
+        bookId: job.bookId,
+        reportArtifactId: artifacts[0]!.artifactId,
+        lancedbArtifactId: artifacts[1]!.artifactId,
+      });
 
       await expect(repo.completeStage({
         bookId: job.bookId,
@@ -1470,7 +1720,92 @@ describe("FileBookJobStateRepository", () => {
     }
   });
 
-  test("rejects query-ready success checkpoint without qmd corpus registration", async () => {
+  test("rejects query-ready success checkpoint without succeeded producer stages", async () => {
+    const root = await createFixtureDir();
+    try {
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "fixture epub content", "utf8");
+
+      const job = await repo.registerBookSource({
+        sourcePath,
+        normalizedContentHash: "normalized-content-hash",
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+      });
+      const outputDir = bookScopedOutputDir(graphVault, job.bookId);
+      const reportsPath = join(outputDir, "community_reports.parquet");
+      const lancedbPath = join(outputDir, "lancedb");
+      await mkdir(outputDir, { recursive: true });
+      await writeFile(reportsPath, "reports", "utf8");
+      await writeCompleteLanceDbFixture(lancedbPath);
+      const artifacts = await repo.recordArtifacts(job.bookId, [
+        {
+          stage: "community_report",
+          kind: "graphrag_community_reports_parquet",
+          path: reportsPath,
+          contentHash: await hashFile(reportsPath),
+          producerRunId: "run-community-report-1",
+        },
+        {
+          stage: "embed",
+          kind: "lancedb_index",
+          path: lancedbPath,
+          contentHash: await hashLanceDbDirectoryContents(lancedbPath),
+          producerRunId: "run-embed-1",
+        },
+      ]);
+      await repo.startStage({
+        bookId: job.bookId,
+        stage: "community_report",
+        runId: "run-community-report-1",
+        inputFingerprint: "fp-community-report",
+        artifactIds: [artifacts[0]!.artifactId],
+      });
+      await repo.failStage({
+        bookId: job.bookId,
+        stage: "embed",
+        runId: "run-embed-1",
+        inputFingerprint: "fp-embed",
+        artifactIds: [artifacts[1]!.artifactId],
+        errorSummary: "provider failed",
+      });
+      await repo.recordGraphTextUnitIdentity({
+        schemaVersion: SchemaVersion,
+        bookId: job.bookId,
+        sourceId: `sha256:${job.sourceHash}`,
+        sourceHash: job.sourceHash,
+        documentId: job.documentId,
+        contentHash: "normalized-content-hash",
+        normalizedPath: "input/book.md",
+        graphDocumentId: "graph-doc-1",
+        graphTextUnitIds: ["tu-1"],
+      });
+      await repo.recordQmdCorpusRegistration({
+        documentId: job.documentId,
+        contentHash: "normalized-content-hash",
+        collection: "books",
+        relativePath: "book.md",
+      });
+
+      await expect(repo.completeStage({
+        bookId: job.bookId,
+        stage: "query_ready",
+        runId: "run-query-ready-1",
+        inputFingerprint: "fp-query-ready",
+        artifactIds: artifacts.map((artifact) => artifact.artifactId),
+      })).rejects.toThrow(/completed GraphRAG producer stages/);
+
+      expect(await repo.getStageCheckpoint(job.bookId, "query_ready")).toBeNull();
+      expect(await loadGraphQueryCapabilities({ graphVault })).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects query-ready checkpoint from shared GraphRAG output", async () => {
     const root = await createFixtureDir();
     try {
       const graphVault = join(root, "graph_vault");
@@ -1479,10 +1814,9 @@ describe("FileBookJobStateRepository", () => {
       const reportsPath = join(graphVault, "output", "community_reports.parquet");
       const lancedbPath = join(graphVault, "output", "lancedb");
       await writeFile(sourcePath, "fixture epub content", "utf8");
+      await mkdir(join(graphVault, "output"), { recursive: true });
       await writeCompleteLanceDbFixture(lancedbPath);
       await writeFile(reportsPath, "reports", "utf8");
-      const reportHash = await hashFile(reportsPath);
-      const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
 
       const job = await repo.registerBookSource({
         sourcePath,
@@ -1496,17 +1830,101 @@ describe("FileBookJobStateRepository", () => {
           stage: "community_report",
           kind: "graphrag_community_reports_parquet",
           path: reportsPath,
+          contentHash: await hashFile(reportsPath),
+          producerRunId: "run-community-report-1",
+        },
+        {
+          stage: "embed",
+          kind: "lancedb_index",
+          path: lancedbPath,
+          contentHash: await hashLanceDbDirectoryContents(lancedbPath),
+          producerRunId: "run-embed-1",
+        },
+      ]);
+      await completeGraphQueryProducerStages({
+        repo,
+        bookId: job.bookId,
+        reportArtifactId: artifacts[0]!.artifactId,
+        lancedbArtifactId: artifacts[1]!.artifactId,
+      });
+      await repo.recordGraphTextUnitIdentity({
+        schemaVersion: SchemaVersion,
+        bookId: job.bookId,
+        sourceId: `sha256:${job.sourceHash}`,
+        sourceHash: job.sourceHash,
+        documentId: job.documentId,
+        contentHash: "normalized-content-hash",
+        normalizedPath: "input/book.md",
+        graphDocumentId: "graph-doc-1",
+        graphTextUnitIds: ["tu-1"],
+      });
+      await repo.recordQmdCorpusRegistration({
+        documentId: job.documentId,
+        contentHash: "normalized-content-hash",
+        collection: "books",
+        relativePath: "book.md",
+      });
+
+      await expect(repo.completeStage({
+        bookId: job.bookId,
+        stage: "query_ready",
+        runId: "run-query-ready-1",
+        inputFingerprint: "fp-query-ready",
+        artifactIds: artifacts.map((artifact) => artifact.artifactId),
+      })).rejects.toThrow(/query_ready checkpoint requires valid/);
+
+      expect(await repo.getStageCheckpoint(job.bookId, "query_ready")).toBeNull();
+      expect(await loadGraphQueryCapabilities({ graphVault })).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects query-ready success checkpoint without qmd corpus registration", async () => {
+    const root = await createFixtureDir();
+    try {
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "fixture epub content", "utf8");
+
+      const job = await repo.registerBookSource({
+        sourcePath,
+        normalizedContentHash: "normalized-content-hash",
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+      });
+      const outputDir = bookScopedOutputDir(graphVault, job.bookId);
+      const reportsPath = join(outputDir, "community_reports.parquet");
+      const lancedbPath = join(outputDir, "lancedb");
+      await mkdir(outputDir, { recursive: true });
+      await writeCompleteLanceDbFixture(lancedbPath);
+      await writeFile(reportsPath, "reports", "utf8");
+      const reportHash = await hashFile(reportsPath);
+      const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
+      const artifacts = await repo.recordArtifacts(job.bookId, [
+        {
+          stage: "community_report",
+          kind: "graphrag_community_reports_parquet",
+          path: reportsPath,
           contentHash: reportHash,
-          producerRunId: "run-query-ready-1",
+          producerRunId: "run-community-report-1",
         },
         {
           stage: "embed",
           kind: "lancedb_index",
           path: lancedbPath,
           contentHash: lancedbHash,
-          producerRunId: "run-query-ready-1",
+          producerRunId: "run-embed-1",
         },
       ]);
+      await completeGraphQueryProducerStages({
+        repo,
+        bookId: job.bookId,
+        reportArtifactId: artifacts[0]!.artifactId,
+        lancedbArtifactId: artifacts[1]!.artifactId,
+      });
       await repo.recordGraphTextUnitIdentity({
         schemaVersion: SchemaVersion,
         bookId: job.bookId,
@@ -1629,16 +2047,24 @@ describe("FileBookJobStateRepository", () => {
           kind: "graphrag_community_reports_parquet",
           path: reportsA,
           contentHash: await hashFile(reportsA),
-          producerRunId: "run-query-ready-a",
+          producerRunId: "run-community-report-a",
         },
         {
           stage: "embed",
           kind: "lancedb_index",
           path: lancedbA,
           contentHash: await hashLanceDbDirectoryContents(lancedbA),
-          producerRunId: "run-query-ready-a",
+          producerRunId: "run-embed-a",
         },
       ]);
+      await completeGraphQueryProducerStages({
+        repo,
+        bookId: jobA.bookId,
+        reportArtifactId: artifactsA[0]!.artifactId,
+        lancedbArtifactId: artifactsA[1]!.artifactId,
+        communityReportRunId: "run-community-report-a",
+        embedRunId: "run-embed-a",
+      });
       await repo.recordGraphTextUnitIdentity({
         schemaVersion: SchemaVersion,
         bookId: jobA.bookId,

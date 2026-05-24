@@ -6,7 +6,9 @@ import YAML from "yaml";
 import {
   BookArtifactManifestListSchema,
   BookJobCatalogSchema,
+  BookJobCheckpointListSchema,
   type BookArtifactManifest,
+  type BookStage,
 } from "../contracts/book-job.js";
 import { DocumentIdentityCatalogSchema } from "../contracts/corpus.js";
 import type { DocumentIdentityMap } from "../contracts/corpus.js";
@@ -95,6 +97,38 @@ async function validateQueryReadyArtifacts(
   bookId: string,
   artifactIds: readonly string[],
 ): Promise<boolean> {
+  const booksRaw = await readYaml(join(graphVault, "catalog", "books.yaml"));
+  const booksResult = BookJobCatalogSchema.safeParse(booksRaw);
+  if (!booksResult.success) return false;
+  const book = booksResult.data.items.find((item) => item.bookId === bookId);
+  if (
+    book == null ||
+    book.stageFingerprints == null ||
+    book.providerFingerprint == null
+  ) {
+    return false;
+  }
+
+  const checkpointsRaw = await readYaml(
+    join(graphVault, "books", bookId, "checkpoints.yaml"),
+  );
+  const checkpointsResult = BookJobCheckpointListSchema.safeParse(checkpointsRaw);
+  if (!checkpointsResult.success) return false;
+  const checkpointByStage = new Map(
+    checkpointsResult.data.items
+      .filter((checkpoint) => checkpoint.status === "succeeded")
+      .map((checkpoint) => [checkpoint.stage, checkpoint]),
+  );
+  const communityReportRunId = checkpointByStage.get("community_report")?.runId;
+  const embedRunId = checkpointByStage.get("embed")?.runId;
+  if (communityReportRunId == null || embedRunId == null) {
+    return false;
+  }
+  const expectedProducerRunIds: Partial<Record<BookStage, string>> = {
+    community_report: communityReportRunId,
+    embed: embedRunId,
+  };
+
   const artifactsRaw = await readYaml(join(graphVault, "books", bookId, "artifacts.yaml"));
   if (artifactsRaw == null) return false;
   const artifactsResult = BookArtifactManifestListSchema.safeParse(artifactsRaw);
@@ -117,6 +151,11 @@ async function validateQueryReadyArtifacts(
     artifactIds,
     artifacts,
     requiredKinds: QUERY_READY_ARTIFACT_KINDS,
+    allowedKinds: QUERY_READY_ARTIFACT_KINDS,
+    requireBookScopedGraphOutput: true,
+    expectedProducerRunIds,
+    expectedStageFingerprints: book.stageFingerprints,
+    expectedProviderFingerprint: book.providerFingerprint,
   });
   return validation.isSatisfied;
 }

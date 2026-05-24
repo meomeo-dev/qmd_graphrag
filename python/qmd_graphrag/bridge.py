@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +21,26 @@ REQUIRED_LANCEDB_TABLES = (
     "community_full_content.lance",
     "text_unit_text.lance",
 )
+QUERY_READY_ARTIFACT_KINDS = {
+    "graphrag_community_reports_parquet",
+    "lancedb_index",
+}
+PRODUCER_STAGE_BY_ARTIFACT_KIND = {
+    "source_epub": "ingest",
+    "normalized_markdown": "normalize",
+    "graphrag_documents_parquet": "graph_extract",
+    "graphrag_text_units_parquet": "graph_extract",
+    "graphrag_entities_parquet": "graph_extract",
+    "graphrag_relationships_parquet": "graph_extract",
+    "graphrag_communities_parquet": "graph_extract",
+    "graphrag_context_json": "graph_extract",
+    "graphrag_stats_json": "graph_extract",
+    "graphrag_community_reports_parquet": "community_report",
+    "lancedb_index": "embed",
+    "query_snapshot": "query_ready",
+}
+WINDOWS_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
+URI_LIKE_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 
 if str(REPO_ROOT / "python") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "python"))
@@ -28,6 +49,27 @@ if str(REPO_ROOT / "python") not in sys.path:
 def _emit_error(message: str) -> int:
     print(message, file=sys.stderr)
     return 1
+
+
+def _normalize_vault_relative_path(path: str) -> str | None:
+    normalized = path.replace("\\", "/")
+    if (
+        not path
+        or "\0" in path
+        or normalized == "~"
+        or normalized.startswith("~/")
+        or re.match(r"^~[^/]*(?:/|$)", normalized) is not None
+        or Path(path).is_absolute()
+        or WINDOWS_DRIVE_PREFIX.match(path) is not None
+        or WINDOWS_DRIVE_PREFIX.match(normalized) is not None
+        or URI_LIKE_PREFIX.match(path) is not None
+        or URI_LIKE_PREFIX.match(normalized) is not None
+    ):
+        return None
+    parts = [part for part in normalized.split("/") if part and part != "."]
+    if not parts or any(part == ".." for part in parts):
+        return None
+    return "/".join(parts)
 
 
 def _read_request() -> dict[str, Any]:
@@ -159,6 +201,7 @@ def _scoped_storage_overrides(
     *,
     input_dir: str | None = None,
     output_dir: str | None = None,
+    report_dir: str | None = None,
 ) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
     if input_dir:
@@ -172,13 +215,16 @@ def _scoped_storage_overrides(
         }
     if output_dir:
         resolved_output = Path(output_dir).resolve()
+        resolved_report = Path(report_dir).resolve() if report_dir else (
+            resolved_output / "reports"
+        )
         overrides["output_storage"] = {
             "type": "file",
             "base_dir": str(resolved_output),
         }
         overrides["reporting"] = {
             "type": "file",
-            "base_dir": str(resolved_output / "reports"),
+            "base_dir": str(resolved_report),
         }
         overrides["cache"] = {
             "type": "json",
@@ -286,6 +332,34 @@ def _load_books_by_id(root_dir: Path) -> dict[str, dict[str, Any]]:
     }
 
 
+def _load_checkpoints(root_dir: Path, book_id: str) -> list[dict[str, Any]]:
+    try:
+        import yaml  # type: ignore
+    except Exception as error:  # noqa: BLE001
+        raise RuntimeError("PyYAML is required to enforce GraphRAG capability scope") from error
+
+    checkpoints_path = root_dir / "books" / book_id / "checkpoints.yaml"
+    if not checkpoints_path.exists():
+        return []
+    checkpoints = yaml.safe_load(checkpoints_path.read_text(encoding="utf-8")) or {}
+    return [
+        item
+        for item in checkpoints.get("items", [])
+        if isinstance(item, dict)
+    ]
+
+
+def _succeeded_checkpoint_by_stage(
+    root_dir: Path,
+    book_id: str,
+) -> dict[str, dict[str, Any]]:
+    return {
+        str(item.get("stage")): item
+        for item in _load_checkpoints(root_dir, book_id)
+        if item.get("status") == "succeeded" and item.get("stage")
+    }
+
+
 def _derive_graph_query_capability(
     root_dir: Path,
     book: dict[str, Any],
@@ -299,6 +373,11 @@ def _derive_graph_query_capability(
     )
     if identity is None:
         raise ValueError(f"book {book_id} is missing document identity")
+    if identity.get("canonicalBookId") != book_id:
+        raise ValueError(f"book {book_id} identity canonicalBookId mismatch")
+    identity_metadata = identity.get("metadata") or {}
+    if identity_metadata.get("qmdCorpusRegistered") is not True:
+        raise ValueError(f"book {book_id} identity is not registered in qmd corpus")
     artifact_ids = _load_query_ready_artifact_ids(root_dir, book_id) or []
     source_id = identity.get("sourceId")
     document_id = identity.get("documentId")
@@ -353,6 +432,13 @@ def _load_book_scope(root_dir: Path, selected_book_ids: list[str]) -> list[dict[
         identity = identity_by_book.get(book_id)
         if identity is None:
             raise ValueError(f"book {book_id} is missing document identity")
+        if identity.get("canonicalBookId") != book_id:
+            raise ValueError(f"book {book_id} identity canonicalBookId mismatch")
+        identity_metadata = identity.get("metadata") or {}
+        if identity_metadata.get("qmdCorpusRegistered") is not True:
+            raise ValueError(
+                f"book {book_id} identity is not registered in qmd corpus"
+            )
         metadata = book.get("metadata") or {}
         normalized_path = identity.get("normalizedPath") or metadata.get("normalizedPath")
         if not isinstance(normalized_path, str) or not normalized_path:
@@ -448,6 +534,13 @@ def _validate_capabilities_against_request_scope(
             raise ValueError(
                 f"document identity missing for graph capability: {document_id}"
             )
+        if str(identity.get("canonicalBookId") or "") != book_id:
+            raise ValueError(f"graph capability bookId mismatches identity: {book_id}")
+        identity_metadata = identity.get("metadata") or {}
+        if identity_metadata.get("qmdCorpusRegistered") is not True:
+            raise ValueError(
+                f"document identity is not registered in qmd corpus: {document_id}"
+            )
         if str(identity.get("sourceId") or "") != source_id:
             raise ValueError(f"graph capability sourceId mismatches identity: {source_id}")
         if str(identity.get("contentHash") or "") != content_hash:
@@ -462,6 +555,33 @@ def _validate_capabilities_against_request_scope(
             raise ValueError(
                 f"document identity missing graphTextUnitIds: {document_id}"
             )
+
+
+def _capability_identity_failure(
+    root_dir: Path,
+    capability: dict[str, Any],
+) -> str | None:
+    book_id = str(capability.get("bookId") or "")
+    source_id = str(capability.get("sourceId") or "")
+    document_id = str(capability.get("documentId") or "")
+    content_hash = str(capability.get("contentHash") or "")
+    identity = _load_document_identity_map(root_dir).get(document_id)
+    if identity is None:
+        return f"document identity missing for graph capability: {document_id}"
+    if str(identity.get("canonicalBookId") or "") != book_id:
+        return f"graph capability bookId mismatches identity: {book_id}"
+    identity_metadata = identity.get("metadata") or {}
+    if identity_metadata.get("qmdCorpusRegistered") is not True:
+        return f"document identity is not registered in qmd corpus: {document_id}"
+    if str(identity.get("sourceId") or "") != source_id:
+        return f"graph capability sourceId mismatches identity: {source_id}"
+    if str(identity.get("contentHash") or "") != content_hash:
+        return f"graph capability contentHash mismatches identity: {content_hash}"
+    if not identity.get("graphDocumentId"):
+        return f"document identity missing graphDocumentId: {document_id}"
+    if not identity.get("graphTextUnitIds"):
+        return f"document identity missing graphTextUnitIds: {document_id}"
+    return None
 
 
 def _validate_index_scope(root_dir: Path, index_scope: dict[str, Any] | None) -> None:
@@ -539,6 +659,9 @@ def _load_graph_capabilities(
             continue
         book_id = str(item.get("bookId") or "")
         artifact_ids = [str(value) for value in item.get("artifactIds") or []]
+        identity_failure = _capability_identity_failure(root_dir, item)
+        if identity_failure is not None:
+            raise ValueError(identity_failure)
         if not book_id or not _validate_query_ready_artifacts(
             root_dir,
             book_id,
@@ -559,19 +682,7 @@ def _load_graph_capabilities(
 
 
 def _load_query_ready_artifact_ids(root_dir: Path, book_id: str) -> list[str] | None:
-    try:
-        import yaml  # type: ignore
-    except Exception as error:  # noqa: BLE001
-        raise RuntimeError("PyYAML is required to enforce GraphRAG capability scope") from error
-
-    checkpoints_path = root_dir / "books" / book_id / "checkpoints.yaml"
-    if not checkpoints_path.exists():
-        return None
-
-    checkpoints = yaml.safe_load(checkpoints_path.read_text(encoding="utf-8")) or {}
-    for checkpoint in checkpoints.get("items", []):
-        if not isinstance(checkpoint, dict):
-            continue
+    for checkpoint in _load_checkpoints(root_dir, book_id):
         if (
             checkpoint.get("stage") == "query_ready"
             and checkpoint.get("status") == "succeeded"
@@ -600,6 +711,27 @@ def _validate_query_ready_artifacts(
     if not checkpoints_path.exists() or not artifacts_path.exists():
         return False
 
+    book = _load_books_by_id(root_dir).get(book_id)
+    if not isinstance(book, dict):
+        return False
+    stage_fingerprints = book.get("stageFingerprints")
+    provider_fingerprint = book.get("providerFingerprint")
+    if not isinstance(stage_fingerprints, dict) or not isinstance(
+        provider_fingerprint,
+        str,
+    ):
+        return False
+
+    checkpoint_by_stage = _succeeded_checkpoint_by_stage(root_dir, book_id)
+    expected_producer_run_ids = {
+        "community_report": checkpoint_by_stage.get("community_report", {}).get(
+            "runId"
+        ),
+        "embed": checkpoint_by_stage.get("embed", {}).get("runId"),
+    }
+    if not all(isinstance(value, str) and value for value in expected_producer_run_ids.values()):
+        return False
+
     checkpoint_artifact_ids = set(_load_query_ready_artifact_ids(root_dir, book_id) or [])
     if not artifact_ids or not set(artifact_ids).issubset(checkpoint_artifact_ids):
         return False
@@ -614,17 +746,39 @@ def _validate_query_ready_artifacts(
     if any(item is None for item in selected):
         return False
 
-    required_kinds = {"graphrag_community_reports_parquet", "lancedb_index"}
     kinds = set()
     for artifact in selected:
         assert artifact is not None
         if artifact.get("bookId") != book_id:
             return False
+        kind = str(artifact.get("kind"))
+        if kind not in QUERY_READY_ARTIFACT_KINDS:
+            return False
+        expected_stage = PRODUCER_STAGE_BY_ARTIFACT_KIND.get(kind)
+        if expected_stage is not None and artifact.get("stage") != expected_stage:
+            return False
+        expected_run_id = expected_producer_run_ids.get(str(artifact.get("stage")))
+        if artifact.get("producerRunId") != expected_run_id:
+            return False
+        expected_stage_fingerprint = stage_fingerprints.get(str(artifact.get("stage")))
+        if artifact.get("stageFingerprint") != expected_stage_fingerprint:
+            return False
+        if artifact.get("providerFingerprint") != provider_fingerprint:
+            return False
         kinds.add(str(artifact.get("kind")))
         path = artifact.get("path")
         if not isinstance(path, str):
             return False
-        artifact_path = (root_dir / path).resolve()
+        portable_path = _normalize_vault_relative_path(path)
+        if portable_path is None:
+            return False
+        expected_prefix = f"books/{book_id}/output/"
+        if kind == "lancedb_index":
+            if portable_path != f"books/{book_id}/output/lancedb":
+                return False
+        elif not portable_path.startswith(expected_prefix):
+            return False
+        artifact_path = (root_dir / portable_path).resolve()
         try:
             artifact_path.relative_to(root_dir.resolve())
         except ValueError:
@@ -634,7 +788,6 @@ def _validate_query_ready_artifacts(
         expected_hash = artifact.get("contentHash")
         if not isinstance(expected_hash, str) or not expected_hash:
             return False
-        kind = str(artifact.get("kind"))
         actual_hash = (
             _hash_lancedb_directory_contents(artifact_path)
             if kind == "lancedb_index"
@@ -653,7 +806,7 @@ def _validate_query_ready_artifacts(
         ):
             return False
 
-    return required_kinds.issubset(kinds)
+    return QUERY_READY_ARTIFACT_KINDS.issubset(kinds)
 
 
 def _load_artifacts_by_id(root_dir: Path, book_ids: list[str]) -> dict[str, dict[str, Any]]:
@@ -1257,6 +1410,7 @@ async def _run_graphrag_index(request: dict[str, Any]) -> dict[str, Any]:
     root_dir = Path(request["rootDir"]).resolve()
     input_dir = request.get("inputDir")
     data_dir = request.get("dataDir")
+    report_dir = request.get("reportDir")
     method = request["method"]
     verbose = bool(request.get("verbose", False))
     skip_validation = bool(request.get("skipValidation", False))
@@ -1272,6 +1426,7 @@ async def _run_graphrag_index(request: dict[str, Any]) -> dict[str, Any]:
     cli_overrides = _scoped_storage_overrides(
         input_dir=input_dir,
         output_dir=data_dir,
+        report_dir=report_dir,
     )
     if workflows:
         cli_overrides["workflows"] = workflows

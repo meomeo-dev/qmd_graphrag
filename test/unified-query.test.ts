@@ -1,7 +1,9 @@
 import { describe, expect, test } from "vitest";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+
+import YAML from "yaml";
 
 import { SchemaVersion } from "../src/contracts/common.js";
 import { DspyQueryExpansionStrictRefusalError } from "../src/dspy/errors.js";
@@ -100,13 +102,97 @@ async function writeValidatedQueryReadyArtifacts(
   const graphDocumentId = identity.graphDocumentId ?? "graph-doc-1";
   const graphTextUnitIds = identity.graphTextUnitIds ?? ["tu-1"];
   const qmdCorpusRegistered = identity.qmdCorpusRegistered ?? true;
+  const providerFingerprint = "provider-openai-responses-jina";
+  const stageFingerprints = {
+    ingest: "stage-ingest",
+    normalize: "stage-normalize",
+    graph_extract: "stage-graph-extract",
+    community_report: "stage-community-report",
+    embed: "stage-embed",
+    query_ready: "stage-query-ready",
+  };
   await mkdir(join(root, "catalog"), { recursive: true });
   await mkdir(join(root, "books", bookId, "output"), { recursive: true });
+  const booksPath = join(root, "catalog", "books.yaml");
+  let booksCatalog: { schemaVersion: string; items: Array<Record<string, unknown>> };
+  try {
+    booksCatalog = YAML.parse(await readFile(booksPath, "utf8")) as typeof booksCatalog;
+    booksCatalog.items ??= [];
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    booksCatalog = { schemaVersion: SchemaVersion, items: [] };
+  }
+  const existingBook = booksCatalog.items.find((item) => item.bookId === bookId);
+  const bookState = {
+    schemaVersion: SchemaVersion,
+    bookId,
+    documentId,
+    sourcePath: `sources/${bookId}/source.epub`,
+    sourceHash,
+    normalizedContentHash: contentHash,
+    normalizedPath: `input/${bookId}.md`,
+    configFingerprint: "config",
+    promptFingerprint: "prompt",
+    modelFingerprint: "model",
+    stageFingerprints,
+    providerFingerprint,
+    currentStage: "query_ready",
+    overallStatus: "succeeded",
+    createdAt: "2026-05-21T00:00:00.000Z",
+    updatedAt: "2026-05-21T00:00:00.000Z",
+    metadata: {
+      normalizedPath: `input/${bookId}.md`,
+      sourceName: "Test Book",
+    },
+  };
+  if (existingBook == null) {
+    booksCatalog.items.push(bookState);
+  } else {
+    Object.assign(existingBook, {
+      ...bookState,
+      ...existingBook,
+      stageFingerprints: {
+        ...stageFingerprints,
+        ...(existingBook.stageFingerprints as Record<string, string> | undefined),
+      },
+      providerFingerprint:
+        typeof existingBook.providerFingerprint === "string"
+          ? existingBook.providerFingerprint
+          : providerFingerprint,
+    });
+  }
+  await writeFile(booksPath, YAML.stringify(booksCatalog), "utf8");
   await writeFile(
     join(root, "books", bookId, "checkpoints.yaml"),
     `
 schemaVersion: ${SchemaVersion}
 items:
+  - schemaVersion: ${SchemaVersion}
+    bookId: ${bookId}
+    stage: community_report
+    status: succeeded
+    attemptCount: 1
+    runId: run-community-report
+    inputFingerprint: stage-community-report
+    contentHash: ${contentHash}
+    stageFingerprint: stage-community-report
+    providerFingerprint: ${providerFingerprint}
+    artifactIds:
+      - artifact-1
+    finishedAt: 2026-05-21T00:00:00.000Z
+  - schemaVersion: ${SchemaVersion}
+    bookId: ${bookId}
+    stage: embed
+    status: succeeded
+    attemptCount: 1
+    runId: run-embed
+    inputFingerprint: stage-embed
+    contentHash: ${contentHash}
+    stageFingerprint: stage-embed
+    providerFingerprint: ${providerFingerprint}
+    artifactIds:
+      - artifact-2
+    finishedAt: 2026-05-21T00:00:00.000Z
   - schemaVersion: ${SchemaVersion}
     bookId: ${bookId}
     stage: query_ready
@@ -115,7 +201,7 @@ items:
     inputFingerprint: fp
     contentHash: ${contentHash}
     stageFingerprint: stage-query-ready
-    providerFingerprint: provider-openai-responses-jina
+    providerFingerprint: ${providerFingerprint}
     artifactIds:
       - artifact-1
       - artifact-2
@@ -147,8 +233,8 @@ items:
     path: books/${bookId}/output/community_reports.parquet
     contentHash: ${reportHash}
     stageFingerprint: stage-community-report
-    providerFingerprint: provider-openai-responses-jina
-    producerRunId: run-1
+    providerFingerprint: ${providerFingerprint}
+    producerRunId: run-community-report
     createdAt: 2026-05-21T00:00:00.000Z
   - schemaVersion: ${SchemaVersion}
     artifactId: artifact-2
@@ -158,8 +244,8 @@ items:
     path: books/${bookId}/output/lancedb
     contentHash: ${lancedbHash}
     stageFingerprint: stage-embed
-    providerFingerprint: provider-openai-responses-jina
-    producerRunId: run-1
+    providerFingerprint: ${providerFingerprint}
+    producerRunId: run-embed
     createdAt: 2026-05-21T00:00:00.000Z
 `,
     "utf8",
@@ -855,34 +941,6 @@ items:
         graphTextUnitIds: [`tu-${bookId.endsWith("1") ? "1" : "2"}`],
       });
     }
-    await writeFile(join(root, "catalog", "books.yaml"), `
-schemaVersion: ${SchemaVersion}
-items:
-  - schemaVersion: ${SchemaVersion}
-    bookId: book-1
-    documentId: doc-1
-    sourcePath: sources/book-1/source.epub
-    sourceHash: source-hash-1
-    normalizedContentHash: content-hash-1
-    configFingerprint: config
-    promptFingerprint: prompt
-    modelFingerprint: model
-    overallStatus: succeeded
-    createdAt: 2026-05-21T00:00:00.000Z
-    updatedAt: 2026-05-21T00:00:00.000Z
-  - schemaVersion: ${SchemaVersion}
-    bookId: book-2
-    documentId: doc-2
-    sourcePath: sources/book-2/source.epub
-    sourceHash: source-hash-2
-    normalizedContentHash: content-hash-2
-    configFingerprint: config
-    promptFingerprint: prompt
-    modelFingerprint: model
-    overallStatus: succeeded
-    createdAt: 2026-05-21T00:00:00.000Z
-    updatedAt: 2026-05-21T00:00:00.000Z
-`);
     await writeFile(join(root, "catalog", "document-identity-map.yaml"), `
 schemaVersion: ${SchemaVersion}
 items:

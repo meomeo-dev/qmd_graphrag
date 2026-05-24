@@ -32,6 +32,12 @@ export function classifyFailure(text) {
   }
   const transient =
     message.includes("concurrency limit") ||
+    message.includes("partial-output") ||
+    message.includes("partial output") ||
+    message.includes("no report found for community") ||
+    message.includes("community report extraction error") ||
+    message.includes("error generating community report") ||
+    message.includes("graphrag stage report") ||
     message.includes("rate limit") ||
     message.includes("temporarily unavailable") ||
     message.includes("timeout") ||

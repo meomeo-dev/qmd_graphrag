@@ -98,6 +98,17 @@ export type GraphRagBookWorkspaceState = {
   bootstrapRunId: string;
 };
 
+export type GraphRagStageReportHealth = {
+  healthy: boolean;
+  stage: BookStage;
+  logPath: string;
+  logStartOffset: number;
+  logEndOffset: number;
+  reason?: string;
+  failureKind?: "transient" | "partial_output";
+  evidence?: string[];
+};
+
 export type GraphRagTextUnitIdentity = {
   schemaVersion: "1.0.0";
   bookId: string;
@@ -124,6 +135,10 @@ export function graphRagBookOutputDir(input: {
   return join(resolve(input.stateRootDir), "books", input.bookId, "output");
 }
 
+function graphRagBookOutputLocator(bookId: string): string {
+  return `books/${bookId}/output`;
+}
+
 type GraphRagOutputProducerManifest = {
   schemaVersion: "1.0.0";
   bookId: string;
@@ -134,10 +149,133 @@ type GraphRagOutputProducerManifest = {
   providerFingerprint: string;
   outputDir: string;
   producerRunId: string;
+  stageProducerRunIds?: Partial<Record<BookStage, string>>;
 };
 
 function stripKnownBookExtension(path: string): string {
   return basename(path).replace(/\.(epub|md|markdown|txt)$/iu, "");
+}
+
+function graphRagIndexLogPath(outputDir: string): string {
+  return join(resolve(outputDir), "reports", "indexing-engine.log");
+}
+
+function graphRagReportLogPath(input: {
+  outputDir: string;
+  reportDir?: string;
+}): string {
+  return input.reportDir == null
+    ? graphRagIndexLogPath(input.outputDir)
+    : join(resolve(input.reportDir), "indexing-engine.log");
+}
+
+const GRAPH_RAG_STAGE_TRANSIENT_LOG_PATTERN =
+  /concurrency limit exceeded|rate limit|temporarily unavailable|timeout|timed out|service unavailable|gateway timeout|bad gateway|connection reset|socket hang up|econnreset|etimedout|eai_again|HTTP\s+(429|5\d\d)|status\s+code[:\s-]*(429|5\d\d)|openai\.APIError/iu;
+const GRAPH_RAG_COMMUNITY_PARTIAL_LOG_PATTERN =
+  /Community Report Extraction Error|error generating community report|No report found for community/iu;
+
+function stageHealthEvidence(text: string, stage: BookStage): GraphRagStageReportHealth {
+  const evidence = text
+    .split(/\r?\n/u)
+    .filter((line) =>
+      GRAPH_RAG_STAGE_TRANSIENT_LOG_PATTERN.test(line) ||
+      (stage === "community_report" &&
+        GRAPH_RAG_COMMUNITY_PARTIAL_LOG_PATTERN.test(line))
+    )
+    .slice(0, 20);
+
+  if (evidence.length === 0) {
+    return {
+      healthy: true,
+      stage,
+      logPath: "",
+      logStartOffset: 0,
+      logEndOffset: 0,
+    };
+  }
+
+  const transient = evidence.some((line) =>
+    GRAPH_RAG_STAGE_TRANSIENT_LOG_PATTERN.test(line)
+  );
+  return {
+    healthy: false,
+    stage,
+    logPath: "",
+    logStartOffset: 0,
+    logEndOffset: 0,
+    failureKind: transient ? "transient" : "partial_output",
+    reason: transient
+      ? "provider transient error found in GraphRAG stage report"
+      : "partial community report output found in GraphRAG stage report",
+    evidence,
+  };
+}
+
+export async function graphRagIndexLogOffset(
+  outputDir: string,
+  reportDir?: string,
+): Promise<number> {
+  try {
+    return (await stat(graphRagReportLogPath({ outputDir, reportDir }))).size;
+  } catch {
+    return 0;
+  }
+}
+
+export async function checkGraphRagStageReportHealth(input: {
+  outputDir: string;
+  reportDir?: string;
+  stage: BookStage;
+  logStartOffset?: number;
+}): Promise<GraphRagStageReportHealth> {
+  const logPath = graphRagReportLogPath(input);
+  let raw = Buffer.alloc(0);
+  let logEndOffset = input.logStartOffset ?? 0;
+  try {
+    raw = await readFile(logPath);
+    logEndOffset = raw.length;
+  } catch {
+    return {
+      healthy: true,
+      stage: input.stage,
+      logPath,
+      logStartOffset: input.logStartOffset ?? 0,
+      logEndOffset,
+    };
+  }
+
+  const logStartOffset = Math.max(0, input.logStartOffset ?? 0);
+  const segment = raw.subarray(logStartOffset).toString("utf8");
+  const health = stageHealthEvidence(segment, input.stage);
+  return {
+    ...health,
+    stage: input.stage,
+    logPath,
+    logStartOffset,
+    logEndOffset,
+  };
+}
+
+export async function assertGraphRagStageReportHealthy(input: {
+  outputDir: string;
+  reportDir?: string;
+  stage: BookStage;
+  logStartOffset?: number;
+}): Promise<GraphRagStageReportHealth> {
+  const health = await checkGraphRagStageReportHealth(input);
+  if (!health.healthy) {
+    throw new Error(
+      "GraphRAG stage report contains recoverable provider or partial-output " +
+        "failure: " +
+        JSON.stringify({
+          stage: input.stage,
+          failureKind: health.failureKind,
+          reason: health.reason,
+          evidence: health.evidence,
+        }),
+    );
+  }
+  return health;
 }
 
 async function parseSettingsFingerprint(
@@ -720,8 +858,12 @@ async function collectWorkspaceArtifacts(
   const normalizedPath = resolve(paths.normalizedPath);
   const outputDir = resolve(paths.outputDir);
   const stageRunId = (stage: BookStage) => `${producerRunId}-${stage}`;
-  const outputRunId = (stage: BookStage) =>
-    expectedOutputProducer?.producerRunId ?? stageRunId(stage);
+  const outputRunId = (stage: BookStage) => {
+    if (expectedOutputProducer?.stageProducerRunIds != null) {
+      return expectedOutputProducer.stageProducerRunIds[stage] ?? stageRunId(stage);
+    }
+    return expectedOutputProducer?.producerRunId ?? stageRunId(stage);
+  };
 
   const canUseGraphOutput = expectedOutputProducer != null;
   const artifacts = await Promise.all([
@@ -835,16 +977,6 @@ async function collectWorkspaceArtifacts(
             : null
         )
       : null,
-    canUseGraphOutput
-      ? maybeArtifactForPath(
-          join(outputDir, "reports", "indexing-engine.log"),
-          "graph_extract",
-          "index_log",
-          outputRunId("graph_extract"),
-          stageFingerprints.graph_extract,
-          providerFingerprint,
-        )
-      : null,
   ]);
 
   return artifacts.filter((item) => item != null);
@@ -887,12 +1019,13 @@ function outputProducerMatches(input: {
 }): boolean {
   const manifest = input.manifest;
   if (manifest == null) return false;
+  const expectedLocator = graphRagBookOutputLocator(input.bookId);
   return manifest.bookId === input.bookId &&
     manifest.sourceHash === input.sourceHash &&
     manifest.documentId === input.documentId &&
     manifest.contentHash === input.contentHash &&
     manifest.providerFingerprint === input.providerFingerprint &&
-    resolve(manifest.outputDir) === resolve(input.outputDir) &&
+    manifest.outputDir === expectedLocator &&
     BookStageOrder.every((stage) =>
       manifest.stageFingerprints?.[stage] === input.stageFingerprints[stage]
     );
@@ -907,7 +1040,13 @@ export async function writeGraphRagOutputProducerManifest(input: {
   stageFingerprints: Record<BookStage, string>;
   providerFingerprint: string;
   producerRunId: string;
+  stage?: BookStage;
 }): Promise<void> {
+  const previous = await readOutputProducerManifest(input.outputDir);
+  const stageProducerRunIds = {
+    ...(previous?.stageProducerRunIds ?? {}),
+    ...(input.stage ? { [input.stage]: input.producerRunId } : {}),
+  };
   const manifest: GraphRagOutputProducerManifest = {
     schemaVersion: "1.0.0",
     bookId: input.bookId,
@@ -916,8 +1055,9 @@ export async function writeGraphRagOutputProducerManifest(input: {
     contentHash: input.contentHash,
     stageFingerprints: input.stageFingerprints,
     providerFingerprint: input.providerFingerprint,
-    outputDir: resolve(input.outputDir),
+    outputDir: graphRagBookOutputLocator(input.bookId),
     producerRunId: input.producerRunId,
+    stageProducerRunIds,
   };
   await mkdir(input.outputDir, { recursive: true });
   await writeFile(

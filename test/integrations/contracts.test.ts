@@ -232,9 +232,9 @@ export function batchItemCheckpointEnvelopeFixture() {
       expectedCommandCheckCount: 27,
       maxCommandAttempts: 3,
       failureKind: "transient",
-      retryable: true,
+      retryable: false,
       retryExhausted: true,
-      recoveryDecision: "retry_same_run_id",
+      recoveryDecision: "stop_until_fixed",
       failedStage: "resume-book-1",
       failedAt: "2026-05-23T00:02:00.000Z",
       errorSummary: "Error code: 503 - Service temporarily unavailable",
@@ -248,9 +248,10 @@ export function batchItemCheckpointEnvelopeFixture() {
         startedAt: "2026-05-23T00:00:00.000Z",
         completedAt: "2026-05-23T00:02:00.000Z",
         failureKind: "transient",
-        retryable: true,
+        retryable: false,
         attemptExhausted: true,
         providerStatusCode: 503,
+        recoveryDecision: "stop_until_fixed",
         errorSummary: "Error code: 503 - Service temporarily unavailable",
       }],
     },
@@ -320,12 +321,13 @@ export function batchRecoverySummaryEnvelopeFixture() {
         bookId: "book-fixture",
         status: "pending",
         attempts: 1,
-        qmdBuildStatus: "unknown",
-        graphBuildStatus: "unknown",
+        qmdBuildStatus: { status: "pending" },
+        graphBuildStatus: { status: "pending" },
         failureKind: "transient",
         retryable: true,
         recoveryDecision: "retry_same_run_id",
         failedStage: "resume-book-1",
+        providerStatusCode: 503,
         nextRetryAt: "2026-05-23T00:05:00.000Z",
         retryDelaySeconds: 180,
         retryBudgetSeconds: 7200,
@@ -1388,12 +1390,12 @@ describe("Data bus contracts", () => {
     expect(hydrated).toMatchObject({
       failureKind: "transient",
       retryable: true,
-      retryExhausted: true,
       recoveryDecision: "retry_same_run_id",
       failedStage: "resume-book-1",
       expectedCommandCheckCount: 27,
       maxCommandAttempts: 3,
     });
+    expect(hydrated.retryExhausted).toBeUndefined();
     expect(hydrated.commandChecks[0]).toMatchObject({
       failureKind: "transient",
       retryable: true,
@@ -1419,7 +1421,7 @@ describe("Data bus contracts", () => {
       .toBe(1);
     expect(checkpointEnvelope.kind).toBe("qmd.batch_run.item_checkpoint");
     expect(BatchItemCheckpointSchema.parse(checkpointEnvelope.payload).retryable)
-      .toBe(true);
+      .toBe(false);
     expect(eventEnvelope.kind).toBe("qmd.batch_run.event_log");
     expect(BatchEventLogSchema.parse(eventEnvelope.payload).failedStage)
       .toBe("resume-book-1");
@@ -2499,6 +2501,14 @@ items:
     configFingerprint: cfg
     promptFingerprint: prompt
     modelFingerprint: model
+    stageFingerprints:
+      ingest: stage-ingest
+      normalize: stage-normalize
+      graph_extract: stage-graph-extract
+      community_report: stage-community-report
+      embed: stage-embed
+      query_ready: stage-query-ready
+    providerFingerprint: provider-openai-responses-jina
     currentStage: query_ready
     overallStatus: succeeded
     createdAt: 2026-05-21T00:00:00.000Z
@@ -2521,6 +2531,32 @@ items:
     await writeFile(join(graphVault, "books", "book-123", "checkpoints.yaml"), `
 schemaVersion: ${SchemaVersion}
 items:
+  - schemaVersion: ${SchemaVersion}
+    bookId: book-123
+    stage: community_report
+    status: succeeded
+    attemptCount: 1
+    runId: run-community-report
+    inputFingerprint: stage-community-report
+    contentHash: ${contentHash}
+    stageFingerprint: stage-community-report
+    providerFingerprint: provider-openai-responses-jina
+    artifactIds:
+      - artifact-1
+    finishedAt: 2026-05-21T00:00:00.000Z
+  - schemaVersion: ${SchemaVersion}
+    bookId: book-123
+    stage: embed
+    status: succeeded
+    attemptCount: 1
+    runId: run-embed
+    inputFingerprint: stage-embed
+    contentHash: ${contentHash}
+    stageFingerprint: stage-embed
+    providerFingerprint: provider-openai-responses-jina
+    artifactIds:
+      - artifact-2
+    finishedAt: 2026-05-21T00:00:00.000Z
   - schemaVersion: ${SchemaVersion}
     bookId: book-123
     stage: query_ready
@@ -2556,6 +2592,8 @@ items:
     kind: lancedb_index
     path: books/book-123/output/lancedb
     contentHash: ${lancedbHash}
+    stageFingerprint: stage-embed
+    providerFingerprint: provider-openai-responses-jina
     producerRunId: run-2
     createdAt: 2026-05-21T00:00:00.000Z
 `);
@@ -2602,7 +2640,7 @@ items:
     expect(report.documentsPortable).toBe(true);
     expect(report.capabilitiesPortable).toBe(false);
     expect(report.portable).toBe(false);
-    expect(report.graphCapabilityCount).toBe(1);
+    expect(report.graphCapabilityCount).toBe(0);
     expect(report.failedItems).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -2635,6 +2673,14 @@ items:
     configFingerprint: cfg
     promptFingerprint: prompt
     modelFingerprint: model
+    stageFingerprints:
+      ingest: stage-ingest
+      normalize: stage-normalize
+      graph_extract: stage-graph-extract
+      community_report: stage-community-report
+      embed: stage-embed
+      query_ready: stage-query-ready
+    providerFingerprint: provider-openai-responses-jina
     currentStage: query_ready
     overallStatus: succeeded
     createdAt: 2026-05-21T00:00:00.000Z
@@ -2662,6 +2708,32 @@ items:
       `
 schemaVersion: ${SchemaVersion}
 items:
+  - schemaVersion: ${SchemaVersion}
+    bookId: book-123
+    stage: community_report
+    status: succeeded
+    attemptCount: 1
+    runId: run-community-report
+    inputFingerprint: stage-community-report
+    contentHash: ${contentHash}
+    stageFingerprint: stage-community-report
+    providerFingerprint: provider-openai-responses-jina
+    artifactIds:
+      - artifact-1
+    finishedAt: 2026-05-21T00:00:00.000Z
+  - schemaVersion: ${SchemaVersion}
+    bookId: book-123
+    stage: embed
+    status: succeeded
+    attemptCount: 1
+    runId: run-embed
+    inputFingerprint: stage-embed
+    contentHash: ${contentHash}
+    stageFingerprint: stage-embed
+    providerFingerprint: provider-openai-responses-jina
+    artifactIds:
+      - artifact-2
+    finishedAt: 2026-05-21T00:00:00.000Z
   - schemaVersion: ${SchemaVersion}
     bookId: book-123
     stage: query_ready
@@ -2692,7 +2764,7 @@ items:
     contentHash: ${reportHash}
     stageFingerprint: stage-community-report
     providerFingerprint: provider-openai-responses-jina
-    producerRunId: run-1
+    producerRunId: run-community-report
     createdAt: 2026-05-21T00:00:00.000Z
   - schemaVersion: ${SchemaVersion}
     artifactId: artifact-2
@@ -2703,7 +2775,7 @@ items:
     contentHash: ${lancedbHash}
     stageFingerprint: stage-embed
     providerFingerprint: provider-openai-responses-jina
-    producerRunId: run-1
+    producerRunId: run-embed
     createdAt: 2026-05-21T00:00:00.000Z
 `,
       "utf8",

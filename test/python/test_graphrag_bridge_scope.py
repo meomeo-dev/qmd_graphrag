@@ -40,14 +40,34 @@ def _write_books(root: Path) -> None:
                 "items": [
                     {
                         "bookId": "book-1",
+                        "documentId": "doc-1",
+                        "sourcePath": "sources/book-1/source.epub",
                         "sourceHash": "source-1",
                         "normalizedContentHash": "content-1",
+                        "configFingerprint": "config",
+                        "promptFingerprint": "prompt",
+                        "modelFingerprint": "model",
+                        "stageFingerprints": _stage_fingerprints(),
+                        "providerFingerprint": "provider-openai-responses-jina",
+                        "overallStatus": "succeeded",
+                        "createdAt": "2026-05-21T00:00:00.000Z",
+                        "updatedAt": "2026-05-21T00:00:00.000Z",
                         "metadata": {"normalizedPath": "input/book-one.md"},
                     },
                     {
                         "bookId": "book-2",
+                        "documentId": "doc-2",
+                        "sourcePath": "sources/book-2/source.epub",
                         "sourceHash": "source-2",
                         "normalizedContentHash": "content-2",
+                        "configFingerprint": "config",
+                        "promptFingerprint": "prompt",
+                        "modelFingerprint": "model",
+                        "stageFingerprints": _stage_fingerprints(),
+                        "providerFingerprint": "provider-openai-responses-jina",
+                        "overallStatus": "succeeded",
+                        "createdAt": "2026-05-21T00:00:00.000Z",
+                        "updatedAt": "2026-05-21T00:00:00.000Z",
                         "metadata": {"normalizedPath": "input/book-two.md"},
                     },
                 ],
@@ -107,6 +127,7 @@ def _write_books(root: Path) -> None:
                         "chunkIds": [],
                         "graphDocumentId": "doc-1",
                         "graphTextUnitIds": ["tu-1"],
+                        "metadata": {"qmdCorpusRegistered": True},
                     },
                     {
                         "schemaVersion": "1.0.0",
@@ -119,6 +140,7 @@ def _write_books(root: Path) -> None:
                         "chunkIds": [],
                         "graphDocumentId": "doc-2",
                         "graphTextUnitIds": ["tu-2"],
+                        "metadata": {"qmdCorpusRegistered": True},
                     },
                 ],
             }
@@ -127,6 +149,17 @@ def _write_books(root: Path) -> None:
     )
     _write_query_ready_state(root, "book-1", "artifact-1")
     _write_query_ready_state(root, "book-2", "artifact-2")
+
+
+def _stage_fingerprints() -> dict[str, str]:
+    return {
+        "ingest": "stage-ingest",
+        "normalize": "stage-normalize",
+        "graph_extract": "stage-graph-extract",
+        "community_report": "stage-community-report",
+        "embed": "stage-embed",
+        "query_ready": "stage-query-ready",
+    }
 
 
 def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> None:
@@ -139,6 +172,7 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
     report_hash = _hash_file(reports_path)
     lancedb_hash = _bridge_hash_lancedb_directory_contents(lancedb_dir)
     artifact_ids = [artifact_prefix, f"{artifact_prefix}-lancedb"]
+    provider_fingerprint = "provider-openai-responses-jina"
     (book_dir / "checkpoints.yaml").write_text(
         yaml.safe_dump(
             {
@@ -147,11 +181,43 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
                     {
                         "schemaVersion": "1.0.0",
                         "bookId": book_id,
+                        "stage": "community_report",
+                        "status": "succeeded",
+                        "attemptCount": 1,
+                        "runId": "run-community-report",
+                        "inputFingerprint": "stage-community-report",
+                        "contentHash": f"content-{book_id.rsplit('-', 1)[-1]}",
+                        "stageFingerprint": "stage-community-report",
+                        "providerFingerprint": provider_fingerprint,
+                        "artifactIds": [artifact_prefix],
+                        "finishedAt": "2026-05-21T00:00:00.000Z",
+                    },
+                    {
+                        "schemaVersion": "1.0.0",
+                        "bookId": book_id,
+                        "stage": "embed",
+                        "status": "succeeded",
+                        "attemptCount": 1,
+                        "runId": "run-embed",
+                        "inputFingerprint": "stage-embed",
+                        "contentHash": f"content-{book_id.rsplit('-', 1)[-1]}",
+                        "stageFingerprint": "stage-embed",
+                        "providerFingerprint": provider_fingerprint,
+                        "artifactIds": [f"{artifact_prefix}-lancedb"],
+                        "finishedAt": "2026-05-21T00:00:00.000Z",
+                    },
+                    {
+                        "schemaVersion": "1.0.0",
+                        "bookId": book_id,
                         "stage": "query_ready",
                         "status": "succeeded",
                         "attemptCount": 1,
                         "inputFingerprint": "fp",
+                        "contentHash": f"content-{book_id.rsplit('-', 1)[-1]}",
+                        "stageFingerprint": "stage-query-ready",
+                        "providerFingerprint": provider_fingerprint,
                         "artifactIds": artifact_ids,
+                        "finishedAt": "2026-05-21T00:00:00.000Z",
                     }
                 ],
             }
@@ -171,7 +237,9 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
                         "kind": "graphrag_community_reports_parquet",
                         "path": f"books/{book_id}/output/community_reports.parquet",
                         "contentHash": report_hash,
-                        "producerRunId": "run-1",
+                        "stageFingerprint": "stage-community-report",
+                        "providerFingerprint": provider_fingerprint,
+                        "producerRunId": "run-community-report",
                         "createdAt": "2026-05-21T00:00:00.000Z",
                     },
                     {
@@ -182,7 +250,9 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
                         "kind": "lancedb_index",
                         "path": f"books/{book_id}/output/lancedb",
                         "contentHash": lancedb_hash,
-                        "producerRunId": "run-1",
+                        "stageFingerprint": "stage-embed",
+                        "providerFingerprint": provider_fingerprint,
+                        "producerRunId": "run-embed",
                         "createdAt": "2026-05-21T00:00:00.000Z",
                     },
                 ],
@@ -767,25 +837,77 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
             catalog = yaml.safe_load(identity_path.read_text(encoding="utf-8"))
             del catalog["items"][0]["graphTextUnitIds"]
             identity_path.write_text(yaml.safe_dump(catalog), encoding="utf-8")
-            _, capabilities = _resolve_capability_scoped_book_ids(
-                root,
-                ["book-1"],
-                ["book-1:graph_query"],
-            )
-
             with self.assertRaisesRegex(ValueError, "missing graphTextUnitIds"):
-                _validate_capabilities_against_request_scope(
+                _resolve_capability_scoped_book_ids(
                     root,
-                    {
-                        "selectedBookIds": ["book-1"],
-                        "graphCapabilityIds": ["book-1:graph_query"],
-                        "sourceIds": ["sha256:source-1"],
-                        "documentIds": ["doc-1"],
-                        "contentHashes": ["content-1"],
-                        "artifactIds": ["artifact-1", "artifact-1-lancedb"],
-                    },
-                    capabilities,
+                    ["book-1"],
+                    ["book-1:graph_query"],
                 )
+
+    def test_capability_scope_requires_qmd_corpus_registration(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmd-bridge-scope-") as tmp:
+            root = Path(tmp)
+            _write_books(root)
+            identity_path = root / "catalog" / "document-identity-map.yaml"
+            catalog = yaml.safe_load(identity_path.read_text(encoding="utf-8"))
+            catalog["items"][0]["metadata"]["qmdCorpusRegistered"] = False
+            identity_path.write_text(yaml.safe_dump(catalog), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "not registered in qmd corpus"):
+                _resolve_capability_scoped_book_ids(
+                    root,
+                    ["book-1"],
+                    ["book-1:graph_query"],
+                )
+
+    def test_capability_scope_requires_identity_canonical_book_id(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmd-bridge-scope-") as tmp:
+            root = Path(tmp)
+            _write_books(root)
+            identity_path = root / "catalog" / "document-identity-map.yaml"
+            catalog = yaml.safe_load(identity_path.read_text(encoding="utf-8"))
+            catalog["items"][0]["canonicalBookId"] = "book-other"
+            identity_path.write_text(yaml.safe_dump(catalog), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "bookId mismatches identity"):
+                _resolve_capability_scoped_book_ids(
+                    root,
+                    ["book-1"],
+                    ["book-1:graph_query"],
+                )
+
+    def test_capability_scope_rejects_non_portable_artifact_paths(self) -> None:
+        rejected_paths = [
+            "",
+            "/outside/community_reports.parquet",
+            "C:/outside/community_reports.parquet",
+            "file:books/book-1/output/community_reports.parquet",
+            "s3://bucket/community_reports.parquet",
+            "~/graph_vault/community_reports.parquet",
+            "~user/graph_vault/community_reports.parquet",
+            "books/book-1/output/../output/community_reports.parquet",
+        ]
+        for rejected_path in rejected_paths:
+            with self.subTest(path=rejected_path):
+                with tempfile.TemporaryDirectory(prefix="qmd-bridge-scope-") as tmp:
+                    root = Path(tmp)
+                    _write_books(root)
+                    artifacts_path = root / "books" / "book-1" / "artifacts.yaml"
+                    artifacts = yaml.safe_load(
+                        artifacts_path.read_text(encoding="utf-8")
+                    )
+                    artifacts["items"][0]["path"] = rejected_path
+                    artifacts_path.write_text(
+                        yaml.safe_dump(artifacts),
+                        encoding="utf-8",
+                    )
+
+                    with self.assertRaisesRegex(ValueError, "unknown or not-ready"):
+                        _resolve_capability_scoped_book_ids(
+                            root,
+                            ["book-1"],
+                            ["book-1:graph_query"],
+                        )
 
 
 if __name__ == "__main__":

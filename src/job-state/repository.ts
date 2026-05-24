@@ -775,6 +775,27 @@ function buildResumePlan(
   });
 }
 
+function producerRunIdsForQueryReady(
+  checkpointByStage: ReadonlyMap<BookStage, BookJobStageCheckpoint>,
+): Partial<Record<BookStage, string>> | undefined {
+  const communityReport = checkpointByStage.get("community_report");
+  const embed = checkpointByStage.get("embed");
+  if (
+    communityReport?.status !== "succeeded" ||
+    typeof communityReport.runId !== "string" ||
+    communityReport.runId.length === 0 ||
+    embed?.status !== "succeeded" ||
+    typeof embed.runId !== "string" ||
+    embed.runId.length === 0
+  ) {
+    return undefined;
+  }
+  return {
+    community_report: communityReport.runId,
+    embed: embed.runId,
+  };
+}
+
 type ArtifactStageValidity = {
   isSatisfied: boolean;
   missingArtifactIds: string[];
@@ -1574,6 +1595,29 @@ export class FileBookJobStateRepository {
     return checkpoints.find((item) => item.stage === stage) ?? null;
   }
 
+  private async getStageCheckpointRunId(
+    bookId: string,
+    stage: BookStage,
+  ): Promise<string | undefined> {
+    const checkpoint = await this.getStageCheckpoint(bookId, stage);
+    return checkpoint?.status === "succeeded" ? checkpoint.runId : undefined;
+  }
+
+  private async queryReadyProducerRunIds(
+    bookId: string,
+  ): Promise<Partial<Record<BookStage, string>> | undefined> {
+    const communityReportRunId = await this.getStageCheckpointRunId(
+      bookId,
+      "community_report",
+    );
+    const embedRunId = await this.getStageCheckpointRunId(bookId, "embed");
+    if (communityReportRunId == null || embedRunId == null) return undefined;
+    return {
+      community_report: communityReportRunId,
+      embed: embedRunId,
+    };
+  }
+
   async startStage(input: StartStageInput): Promise<BookJobStageCheckpoint> {
     return this.writeStageCheckpoint({
       ...input,
@@ -2009,6 +2053,7 @@ export class FileBookJobStateRepository {
     checkpoints: BookJobStageCheckpoint[],
     requirements: StageArtifactRequirementMap,
   ): Promise<Map<BookStage, ArtifactStageValidity>> {
+    const job = await this.getBookJob(bookId);
     const stagesToValidate = new Set<BookStage>();
     for (const stage of Object.keys(requirements) as BookStage[]) {
       stagesToValidate.add(stage);
@@ -2025,6 +2070,9 @@ export class FileBookJobStateRepository {
 
     const artifacts = await this.listArtifacts(bookId);
     const result = new Map<BookStage, ArtifactStageValidity>();
+    const checkpointByStage = new Map(
+      checkpoints.map((item) => [item.stage, item]),
+    );
 
     for (const checkpoint of checkpoints) {
       if (!stagesToValidate.has(checkpoint.stage)) {
@@ -2032,12 +2080,34 @@ export class FileBookJobStateRepository {
       }
 
       const requiredKinds = requirements[checkpoint.stage] ?? [];
+      const queryReadyProducerRunIds = checkpoint.stage === "query_ready"
+        ? producerRunIdsForQueryReady(checkpointByStage)
+        : undefined;
       const artifactValidation = await validateBookArtifactSet({
         graphVault: this.rootDir,
         bookId,
         artifactIds: checkpoint.artifactIds,
         artifacts,
         requiredKinds,
+        allowedKinds: checkpoint.stage === "query_ready"
+          ? QUERY_READY_ARTIFACT_KINDS
+          : undefined,
+        requireBookScopedGraphOutput: checkpoint.stage === "query_ready" ||
+          requiredKinds.some((kind) =>
+            kind === "graphrag_community_reports_parquet" ||
+            kind === "lancedb_index" ||
+            kind.startsWith("graphrag_")
+          ),
+        expectedProducerRunIds: checkpoint.stage === "query_ready"
+          ? queryReadyProducerRunIds ?? {
+              community_report: "__missing_query_ready_producer__",
+              embed: "__missing_query_ready_producer__",
+            }
+          : checkpoint.runId == null || !HIGH_COST_STAGES.has(checkpoint.stage)
+            ? undefined
+            : { [checkpoint.stage]: checkpoint.runId },
+        expectedStageFingerprints: job?.stageFingerprints,
+        expectedProviderFingerprint: job?.providerFingerprint,
       });
 
       result.set(checkpoint.stage, {
@@ -2155,6 +2225,16 @@ export class FileBookJobStateRepository {
           `query_ready checkpoint requires registered book state: ${input.bookId}`,
         );
       }
+      const communityReportRunId = await this.getStageCheckpointRunId(
+        input.bookId,
+        "community_report",
+      );
+      const embedRunId = await this.getStageCheckpointRunId(input.bookId, "embed");
+      if (communityReportRunId == null || embedRunId == null) {
+        throw new Error(
+          "query_ready checkpoint requires completed GraphRAG producer stages",
+        );
+      }
       const artifacts = await this.listArtifacts(input.bookId);
       const validation = await validateBookArtifactSet({
         graphVault: this.rootDir,
@@ -2162,6 +2242,14 @@ export class FileBookJobStateRepository {
         artifactIds: checkpoint.artifactIds,
         artifacts,
         requiredKinds: QUERY_READY_ARTIFACT_KINDS,
+        allowedKinds: QUERY_READY_ARTIFACT_KINDS,
+        requireBookScopedGraphOutput: true,
+        expectedProducerRunIds: {
+          community_report: communityReportRunId,
+          embed: embedRunId,
+        },
+        expectedStageFingerprints: job.stageFingerprints,
+        expectedProviderFingerprint: job.providerFingerprint,
       });
       if (!validation.isSatisfied) {
         throw new Error(
@@ -2412,12 +2500,19 @@ export class FileBookJobStateRepository {
     artifactIds: readonly string[],
     artifacts: readonly BookArtifactManifest[],
   ): Promise<boolean> {
+    const expectedProducerRunIds = await this.queryReadyProducerRunIds(job.bookId);
+    if (expectedProducerRunIds == null) return false;
     const validation = await validateBookArtifactSet({
       graphVault: this.rootDir,
       bookId: job.bookId,
       artifactIds,
       artifacts,
       requiredKinds: QUERY_READY_ARTIFACT_KINDS,
+      allowedKinds: QUERY_READY_ARTIFACT_KINDS,
+      requireBookScopedGraphOutput: true,
+      expectedProducerRunIds,
+      expectedStageFingerprints: job.stageFingerprints,
+      expectedProviderFingerprint: job.providerFingerprint,
     });
     if (!validation.isSatisfied) return false;
     try {

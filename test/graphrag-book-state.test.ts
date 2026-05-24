@@ -10,7 +10,10 @@ import YAML from "yaml";
 import {
   buildGraphRagRuntimeSettingsProjection,
   assertGraphRagStageArtifactsReady,
+  assertGraphRagStageReportHealthy,
+  checkGraphRagStageReportHealth,
   FileBookJobStateRepository,
+  graphRagIndexLogOffset,
   graphRagBookOutputDir,
   SchemaVersion,
   syncGraphRagBookWorkspace,
@@ -589,6 +592,56 @@ describe("syncGraphRagBookWorkspace", () => {
     }
   });
 
+  test("rejects GraphRAG stage reports with provider or partial-output errors", async () => {
+    const root = await createWorkspace();
+    try {
+      const outputDir = join(root, "graph_vault", "books", "book-1", "output");
+      const reportDir = join(outputDir, "reports");
+      await mkdir(reportDir, { recursive: true });
+      const logPath = join(reportDir, "indexing-engine.log");
+      await writeFile(
+        logPath,
+        "2026-05-24 INFO old stage completed\n" +
+          "2026-05-24 ERROR old Concurrency limit exceeded for user\n",
+        "utf8",
+      );
+      const offset = await graphRagIndexLogOffset(outputDir);
+
+      let health = await checkGraphRagStageReportHealth({
+        outputDir,
+        stage: "community_report",
+        logStartOffset: offset,
+      });
+      expect(health.healthy).toBe(true);
+
+      await writeFile(
+        logPath,
+        "2026-05-24 INFO old stage completed\n" +
+          "2026-05-24 ERROR old Concurrency limit exceeded for user\n" +
+          "2026-05-24 ERROR Community Report Extraction Error\n" +
+          "2026-05-24 WARNING No report found for community: 16\n",
+        "utf8",
+      );
+      health = await checkGraphRagStageReportHealth({
+        outputDir,
+        stage: "community_report",
+        logStartOffset: offset,
+      });
+      expect(health).toMatchObject({
+        healthy: false,
+        stage: "community_report",
+        failureKind: "partial_output",
+      });
+      await expect(assertGraphRagStageReportHealthy({
+        outputDir,
+        stage: "community_report",
+        logStartOffset: offset,
+      })).rejects.toThrow("GraphRAG stage report contains recoverable provider");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("records GraphRAG text unit identity in the document identity map", async () => {
     const root = await createWorkspace();
     try {
@@ -631,6 +684,7 @@ describe("syncGraphRagBookWorkspace", () => {
         stageFingerprints: initial.stageFingerprints,
         providerFingerprint: initial.job.providerFingerprint!,
         producerRunId: "real-test-run",
+        stage: "graph_extract",
       });
       const state = await syncGraphRagBookWorkspace({
         stateRootDir: graphVault,
@@ -657,6 +711,76 @@ describe("syncGraphRagBookWorkspace", () => {
 
       expect(identity?.graphDocumentId).toBe("graph-doc-1");
       expect(identity?.graphTextUnitIds).toEqual(["tu-1", "tu-2"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps producer manifest portable and stage-scoped", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+      await writeFile(join(graphVault, "settings.yaml"), "vector_store: {}\n", "utf8");
+      await writeFile(join(graphVault, "prompts", "extract_graph.txt"), "prompt", "utf8");
+
+      const initial = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        recordRecoveredStages: false,
+      });
+      const outputDir = graphRagBookOutputDir({
+        stateRootDir: graphVault,
+        bookId: initial.job.bookId,
+      });
+      await writeMinimalGraphOutput(outputDir);
+      await writeGraphRagOutputProducerManifest({
+        outputDir,
+        bookId: initial.job.bookId,
+        sourceHash: initial.job.sourceHash,
+        documentId: initial.job.documentId,
+        contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+        stageFingerprints: initial.stageFingerprints,
+        providerFingerprint: initial.job.providerFingerprint!,
+        producerRunId: "graph-run",
+        stage: "graph_extract",
+      });
+
+      const manifest = JSON.parse(await readFile(
+        join(outputDir, "qmd_output_manifest.json"),
+        "utf8",
+      ));
+      expect(manifest.outputDir).toBe(`books/${initial.job.bookId}/output`);
+      expect(manifest.outputDir).not.toContain(root);
+      expect(manifest.stageProducerRunIds).toMatchObject({
+        graph_extract: "graph-run",
+      });
+
+      const synced = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        recordRecoveredStages: false,
+      });
+      await expect(assertGraphRagStageArtifactsReady({
+        stateRootDir: graphVault,
+        bookId: initial.job.bookId,
+        stage: "community_report",
+        producerRunId: "graph-run",
+        artifacts: synced.artifacts,
+      })).rejects.toThrow("GraphRAG stage did not produce valid book-scoped artifacts");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -701,7 +825,30 @@ describe("syncGraphRagBookWorkspace", () => {
         contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
         stageFingerprints: initial.stageFingerprints,
         providerFingerprint: initial.job.providerFingerprint!,
-        producerRunId: "real-test-run",
+        producerRunId: "real-graph-extract",
+        stage: "graph_extract",
+      });
+      await writeGraphRagOutputProducerManifest({
+        outputDir,
+        bookId: initial.job.bookId,
+        sourceHash: initial.job.sourceHash,
+        documentId: initial.job.documentId,
+        contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+        stageFingerprints: initial.stageFingerprints,
+        providerFingerprint: initial.job.providerFingerprint!,
+        producerRunId: "real-community-report",
+        stage: "community_report",
+      });
+      await writeGraphRagOutputProducerManifest({
+        outputDir,
+        bookId: initial.job.bookId,
+        sourceHash: initial.job.sourceHash,
+        documentId: initial.job.documentId,
+        contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+        stageFingerprints: initial.stageFingerprints,
+        providerFingerprint: initial.job.providerFingerprint!,
+        producerRunId: "real-embed",
+        stage: "embed",
       });
 
       const syncedArtifacts = await syncGraphRagBookWorkspace({

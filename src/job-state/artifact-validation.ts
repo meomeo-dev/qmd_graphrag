@@ -1,4 +1,4 @@
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 
 import type {
@@ -233,6 +233,16 @@ export async function validateArtifact(
   let artifactStat;
   try {
     artifactStat = await stat(artifactPath);
+    const [vaultRealPath, artifactRealPath] = await Promise.all([
+      realpath(graphVault),
+      realpath(artifactPath),
+    ]);
+    if (
+      artifactRealPath !== vaultRealPath &&
+      !artifactRealPath.startsWith(`${vaultRealPath}/`)
+    ) {
+      return { valid: false, reason: "realpath_outside_graph_vault" };
+    }
   } catch {
     return { valid: false, reason: "path_missing" };
   }
@@ -283,8 +293,16 @@ export async function validateBookArtifactSet(input: {
   artifactIds: readonly string[];
   artifacts: readonly BookArtifactManifest[];
   requiredKinds?: readonly BookArtifactKind[];
+  allowedKinds?: readonly BookArtifactKind[];
+  requireBookScopedGraphOutput?: boolean;
+  expectedProducerRunIds?: Partial<Record<BookStage, string>>;
+  expectedStageFingerprints?: Partial<Record<BookStage, string>>;
+  expectedProviderFingerprint?: string;
 }): Promise<BookArtifactSetValidationResult> {
   const requiredKinds = input.requiredKinds ?? [];
+  const allowedKinds = input.allowedKinds == null
+    ? null
+    : new Set(input.allowedKinds);
   const artifactById = new Map(
     input.artifacts.map((artifact) => [artifact.artifactId, artifact]),
   );
@@ -294,6 +312,40 @@ export async function validateBookArtifactSet(input: {
   for (const artifactId of input.artifactIds) {
     const artifact = artifactById.get(artifactId);
     if (artifact == null || artifact.bookId !== input.bookId) {
+      missingArtifactIds.push(artifactId);
+      continue;
+    }
+    if (allowedKinds != null && !allowedKinds.has(artifact.kind)) {
+      missingArtifactIds.push(artifactId);
+      continue;
+    }
+    if (
+      input.requireBookScopedGraphOutput === true &&
+      !isBookScopedGraphOutputArtifact(input.bookId, artifact)
+    ) {
+      missingArtifactIds.push(artifactId);
+      continue;
+    }
+    const expectedProducerRunId = input.expectedProducerRunIds?.[artifact.stage];
+    if (
+      expectedProducerRunId != null &&
+      artifact.producerRunId !== expectedProducerRunId
+    ) {
+      missingArtifactIds.push(artifactId);
+      continue;
+    }
+    const expectedStageFingerprint = input.expectedStageFingerprints?.[artifact.stage];
+    if (
+      expectedStageFingerprint != null &&
+      artifact.stageFingerprint !== expectedStageFingerprint
+    ) {
+      missingArtifactIds.push(artifactId);
+      continue;
+    }
+    if (
+      input.expectedProviderFingerprint != null &&
+      artifact.providerFingerprint !== input.expectedProviderFingerprint
+    ) {
       missingArtifactIds.push(artifactId);
       continue;
     }
@@ -319,4 +371,21 @@ export async function validateBookArtifactSet(input: {
     missingArtifactKinds,
     validArtifacts,
   };
+}
+
+function isBookScopedGraphOutputArtifact(
+  bookId: string,
+  artifact: BookArtifactManifest,
+): boolean {
+  const base = `books/${bookId}/output`;
+  if (artifact.kind === "lancedb_index") {
+    return artifact.path === `${base}/lancedb`;
+  }
+  if (
+    artifact.kind === "graphrag_community_reports_parquet" ||
+    artifact.kind.startsWith("graphrag_")
+  ) {
+    return artifact.path.startsWith(`${base}/`);
+  }
+  return true;
 }
