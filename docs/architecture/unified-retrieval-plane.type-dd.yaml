@@ -353,6 +353,7 @@ typed_buses:
         required_observability_fields:
           - qmdBuildStatus
           - graphBuildStatus
+          - graphQueryStatus
           - providerStatusCode
           - recoveryDecision
           - failedStage
@@ -1538,8 +1539,8 @@ state_and_recovery:
       recovered to pending with recoveryDecision=retry_same_run_id.
     status_json_projection_rule: >-
       --status-json is a read-only projection. It recomputes recovery decisions,
-      qmdBuildStatus, and graphBuildStatus for stdout without writing manifest,
-      item checkpoints, events, or producer manifests.
+      qmdBuildStatus, graphBuildStatus, and graphQueryStatus for stdout without
+      writing manifest, item checkpoints, events, or producer manifests.
     command_timeout_rule: >-
       Every spawned command has commandTimeoutSeconds. Timeout failures are
       classified as transient and enter the same bounded retry path as provider
@@ -1597,7 +1598,9 @@ state_and_recovery:
     command_check_rule: >-
       Every completed item has exactly 27 required commandChecks and every
       commandCheck status is passed. Persisted qmdBuildStatus is never trusted
-      without recomputing it from commandChecks.
+      without recomputing it from commandChecks. completed items require
+      qmdBuildStatus.status=succeeded, graphBuildStatus.status=succeeded, and
+      graphQueryStatus.status=succeeded.
     command_check_failure_rule: >-
       Failed commandChecks carry failureKind, retryable, providerStatusCode
       when available, attemptExhausted, the failed command name, and

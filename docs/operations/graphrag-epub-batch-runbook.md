@@ -27,10 +27,11 @@ graph_vault/catalog/batch-runs/<runId>/
   stateRootLocator、qmdIndexLocator、configLocator、item 计数和当前状态。
 - `items/<itemId>.json`：`BatchItemCheckpoint`，记录单本 EPUB 的 source
   locator、normalized locator、status、attempts、bookId、errorSummary、
-  `qmdBuildStatus`、`graphBuildStatus` 和 CLI check 结果。
+  `qmdBuildStatus`、`graphBuildStatus`、`graphQueryStatus` 和 CLI check 结果。
 - `events.jsonl`：`BatchEventLog`，逐行记录 batch/item/command 事件。
 - `recovery-summary.json`：批次观测摘要，记录每本书的 qmd/GraphRAG
-  构建状态、失败分类、下一次重试时间（next retry time）和恢复决策。
+  构建状态、GraphRAG query 检查状态、失败分类、下一次重试时间
+  （next retry time）和恢复决策。
 
 状态取值：
 
@@ -82,8 +83,9 @@ item。真实准入批次必须让每本 EPUB 形成 `completed` checkpoint。
 不得作为信任源；批量执行器必须从 `commandChecks` 重新计算 qmd 构建状态。
 缺少 27 个固定名称 command checks、任一 command check 非 `passed`、缺少真实
 GraphRAG producer lineage，或 `graphBuildStatus.status` 不能重新计算为
-`succeeded` 的 checkpoint，必须降级为 `pending`，写入
-`item_completed_reopened` 事件，并以 `recoveryDecision=continue_pending` 继续。
+`succeeded`、`graphQueryStatus.status` 不能重新计算为 `succeeded` 的
+checkpoint，必须降级为 `pending`，写入 `item_completed_reopened` 事件，并以
+`recoveryDecision=continue_pending` 继续。
 该规则适用于 `--migrate-only`、`--status-json` 和正式运行。
 
 `graphBuildStatus.status=succeeded` 的必要条件：
@@ -234,8 +236,8 @@ stdout 的单一 JSON 对象中。
 `recovery-summary.json` 与 `--status-json` 输出均受
 `BatchRecoverySummarySchema` 约束。摘要记录批次恢复决策、重试策略、
 `retryableItemCount`、最早 `nextRetryAt`，以及每本书的 `qmdBuildStatus`、
-`graphBuildStatus`、runner ownership 和 orphan 检测状态。摘要不得包含密钥、
-Bearer token、原始 provider 请求体或响应体。
+`graphBuildStatus`、`graphQueryStatus`、runner ownership 和 orphan 检测状态。
+摘要不得包含密钥、Bearer token、原始 provider 请求体或响应体。
 
 ## 只读验证命令
 
@@ -327,7 +329,7 @@ NODE
 每个 completed checkpoint 必须包含 27 个 `commandChecks`，名称集合必须与上述检查
 集一致，且全部为 `passed`。缺项、重复项或失败项均不得写入 completed。
 每个 completed checkpoint 必须同时包含 `qmdBuildStatus.status=succeeded` 与
-`graphBuildStatus.status=succeeded`。
+`graphBuildStatus.status=succeeded`、`graphQueryStatus.status=succeeded`。
 
 `qmd vsearch` 是向量检索（vector search）检查，只允许 embedding/vector
 lookup，不允许 query expansion、OpenAI Responses generation、DSPy expansion、
