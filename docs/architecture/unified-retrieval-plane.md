@@ -634,7 +634,7 @@ bridge 将该投影传给 GEPA runner。GEPA runner 只允许 `endpoint=/respons
 
 - processing unit：`source_document`
 - graph business unit：`book_id`
-- recovery unit：`book_id + processing_stage`
+- recovery unit：`book_id + processing_stage + command_check`
 - cache unit：`normalized_provider_request_hash`
 
 `graph_vault` 是可迁移持久化单元。迁移后通过 `restore-from-vault` 从以下
@@ -655,15 +655,24 @@ GraphRAG capability。
 
 - `BatchRunManifest` 保存于 `graph_vault/catalog/batch-runs/<runId>/manifest.json`。
 - `BatchItemCheckpoint` 保存每本 EPUB 的 `pending/running/completed/failed`
-  状态、source locator、normalized locator、bookId、attempts、startedAt、
-  completedAt、failedAt 和 redacted error summary。
+  状态、source locator、normalized locator、sourceHash、bookId、attempts、
+  expectedCommandCheckCount、failureKind、retryable、retryExhausted、
+  recoveryDecision、failedStage、startedAt、completedAt、failedAt 和 redacted
+  error summary。
 - `BatchEventLog` 保存于 `graph_vault/catalog/batch-runs/<runId>/events.jsonl`。
 - 批量恢复时先读取 batch manifest，再读取单书 `BookResumePlan.nextStage`。
 - 已 `completed` 的批量 item 不重跑；单书 checkpoint 不完整时以
   `BookResumePlan.nextStage` 继续，不从第一本或第一阶段重跑。
 - Provider 429、concurrency limit、timeout、502、503、504 属于 transient
   failure。批量执行器对 transient failure 做有限重试；重试耗尽后标记当前
-  item failed 并停止批次，保留已完成 item。
+  item failed，写入 `failureKind=transient`、`retryable=true`、
+  `recoveryDecision=retry_same_run_id`，并继续处理后续 pending item。
+- `failed` item 只有 `retryable=true` 时由同一 `runId` 自动重试；permanent
+  failed item 保持 failed，不阻塞其他 pending item。
+- 批次完成条件只接受 `completedItems == totalItems`。`skippedItems` 和
+  `importedCompletedItems` 是调度事实，不抵扣闭环完成。
+- 每个 completed checkpoint 必须包含 27 个固定名称的 command checks，且全部
+  为 `passed`。
 
 active vault 目录必须保持 canonical：
 

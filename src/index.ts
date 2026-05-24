@@ -415,13 +415,18 @@ export {
 } from "./contracts/corpus.js";
 export {
   BatchItemStatusSchema,
+  BatchRunStatusSchema,
+  BatchFailureKindSchema,
+  BatchRecoveryDecisionSchema,
   BatchCommandCheckSchema,
+  BatchItemCheckpointInputSchema,
   BatchItemCheckpointSchema,
   BatchRunManifestSchema,
   BatchEventLogSchema,
   BatchRunManifestEnvelopeSchema,
   BatchItemCheckpointEnvelopeSchema,
   BatchEventLogEnvelopeSchema,
+  parseBatchItemCheckpoint,
 } from "./contracts/batch-run.js";
 export {
   ContentVectorEmbeddingRecordSchema,

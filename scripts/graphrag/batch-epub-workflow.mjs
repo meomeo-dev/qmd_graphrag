@@ -48,6 +48,7 @@ const { values } = parseArgs({
     "max-command-attempts": { type: "string", default: "3" },
     "completed-manifest": { type: "string" },
     "skip-dotenv": { type: "boolean", default: false },
+    "fail-fast": { type: "boolean", default: false },
     verbose: { type: "boolean", default: true },
   },
 });
@@ -68,11 +69,42 @@ const maxCommandAttempts = Math.max(
   1,
   Number.parseInt(String(values["max-command-attempts"]), 10) || 3,
 );
+const failFast = Boolean(values["fail-fast"]);
 
 const batchRoot = join(stateRoot, "catalog", "batch-runs", runId);
 const itemRoot = join(batchRoot, "items");
 const eventsPath = join(batchRoot, "events.jsonl");
 const manifestPath = join(batchRoot, "manifest.json");
+const requiredCommandCheckNames = [
+  "qmd-version",
+  "qmd-status",
+  "qmd-doctor-json",
+  "qmd-pull",
+  "qmd-update",
+  "qmd-embed",
+  "qmd-ls-books",
+  "qmd-search-json",
+  "qmd-search-csv",
+  "qmd-search-md",
+  "qmd-search-xml",
+  "qmd-search-files",
+  "qmd-vsearch-json",
+  "qmd-query-json",
+  "qmd-query-auto-json",
+  "qmd-query-graphrag-json",
+  "qmd-get-book",
+  "qmd-multi-get-json",
+  "qmd-collection-list",
+  "qmd-collection-show-books",
+  "qmd-context-list",
+  "qmd-skills-list-json",
+  "qmd-skills-get-json",
+  "qmd-skills-path-json",
+  "qmd-skill-show",
+  "qmd-dspy-status-json",
+  "qmd-cleanup",
+];
+const expectedCommandCheckCount = requiredCommandCheckNames.length;
 
 const JsonPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 const JsonValueSchema = z.lazy(() =>
@@ -89,6 +121,23 @@ const BatchItemStatusSchema = z.enum([
   "completed",
   "failed",
 ]);
+const BatchRunStatusSchema = z.enum([
+  "running",
+  "completed",
+  "failed",
+  "incomplete",
+]);
+const BatchFailureKindSchema = z.enum([
+  "transient",
+  "permanent",
+  "unknown",
+]);
+const BatchRecoveryDecisionSchema = z.enum([
+  "none",
+  "retry_same_run_id",
+  "continue_pending",
+  "stop_until_fixed",
+]);
 const BatchCommandCheckSchema = z.object({
   name: z.string().min(1),
   status: z.enum(["passed", "failed"]),
@@ -98,6 +147,11 @@ const BatchCommandCheckSchema = z.object({
   stderrBytes: z.number().int().nonnegative(),
   startedAt: z.string().datetime(),
   completedAt: z.string().datetime(),
+  failureKind: BatchFailureKindSchema.optional(),
+  retryable: z.boolean().optional(),
+  retryAfterSeconds: z.number().int().nonnegative().optional(),
+  attemptExhausted: z.boolean().optional(),
+  providerStatusCode: z.number().int().positive().optional(),
   errorSummary: z.string().max(1000).optional(),
 });
 const BatchItemCheckpointSchema = z.object({
@@ -107,10 +161,17 @@ const BatchItemCheckpointSchema = z.object({
   status: BatchItemStatusSchema,
   sourceName: z.string().min(1),
   sourceRelativePath: z.string().min(1),
-  sourceHash: z.string().min(1).optional(),
+  sourceHash: z.string().min(1),
   normalizedPath: z.string().min(1),
-  bookId: z.string().min(1).optional(),
+  bookId: z.string().min(1),
   attempts: z.number().int().nonnegative(),
+  expectedCommandCheckCount: z.number().int().positive().optional(),
+  maxCommandAttempts: z.number().int().positive().optional(),
+  failureKind: BatchFailureKindSchema.optional(),
+  retryable: z.boolean().optional(),
+  retryExhausted: z.boolean().optional(),
+  recoveryDecision: BatchRecoveryDecisionSchema.optional(),
+  failedStage: z.string().min(1).optional(),
   startedAt: z.string().datetime().optional(),
   completedAt: z.string().datetime().optional(),
   failedAt: z.string().datetime().optional(),
@@ -121,15 +182,20 @@ const BatchItemCheckpointSchema = z.object({
 const BatchRunManifestSchema = z.object({
   schemaVersion: z.literal(SchemaVersion),
   runId: z.string().min(1),
-  status: z.enum(["running", "completed", "failed"]),
+  status: BatchRunStatusSchema,
   sourceRootName: z.string().min(1),
   stateRootLocator: z.string().min(1),
   qmdIndexLocator: z.string().min(1),
   configLocator: z.string().min(1),
   totalItems: z.number().int().nonnegative(),
+  pendingItems: z.number().int().nonnegative().default(0),
+  runningItems: z.number().int().nonnegative().default(0),
   completedItems: z.number().int().nonnegative(),
   skippedItems: z.number().int().nonnegative().default(0),
+  importedCompletedItems: z.number().int().nonnegative().default(0),
   failedItems: z.number().int().nonnegative(),
+  expectedCommandCheckCount: z.number().int().positive().optional(),
+  maxCommandAttempts: z.number().int().positive().optional(),
   startedAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
   completedAt: z.string().datetime().optional(),
@@ -144,6 +210,13 @@ const BatchEventLogSchema = z.object({
   event: z.string().min(1),
   status: BatchItemStatusSchema.optional(),
   command: z.string().min(1).optional(),
+  failureKind: BatchFailureKindSchema.optional(),
+  retryable: z.boolean().optional(),
+  retryAfterSeconds: z.number().int().nonnegative().optional(),
+  attemptExhausted: z.boolean().optional(),
+  providerStatusCode: z.number().int().positive().optional(),
+  recoveryDecision: BatchRecoveryDecisionSchema.optional(),
+  failedStage: z.string().min(1).optional(),
   at: z.string().datetime(),
   message: z.string().max(1000).optional(),
   metadata: z.record(z.string(), JsonValueSchema).optional(),
@@ -204,9 +277,47 @@ function redactExactEnvValues(text) {
   return output;
 }
 
-function isTransient(text) {
+function classifyFailure(text) {
   const message = String(text).toLowerCase();
-  return (
+  const statusCodeMatch = message.match(
+    /(?:status|code|error code)[:\s-]*([45]\d\d)|\(([45]\d\d)\)/iu,
+  );
+  const providerStatusCode = statusCodeMatch
+    ? Number.parseInt(statusCodeMatch[1] ?? statusCodeMatch[2], 10)
+    : undefined;
+  const retryAfterMatch = message.match(/retry-after[:\s-]*(\d+)/iu);
+  const retryAfterSeconds = retryAfterMatch
+    ? Number.parseInt(retryAfterMatch[1], 10)
+    : undefined;
+  if (
+    providerStatusCode === 400 ||
+    providerStatusCode === 401 ||
+    providerStatusCode === 403 ||
+    providerStatusCode === 404 ||
+    providerStatusCode === 422
+  ) {
+    return {
+      failureKind: "permanent",
+      retryable: false,
+      providerStatusCode,
+      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+    };
+  }
+  if (
+    providerStatusCode === 429 ||
+    providerStatusCode === 500 ||
+    providerStatusCode === 502 ||
+    providerStatusCode === 503 ||
+    providerStatusCode === 504
+  ) {
+    return {
+      failureKind: "transient",
+      retryable: true,
+      providerStatusCode,
+      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+    };
+  }
+  const transient =
     message.includes("concurrency limit") ||
     message.includes("rate limit") ||
     message.includes("temporarily unavailable") ||
@@ -220,8 +331,21 @@ function isTransient(text) {
     message.includes("status 500") ||
     message.includes("status 502") ||
     message.includes("status 503") ||
-    message.includes("status 504")
-  );
+    message.includes("status 504");
+  if (transient) {
+    return {
+      failureKind: "transient",
+      retryable: true,
+      ...(providerStatusCode ? { providerStatusCode } : {}),
+      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+    };
+  }
+  return {
+    failureKind: "unknown",
+    retryable: false,
+    ...(providerStatusCode ? { providerStatusCode } : {}),
+    ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+  };
 }
 
 function sleep(ms) {
@@ -354,6 +478,10 @@ function itemIdFor(sourceHash, sourceRelativePath) {
   return `item-${sourceHash.slice(0, 12)}-${sha256Text(sourceRelativePath).slice(0, 8)}`;
 }
 
+function defaultBookIdFor(sourceHash) {
+  return `book-${sourceHash.slice(0, 12)}`;
+}
+
 function discoverItems() {
   const catalogByHash = loadCatalogBySourceHash();
   return readdirSync(sourceDir)
@@ -375,7 +503,7 @@ function discoverItems() {
         sourceRelativePath,
         bookId: typeof catalogItem?.bookId === "string"
           ? catalogItem.bookId
-          : undefined,
+          : defaultBookIdFor(sourceHash),
       };
     });
 }
@@ -390,9 +518,14 @@ function makeManifest(items) {
     qmdIndexLocator: relative(root, qmdIndexPath),
     configLocator: relative(root, configPath),
     totalItems: items.length,
+    pendingItems: items.length,
+    runningItems: 0,
     completedItems: 0,
     skippedItems: 0,
+    importedCompletedItems: 0,
     failedItems: 0,
+    expectedCommandCheckCount,
+    maxCommandAttempts,
     startedAt: now(),
     updatedAt: now(),
     itemIds: items.map((item) => item.itemId),
@@ -430,6 +563,9 @@ function defaultCheckpoint(item, completedSeed = new Map()) {
       normalizedPath: item.normalizedRel,
       bookId: item.bookId,
       attempts: 0,
+      expectedCommandCheckCount,
+      maxCommandAttempts,
+      recoveryDecision: "none",
       commandChecks: [],
       metadata: {
         seededFromCompletedManifest: basename(completedManifestPath),
@@ -448,7 +584,34 @@ function defaultCheckpoint(item, completedSeed = new Map()) {
     normalizedPath: item.normalizedRel,
     bookId: item.bookId,
     attempts: 0,
+    expectedCommandCheckCount,
+    maxCommandAttempts,
+    recoveryDecision: "none",
     commandChecks: [],
+  };
+}
+
+function hydrateCheckpoint(item, checkpoint) {
+  const failureText = [
+    checkpoint.errorSummary,
+    ...(checkpoint.commandChecks ?? []).map((check) => check.errorSummary),
+  ].filter(Boolean).join("\n");
+  const inferredFailure = checkpoint.status === "failed"
+    ? classifyFailure(failureText)
+    : null;
+  return {
+    ...checkpoint,
+    sourceHash: checkpoint.sourceHash ?? item.sourceHash,
+    bookId: checkpoint.bookId ?? item.bookId ?? defaultBookIdFor(item.sourceHash),
+    expectedCommandCheckCount:
+      checkpoint.expectedCommandCheckCount ?? expectedCommandCheckCount,
+    maxCommandAttempts: checkpoint.maxCommandAttempts ?? maxCommandAttempts,
+    failureKind: checkpoint.failureKind ?? inferredFailure?.failureKind,
+    retryable: checkpoint.retryable ?? inferredFailure?.retryable,
+    retryExhausted: checkpoint.retryExhausted ??
+      (checkpoint.status === "failed" ? true : undefined),
+    recoveryDecision: checkpoint.recoveryDecision ??
+      (inferredFailure?.retryable ? "retry_same_run_id" : "none"),
   };
 }
 
@@ -458,7 +621,8 @@ function loadCheckpoint(item, completedSeed) {
     const checkpoint = defaultCheckpoint(item, completedSeed);
     return writeTypedJson(path, BatchItemCheckpointSchema, checkpoint);
   }
-  return BatchItemCheckpointSchema.parse(readJson(path));
+  const checkpoint = hydrateCheckpoint(item, readJson(path));
+  return BatchItemCheckpointSchema.parse(checkpoint);
 }
 
 function saveCheckpoint(item, checkpoint) {
@@ -466,20 +630,31 @@ function saveCheckpoint(item, checkpoint) {
 }
 
 function updateManifest(manifest, checkpoints) {
+  const pending = checkpoints.filter((item) => item.status === "pending").length;
+  const running = checkpoints.filter((item) => item.status === "running").length;
   const completed = checkpoints.filter((item) => item.status === "completed").length;
   const skipped = checkpoints.filter((item) => item.status === "skipped").length;
   const failed = checkpoints.filter((item) => item.status === "failed").length;
+  manifest.pendingItems = pending;
+  manifest.runningItems = running;
   manifest.completedItems = completed;
   manifest.skippedItems = skipped;
+  manifest.importedCompletedItems = skipped;
   manifest.failedItems = failed;
+  manifest.expectedCommandCheckCount = expectedCommandCheckCount;
+  manifest.maxCommandAttempts = maxCommandAttempts;
   manifest.updatedAt = now();
   if (failed > 0) {
     manifest.status = "failed";
     manifest.failedAt = manifest.failedAt ?? now();
     delete manifest.completedAt;
-  } else if (completed + skipped === manifest.totalItems) {
+  } else if (completed === manifest.totalItems) {
     manifest.status = "completed";
     manifest.completedAt = manifest.completedAt ?? now();
+    delete manifest.failedAt;
+  } else if (pending === 0 && running === 0) {
+    manifest.status = "incomplete";
+    delete manifest.completedAt;
     delete manifest.failedAt;
   } else {
     manifest.status = "running";
@@ -487,6 +662,19 @@ function updateManifest(manifest, checkpoints) {
     delete manifest.failedAt;
   }
   return writeTypedJson(manifestPath, BatchRunManifestSchema, manifest);
+}
+
+function recoveryDecisionForBatch(checkpoints) {
+  if (checkpoints.some((item) => item.status === "failed" && item.retryable === true)) {
+    return "retry_same_run_id";
+  }
+  if (checkpoints.some((item) => item.status === "pending" || item.status === "running")) {
+    return "continue_pending";
+  }
+  if (checkpoints.some((item) => item.status === "failed")) {
+    return "stop_until_fixed";
+  }
+  return "none";
 }
 
 function qmdRunner() {
@@ -532,6 +720,8 @@ function runCommand(item, name, command, args, options = {}) {
     const stderr = result.stderr ?? "";
     writeFileSync(join(logRoot, `${item.itemId}-${name}.out`), redactLog(stdout));
     writeFileSync(join(logRoot, `${item.itemId}-${name}.err`), redactLog(stderr));
+    const failureText = stderr || stdout || result.error?.message || "";
+    const failure = result.status === 0 ? null : classifyFailure(failureText);
     const check = {
       name,
       status: result.status === 0 ? "passed" : "failed",
@@ -543,7 +733,11 @@ function runCommand(item, name, command, args, options = {}) {
       completedAt,
       ...(result.status === 0
         ? {}
-        : { errorSummary: redacted(stderr || stdout || result.error?.message || "") }),
+        : {
+            ...failure,
+            attemptExhausted: attempt >= attempts || !failure?.retryable,
+            errorSummary: redacted(failureText),
+          }),
     };
     last = { check, stdout, stderr, result };
     if (result.status === 0) {
@@ -555,12 +749,45 @@ function runCommand(item, name, command, args, options = {}) {
       event: "command_failed",
       command: name,
       message: check.errorSummary,
+      failureKind: check.failureKind,
+      retryable: check.retryable,
+      retryAfterSeconds: check.retryAfterSeconds,
+      attemptExhausted: check.attemptExhausted,
+      providerStatusCode: check.providerStatusCode,
       metadata: { attempt, exitCode: result.status },
     });
-    if (attempt >= attempts || !isTransient(`${stderr}\n${stdout}`)) break;
-    sleep(1000 * 2 ** (attempt - 1));
+    if (attempt >= attempts || !check.retryable) break;
+    const delayMs = Math.max(
+      (check.retryAfterSeconds ?? 0) * 1000,
+      1000 * 2 ** (attempt - 1),
+    );
+    event({
+      itemId: item.itemId,
+      event: "command_retry_scheduled",
+      command: name,
+      failureKind: check.failureKind,
+      retryable: check.retryable,
+      retryAfterSeconds: check.retryAfterSeconds,
+      recoveryDecision: "retry_same_run_id",
+      metadata: { attempt, nextAttempt: attempt + 1, delayMs },
+    });
+    sleep(delayMs);
   }
   const summary = last?.check?.errorSummary ?? `${name} failed`;
+  if (last?.check?.status === "failed") {
+    event({
+      itemId: item.itemId,
+      event: "command_retry_exhausted",
+      command: name,
+      failureKind: last.check.failureKind,
+      retryable: last.check.retryable,
+      retryAfterSeconds: last.check.retryAfterSeconds,
+      attemptExhausted: true,
+      providerStatusCode: last.check.providerStatusCode,
+      recoveryDecision: last.check.retryable ? "retry_same_run_id" : "stop_until_fixed",
+      message: last.check.errorSummary,
+    });
+  }
   throw Object.assign(new Error(summary), { commandCheck: last?.check });
 }
 
@@ -773,6 +1000,27 @@ function parseBookIdFromResume(item) {
   return undefined;
 }
 
+function validateCommandChecks(commandChecks) {
+  const names = commandChecks.map((check) => check.name);
+  const unique = new Set(names);
+  const missing = requiredCommandCheckNames.filter((name) => !unique.has(name));
+  const unexpected = names.filter((name) => !requiredCommandCheckNames.includes(name));
+  const failed = commandChecks.filter((check) => check.status !== "passed");
+  if (
+    commandChecks.length !== expectedCommandCheckCount ||
+    unique.size !== expectedCommandCheckCount ||
+    missing.length ||
+    unexpected.length ||
+    failed.length
+  ) {
+    throw new Error(
+      `invalid command check set: expected=${expectedCommandCheckCount} ` +
+      `actual=${commandChecks.length} missing=${missing.join(",") || "none"} ` +
+      `unexpected=${unexpected.join(",") || "none"} failed=${failed.length}`,
+    );
+  }
+}
+
 function runCliChecks(item) {
   const checks = [];
   const record = (result) => checks.push(result.check);
@@ -803,6 +1051,7 @@ function runCliChecks(item) {
   record(qmd(item, "qmd-skill-show", ["skill", "show"]));
   record(qmd(item, "qmd-dspy-status-json", ["dspy", "status", "--json"]));
   record(qmd(item, "qmd-cleanup", ["cleanup"]));
+  validateCommandChecks(checks);
   return checks;
 }
 
@@ -815,6 +1064,13 @@ function runItem(item, checkpoint) {
     startedAt: checkpoint.startedAt ?? startedAt,
     failedAt: undefined,
     errorSummary: undefined,
+    failureKind: undefined,
+    retryable: undefined,
+    retryExhausted: undefined,
+    recoveryDecision: "none",
+    failedStage: undefined,
+    expectedCommandCheckCount,
+    maxCommandAttempts,
   };
   saveCheckpoint(item, running);
   event({ itemId: item.itemId, event: "item_start", status: "running" });
@@ -825,8 +1081,15 @@ function runItem(item, checkpoint) {
   const completed = {
     ...running,
     status: "completed",
-    bookId: parseBookIdFromResume(item),
+    bookId: parseBookIdFromResume(item) ?? running.bookId,
     completedAt: now(),
+    failedAt: undefined,
+    errorSummary: undefined,
+    failureKind: undefined,
+    retryable: undefined,
+    retryExhausted: undefined,
+    recoveryDecision: "none",
+    failedStage: undefined,
     commandChecks,
   };
   saveCheckpoint(item, completed);
@@ -843,13 +1106,13 @@ function main() {
   if (items.length === 0) {
     throw new Error(`no EPUB files found in ${sourceDir}`);
   }
-  const manifest = loadManifest(items);
+  let manifest = loadManifest(items);
   const completedSeed = loadCompletedSeed();
   const checkpoints = new Map(items.map((item) => [
     item.itemId,
     loadCheckpoint(item, completedSeed),
   ]));
-  updateManifest(manifest, Array.from(checkpoints.values()));
+  manifest = updateManifest(manifest, Array.from(checkpoints.values()));
 
   for (const item of items) {
     const checkpoint = checkpoints.get(item.itemId);
@@ -866,39 +1129,97 @@ function main() {
       });
       continue;
     }
+    if (checkpoint?.status === "failed" && checkpoint.retryable === false) {
+      event({
+        itemId: item.itemId,
+        event: "item_failed_not_retryable",
+        status: "failed",
+        failureKind: checkpoint.failureKind ?? "unknown",
+        retryable: false,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: checkpoint.failedStage,
+        message: checkpoint.errorSummary,
+      });
+      continue;
+    }
+    if (checkpoint?.status === "failed" && checkpoint.retryable === true) {
+      event({
+        itemId: item.itemId,
+        event: "item_retry_same_run_id",
+        status: "running",
+        failureKind: checkpoint.failureKind ?? "transient",
+        retryable: true,
+        recoveryDecision: "retry_same_run_id",
+        failedStage: checkpoint.failedStage,
+      });
+    }
 
     try {
       const completed = runItem(item, checkpoint ?? defaultCheckpoint(item, completedSeed));
       checkpoints.set(item.itemId, completed);
-      updateManifest(manifest, Array.from(checkpoints.values()));
+      manifest = updateManifest(manifest, Array.from(checkpoints.values()));
     } catch (error) {
+      const running = existsSync(itemPath(item))
+        ? loadCheckpoint(item, completedSeed)
+        : checkpoint ?? defaultCheckpoint(item, completedSeed);
+      const commandCheck = error?.commandCheck;
+      const failureKind = commandCheck?.failureKind ?? "unknown";
+      const retryable = commandCheck?.retryable ?? false;
       const failed = {
-        ...(checkpoints.get(item.itemId) ?? defaultCheckpoint(item, completedSeed)),
+        ...running,
         status: "failed",
         failedAt: now(),
         errorSummary: redacted(error instanceof Error ? error.message : String(error)),
+        failureKind,
+        retryable,
+        retryExhausted: Boolean(commandCheck?.attemptExhausted),
+        recoveryDecision: retryable ? "retry_same_run_id" : "stop_until_fixed",
+        failedStage: commandCheck?.name,
       };
-      if (error?.commandCheck) {
+      if (commandCheck) {
         failed.commandChecks = [
           ...(failed.commandChecks ?? []),
-          error.commandCheck,
+          commandCheck,
         ];
       }
       saveCheckpoint(item, failed);
       checkpoints.set(item.itemId, failed);
-      updateManifest(manifest, Array.from(checkpoints.values()));
+      manifest = updateManifest(manifest, Array.from(checkpoints.values()));
       event({
         itemId: item.itemId,
         event: "item_failed",
         status: "failed",
         message: failed.errorSummary,
+        failureKind: failed.failureKind,
+        retryable: failed.retryable,
+        attemptExhausted: failed.retryExhausted,
+        providerStatusCode: commandCheck?.providerStatusCode,
+        retryAfterSeconds: commandCheck?.retryAfterSeconds,
+        recoveryDecision: failed.recoveryDecision,
+        failedStage: failed.failedStage,
       });
-      throw error;
+      if (failFast) throw error;
     }
   }
 
-  updateManifest(manifest, Array.from(checkpoints.values()));
-  event({ event: "batch_completed", status: "completed" });
+  manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+  if (manifest.status === "completed") {
+    event({ event: "batch_completed", status: "completed" });
+    return;
+  }
+  const finalCheckpoints = Array.from(checkpoints.values());
+  event({
+    event: "batch_incomplete",
+    recoveryDecision: recoveryDecisionForBatch(finalCheckpoints),
+    metadata: {
+      pendingItems: manifest.pendingItems,
+      runningItems: manifest.runningItems,
+      completedItems: manifest.completedItems,
+      skippedItems: manifest.skippedItems,
+      failedItems: manifest.failedItems,
+    },
+  });
+  process.exitCode = 1;
 }
 
 try {

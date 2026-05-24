@@ -23,10 +23,15 @@ contract_artifacts:
     exports:
       - BatchRunManifestSchema
       - BatchRunManifestEnvelopeSchema
+      - BatchRunStatusSchema
+      - BatchFailureKindSchema
+      - BatchRecoveryDecisionSchema
+      - BatchItemCheckpointInputSchema
       - BatchItemCheckpointSchema
       - BatchItemCheckpointEnvelopeSchema
       - BatchEventLogSchema
       - BatchEventLogEnvelopeSchema
+      - parseBatchItemCheckpoint
   corpus:
     path: src/contracts/corpus.ts
     exports:
@@ -290,6 +295,38 @@ deduplication:
     - runId
 
 typed_buses:
+  batch_execution_bus:
+    role: Typed EPUB batch scheduling, recovery, and command-check evidence.
+    invariant: >-
+      Batch execution state records scheduling facts only. Per-book
+      GraphRAG state remains owned by BookResumePlan and graph_vault
+      book checkpoints.
+    payloads:
+      - name: batch_run_manifest
+        schema: src/contracts/batch-run.ts#BatchRunManifestSchema
+        envelope: src/contracts/batch-run.ts#BatchRunManifestEnvelopeSchema
+        storage: graph_vault/catalog/batch-runs/<run_id>/manifest.json
+        producers:
+          - scripts/graphrag/batch-epub-workflow.mjs#updateManifest
+        consumers:
+          - scripts/graphrag/batch-epub-workflow.mjs#loadManifest
+      - name: batch_item_checkpoint
+        schema: src/contracts/batch-run.ts#BatchItemCheckpointSchema
+        envelope: src/contracts/batch-run.ts#BatchItemCheckpointEnvelopeSchema
+        storage: graph_vault/catalog/batch-runs/<run_id>/items/<item_id>.json
+        producers:
+          - scripts/graphrag/batch-epub-workflow.mjs#saveCheckpoint
+        consumers:
+          - scripts/graphrag/batch-epub-workflow.mjs#loadCheckpoint
+      - name: batch_event_log
+        schema: src/contracts/batch-run.ts#BatchEventLogSchema
+        envelope: src/contracts/batch-run.ts#BatchEventLogEnvelopeSchema
+        storage: graph_vault/catalog/batch-runs/<run_id>/events.jsonl
+        producers:
+          - scripts/graphrag/batch-epub-workflow.mjs#event
+        consumers:
+          - scripts/graphrag/batch-epub-workflow.mjs#main
+
   corpus_bus:
     role: Whole-corpus ingestion and document identity.
     invariant: Every graph-enhanced source is registered on this bus first.
@@ -413,6 +450,17 @@ typed_buses:
           qmd_query_request expresses direct qmd whole-corpus retrieval intent;
           unified_query_request wraps user-facing route selection for qmd,
           graphrag, and auto routes.
+      - name: qmd_vector_search_request
+        schema: src/contracts/qmd-query.ts#QmdVectorSearchRequestSchema
+        envelope: src/contracts/qmd-query.ts#QmdVectorSearchRequestEnvelopeSchema
+        storage: transient
+        producers:
+          - src/cli/qmd.ts#vectorSearch
+        consumers:
+          - src/store.ts#vectorSearchQuery
+        invariant: >-
+          qmd vsearch is whole-corpus vector lookup over the qmd vector index.
+          ProviderPolicy disables generation, query expansion, and rerank.
       - name: qmd_retrieval_candidate
         schema: src/contracts/qmd-query.ts#QmdRetrievalCandidateSchema
         envelope: src/contracts/qmd-query.ts#QmdRetrievalCandidateEnvelopeSchema
@@ -436,6 +484,18 @@ typed_buses:
           - src/cli/qmd.ts#querySearch
           - src/cli/qmd.ts#autoQuerySearch
           - src/query/unified-answer.ts#buildUnifiedAnswer
+      - name: qmd_vector_search_result
+        schema: src/contracts/qmd-query.ts#QmdVectorSearchResultSchema
+        envelope: src/contracts/qmd-query.ts#QmdVectorSearchResultEnvelopeSchema
+        storage: transient
+        producers:
+          - src/cli/qmd.ts#vectorSearch
+        consumers:
+          - src/cli/qmd.ts#vectorSearch
+        invariant: >-
+          qmd vsearch --json emits this schema directly and all candidates are
+          vector-only retrieval candidates filtered by active embedding
+          fingerprint.
       - name: query_expansion_item
         schema: src/contracts/common.ts#QueryExpansionItemSchema
         envelope: src/contracts/common.ts#QueryExpansionItemEnvelopeSchema
@@ -1412,7 +1472,7 @@ route_contracts:
 state_and_recovery:
   processing_unit: source_document
   graph_business_unit: book_id
-  recovery_unit: book_id_plus_processing_stage
+  recovery_unit: book_id_plus_processing_stage_plus_command_check
   cache_unit: normalized_provider_request_hash
   batch_execution:
     closed_loop_unit: book_id
@@ -1425,9 +1485,21 @@ state_and_recovery:
       Batch resume reads item checkpoints first and then delegates each
       unfinished item to the existing BookResumePlan nextStage calculation.
     completed_item_rule: completed items are not reprocessed by the same run.
+    completion_rule: >-
+      A batch run is completed only when completedItems equals totalItems.
+      skippedItems and importedCompletedItems are scheduling facts and do not
+      satisfy the book closed-loop acceptance gate.
+    command_check_rule: >-
+      Every completed item has exactly 27 required commandChecks and every
+      commandCheck status is passed.
     transient_failure_policy: >-
       429, concurrency limit, timeout, and 5xx provider failures are retried
-      with bounded backoff before the current item is marked failed.
+      with bounded backoff before the current item is marked failed with
+      failureKind=transient, retryable=true, retryExhausted=true, and
+      recoveryDecision=retry_same_run_id. The batch continues pending items.
+    permanent_failure_policy: >-
+      Permanent failed items remain failed with retryable=false and
+      recoveryDecision=stop_until_fixed. They do not block other pending items.
   commit_rule: >-
     A processing stage is committed only after required artifact manifests
     pass schema validation and vault-relative paths resolve from graph_vault.

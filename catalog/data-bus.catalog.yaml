@@ -16,41 +16,46 @@ types:
     envelope: src/contracts/batch-run.ts#BatchRunManifestEnvelopeSchema
     contract_level: required
     producers:
-      - scripts/graphrag/batch-epub-workflow.mjs
+      - scripts/graphrag/batch-epub-workflow.mjs#updateManifest
     consumers:
-      - scripts/graphrag/batch-epub-workflow.mjs
+      - scripts/graphrag/batch-epub-workflow.mjs#loadManifest
     storage: graph_vault/catalog/batch-runs/<run_id>/manifest.json
     notes:
       - tracks batch scheduling state only
       - does not replace per-book stage checkpoints
+      - completed only when completedItems equals totalItems
+      - skippedItems and importedCompletedItems do not satisfy acceptance
 
   - name: batch_item_checkpoint
     schema: src/contracts/batch-run.ts#BatchItemCheckpointSchema
     envelope: src/contracts/batch-run.ts#BatchItemCheckpointEnvelopeSchema
     contract_level: required
     producers:
-      - scripts/graphrag/batch-epub-workflow.mjs
+      - scripts/graphrag/batch-epub-workflow.mjs#saveCheckpoint
     consumers:
-      - scripts/graphrag/batch-epub-workflow.mjs
+      - scripts/graphrag/batch-epub-workflow.mjs#loadCheckpoint
     storage: graph_vault/catalog/batch-runs/<run_id>/items/<item_id>.json
     notes:
       - one checkpoint per EPUB item
       - completed items are skipped on resume
+      - retryable failed items resume through the same runId
       - unfinished items delegate recovery to BookResumePlan.nextStage
+      - completed items require the fixed 27-command check set
 
   - name: batch_event_log
     schema: src/contracts/batch-run.ts#BatchEventLogSchema
     envelope: src/contracts/batch-run.ts#BatchEventLogEnvelopeSchema
     contract_level: required
     producers:
-      - scripts/graphrag/batch-epub-workflow.mjs
+      - scripts/graphrag/batch-epub-workflow.mjs#event
     consumers:
-      - operators
-      - audit
+      - scripts/graphrag/batch-epub-workflow.mjs#main
     storage: graph_vault/catalog/batch-runs/<run_id>/events.jsonl
     notes:
       - stores redacted event summaries
+      - records failureKind, retryable, failedStage, and recoveryDecision
       - raw stdout and stderr stay in temporary run logs
+      - operators and audits consume this JSONL as a persisted record
 
   - name: source_document
     schema: src/contracts/corpus.ts#SourceDocumentSchema
@@ -1069,6 +1074,13 @@ types:
         validated capability source material for graph-enhanced identities
 
 buses:
+  - name: batch_execution_bus
+    description: Typed EPUB batch scheduling, recovery, and command-check bus.
+    payloads:
+      - batch_run_manifest
+      - batch_item_checkpoint
+      - batch_event_log
+
   - name: corpus_bus
     description: Typed ingestion bus for whole-corpus source and identity maps.
     payloads:

@@ -14,6 +14,26 @@ export const BatchItemStatusSchema = z.enum([
   "failed",
 ]);
 
+export const BatchRunStatusSchema = z.enum([
+  "running",
+  "completed",
+  "failed",
+  "incomplete",
+]);
+
+export const BatchFailureKindSchema = z.enum([
+  "transient",
+  "permanent",
+  "unknown",
+]);
+
+export const BatchRecoveryDecisionSchema = z.enum([
+  "none",
+  "retry_same_run_id",
+  "continue_pending",
+  "stop_until_fixed",
+]);
+
 export const BatchCommandCheckSchema = z.object({
   name: z.string().min(1),
   status: z.enum(["passed", "failed"]),
@@ -23,6 +43,11 @@ export const BatchCommandCheckSchema = z.object({
   stderrBytes: z.number().int().nonnegative(),
   startedAt: z.string().datetime(),
   completedAt: z.string().datetime(),
+  failureKind: BatchFailureKindSchema.optional(),
+  retryable: z.boolean().optional(),
+  retryAfterSeconds: z.number().int().nonnegative().optional(),
+  attemptExhausted: z.boolean().optional(),
+  providerStatusCode: z.number().int().positive().optional(),
   errorSummary: z.string().max(1000).optional(),
 });
 
@@ -33,10 +58,17 @@ export const BatchItemCheckpointSchema = z.object({
   status: BatchItemStatusSchema,
   sourceName: z.string().min(1),
   sourceRelativePath: z.string().min(1),
-  sourceHash: z.string().min(1).optional(),
+  sourceHash: z.string().min(1),
   normalizedPath: z.string().min(1),
-  bookId: z.string().min(1).optional(),
+  bookId: z.string().min(1),
   attempts: z.number().int().nonnegative(),
+  expectedCommandCheckCount: z.number().int().positive().optional(),
+  maxCommandAttempts: z.number().int().positive().optional(),
+  failureKind: BatchFailureKindSchema.optional(),
+  retryable: z.boolean().optional(),
+  retryExhausted: z.boolean().optional(),
+  recoveryDecision: BatchRecoveryDecisionSchema.optional(),
+  failedStage: z.string().min(1).optional(),
   startedAt: z.string().datetime().optional(),
   completedAt: z.string().datetime().optional(),
   failedAt: z.string().datetime().optional(),
@@ -48,15 +80,20 @@ export const BatchItemCheckpointSchema = z.object({
 export const BatchRunManifestSchema = z.object({
   schemaVersion: z.literal(SchemaVersion),
   runId: z.string().min(1),
-  status: z.enum(["running", "completed", "failed"]),
+  status: BatchRunStatusSchema,
   sourceRootName: z.string().min(1),
   stateRootLocator: z.string().min(1),
   qmdIndexLocator: z.string().min(1),
   configLocator: z.string().min(1),
   totalItems: z.number().int().nonnegative(),
+  pendingItems: z.number().int().nonnegative().default(0),
+  runningItems: z.number().int().nonnegative().default(0),
   completedItems: z.number().int().nonnegative(),
   skippedItems: z.number().int().nonnegative().default(0),
+  importedCompletedItems: z.number().int().nonnegative().default(0),
   failedItems: z.number().int().nonnegative(),
+  expectedCommandCheckCount: z.number().int().positive().optional(),
+  maxCommandAttempts: z.number().int().positive().optional(),
   startedAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
   completedAt: z.string().datetime().optional(),
@@ -72,10 +109,34 @@ export const BatchEventLogSchema = z.object({
   event: z.string().min(1),
   status: BatchItemStatusSchema.optional(),
   command: z.string().min(1).optional(),
+  failureKind: BatchFailureKindSchema.optional(),
+  retryable: z.boolean().optional(),
+  retryAfterSeconds: z.number().int().nonnegative().optional(),
+  attemptExhausted: z.boolean().optional(),
+  providerStatusCode: z.number().int().positive().optional(),
+  recoveryDecision: BatchRecoveryDecisionSchema.optional(),
+  failedStage: z.string().min(1).optional(),
   at: z.string().datetime(),
   message: z.string().max(1000).optional(),
   metadata: z.record(z.string(), JsonValueSchema).optional(),
 });
+
+export const BatchItemCheckpointInputSchema = BatchItemCheckpointSchema.extend({
+  sourceHash: z.string().min(1).optional(),
+  bookId: z.string().min(1).optional(),
+});
+
+export function parseBatchItemCheckpoint(
+  value: unknown,
+  defaults: { sourceHash: string; bookId: string },
+) {
+  const parsed = BatchItemCheckpointInputSchema.parse(value);
+  return BatchItemCheckpointSchema.parse({
+    ...parsed,
+    sourceHash: parsed.sourceHash ?? defaults.sourceHash,
+    bookId: parsed.bookId ?? defaults.bookId,
+  });
+}
 
 export const BatchRunManifestEnvelopeSchema = buildEnvelopeSchema(
   "qmd.batch_run.manifest",
@@ -93,7 +154,11 @@ export const BatchEventLogEnvelopeSchema = buildEnvelopeSchema(
 );
 
 export type BatchItemStatus = z.infer<typeof BatchItemStatusSchema>;
+export type BatchRunStatus = z.infer<typeof BatchRunStatusSchema>;
+export type BatchFailureKind = z.infer<typeof BatchFailureKindSchema>;
+export type BatchRecoveryDecision = z.infer<typeof BatchRecoveryDecisionSchema>;
 export type BatchCommandCheck = z.infer<typeof BatchCommandCheckSchema>;
+export type BatchItemCheckpointInput = z.infer<typeof BatchItemCheckpointInputSchema>;
 export type BatchItemCheckpoint = z.infer<typeof BatchItemCheckpointSchema>;
 export type BatchRunManifest = z.infer<typeof BatchRunManifestSchema>;
 export type BatchEventLog = z.infer<typeof BatchEventLogSchema>;

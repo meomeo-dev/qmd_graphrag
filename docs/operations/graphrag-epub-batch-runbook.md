@@ -23,8 +23,8 @@ graph_vault/catalog/batch-runs/<runId>/
 
 必需文件：
 
-- `manifest.json`：`BatchRunManifest`，记录 runId、sourceDir、stateRoot、
-  qmdIndexPath、configPath、item 计数和当前状态。
+- `manifest.json`：`BatchRunManifest`，记录 runId、sourceRootName、
+  stateRootLocator、qmdIndexLocator、configLocator、item 计数和当前状态。
 - `items/<itemId>.json`：`BatchItemCheckpoint`，记录单本 EPUB 的 source
   locator、normalized locator、status、attempts、bookId、errorSummary 和
   CLI check 结果。
@@ -35,7 +35,13 @@ graph_vault/catalog/batch-runs/<runId>/
 - `pending`：未开始。
 - `running`：当前 item 正在执行。
 - `completed`：当前 item 的 GraphRAG 闭环和 CLI 检查通过。
-- `failed`：当前 item 重试耗尽或遇到非 transient 错误。
+- `failed`：当前 item 未完成。`failureKind`、`retryable` 和
+  `recoveryDecision` 决定是否由同一 `runId` 自动恢复。
+
+`BatchRunManifest` 必须记录 `pendingItems`、`runningItems`、`completedItems`、
+`skippedItems`、`importedCompletedItems` 和 `failedItems`。批次完成条件只接受
+`completedItems == totalItems`。`skippedItems` 是调度跳过记录，不得抵扣真实闭环
+完成。
 
 ## 恢复规则
 
@@ -48,12 +54,14 @@ graph_vault/catalog/batch-runs/<runId>/
 5. `nextStage` 为 `null` 时只运行查询和 CLI 检查。
 6. `nextStage` 非空时只执行该 stage，不重跑已完成 stage。
 
-同一 runId 再次运行不会重跑已 completed item。更换 runId 会创建新的批量审计
-记录，但单书仍由 `BookResumePlan.nextStage` 防止重复高成本 stage。
+同一 runId 再次运行不会重跑已 completed item。`failed` item 只有在
+`retryable=true` 且 `recoveryDecision=retry_same_run_id` 时自动重试。`retryable=false`
+的 failed item 保持 failed，并继续处理其他 pending item。更换 runId 会创建新的
+批量审计记录，但单书仍由 `BookResumePlan.nextStage` 防止重复高成本 stage。
 
-从临时批次迁移到正式批次时，可用 `--completed-manifest <path>` 导入已完成
-item 种子。导入只标记同名 EPUB 为 completed；未完成 item 仍按
-`BookResumePlan.nextStage` 继续。
+从临时批次迁移到正式批次时，可用 `--completed-manifest <path>` 导入调度种子。
+导入只产生 `skipped` checkpoint 和 `importedCompletedItems` 统计，不产生
+`completed` item。真实准入批次必须让每本 EPUB 形成 `completed` checkpoint。
 
 ## Provider 限流与重试
 
@@ -71,29 +79,61 @@ item 种子。导入只标记同名 EPUB 为 completed；未完成 item 仍按
 批量执行器对 transient failure 做有限重试和退避。重试耗尽后：
 
 - 当前 item 标记为 failed。
-- `events.jsonl` 写入 redacted error summary。
-- 批量停止，不继续处理后续 item。
+- checkpoint 写入 `failureKind=transient`、`retryable=true`、
+  `retryExhausted=true`、`recoveryDecision=retry_same_run_id` 和 `failedStage`。
+- `events.jsonl` 写入 redacted error summary、provider status code、
+  retryable 标记和恢复决策。
+- 默认继续处理后续 pending item。使用 `--fail-fast` 时在当前 item 失败后停止。
 - 已 completed item 保持 completed，不回滚。
+
+恢复操作使用相同 runId 重新执行：
+
+```bash
+npm run batch:epub -- \
+  --run-id <same-run-id> \
+  --source-dir <same-source-dir> \
+  --state-root <same-state-root> \
+  --qmd-index-path <same-qmd-index-path> \
+  --config <same-config> \
+  --log-root /tmp/qmd-<same-run-id>/logs
+```
+
+执行器跳过 completed item，只重试 retryable failed item 和继续 pending item。
 
 ## 子命令检查
 
 每本书闭环后运行 CLI 检查集：
 
-- `qmd --version`
-- `qmd status`
-- `qmd doctor --json`
-- `qmd pull`
-- `qmd update`
-- `qmd embed --max-docs-per-batch 1`
-- `qmd ls books`
-- `qmd search` 的 json/csv/md/xml/files 输出
-- `qmd vsearch --json`
-- `qmd query --json`
-- `qmd query --mode auto --json`
-- `qmd query --graphrag --json`
-- `qmd get`
-- `qmd multi-get --json`
-- collection/context/skills/dspy/cleanup 子命令
+- `qmd-version`：`qmd --version`
+- `qmd-status`：`qmd status`
+- `qmd-doctor-json`：`qmd doctor --json`
+- `qmd-pull`：`qmd pull`
+- `qmd-update`：`qmd update`
+- `qmd-embed`：`qmd embed --max-docs-per-batch 1`
+- `qmd-ls-books`：`qmd ls books`
+- `qmd-search-json`：`qmd search --json`
+- `qmd-search-csv`：`qmd search --csv`
+- `qmd-search-md`：`qmd search --md`
+- `qmd-search-xml`：`qmd search --xml`
+- `qmd-search-files`：`qmd search --files`
+- `qmd-vsearch-json`：`qmd vsearch --json`
+- `qmd-query-json`：`qmd query --json`
+- `qmd-query-auto-json`：`qmd query --mode auto --json`
+- `qmd-query-graphrag-json`：`qmd query --graphrag --json`
+- `qmd-get-book`：`qmd get`
+- `qmd-multi-get-json`：`qmd multi-get --json`
+- `qmd-collection-list`：`qmd collection list`
+- `qmd-collection-show-books`：`qmd collection show books`
+- `qmd-context-list`：`qmd context list`
+- `qmd-skills-list-json`：`qmd skills list --json`
+- `qmd-skills-get-json`：`qmd skills get qmd --json`
+- `qmd-skills-path-json`：`qmd skills path qmd --json`
+- `qmd-skill-show`：`qmd skill show`
+- `qmd-dspy-status-json`：`qmd dspy status --json`
+- `qmd-cleanup`：`qmd cleanup`
+
+每个 completed checkpoint 必须包含 27 个 `commandChecks`，名称集合必须与上述检查
+集一致，且全部为 `passed`。缺项、重复项或失败项均不得写入 completed。
 
 `qmd vsearch` 是向量检索（vector search）检查，只允许 embedding/vector
 lookup，不允许 query expansion、OpenAI Responses generation、DSPy expansion、

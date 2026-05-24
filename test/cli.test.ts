@@ -1034,11 +1034,20 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(contract).toContain("BatchItemCheckpointSchema");
     expect(contract).toContain("BatchEventLogSchema");
     expect(contract).toContain("\"skipped\"");
+    expect(contract).toContain("BatchFailureKindSchema");
+    expect(contract).toContain("BatchRecoveryDecisionSchema");
+    expect(contract).toContain("pendingItems");
+    expect(contract).toContain("runningItems");
     expect(contract).toContain("skippedItems");
+    expect(contract).toContain("expectedCommandCheckCount");
     expect(script).toContain("\"completed-manifest\"");
+    expect(script).toContain("\"fail-fast\"");
     expect(script).toContain("BatchRunManifestSchema.parse");
     expect(script).toContain("BatchItemCheckpointSchema.parse");
     expect(script).toContain("BatchEventLogSchema.parse");
+    expect(script).toContain("command_retry_exhausted");
+    expect(script).toContain("batch_incomplete");
+    expect(script).toContain("validateCommandChecks(checks)");
     expect(script).toContain("--log-root must be outside graph_vault");
     expect(script).toContain("resume-book-workspace.mjs");
     expect(script).toContain("resume-book did not reach ready");
@@ -1169,31 +1178,55 @@ describe("GraphRAG EPUB batch runner", () => {
     );
 
     await rm(tmpRoot, { recursive: true, force: true });
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode).toBe(1);
     expect(result.stderr).toBe("");
     expect(manifest).toMatchObject({
       schemaVersion: SchemaVersion,
       runId,
-      status: "completed",
+      status: "incomplete",
       totalItems: 1,
+      pendingItems: 0,
+      runningItems: 0,
       completedItems: 0,
       skippedItems: 1,
+      importedCompletedItems: 1,
       failedItems: 0,
+      expectedCommandCheckCount: 27,
     });
     expect(checkpoint).toMatchObject({
       schemaVersion: SchemaVersion,
       runId,
       status: "skipped",
       sourceName: "Book.epub",
+      sourceHash,
+      bookId: `book-${sourceHash.slice(0, 12)}`,
+      expectedCommandCheckCount: 27,
       metadata: {
         seedMatchMode: "source_name_and_hash",
       },
     });
     expect(eventLines.some((event) => event.event === "item_skipped")).toBe(true);
     expect(eventLines.at(-1)).toMatchObject({
-      event: "batch_completed",
-      status: "completed",
+      event: "batch_incomplete",
+      recoveryDecision: "none",
     });
+  });
+
+  test("keeps transient and permanent provider recovery decisions typed", () => {
+    const script = readFileSync(
+      join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+      "utf8",
+    );
+
+    expect(script.indexOf("providerStatusCode === 400")).toBeGreaterThan(0);
+    expect(script.indexOf("providerStatusCode === 400"))
+      .toBeLessThan(script.indexOf("const transient ="));
+    expect(script).toContain("providerStatusCode === 429");
+    expect(script).toContain("providerStatusCode === 503");
+    expect(script).not.toContain("function isTransient(");
+    expect(script).toContain("function recoveryDecisionForBatch(checkpoints)");
+    expect(script).toContain("item.status === \"failed\" && item.retryable === true");
+    expect(script).toContain("checkpoint?.status === \"failed\" && checkpoint.retryable === false");
   });
 
   test("keeps checkpoints unique for duplicate EPUB content", async () => {
@@ -1253,13 +1286,18 @@ describe("GraphRAG EPUB batch runner", () => {
     const manifest = JSON.parse(readFileSync(join(batchRoot, "manifest.json"), "utf8"));
     const checkpoints = readdirSync(itemRoot).sort();
     await rm(tmpRoot, { recursive: true, force: true });
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode).toBe(1);
     expect(result.stderr).toBe("");
     expect(manifest).toMatchObject({
+      status: "incomplete",
       totalItems: 2,
+      pendingItems: 0,
+      runningItems: 0,
       completedItems: 0,
       skippedItems: 2,
+      importedCompletedItems: 2,
       failedItems: 0,
+      expectedCommandCheckCount: 27,
     });
     expect(checkpoints).toHaveLength(2);
     expect(new Set(checkpoints).size).toBe(2);

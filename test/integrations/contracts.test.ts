@@ -65,6 +65,11 @@ import {
   BookJobRunRecordEnvelopeSchema,
 } from "../../src/contracts/book-job.js";
 import {
+  BatchItemCheckpointInputSchema,
+  BatchItemCheckpointSchema,
+  parseBatchItemCheckpoint,
+} from "../../src/contracts/batch-run.js";
+import {
   CorpusChunkSchema,
   CorpusDocumentSchema,
   DocumentIdentityMapSchema,
@@ -1180,6 +1185,43 @@ describe("Provider contracts", () => {
 });
 
 describe("Data bus contracts", () => {
+  test("normalizes legacy batch item checkpoints without source identity", () => {
+    const legacy = {
+      schemaVersion: SchemaVersion,
+      itemId: "item-legacy",
+      runId: "run-legacy",
+      status: "failed",
+      sourceName: "Legacy.epub",
+      sourceRelativePath: "inbox/books/Legacy.epub",
+      normalizedPath: "graph_vault/input/legacy.md",
+      attempts: 1,
+      failedAt: "2026-05-23T00:00:00.000Z",
+      errorSummary: "Error code: 503 - Service temporarily unavailable",
+      commandChecks: [{
+        name: "resume-book-1",
+        status: "failed",
+        attempts: 3,
+        exitCode: 1,
+        stdoutBytes: 0,
+        stderrBytes: 12,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        completedAt: "2026-05-23T00:01:00.000Z",
+        errorSummary: "Error code: 503 - Service temporarily unavailable",
+      }],
+    };
+
+    expect(() => BatchItemCheckpointSchema.parse(legacy)).toThrow();
+    expect(BatchItemCheckpointInputSchema.parse(legacy).bookId).toBeUndefined();
+
+    const parsed = parseBatchItemCheckpoint(legacy, {
+      sourceHash: "sha256:legacy-source",
+      bookId: "book-legacy",
+    });
+    expect(parsed.sourceHash).toBe("sha256:legacy-source");
+    expect(parsed.bookId).toBe("book-legacy");
+    expect(parsed.commandChecks[0]?.name).toBe("resume-book-1");
+  });
+
   test("keeps Type DD payload ownership aligned with catalog inventory", async () => {
     const [typeDdRaw, catalogRaw] = await Promise.all([
       readFile(
