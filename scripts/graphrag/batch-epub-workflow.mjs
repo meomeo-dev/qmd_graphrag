@@ -9,6 +9,7 @@ import {
   readdirSync,
   realpathSync,
   renameSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import {
@@ -148,7 +149,20 @@ const requiredCommandCheckNames = [
   "qmd-dspy-status-json",
   "qmd-cleanup",
 ];
+const graphQueryCommandCheckNames = [
+  "qmd-query-auto-json",
+  "qmd-query-graphrag-json",
+];
+const qmdNativeCommandCheckNames = requiredCommandCheckNames.filter(
+  (name) => !graphQueryCommandCheckNames.includes(name),
+);
 const expectedCommandCheckCount = requiredCommandCheckNames.length;
+const expectedQmdNativeCommandCheckCount = qmdNativeCommandCheckNames.length;
+const requiredLanceDbTables = [
+  "entity_description.lance",
+  "community_full_content.lance",
+  "text_unit_text.lance",
+];
 
 const JsonPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 const JsonValueSchema = z.lazy(() =>
@@ -337,6 +351,7 @@ const BatchItemCheckpointSchema = z.object({
   failedStage: z.string().min(1).optional(),
   qmdBuildStatus: BatchBuildStatusSchema.optional(),
   graphBuildStatus: BatchBuildStatusSchema.optional(),
+  graphQueryStatus: BatchBuildStatusSchema.optional(),
   startedAt: z.string().datetime().optional(),
   completedAt: z.string().datetime().optional(),
   failedAt: z.string().datetime().optional(),
@@ -432,6 +447,7 @@ const BatchRecoverySummaryItemSchema = z.object({
   attempts: z.number().int().nonnegative(),
   qmdBuildStatus: BatchBuildStatusSchema,
   graphBuildStatus: BatchBuildStatusSchema,
+  graphQueryStatus: BatchBuildStatusSchema,
   failureKind: BatchFailureKindSchema.optional(),
   retryable: z.boolean().optional(),
   retryExhausted: z.boolean().optional(),
@@ -979,6 +995,9 @@ function hydrateCheckpoint(item, checkpoint) {
     graphBuildStatus: hydrated.graphBuildStatus == null
       ? undefined
       : redactJsonValue(hydrated.graphBuildStatus),
+    graphQueryStatus: hydrated.graphQueryStatus == null
+      ? undefined
+      : redactJsonValue(hydrated.graphQueryStatus),
     metadata: hydrated.metadata == null ? undefined : redactJsonValue(hydrated.metadata),
     commandChecks: (hydrated.commandChecks ?? []).map((check) => ({
       ...check,
@@ -1063,11 +1082,176 @@ function graphRagBookOutputLocator(bookId) {
   return `books/${bookId}/output`;
 }
 
-function artifactExistsForBook(artifact, bookId) {
-  if (!artifact || artifact.bookId !== bookId || typeof artifact.path !== "string") {
-    return false;
+function normalizeForStableHash(input) {
+  if (
+    input === null ||
+    typeof input === "boolean" ||
+    typeof input === "number" ||
+    typeof input === "string"
+  ) {
+    return input;
   }
-  return existsSync(join(stateRoot, artifact.path));
+  if (Array.isArray(input)) {
+    return input.map((item) => normalizeForStableHash(item));
+  }
+  if (input instanceof Date) {
+    return input.toISOString();
+  }
+  if (typeof input === "object" && input != null) {
+    return Object.fromEntries(
+      Object.entries(input)
+        .filter(([, value]) => value !== undefined)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, value]) => [key, normalizeForStableHash(value)]),
+    );
+  }
+  return String(input);
+}
+
+function stableHash(input) {
+  return createHash("sha256")
+    .update(JSON.stringify(normalizeForStableHash(input)))
+    .digest("hex");
+}
+
+function hashFilePayload(rootDir, files) {
+  return files.map((path) => ({
+    hash: sha256File(path),
+    path: path.slice(rootDir.length + 1),
+  }));
+}
+
+function listFilesRecursive(rootDir) {
+  const files = [];
+  for (const entry of readdirSync(rootDir, { withFileTypes: true })) {
+    const entryPath = join(rootDir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...listFilesRecursive(entryPath));
+      continue;
+    }
+    if (entry.isFile()) files.push(entryPath);
+  }
+  return files.sort((left, right) => left.localeCompare(right));
+}
+
+function hashDirectoryContents(rootDir) {
+  return stableHash(hashFilePayload(rootDir, listFilesRecursive(rootDir)));
+}
+
+function readLanceRowCount(tableDir) {
+  try {
+    const parsed = JSON.parse(readFileSync(join(tableDir, "qmd_row_count.json"), "utf8"));
+    if (typeof parsed === "number") return parsed;
+    if (parsed && typeof parsed === "object" && typeof parsed.rowCount === "number") {
+      return parsed.rowCount;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function validateLanceDbDirectory(path) {
+  try {
+    if (!statSync(path).isDirectory()) return "lancedb_path_not_directory";
+    for (const tableName of requiredLanceDbTables) {
+      const tableDir = join(path, tableName);
+      if (!statSync(tableDir).isDirectory()) {
+        return `${tableName}:lancedb_table_not_directory`;
+      }
+      const dataDir = join(tableDir, "data");
+      const dataFiles = readdirSync(dataDir).filter((item) => item.endsWith(".lance"));
+      if (dataFiles.length === 0) return `${tableName}:lancedb_table_missing_data`;
+      const nonEmpty = dataFiles.some((fileName) => {
+        try {
+          const entry = statSync(join(dataDir, fileName));
+          return entry.isFile() && entry.size > 0;
+        } catch {
+          return false;
+        }
+      });
+      if (!nonEmpty) return `${tableName}:lancedb_table_has_no_non_empty_fragments`;
+      const rowCount = readLanceRowCount(tableDir);
+      if (rowCount == null || rowCount <= 0) {
+        return `${tableName}:lancedb_table_missing_positive_row_count`;
+      }
+    }
+    return null;
+  } catch {
+    return "lancedb_path_missing_or_unreadable";
+  }
+}
+
+function hashLanceDbDirectoryContents(rootDir) {
+  const files = [];
+  for (const tableName of requiredLanceDbTables) {
+    const tableDir = join(rootDir, tableName);
+    const dataDir = join(tableDir, "data");
+    const dataFiles = readdirSync(dataDir);
+    files.push(
+      ...dataFiles
+        .filter((item) => item.endsWith(".lance"))
+        .map((item) => join(dataDir, item)),
+      join(tableDir, "qmd_row_count.json"),
+    );
+  }
+  return stableHash(hashFilePayload(rootDir, files.sort((left, right) =>
+    left.localeCompare(right)
+  )));
+}
+
+function isParquetArtifact(kind) {
+  return typeof kind === "string" &&
+    kind.startsWith("graphrag_") &&
+    kind.endsWith("_parquet");
+}
+
+function validateArtifactContent(artifact, bookId) {
+  if (!artifact || artifact.bookId !== bookId || typeof artifact.path !== "string") {
+    return "artifact_identity_mismatch";
+  }
+  const artifactPath = join(stateRoot, artifact.path);
+  try {
+    const entry = statSync(artifactPath);
+    const vaultRealPath = realpathSync(stateRoot);
+    const artifactRealPath = realpathSync(artifactPath);
+    if (
+      artifactRealPath !== vaultRealPath &&
+      !artifactRealPath.startsWith(`${vaultRealPath}${sep}`)
+    ) {
+      return "realpath_outside_graph_vault";
+    }
+
+    if (artifact.kind === "lancedb_index") {
+      const lanceReason = validateLanceDbDirectory(artifactPath);
+      if (lanceReason) return lanceReason;
+    }
+
+    const actualHash = artifact.kind === "lancedb_index"
+      ? hashLanceDbDirectoryContents(artifactPath)
+      : entry.isDirectory()
+        ? hashDirectoryContents(artifactPath)
+        : sha256File(artifactPath);
+    if (actualHash !== artifact.contentHash) {
+      return "content_hash_mismatch";
+    }
+
+    if (isParquetArtifact(artifact.kind) && (!entry.isFile() || entry.size === 0)) {
+      return "parquet_file_empty_or_not_file";
+    }
+    if (
+      artifact.kind === "graphrag_context_json" ||
+      artifact.kind === "graphrag_stats_json"
+    ) {
+      const parsed = JSON.parse(readFileSync(artifactPath, "utf8"));
+      if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return "json_artifact_not_object";
+      }
+    }
+    return null;
+  } catch {
+    return "path_missing_or_unreadable";
+  }
 }
 
 function readGraphJob(item) {
@@ -1096,17 +1280,22 @@ function validateGraphStageEvidence({
   expectedStageFingerprints,
   expectedProviderFingerprint,
   expectedProducerRunId,
+  producer,
 }) {
   if (
     checkpoint?.stage !== stage ||
     checkpoint?.status !== "succeeded" ||
     checkpoint?.metadata?.bootstrap === true
   ) {
+    const checkpointStatus = checkpoint?.status;
     return {
       ok: false,
+      failed: checkpointStatus === "failed",
       reason: checkpoint?.metadata?.bootstrap === true
         ? "bootstrap_stage_requires_real_rebuild"
-        : "real_graphrag_stage_missing",
+        : checkpointStatus === "failed"
+          ? `real_graphrag_stage_failed:${stage}`
+          : "real_graphrag_stage_missing",
       artifactIds: checkpointArtifactIds(checkpoint),
     };
   }
@@ -1153,11 +1342,21 @@ function validateGraphStageEvidence({
     };
   }
 
-  const stageArtifacts = artifactIds
-    .map((artifactId) => artifacts.find((artifact) =>
-      String(artifact?.artifactId) === artifactId
-    ))
-    .filter((artifact) => artifactExistsForBook(artifact, item.bookId));
+  const stageArtifacts = [];
+  for (const artifactId of artifactIds) {
+    const artifact = artifacts.find((candidate) =>
+      String(candidate?.artifactId) === artifactId
+    );
+    const invalidReason = validateArtifactContent(artifact, item.bookId);
+    if (invalidReason != null) {
+      return {
+        ok: false,
+        reason: `stage_artifact_invalid:${invalidReason}`,
+        artifactIds,
+      };
+    }
+    stageArtifacts.push(artifact);
+  }
   if (stageArtifacts.length !== artifactIds.length) {
     return {
       ok: false,
@@ -1188,9 +1387,18 @@ function validateGraphStageEvidence({
     };
   }
 
-  const invalidArtifactProducer = stage !== "query_ready"
-    ? stageArtifacts.find((artifact) => artifact.producerRunId !== checkpoint.runId)
-    : null;
+  const invalidArtifactProducer = stageArtifacts.find((artifact) => {
+    const artifactStage = expectedArtifactStage(stage, artifact);
+    if (artifactStage == null) return true;
+    if (stage !== "query_ready") {
+      if (expectedProducerRunId != null) {
+        return artifact.producerRunId !== expectedProducerRunId;
+      }
+      return artifact.producerRunId !== checkpoint.runId;
+    }
+    const expectedRunId = producer?.stageProducerRunIds?.[artifactStage];
+    return expectedRunId == null || artifact.producerRunId !== expectedRunId;
+  });
   if (invalidArtifactProducer) {
     return {
       ok: false,
@@ -1282,12 +1490,15 @@ function graphBuildEvidence(item) {
       expectedProducerRunId: graphProducerStages.includes(stage)
         ? producer?.stageProducerRunIds?.[stage]
         : undefined,
+      producer,
     });
     if (!stageEvidence.ok) {
       return {
-        status: stageEvidence.reason === "real_graphrag_stage_missing"
-          ? "pending"
-          : "stale",
+        status: stageEvidence.failed === true
+          ? "failed"
+          : stageEvidence.reason === "real_graphrag_stage_missing"
+            ? "pending"
+            : "stale",
         checkedAt,
         stage,
         reason: stageEvidence.reason,
@@ -1356,7 +1567,8 @@ function graphBuildEvidence(item) {
 
 function qmdBuildEvidence(checkpoint) {
   const checkedAt = now();
-  const checks = checkpoint.commandChecks ?? [];
+  const checks = (checkpoint.commandChecks ?? [])
+    .filter((check) => qmdNativeCommandCheckNames.includes(check.name));
   const names = new Set(checks.map((check) => check.name));
   const failed = checks.find((check) => check.status !== "passed");
   if (failed) {
@@ -1368,7 +1580,7 @@ function qmdBuildEvidence(checkpoint) {
       artifactIds: [],
     };
   }
-  const missing = requiredCommandCheckNames.find((name) => !names.has(name));
+  const missing = qmdNativeCommandCheckNames.find((name) => !names.has(name));
   if (missing) {
     return {
       status: "pending",
@@ -1379,12 +1591,12 @@ function qmdBuildEvidence(checkpoint) {
     };
   }
   const unexpected = checks.find((check) =>
-    !requiredCommandCheckNames.includes(check.name)
+    !qmdNativeCommandCheckNames.includes(check.name)
   );
   if (
     unexpected ||
-    checks.length !== expectedCommandCheckCount ||
-    names.size !== expectedCommandCheckCount
+    checks.length !== expectedQmdNativeCommandCheckCount ||
+    names.size !== expectedQmdNativeCommandCheckCount
   ) {
     return {
       status: "pending",
@@ -1404,31 +1616,83 @@ function qmdBuildEvidence(checkpoint) {
   };
 }
 
+function graphQueryEvidence(checkpoint) {
+  const checkedAt = now();
+  const checks = (checkpoint.commandChecks ?? [])
+    .filter((check) => graphQueryCommandCheckNames.includes(check.name));
+  const names = new Set(checks.map((check) => check.name));
+  const failed = checks.find((check) => check.status !== "passed");
+  if (failed) {
+    return {
+      status: "failed",
+      checkedAt,
+      stage: failed.name,
+      reason: "graph_query_command_check_failed",
+      artifactIds: [],
+    };
+  }
+  const missing = graphQueryCommandCheckNames.find((name) => !names.has(name));
+  if (missing) {
+    return {
+      status: "pending",
+      checkedAt,
+      stage: missing,
+      reason: "graph_query_check_missing",
+      artifactIds: [],
+    };
+  }
+  if (
+    checks.length !== graphQueryCommandCheckNames.length ||
+    names.size !== graphQueryCommandCheckNames.length
+  ) {
+    return {
+      status: "pending",
+      checkedAt,
+      stage: "graph-query-command-checks",
+      reason: "graph_query_check_set_incomplete",
+      artifactIds: [],
+    };
+  }
+  return {
+    status: "succeeded",
+    checkedAt,
+    stage: "qmd-query-graphrag-json",
+    artifactIds: [],
+  };
+}
+
 function downgradeCompletedIfClosedLoopInvalid(item, checkpoint) {
   if (checkpoint.status !== "completed") return checkpoint;
   const qmdBuildStatus = qmdBuildEvidence(checkpoint);
   const graphBuildStatus = graphBuildEvidence(item);
+  const graphQueryStatus = graphQueryEvidence(checkpoint);
   if (
     qmdBuildStatus.status === "succeeded" &&
-    graphBuildStatus.status === "succeeded"
+    graphBuildStatus.status === "succeeded" &&
+    graphQueryStatus.status === "succeeded"
   ) {
     return {
       ...checkpoint,
       qmdBuildStatus,
       graphBuildStatus,
+      graphQueryStatus,
     };
   }
+  const reopenStatus = graphBuildStatus.status !== "succeeded"
+    ? graphBuildStatus
+    : qmdBuildStatus.status !== "succeeded"
+      ? qmdBuildStatus
+      : graphQueryStatus;
   event({
     itemId: item.itemId,
     event: "item_completed_reopened",
     status: "pending",
     recoveryDecision: "continue_pending",
-    failedStage: graphBuildStatus.status === "succeeded"
-      ? qmdBuildStatus.stage
-      : graphBuildStatus.stage,
+    failedStage: reopenStatus.stage,
     metadata: {
       qmdBuildStatus,
       graphBuildStatus,
+      graphQueryStatus,
     },
   });
   return {
@@ -1436,14 +1700,14 @@ function downgradeCompletedIfClosedLoopInvalid(item, checkpoint) {
     status: "pending",
     completedAt: undefined,
     recoveryDecision: "continue_pending",
+    failedStage: reopenStatus.stage,
     qmdBuildStatus,
     graphBuildStatus,
+    graphQueryStatus,
     metadata: {
       ...(checkpoint.metadata ?? {}),
       reopenedFromCompleted: true,
-      reopenReason: graphBuildStatus.status === "succeeded"
-        ? qmdBuildStatus.reason
-        : graphBuildStatus.reason,
+      reopenReason: reopenStatus.reason,
     },
   };
 }
@@ -1578,6 +1842,7 @@ function buildRecoverySummary(manifest, checkpoints) {
   const items = checkpoints.map((item) => {
     const qmdStatus = qmdBuildEvidence(item);
     const graphStatus = graphBuildEvidence(item);
+    const graphQueryStatus = graphQueryEvidence(item);
     const failedCommand = (item.commandChecks ?? []).find((check) =>
       check.status === "failed"
     );
@@ -1589,6 +1854,7 @@ function buildRecoverySummary(manifest, checkpoints) {
       attempts: item.attempts,
       qmdBuildStatus: redactJsonValue(qmdStatus),
       graphBuildStatus: redactJsonValue(graphStatus),
+      graphQueryStatus: redactJsonValue(graphQueryStatus),
       failureKind: item.failureKind,
       retryable: item.retryable,
       retryExhausted: item.retryExhausted,
@@ -1770,7 +2036,6 @@ function migrateGraphVaultRawLogs() {
     mkdirSync(targetDir, { recursive: true });
     for (const name of readdirSync(reportsDir)) {
       const source = join(reportsDir, name);
-      if (!name.endsWith(".log")) continue;
       const target = join(targetDir, `${Date.now()}-${name}`);
       renameSync(source, target);
       event({
@@ -1793,11 +2058,17 @@ function migrateGraphVaultRawLogs() {
 }
 
 function assertNoBookScopedRawReports() {
+  const residuals = [];
   for (const item of discoverItems()) {
     const reportsDir = join(stateRoot, "books", item.bookId, "output", "reports");
     if (!existsSync(reportsDir)) continue;
-    const logNames = readdirSync(reportsDir).filter((name) => name.endsWith(".log"));
-    if (logNames.length === 0) continue;
+    const residualNames = readdirSync(reportsDir);
+    if (residualNames.length === 0) continue;
+    residuals.push({
+      bookId: item.bookId,
+      sourceName: item.sourceName,
+      residualCount: residualNames.length,
+    });
     event({
       event: "raw_log_residual_detected",
       metadata: {
@@ -1805,6 +2076,12 @@ function assertNoBookScopedRawReports() {
         logCount: logNames.length,
       },
     });
+  }
+  if (residuals.length > 0) {
+    throw new Error(
+      "book-scoped raw GraphRAG logs remain inside graph_vault: " +
+        JSON.stringify(residuals),
+    );
   }
 }
 
@@ -2254,6 +2531,7 @@ function runItem(item, checkpoint) {
   const commandChecks = runCliChecks(resolvedItem);
   const qmdBuildStatus = qmdBuildEvidence({ commandChecks });
   const graphBuildStatus = graphBuildEvidence(resolvedItem);
+  const graphQueryStatus = graphQueryEvidence({ commandChecks });
   if (qmdBuildStatus.status !== "succeeded") {
     throw Object.assign(new Error(`qmd build did not succeed: ${qmdBuildStatus.reason}`), {
       commandCheck: commandChecks.find((check) => check.name === qmdBuildStatus.stage),
@@ -2280,6 +2558,16 @@ function runItem(item, checkpoint) {
       },
     );
   }
+  if (graphQueryStatus.status !== "succeeded") {
+    throw Object.assign(
+      new Error(`GraphRAG query check did not succeed: ${graphQueryStatus.reason}`),
+      {
+        commandCheck: commandChecks.find((check) =>
+          check.name === graphQueryStatus.stage
+        ),
+      },
+    );
+  }
   const completed = {
     ...checkpoint,
     status: "completed",
@@ -2294,6 +2582,7 @@ function runItem(item, checkpoint) {
     failedStage: undefined,
     qmdBuildStatus,
     graphBuildStatus,
+    graphQueryStatus,
     commandChecks,
     runnerHeartbeatAt: now(),
   };

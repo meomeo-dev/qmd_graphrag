@@ -18,12 +18,15 @@ function required(value, name) {
 async function importRuntime() {
   const srcIndex = new URL("../../src/index.ts", import.meta.url);
   const srcCollections = new URL("../../src/collections.ts", import.meta.url);
+  const srcMetadata = new URL("../../src/vault/metadata.ts", import.meta.url);
   const distIndex = new URL("../../dist/index.js", import.meta.url);
   const distCollections = new URL("../../dist/collections.js", import.meta.url);
+  const distMetadata = new URL("../../dist/vault/metadata.js", import.meta.url);
   const useSource = existsSync(srcIndex) && existsSync(new URL("../../.git", import.meta.url));
-  const [indexModule, collectionsModule] = await Promise.all([
+  const [indexModule, collectionsModule, metadataModule] = await Promise.all([
     import(useSource ? srcIndex.href : distIndex.href),
     import(useSource ? srcCollections.href : distCollections.href),
+    import(useSource ? srcMetadata.href : distMetadata.href),
   ]);
   return {
     FileBookJobStateRepository: indexModule.FileBookJobStateRepository,
@@ -41,6 +44,7 @@ async function importRuntime() {
     writeManagedGraphRagSettings: indexModule.writeManagedGraphRagSettings,
     loadConfig: collectionsModule.loadConfig,
     setConfigSource: collectionsModule.setConfigSource,
+    sanitizeVaultText: metadataModule.sanitizeVaultText,
   };
 }
 
@@ -85,6 +89,14 @@ let GraphRagWorkflowNameSchemaRef;
 
 function printJson(payload) {
   console.log(JSON.stringify(payload, null, 2));
+}
+
+function errorText(error) {
+  return error instanceof Error ? error.stack ?? error.message : String(error);
+}
+
+function safeText(runtimeApi, value) {
+  return runtimeApi.sanitizeVaultText(String(value)) ?? "[redacted]";
 }
 
 function stageWorkflows(stage) {
@@ -363,42 +375,77 @@ async function run() {
     );
     const runId = reusableRunIdForStage(sync, nextStage) ??
       runtimeApi.createRunId(nextStage);
-    await runtimeApi.writeGraphRagOutputProducerManifest({
-      outputDir: scopedOutputDir,
-      bookId: sync.job.bookId,
-      sourceHash: sync.job.sourceHash,
-      documentId: sync.job.documentId,
-      contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
-      stageFingerprints: sync.stageFingerprints,
-      providerFingerprint: sync.job.providerFingerprint,
-      producerRunId: runId,
-      stage: nextStage,
-    });
-    await repo.completeStage({
+    const inputFingerprint = sync.stageFingerprints[nextStage];
+    await repo.startStage({
       bookId: sync.job.bookId,
       stage: nextStage,
       runId,
-      inputFingerprint: sync.stageFingerprints[nextStage],
+      inputFingerprint,
       contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
-      stageFingerprint: sync.stageFingerprints[nextStage],
+      stageFingerprint: inputFingerprint,
       providerFingerprint: sync.job.providerFingerprint,
-      artifactIds: sync.artifacts
-        .filter((artifact) =>
-          artifact.stage === "community_report" || artifact.stage === "embed"
-        )
-        .map((artifact) => artifact.artifactId),
       metadata: {
         graphWorkspace: "book_scoped",
         readinessSource: "real_stage_checkpoints",
       },
     });
-    const { sync: refreshed } = await syncCurrentBook(
-      runtimeApi,
-      projectConfig,
-      sourcePath,
-      sourceIdentityPath,
-      normalizedPath,
-    );
+    let refreshed;
+    try {
+      await runtimeApi.writeGraphRagOutputProducerManifest({
+        outputDir: scopedOutputDir,
+        bookId: sync.job.bookId,
+        sourceHash: sync.job.sourceHash,
+        documentId: sync.job.documentId,
+        contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
+        stageFingerprints: sync.stageFingerprints,
+        providerFingerprint: sync.job.providerFingerprint,
+        producerRunId: runId,
+        stage: nextStage,
+      });
+      await repo.completeStage({
+        bookId: sync.job.bookId,
+        stage: nextStage,
+        runId,
+        inputFingerprint,
+        contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
+        stageFingerprint: inputFingerprint,
+        providerFingerprint: sync.job.providerFingerprint,
+        artifactIds: sync.artifacts
+          .filter((artifact) =>
+            artifact.stage === "community_report" || artifact.stage === "embed"
+          )
+          .map((artifact) => artifact.artifactId),
+        metadata: {
+          graphWorkspace: "book_scoped",
+          readinessSource: "real_stage_checkpoints",
+        },
+      });
+      ({ sync: refreshed } = await syncCurrentBook(
+        runtimeApi,
+        projectConfig,
+        sourcePath,
+        sourceIdentityPath,
+        normalizedPath,
+      ));
+    } catch (error) {
+      await repo.failStage({
+        bookId: sync.job.bookId,
+        stage: nextStage,
+        runId,
+        inputFingerprint,
+        contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
+        stageFingerprint: inputFingerprint,
+        providerFingerprint: sync.job.providerFingerprint,
+        errorSummary: safeText(runtimeApi, error instanceof Error
+          ? error.message
+          : String(error)),
+        metadata: {
+          graphWorkspace: "book_scoped",
+          readinessSource: "real_stage_checkpoints",
+        },
+      });
+      throw error;
+    }
 
     printJson({
       status: refreshed.resumePlan.nextStage == null ? "ready" : "blocked",
@@ -562,7 +609,9 @@ async function run() {
       stage: nextStage,
       runId,
       inputFingerprint,
-      errorSummary: error instanceof Error ? error.message : String(error),
+      errorSummary: safeText(runtimeApi, error instanceof Error
+        ? error.message
+        : String(error)),
       metadata: {
         resumedFrom: nextStage,
       },
@@ -572,6 +621,12 @@ async function run() {
 }
 
 run().catch((error) => {
-  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  importRuntime()
+    .then((runtimeApi) => {
+      console.error(safeText(runtimeApi, errorText(error)));
+    })
+    .catch(() => {
+      console.error("[redacted]");
+    });
   process.exitCode = 1;
 });

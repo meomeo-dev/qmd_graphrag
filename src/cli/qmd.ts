@@ -3160,9 +3160,30 @@ async function autoQuerySearch(query: string, opts: OutputOptions): Promise<void
       resolveGraphCapabilities: async (candidates) =>
         resolveCandidateGraphCapabilities({ graphVault, candidates }),
       queryGraphRag: async (request, decision) => {
+        if (decision.selectedBookIds.length !== 1) {
+          throw new TypedQueryErrorException(createTypedQueryError({
+            route: request.requestedRoute,
+            stage: "route",
+            provider: "graphrag",
+            capability: "graph_query",
+            code: "ambiguous_graph_book_scope",
+            retryable: false,
+            redactedMessage:
+              "GraphRAG auto upgrade requires exactly one graph-ready book.",
+            metadata: {
+              selectedBookCount: decision.selectedBookIds.length,
+            },
+          }));
+        }
         const runtime = createQmdGraphRagRuntime();
         return runtime.graphQuery({
           rootDir: graphVault,
+          dataDir: pathResolve(
+            graphVault,
+            "books",
+            decision.selectedBookIds[0]!,
+            "output",
+          ),
           method: GraphRagSearchMethodSchema.parse(request.method ?? method),
           query: request.query,
           responseType,
@@ -3244,12 +3265,26 @@ async function graphRagQuerySearch(
     resolveGraphCapabilities: async (candidates) =>
       resolveCandidateGraphCapabilities({ graphVault, candidates }),
     queryGraphRag: async (request, decision) => {
+      if (decision.selectedBookIds.length !== 1) {
+        throw new TypedQueryErrorException(createTypedQueryError({
+          route: request.requestedRoute,
+          stage: "route",
+          provider: "graphrag",
+          capability: "graph_query",
+          code: "ambiguous_graph_book_scope",
+          retryable: false,
+          redactedMessage:
+            "qmd query --graphrag requires --graph-book-id when multiple " +
+            "graph-ready books match the request.",
+          metadata: {
+            selectedBookCount: decision.selectedBookIds.length,
+          },
+        }));
+      }
       const runtime = createQmdGraphRagRuntime();
       return runtime.graphQuery({
         rootDir: graphVault,
-        dataDir: decision.selectedBookIds.length === 1
-          ? pathResolve(graphVault, "books", decision.selectedBookIds[0]!, "output")
-          : undefined,
+        dataDir: pathResolve(graphVault, "books", decision.selectedBookIds[0]!, "output"),
         method: GraphRagSearchMethodSchema.parse(request.method ?? method),
         query: request.query,
         responseType,

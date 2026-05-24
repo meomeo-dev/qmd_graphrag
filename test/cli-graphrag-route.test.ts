@@ -106,7 +106,11 @@ process.stdin.on("end", () => {
       locator: { path: "graph/books/book-cli/community-report.md", lineStart: 3 },
       quote: "Graph-only CLI projected evidence",
       score: 0.97,
-      metadata: { title: "CLI Graph Community Report" }
+      metadata: {
+        title: "CLI Graph Community Report",
+        requestDataDir: request.dataDir || null,
+        requestRootDir: request.rootDir || null
+      }
     }]
   };
   process.stdout.write(JSON.stringify(response));
@@ -134,7 +138,117 @@ async function writeLanceDbFixture(root: string): Promise<void> {
   }
 }
 
-async function createWorkspace(): Promise<Workspace> {
+type GraphBookFixture = {
+  bookId: string;
+  sourceId: string;
+  sourceHash: string;
+  documentId: string;
+  contentHash: string;
+  normalizedPath: string;
+  reportArtifactId: string;
+  lancedbArtifactId: string;
+  reportHash: string;
+  lancedbHash: string;
+  graphTextUnitId: string;
+  graphDocumentId: string;
+  stageFingerprints: Record<string, string>;
+  providerFingerprint: string;
+  runIds: Record<string, string>;
+};
+
+function checkpointFixture(input: GraphBookFixture, stage: string) {
+  return {
+    schemaVersion: SchemaVersion,
+    bookId: input.bookId,
+    stage,
+    status: "succeeded",
+    attemptCount: 1,
+    runId: input.runIds[stage],
+    inputFingerprint: input.stageFingerprints[stage],
+    contentHash: input.contentHash,
+    stageFingerprint: input.stageFingerprints[stage],
+    providerFingerprint: input.providerFingerprint,
+    artifactIds: stage === "community_report"
+      ? [input.reportArtifactId]
+      : stage === "embed"
+        ? [input.lancedbArtifactId]
+        : stage === "query_ready"
+          ? [input.reportArtifactId, input.lancedbArtifactId]
+          : [],
+    finishedAt: "2026-05-22T00:00:00.000Z",
+  };
+}
+
+async function writeGraphBookFixture(
+  graphVault: string,
+  input: Omit<GraphBookFixture, "reportHash" | "lancedbHash">,
+): Promise<GraphBookFixture> {
+  const outputDir = join(graphVault, "books", input.bookId, "output");
+  await mkdir(outputDir, { recursive: true });
+  const reportPath = join(outputDir, "community_reports.parquet");
+  const lancedbPath = join(outputDir, "lancedb");
+  await writeFile(reportPath, `${input.bookId} community reports`, "utf8");
+  await writeLanceDbFixture(lancedbPath);
+  const fixture = {
+    ...input,
+    reportHash: await hashFile(reportPath),
+    lancedbHash: await hashLanceDbDirectoryContents(lancedbPath),
+  };
+
+  await writeFile(
+    join(graphVault, "books", fixture.bookId, "checkpoints.yaml"),
+    YAML.stringify({
+      schemaVersion: SchemaVersion,
+      items: [
+        checkpointFixture(fixture, "community_report"),
+        checkpointFixture(fixture, "embed"),
+        checkpointFixture(fixture, "query_ready"),
+      ],
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(graphVault, "books", fixture.bookId, "artifacts.yaml"),
+    YAML.stringify({
+      schemaVersion: SchemaVersion,
+      items: [
+        {
+          schemaVersion: SchemaVersion,
+          artifactId: fixture.reportArtifactId,
+          bookId: fixture.bookId,
+          stage: "community_report",
+          kind: "graphrag_community_reports_parquet",
+          path: `books/${fixture.bookId}/output/community_reports.parquet`,
+          contentHash: fixture.reportHash,
+          stageFingerprint: fixture.stageFingerprints.community_report,
+          providerFingerprint: fixture.providerFingerprint,
+          producerRunId: fixture.runIds.community_report,
+          createdAt: "2026-05-22T00:00:00.000Z",
+        },
+        {
+          schemaVersion: SchemaVersion,
+          artifactId: fixture.lancedbArtifactId,
+          bookId: fixture.bookId,
+          stage: "embed",
+          kind: "lancedb_index",
+          path: `books/${fixture.bookId}/output/lancedb`,
+          contentHash: fixture.lancedbHash,
+          stageFingerprint: fixture.stageFingerprints.embed,
+          providerFingerprint: fixture.providerFingerprint,
+          producerRunId: fixture.runIds.embed,
+          createdAt: "2026-05-22T00:00:00.000Z",
+        },
+      ],
+    }),
+    "utf8",
+  );
+
+  return fixture;
+}
+
+async function createWorkspace(options: {
+  includeSecondGraphReadyBook?: boolean;
+} = {}): Promise<Workspace> {
   const root = await mkdtemp(join(tmpdir(), "qmd-cli-graphrag-"));
   const dbPath = join(root, "index.sqlite");
   const configDir = join(root, "config");
@@ -149,16 +263,44 @@ async function createWorkspace(): Promise<Workspace> {
     "",
     "This book explains how architecture decisions relate across chapters.",
   ].join("\n");
+  const secondBody = [
+    "# Second Graph Ready Book",
+    "",
+    "This second book also explains how architecture decisions relate across chapters.",
+  ].join("\n");
   const relativePath = "docs/graph-ready.md";
+  const secondRelativePath = "docs/second-graph-ready.md";
   const sourcePath = join(root, relativePath);
+  const secondSourcePath = join(root, secondRelativePath);
   await writeFile(sourcePath, body, "utf8");
+  if (options.includeSecondGraphReadyBook) {
+    await writeFile(secondSourcePath, secondBody, "utf8");
+  }
   const contentHash = await hashContent(body);
+  const secondContentHash = await hashContent(secondBody);
   const sourceHash = sha256Text(body);
+  const secondSourceHash = sha256Text(secondBody);
   const documentId = `doc-${contentHash.slice(0, 12)}`;
+  const secondDocumentId = `doc-${secondContentHash.slice(0, 12)}`;
   const sourceId = `sha256:${sourceHash}`;
+  const secondSourceId = `sha256:${secondSourceHash}`;
   const bookId = "book-cli";
+  const secondBookId = "book-cli-second";
   const reportArtifactId = "artifact-cli-report";
+  const secondReportArtifactId = "artifact-cli-second-report";
   const lancedbArtifactId = "artifact-cli-lancedb";
+  const secondLancedbArtifactId = "artifact-cli-second-lancedb";
+  const providerFingerprint = "provider-openai-responses-jina";
+  const stageFingerprints = {
+    community_report: "stage-community-report",
+    embed: "stage-embed",
+    query_ready: "stage-query-ready",
+  };
+  const secondStageFingerprints = {
+    community_report: "stage-second-community-report",
+    embed: "stage-second-embed",
+    query_ready: "stage-second-query-ready",
+  };
 
   const store = createStore(dbPath);
   try {
@@ -173,6 +315,18 @@ async function createWorkspace(): Promise<Workspace> {
       now,
       now,
     );
+    if (options.includeSecondGraphReadyBook) {
+      insertContent(store.db, secondContentHash, secondBody, now);
+      insertDocument(
+        store.db,
+        "docs",
+        secondRelativePath,
+        extractTitle(secondBody, secondRelativePath),
+        secondContentHash,
+        now,
+        now,
+      );
+    }
     syncConfigToDb(store.db, {
       collections: {
         docs: {
@@ -222,66 +376,73 @@ async function createWorkspace(): Promise<Workspace> {
   );
 
   await mkdir(join(graphVault, "catalog"), { recursive: true });
-  await mkdir(join(graphVault, "books", bookId, "output"), { recursive: true });
-  const reportPath = join(graphVault, "books", bookId, "output", "community_reports.parquet");
-  const lancedbPath = join(graphVault, "books", bookId, "output", "lancedb");
-  await writeFile(reportPath, "community reports", "utf8");
-  await writeLanceDbFixture(lancedbPath);
-  const reportHash = await hashFile(reportPath);
-  const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
+  const fixtures: GraphBookFixture[] = [];
+  fixtures.push(await writeGraphBookFixture(graphVault, {
+    bookId,
+    sourceId,
+    sourceHash,
+    documentId,
+    contentHash,
+    normalizedPath: relativePath,
+    reportArtifactId,
+    lancedbArtifactId,
+    graphTextUnitId: "tu-cli",
+    graphDocumentId: "graph-doc-cli",
+    stageFingerprints,
+    providerFingerprint,
+    runIds: {
+      community_report: "run-cli-community-report",
+      embed: "run-cli-embed",
+      query_ready: "run-cli-query-ready",
+    },
+  }));
+  if (options.includeSecondGraphReadyBook) {
+    fixtures.push(await writeGraphBookFixture(graphVault, {
+      bookId: secondBookId,
+      sourceId: secondSourceId,
+      sourceHash: secondSourceHash,
+      documentId: secondDocumentId,
+      contentHash: secondContentHash,
+      normalizedPath: secondRelativePath,
+      reportArtifactId: secondReportArtifactId,
+      lancedbArtifactId: secondLancedbArtifactId,
+      graphTextUnitId: "tu-cli-second",
+      graphDocumentId: "graph-doc-cli-second",
+      stageFingerprints: secondStageFingerprints,
+      providerFingerprint,
+      runIds: {
+        community_report: "run-cli-second-community-report",
+        embed: "run-cli-second-embed",
+        query_ready: "run-cli-second-query-ready",
+      },
+    }));
+  }
 
   await writeFile(
-    join(graphVault, "books", bookId, "checkpoints.yaml"),
+    join(graphVault, "catalog", "books.yaml"),
     YAML.stringify({
       schemaVersion: SchemaVersion,
-      items: [{
+      items: fixtures.map((fixture) => ({
         schemaVersion: SchemaVersion,
-        bookId,
-        stage: "query_ready",
-        status: "succeeded",
-        attemptCount: 1,
-        inputFingerprint: "fp-query-ready",
-        contentHash,
-        stageFingerprint: "stage-query-ready",
-        providerFingerprint: "provider-openai-responses-jina",
-        artifactIds: [reportArtifactId, lancedbArtifactId],
-        finishedAt: "2026-05-22T00:00:00.000Z",
-      }],
-    }),
-    "utf8",
-  );
-  await writeFile(
-    join(graphVault, "books", bookId, "artifacts.yaml"),
-    YAML.stringify({
-      schemaVersion: SchemaVersion,
-      items: [
-        {
-          schemaVersion: SchemaVersion,
-          artifactId: reportArtifactId,
-          bookId,
-          stage: "community_report",
-          kind: "graphrag_community_reports_parquet",
-          path: `books/${bookId}/output/community_reports.parquet`,
-          contentHash: reportHash,
-          stageFingerprint: "stage-community-report",
-          providerFingerprint: "provider-openai-responses-jina",
-          producerRunId: "run-cli",
-          createdAt: "2026-05-22T00:00:00.000Z",
-        },
-        {
-          schemaVersion: SchemaVersion,
-          artifactId: lancedbArtifactId,
-          bookId,
-          stage: "embed",
-          kind: "lancedb_index",
-          path: `books/${bookId}/output/lancedb`,
-          contentHash: lancedbHash,
-          stageFingerprint: "stage-embed",
-          providerFingerprint: "provider-openai-responses-jina",
-          producerRunId: "run-cli",
-          createdAt: "2026-05-22T00:00:00.000Z",
-        },
-      ],
+        bookId: fixture.bookId,
+        documentId: fixture.documentId,
+        sourcePath: `input/${fixture.bookId}.epub`,
+        sourceHash: fixture.sourceHash,
+        normalizedContentHash: fixture.contentHash,
+        normalizedPath: fixture.normalizedPath,
+        normalizationPolicyVersion: "qmd-sqlite-content-v1",
+        configFingerprint: "config-fp",
+        promptFingerprint: "prompt-fp",
+        modelFingerprint: "model-fp",
+        stageFingerprints: fixture.stageFingerprints,
+        providerFingerprint: fixture.providerFingerprint,
+        currentStage: "query_ready",
+        overallStatus: "succeeded",
+        lastSuccessRunId: fixture.runIds.query_ready,
+        createdAt: "2026-05-22T00:00:00.000Z",
+        updatedAt: "2026-05-22T00:00:00.000Z",
+        metadata: { sourceName: `${fixture.bookId}.epub` },
+      })),
     }),
     "utf8",
   );
@@ -289,19 +450,34 @@ async function createWorkspace(): Promise<Workspace> {
     join(graphVault, "catalog", "graph-capabilities.yaml"),
     YAML.stringify({
       schemaVersion: SchemaVersion,
-      items: [{
-        schemaVersion: SchemaVersion,
-        capabilityId: "book-cli:graph_query",
-        kind: "graph_query",
-        bookId,
-        sourceId,
-        documentId,
-        contentHash,
-        ready: true,
-        readinessSource: "validated_checkpoint_plus_validated_manifest",
-        artifactIds: [reportArtifactId, lancedbArtifactId],
-        createdAt: "2026-05-22T00:00:00.000Z",
-      }],
+      items: [
+        {
+          schemaVersion: SchemaVersion,
+          capabilityId: "book-cli:graph_query",
+          kind: "graph_query",
+          bookId,
+          sourceId,
+          documentId,
+          contentHash,
+          ready: true,
+          readinessSource: "validated_checkpoint_plus_validated_manifest",
+          artifactIds: [reportArtifactId, lancedbArtifactId],
+          createdAt: "2026-05-22T00:00:00.000Z",
+        },
+        ...(options.includeSecondGraphReadyBook ? [{
+          schemaVersion: SchemaVersion,
+          capabilityId: "book-cli-second:graph_query",
+          kind: "graph_query",
+          bookId: secondBookId,
+          sourceId: secondSourceId,
+          documentId: secondDocumentId,
+          contentHash: secondContentHash,
+          ready: true,
+          readinessSource: "validated_checkpoint_plus_validated_manifest" as const,
+          artifactIds: [secondReportArtifactId, secondLancedbArtifactId],
+          createdAt: "2026-05-22T00:00:00.000Z",
+        }] : []),
+      ],
     }),
     "utf8",
   );
@@ -309,20 +485,44 @@ async function createWorkspace(): Promise<Workspace> {
     join(graphVault, "catalog", "document-identity-map.yaml"),
     YAML.stringify({
       schemaVersion: SchemaVersion,
-      items: [{
-        schemaVersion: SchemaVersion,
-        sourceId,
-        sourceHash,
-        canonicalBookId: bookId,
-        documentId,
-        contentHash,
-        normalizationPolicyVersion: "qmd-sqlite-content-v1",
-        normalizedPath: relativePath,
-        chunkIds: [],
-        graphDocumentId: "graph-doc-cli",
-        graphTextUnitIds: ["tu-cli"],
-        metadata: { qmdCorpusRegistered: true },
-      }],
+      items: [
+        {
+          schemaVersion: SchemaVersion,
+          sourceId,
+          sourceHash,
+          canonicalBookId: bookId,
+          documentId,
+          contentHash,
+          normalizationPolicyVersion: "qmd-sqlite-content-v1",
+          normalizedPath: relativePath,
+          chunkIds: [],
+          graphDocumentId: "graph-doc-cli",
+          graphTextUnitIds: ["tu-cli"],
+          metadata: {
+            qmdCorpusRegistered: true,
+            qmdCollection: "docs",
+            qmdRelativePath: relativePath,
+          },
+        },
+        ...(options.includeSecondGraphReadyBook ? [{
+          schemaVersion: SchemaVersion,
+          sourceId: secondSourceId,
+          sourceHash: secondSourceHash,
+          canonicalBookId: secondBookId,
+          documentId: secondDocumentId,
+          contentHash: secondContentHash,
+          normalizationPolicyVersion: "qmd-sqlite-content-v1",
+          normalizedPath: secondRelativePath,
+          chunkIds: [],
+          graphDocumentId: "graph-doc-cli-second",
+          graphTextUnitIds: ["tu-cli-second"],
+          metadata: {
+            qmdCorpusRegistered: true,
+            qmdCollection: "docs",
+            qmdRelativePath: secondRelativePath,
+          },
+        }] : []),
+      ],
     }),
     "utf8",
   );
@@ -359,6 +559,9 @@ describe("CLI GraphRAG unified route", () => {
     expect(answer.answerText).toBe("GraphRAG CLI answer from fake bridge");
     expect(answer.evidence[0].graphCapabilityId).toBe("book-cli:graph_query");
     expect(answer.evidence[0].quote).toContain("Graph-only CLI");
+    expect(answer.evidence[0].metadata.requestDataDir).toBe(
+      join(workspace.graphVault, "books", "book-cli", "output"),
+    );
   }, 30000);
 
   test("qmd query --mode auto upgrades to GraphRAG when coverage and intent match", async () => {
@@ -382,5 +585,86 @@ describe("CLI GraphRAG unified route", () => {
     expect(answer.routeDecision.reasonCode).toBe("graph_upgrade");
     expect(answer.routeDecision.refusalReasons).toEqual([]);
     expect(answer.answerText).toBe("GraphRAG CLI answer from fake bridge");
+    expect(answer.evidence[0].metadata.requestDataDir).toBe(
+      join(workspace.graphVault, "books", "book-cli", "output"),
+    );
+  }, 30000);
+
+  test("qmd query --graphrag rejects multiple books without a graph book id", async () => {
+    const workspace = await createWorkspace({ includeSecondGraphReadyBook: true });
+    const result = await runQmd(workspace, [
+      "query",
+      "--graphrag",
+      "--json",
+      "--no-rerank",
+      "How do architecture decisions relate across chapters?",
+    ]);
+
+    expect(result.exitCode).toBe(1);
+    const error = JSON.parse(result.stderr);
+    expect(error).toMatchObject({
+      route: "graphrag",
+      stage: "route",
+      provider: "graphrag",
+      capability: "graph_query",
+      code: "ambiguous_graph_book_scope",
+      retryable: false,
+      redactedMessage:
+        "qmd query --graphrag requires --graph-book-id when multiple " +
+        "graph-ready books match the request.",
+    });
+    expect(result.stdout).toBe("");
+  }, 30000);
+
+  test("qmd query --graphrag uses the selected book scoped output", async () => {
+    const workspace = await createWorkspace({ includeSecondGraphReadyBook: true });
+    const result = await runQmd(workspace, [
+      "query",
+      "--graphrag",
+      "--graph-book-id",
+      "book-cli-second",
+      "--json",
+      "--no-rerank",
+      "How do architecture decisions relate across chapters?",
+    ]);
+
+    expect(result.exitCode, result.stderr).toBe(0);
+    const answer = JSON.parse(result.stdout);
+    expect(answer.routeDecision.selectedBookIds).toEqual(["book-cli-second"]);
+    expect(answer.evidence[0].metadata.requestDataDir).toBe(
+      join(workspace.graphVault, "books", "book-cli-second", "output"),
+    );
+    expect(answer.evidence[0].metadata.requestDataDir).not.toBe(
+      join(workspace.graphVault, "output"),
+    );
+  }, 30000);
+
+  test("qmd query --mode auto rejects ambiguous multi-book graph upgrade", async () => {
+    const workspace = await createWorkspace({ includeSecondGraphReadyBook: true });
+    const result = await runQmd(workspace, [
+      "query",
+      "--mode",
+      "auto",
+      "--json",
+      "--no-rerank",
+      [
+        "intent: relationships across chapters",
+        "lex: architecture decisions relate across chapters",
+      ].join("\n"),
+    ]);
+
+    expect(result.exitCode).toBe(1);
+    const error = JSON.parse(result.stderr);
+    expect(error).toMatchObject({
+      route: "auto",
+      stage: "route",
+      provider: "graphrag",
+      capability: "graph_query",
+      code: "ambiguous_graph_book_scope",
+      retryable: false,
+      redactedMessage:
+        "GraphRAG auto upgrade requires exactly one graph-ready book.",
+    });
+    expect(result.stdout).toBe("");
   }, 30000);
 });

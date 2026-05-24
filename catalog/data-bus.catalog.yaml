@@ -45,6 +45,7 @@ types:
       - completed items require the fixed 27-command check set
       - completed items require qmdBuildStatus.status=succeeded
       - completed items require graphBuildStatus.status=succeeded
+      - completed items require graphQueryStatus.status=succeeded
       - legacy completed items without real GraphRAG evidence are reopened as
         pending during checkpoint load
 

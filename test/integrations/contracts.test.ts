@@ -323,6 +323,7 @@ export function batchRecoverySummaryEnvelopeFixture() {
         attempts: 1,
         qmdBuildStatus: { status: "pending" },
         graphBuildStatus: { status: "pending" },
+        graphQueryStatus: { status: "pending" },
         failureKind: "transient",
         retryable: true,
         recoveryDecision: "retry_same_run_id",
