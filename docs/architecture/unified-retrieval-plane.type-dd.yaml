@@ -1586,6 +1586,13 @@ state_and_recovery:
       recoveryDecision=retry_same_run_id with nextRetryAt,
       retryDelaySeconds, and waitingForProviderRecovery=true. Command-level
       attemptExhausted does not exhaust book-level recovery.
+    provider_recovery_wait_limit_rule: >-
+      Provider recovery wait is bounded per runner process by
+      maxProviderRecoveryWaits. When the limit is reached, the runner records
+      batch_provider_recovery_wait_limit and exits the current run as
+      incomplete while keeping affected items pending with
+      recoveryDecision=retry_same_run_id. Operators or schedulers resume the
+      same runId after nextRetryAt.
     completed_item_rule: completed items are not reprocessed by the same run.
     completion_rule: >-
       A batch run is completed only when completedItems equals totalItems.
@@ -1599,8 +1606,8 @@ state_and_recovery:
       Every completed item has exactly 27 required commandChecks and every
       commandCheck status is passed. Persisted qmdBuildStatus is never trusted
       without recomputing it from commandChecks. completed items require
-      qmdBuildStatus.status=succeeded, graphBuildStatus.status=succeeded, and
-      graphQueryStatus.status=succeeded.
+      exact command check set validation, qmdBuildStatus.status=succeeded,
+      graphBuildStatus.status=succeeded, and graphQueryStatus.status=succeeded.
     command_check_failure_rule: >-
       Failed commandChecks carry failureKind, retryable, providerStatusCode
       when available, attemptExhausted, the failed command name, and

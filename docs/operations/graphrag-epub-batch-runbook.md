@@ -160,6 +160,10 @@ transient failure 发生后：
 - checkpoint 写入 `failureKind=transient`、`retryable=true`、
   `retryExhausted=false`、`recoveryDecision=retry_same_run_id`、`failedStage`、
   `nextRetryAt`、`retryDelaySeconds` 和 `waitingForProviderRecovery=true`。
+- provider recovery wait 受 `maxProviderRecoveryWaits` 限制。达到上限后，
+  当前 runner 写入 `batch_provider_recovery_wait_limit`，批次状态为
+  `incomplete`，item 仍保持 `pending` 与 `retry_same_run_id`，由操作者或调度器在
+  `nextRetryAt` 后使用同一 `runId` 恢复。
 - `events.jsonl` 写入 redacted error summary、provider status code、
   retryable 标记和恢复决策。
 - 默认继续处理后续 pending item。使用 `--fail-fast` 时在当前 item 失败后停止。
@@ -170,6 +174,8 @@ GraphRAG 输出生产者 manifest 必须保存在每本书的 book-scoped output
 
 - `qmd_output_manifest.json` 的 `outputDir` 使用 `books/<bookId>/output`，不得写
   host absolute path。
+- `--migrate-only` 会把历史 absolute `outputDir` 重写为
+  `books/<bookId>/output`，只在路径解析到当前 book-scoped output 时执行。
 - `stageProducerRunIds` 记录每个高成本 stage 的真实 producer run。
 - `query_ready` 阶段也会刷新 producer manifest，使恢复后的 portable manifest
   记录完整高成本 stage lineage。
@@ -235,9 +241,9 @@ stdout 的单一 JSON 对象中。
 
 `recovery-summary.json` 与 `--status-json` 输出均受
 `BatchRecoverySummarySchema` 约束。摘要记录批次恢复决策、重试策略、
-`retryableItemCount`、最早 `nextRetryAt`，以及每本书的 `qmdBuildStatus`、
-`graphBuildStatus`、`graphQueryStatus`、runner ownership 和 orphan 检测状态。
-摘要不得包含密钥、Bearer token、原始 provider 请求体或响应体。
+`maxProviderRecoveryWaits`、`retryableItemCount`、最早 `nextRetryAt`，以及每本书的
+`qmdBuildStatus`、`graphBuildStatus`、`graphQueryStatus`、runner ownership 和
+orphan 检测状态。摘要不得包含密钥、Bearer token、原始 provider 请求体或响应体。
 
 ## 只读验证命令
 
@@ -327,7 +333,8 @@ NODE
 - `qmd-cleanup`：`qmd cleanup`
 
 每个 completed checkpoint 必须包含 27 个 `commandChecks`，名称集合必须与上述检查
-集一致，且全部为 `passed`。缺项、重复项或失败项均不得写入 completed。
+集 exact match，且全部为 `passed`。缺项、重复项、额外项或失败项均不得写入
+completed。
 每个 completed checkpoint 必须同时包含 `qmdBuildStatus.status=succeeded` 与
 `graphBuildStatus.status=succeeded`、`graphQueryStatus.status=succeeded`。
 

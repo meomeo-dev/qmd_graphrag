@@ -61,6 +61,7 @@ const { values } = parseArgs({
     "retry-base-delay-seconds": { type: "string", default: "30" },
     "retry-max-delay-seconds": { type: "string", default: "300" },
     "retry-budget-seconds": { type: "string", default: "7200" },
+    "max-provider-recovery-waits": { type: "string", default: "3" },
     "command-timeout-seconds": { type: "string", default: "5400" },
     "completed-manifest": { type: "string" },
     "migrate-only": { type: "boolean", default: false },
@@ -106,6 +107,10 @@ const retryMaxDelaySeconds = Math.max(
 const retryBudgetSeconds = Math.max(
   retryMaxDelaySeconds,
   Number.parseInt(String(values["retry-budget-seconds"]), 10) || 7200,
+);
+const maxProviderRecoveryWaits = Math.max(
+  1,
+  Number.parseInt(String(values["max-provider-recovery-waits"]), 10) || 3,
 );
 const commandTimeoutSeconds = Math.max(
   1,
@@ -339,6 +344,7 @@ const BatchItemCheckpointSchema = z.object({
   retryBaseDelaySeconds: z.number().int().positive().optional(),
   retryMaxDelaySeconds: z.number().int().positive().optional(),
   retryBudgetSeconds: z.number().int().positive().optional(),
+  maxProviderRecoveryWaits: z.number().int().positive().optional(),
   commandTimeoutSeconds: z.number().int().positive().optional(),
   retryStartedAt: z.string().datetime().optional(),
   runnerSessionId: z.string().min(1).optional(),
@@ -414,6 +420,7 @@ const BatchRunManifestSchema = z.object({
   retryBaseDelaySeconds: z.number().int().positive().optional(),
   retryMaxDelaySeconds: z.number().int().positive().optional(),
   retryBudgetSeconds: z.number().int().positive().optional(),
+  maxProviderRecoveryWaits: z.number().int().positive().optional(),
   commandTimeoutSeconds: z.number().int().positive().optional(),
   startedAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
@@ -490,6 +497,7 @@ const BatchRecoverySummarySchema = z.object({
     retryBaseDelaySeconds: z.number().int().positive(),
     retryMaxDelaySeconds: z.number().int().positive(),
     retryBudgetSeconds: z.number().int().positive(),
+    maxProviderRecoveryWaits: z.number().int().positive(),
     commandTimeoutSeconds: z.number().int().positive(),
   }),
   recoveryDecision: BatchRecoveryDecisionSchema,
@@ -552,6 +560,18 @@ function transientBudgetAvailable(checkpoint) {
 
 function retryBudgetExhausted(checkpoint) {
   return !transientBudgetAvailable(checkpoint);
+}
+
+function providerRecoveryWaitCount(checkpoint) {
+  return Number(checkpoint?.metadata?.providerRecoveryWaitCount ?? 0);
+}
+
+function providerRecoveryWaitAvailable(checkpoint) {
+  return providerRecoveryWaitCount(checkpoint) < maxProviderRecoveryWaits;
+}
+
+function nextProviderRecoveryWaitCount(checkpoint) {
+  return providerRecoveryWaitCount(checkpoint) + 1;
 }
 
 function checkpointFailureText(checkpoint) {
@@ -908,6 +928,7 @@ function makeManifest(items) {
     retryBaseDelaySeconds,
     retryMaxDelaySeconds,
     retryBudgetSeconds,
+    maxProviderRecoveryWaits,
     commandTimeoutSeconds,
     startedAt: now(),
     updatedAt: now(),
@@ -934,6 +955,7 @@ function loadManifest(items) {
     manifest.retryBaseDelaySeconds = retryBaseDelaySeconds;
     manifest.retryMaxDelaySeconds = retryMaxDelaySeconds;
     manifest.retryBudgetSeconds = retryBudgetSeconds;
+    manifest.maxProviderRecoveryWaits = maxProviderRecoveryWaits;
     manifest.commandTimeoutSeconds = commandTimeoutSeconds;
     return manifest;
   }
@@ -970,6 +992,7 @@ function defaultCheckpoint(item, completedSeed = new Map()) {
     retryBaseDelaySeconds,
     retryMaxDelaySeconds,
     retryBudgetSeconds,
+    maxProviderRecoveryWaits,
     commandTimeoutSeconds,
     recoveryDecision: "none",
     commandChecks: [],
@@ -1615,6 +1638,47 @@ function graphBuildEvidence(item) {
   };
 }
 
+function migrateGraphOutputProducerManifests() {
+  for (const item of discoverItems()) {
+    const manifestPath = join(
+      stateRoot,
+      "books",
+      item.bookId,
+      "output",
+      "qmd_output_manifest.json",
+    );
+    if (!existsSync(manifestPath)) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(readFileSync(manifestPath, "utf8"));
+    } catch {
+      continue;
+    }
+    if (typeof parsed?.outputDir !== "string") continue;
+    const expectedLocator = graphRagBookOutputLocator(item.bookId);
+    if (parsed.outputDir === expectedLocator) continue;
+    const resolvedOutputDir = resolve(parsed.outputDir);
+    const expectedOutputDir = resolve(
+      stateRoot,
+      "books",
+      item.bookId,
+      "output",
+    );
+    if (resolvedOutputDir !== expectedOutputDir) continue;
+    parsed.outputDir = expectedLocator;
+    writeFileSync(manifestPath, JSON.stringify(parsed, null, 2) + "\n", "utf8");
+    event({
+      itemId: item.itemId,
+      event: "graph_output_manifest_migrated",
+      status: "pending",
+      metadata: {
+        manifestLocator: `graph_vault/${expectedLocator}/qmd_output_manifest.json`,
+        outputDir: expectedLocator,
+      },
+    });
+  }
+}
+
 function qmdBuildEvidence(checkpoint) {
   const checkedAt = now();
   const checks = (checkpoint.commandChecks ?? [])
@@ -1711,12 +1775,51 @@ function graphQueryEvidence(checkpoint) {
   };
 }
 
+function commandCheckSetEvidence(checkpoint) {
+  const checkedAt = now();
+  const commandChecks = checkpoint.commandChecks ?? [];
+  const names = commandChecks.map((check) => check.name);
+  const unique = new Set(names);
+  const missing = requiredCommandCheckNames.filter((name) => !unique.has(name));
+  const unexpected = names.filter((name) => !requiredCommandCheckNames.includes(name));
+  const failed = commandChecks.find((check) => check.status !== "passed");
+  if (
+    commandChecks.length === expectedCommandCheckCount &&
+    unique.size === expectedCommandCheckCount &&
+    missing.length === 0 &&
+    unexpected.length === 0 &&
+    failed == null
+  ) {
+    return {
+      status: "succeeded",
+      checkedAt,
+      stage: "command-checks",
+      artifactIds: [],
+    };
+  }
+  return {
+    status: failed != null ? "failed" : "pending",
+    checkedAt,
+    stage: failed?.name ?? unexpected[0] ?? missing[0] ?? "command-checks",
+    reason: failed != null
+      ? "command_check_failed"
+      : unexpected.length > 0
+        ? "command_check_unexpected"
+        : missing.length > 0
+          ? "command_check_missing"
+          : "command_check_set_incomplete",
+    artifactIds: [],
+  };
+}
+
 function downgradeCompletedIfClosedLoopInvalid(item, checkpoint) {
   if (checkpoint.status !== "completed") return checkpoint;
+  const commandCheckStatus = commandCheckSetEvidence(checkpoint);
   const qmdBuildStatus = qmdBuildEvidence(checkpoint);
   const graphBuildStatus = graphBuildEvidence(item);
   const graphQueryStatus = graphQueryEvidence(checkpoint);
   if (
+    commandCheckStatus.status === "succeeded" &&
     qmdBuildStatus.status === "succeeded" &&
     graphBuildStatus.status === "succeeded" &&
     graphQueryStatus.status === "succeeded"
@@ -1728,7 +1831,9 @@ function downgradeCompletedIfClosedLoopInvalid(item, checkpoint) {
       graphQueryStatus,
     };
   }
-  const reopenStatus = graphBuildStatus.status !== "succeeded"
+  const reopenStatus = commandCheckStatus.status !== "succeeded"
+    ? commandCheckStatus
+    : graphBuildStatus.status !== "succeeded"
     ? graphBuildStatus
     : qmdBuildStatus.status !== "succeeded"
       ? qmdBuildStatus
@@ -1743,6 +1848,7 @@ function downgradeCompletedIfClosedLoopInvalid(item, checkpoint) {
       qmdBuildStatus,
       graphBuildStatus,
       graphQueryStatus,
+      commandCheckStatus,
     },
   });
   return {
@@ -1758,6 +1864,7 @@ function downgradeCompletedIfClosedLoopInvalid(item, checkpoint) {
       ...(checkpoint.metadata ?? {}),
       reopenedFromCompleted: true,
       reopenReason: reopenStatus.reason,
+      commandCheckStatus,
     },
   };
 }
@@ -1822,6 +1929,10 @@ function recoverProviderTransientCheckpoint(item, checkpoint) {
     return checkpoint;
   }
 
+  const existingWaitCount = providerRecoveryWaitCount(checkpoint);
+  const waitCount = existingWaitCount > 0
+    ? existingWaitCount
+    : nextProviderRecoveryWaitCount(checkpoint);
   const delaySeconds = checkpoint.nextRetryAt != null
     ? Math.max(
         0,
@@ -1851,6 +1962,8 @@ function recoverProviderTransientCheckpoint(item, checkpoint) {
         : retryBudgetExhausted(checkpoint)
           ? "retry_budget_window_elapsed"
           : "transient_failure_recovered",
+      providerRecoveryWaitCount: waitCount,
+      maxProviderRecoveryWaits,
     },
   };
   event({
@@ -1868,6 +1981,8 @@ function recoverProviderTransientCheckpoint(item, checkpoint) {
       retryDelaySeconds: delaySeconds,
       retryBudgetSeconds,
       elapsedRetrySeconds: elapsedRetrySeconds(recovered),
+      providerRecoveryWaitCount: waitCount,
+      maxProviderRecoveryWaits,
     },
   });
   return recovered;
@@ -1897,6 +2012,7 @@ function updateManifest(manifest, checkpoints) {
   manifest.retryBaseDelaySeconds = retryBaseDelaySeconds;
   manifest.retryMaxDelaySeconds = retryMaxDelaySeconds;
   manifest.retryBudgetSeconds = retryBudgetSeconds;
+  manifest.maxProviderRecoveryWaits = maxProviderRecoveryWaits;
   manifest.commandTimeoutSeconds = commandTimeoutSeconds;
   manifest.updatedAt = now();
   if (failed > 0) {
@@ -1988,6 +2104,7 @@ function buildRecoverySummary(manifest, checkpoints) {
       retryBaseDelaySeconds,
       retryMaxDelaySeconds,
       retryBudgetSeconds,
+      maxProviderRecoveryWaits,
       commandTimeoutSeconds,
     },
     recoveryDecision: recoveryDecisionForBatch(checkpoints),
@@ -2735,6 +2852,7 @@ function buildRecoverableTransientCheckpoint({ item, running, commandCheck, erro
       waitingForProviderRecovery: true,
       lastRetryableFailureAt: now(),
       retryBudgetSeconds,
+      maxProviderRecoveryWaits,
       sourceName: item.sourceName,
     },
   };
@@ -2764,6 +2882,8 @@ function markItemRunning(item, checkpoint, checkpoints, manifest) {
     retryBaseDelaySeconds,
     retryMaxDelaySeconds,
     retryBudgetSeconds,
+    maxProviderRecoveryWaits,
+    commandTimeoutSeconds,
     runnerSessionId,
     runnerHost,
     runnerPid,
@@ -2800,13 +2920,56 @@ function eventRetryWindowDeferred(item, checkpoint, delayMs) {
   });
 }
 
+function providerRecoveryWaitLimitReached(items, checkpoints) {
+  return items.some((item) => {
+    const checkpoint = checkpoints.get(item.itemId);
+    return checkpoint?.status === "pending" &&
+      checkpoint.retryable === true &&
+      checkpoint.failureKind === "transient" &&
+      checkpoint.metadata?.waitingForProviderRecovery === true &&
+      retryWindowDelayMs(checkpoint) > 0 &&
+      !providerRecoveryWaitAvailable(checkpoint);
+  });
+}
+
+function eventProviderRecoveryWaitLimit(items, checkpoints) {
+  const limited = items
+    .map((item) => ({ item, checkpoint: checkpoints.get(item.itemId) }))
+    .filter(({ checkpoint }) =>
+      checkpoint?.status === "pending" &&
+      checkpoint.retryable === true &&
+      checkpoint.failureKind === "transient" &&
+      checkpoint.metadata?.waitingForProviderRecovery === true &&
+      retryWindowDelayMs(checkpoint) > 0 &&
+      !providerRecoveryWaitAvailable(checkpoint)
+    );
+  if (limited.length === 0) return false;
+  const nextRetryAt = limited
+    .map(({ checkpoint }) => checkpoint.nextRetryAt)
+    .filter(Boolean)
+    .sort()[0];
+  event({
+    event: "batch_provider_recovery_wait_limit",
+    status: "pending",
+    recoveryDecision: "retry_same_run_id",
+    metadata: {
+      limitedItemCount: limited.length,
+      maxProviderRecoveryWaits,
+      nextRetryAt,
+      retryPolicy: "exit_current_runner_recover_same_run_id",
+    },
+  });
+  return true;
+}
+
 function waitForNextRetryWindow(items, checkpoints) {
   const waiting = items
     .map((item) => ({ item, checkpoint: checkpoints.get(item.itemId) }))
     .filter(({ checkpoint }) =>
       checkpoint?.status === "pending" &&
       checkpoint.retryable === true &&
-      retryWindowDelayMs(checkpoint) > 0
+      retryWindowDelayMs(checkpoint) > 0 &&
+      providerRecoveryWaitAvailable(checkpoint)
     )
     .sort((a, b) => epochMs(a.checkpoint.nextRetryAt) - epochMs(b.checkpoint.nextRetryAt));
   const next = waiting[0];
@@ -2847,6 +3010,7 @@ function main() {
     item.itemId,
     loadCheckpoint(item, completedSeed),
   ]));
+  if (!statusJson) migrateGraphOutputProducerManifests();
   manifest = updateManifest(manifest, Array.from(checkpoints.values()));
   if (statusJson) {
     printStatusAndExit(manifest, Array.from(checkpoints.values()));
@@ -2855,6 +3019,7 @@ function main() {
   if (migrateOnly) {
     migrateEventLog(Array.from(checkpoints.values()));
     migrateGraphVaultRawLogs();
+    assertNoBookScopedRawReports();
     const summary = writeRecoverySummary(
       manifest,
       Array.from(checkpoints.values()),
@@ -3008,9 +3173,16 @@ function main() {
           continue;
         }
         const recoverableProviderFailure =
-          retryable && failureKind === "transient" && !failFast;
+          retryable &&
+          failureKind === "transient" &&
+          !failFast;
+        const providerRecoveryWaitStillAvailable =
+          recoverableProviderFailure && providerRecoveryWaitAvailable(running);
         const providerRecoveryDelay = recoverableProviderFailure
           ? providerRecoveryDelaySeconds(running)
+          : undefined;
+        const providerRecoveryWaitCount = recoverableProviderFailure
+          ? nextProviderRecoveryWaitCount(running)
           : undefined;
         const failed = recoverableProviderFailure ? {
           ...running,
@@ -3030,7 +3202,11 @@ function main() {
             ...(running.metadata ?? {}),
             waitingForProviderRecovery: true,
             providerRecoveryWaitStartedAt: now(),
-            providerRecoveryReason: "transient_retry_budget_window_elapsed",
+            providerRecoveryReason: providerRecoveryWaitStillAvailable
+              ? "transient_retry_budget_window_elapsed"
+              : "provider_recovery_wait_limit_reached",
+            providerRecoveryWaitCount,
+            maxProviderRecoveryWaits,
             retryBudgetSeconds,
             sourceName: item.sourceName,
           },
@@ -3082,6 +3258,9 @@ function main() {
                 retryDelaySeconds: failed.retryDelaySeconds,
                 retryBudgetSeconds,
                 elapsedRetrySeconds: elapsedRetrySeconds(failed),
+                providerRecoveryWaitCount,
+                maxProviderRecoveryWaits,
+                waitLimitReached: !providerRecoveryWaitStillAvailable,
               }
             : undefined,
         });
@@ -3090,6 +3269,10 @@ function main() {
       }
     }
     if (!processedInPass && deferredForRetryWindow) {
+      if (providerRecoveryWaitLimitReached(items, checkpoints)) {
+        eventProviderRecoveryWaitLimit(items, checkpoints);
+        break;
+      }
       processedInPass = waitForNextRetryWindow(items, checkpoints);
     }
   }
