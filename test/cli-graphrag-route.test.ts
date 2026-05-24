@@ -138,6 +138,10 @@ async function writeLanceDbFixture(root: string): Promise<void> {
   }
 }
 
+async function writeMinimalParquetFixture(path: string): Promise<void> {
+  await writeFile(path, Buffer.from("PAR1fixturePAR1", "ascii"));
+}
+
 type GraphBookFixture = {
   bookId: string;
   sourceId: string;
@@ -187,7 +191,7 @@ async function writeGraphBookFixture(
   await mkdir(outputDir, { recursive: true });
   const reportPath = join(outputDir, "community_reports.parquet");
   const lancedbPath = join(outputDir, "lancedb");
-  await writeFile(reportPath, `${input.bookId} community reports`, "utf8");
+  await writeMinimalParquetFixture(reportPath);
   await writeLanceDbFixture(lancedbPath);
   const fixture = {
     ...input,
@@ -224,6 +228,7 @@ async function writeGraphBookFixture(
           providerFingerprint: fixture.providerFingerprint,
           producerRunId: fixture.runIds.community_report,
           createdAt: "2026-05-22T00:00:00.000Z",
+          metadata: { corpusContentHash: fixture.contentHash },
         },
         {
           schemaVersion: SchemaVersion,
@@ -237,6 +242,7 @@ async function writeGraphBookFixture(
           providerFingerprint: fixture.providerFingerprint,
           producerRunId: fixture.runIds.embed,
           createdAt: "2026-05-22T00:00:00.000Z",
+          metadata: { corpusContentHash: fixture.contentHash },
         },
       ],
     }),

@@ -9,7 +9,10 @@ import {
   readdirSync,
   realpathSync,
   renameSync,
+  openSync,
   statSync,
+  closeSync,
+  readSync,
   writeFileSync,
 } from "node:fs";
 import {
@@ -375,18 +378,15 @@ const BatchItemCheckpointSchema = z.object({
       }
     }
   }
-  if (
-    value.retryExhausted === true &&
-    (
-      value.retryable !== false ||
-      value.recoveryDecision !== "stop_until_fixed"
-    )
-  ) {
+  if (value.retryExhausted === true && value.failureKind !== "transient" && (
+    value.retryable !== false ||
+    value.recoveryDecision !== "stop_until_fixed"
+  )) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message:
-        "retryExhausted checkpoint requires retryable=false and " +
-        "recoveryDecision=stop_until_fixed",
+        "non-transient retryExhausted checkpoint requires retryable=false " +
+        "and recoveryDecision=stop_until_fixed",
       path: ["retryExhausted"],
     });
   }
@@ -551,6 +551,21 @@ function transientBudgetAvailable(checkpoint) {
 
 function retryBudgetExhausted(checkpoint) {
   return !transientBudgetAvailable(checkpoint);
+}
+
+function checkpointFailureText(checkpoint) {
+  return [
+    checkpoint?.errorSummary,
+    ...(checkpoint?.commandChecks ?? [])
+      .filter((check) => check.status === "failed")
+      .map((check) => check.errorSummary),
+  ].filter(Boolean).join("\n");
+}
+
+function checkpointHasTransientFailure(checkpoint) {
+  if (checkpoint?.failureKind === "transient") return true;
+  const failure = classifyFailure(checkpointFailureText(checkpoint));
+  return failure.failureKind === "transient" && failure.retryable === true;
 }
 
 function processAlive(pid) {
@@ -1016,7 +1031,7 @@ function loadCheckpoint(item, completedSeed) {
     return writeTypedJson(path, BatchItemCheckpointSchema, checkpoint);
   }
   const hydrated = hydrateCheckpoint(item, readJson(path));
-  const checkpoint = terminalizeExhaustedRetryCheckpoint(item,
+  const checkpoint = recoverProviderTransientCheckpoint(item,
     recoverOrphanedRunningCheckpoint(item, downgradeCompletedIfClosedLoopInvalid(
       item,
       hydrated,
@@ -1206,6 +1221,23 @@ function isParquetArtifact(kind) {
     kind.endsWith("_parquet");
 }
 
+function validateParquetFile(path, size) {
+  if (size < 12) return "parquet_file_too_small";
+  const fd = openSync(path, "r");
+  try {
+    const header = Buffer.alloc(4);
+    const footer = Buffer.alloc(4);
+    readSync(fd, header, 0, 4, 0);
+    readSync(fd, footer, 0, 4, size - 4);
+    if (header.toString("ascii") !== "PAR1" || footer.toString("ascii") !== "PAR1") {
+      return "parquet_magic_mismatch";
+    }
+    return null;
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function validateArtifactContent(artifact, bookId) {
   if (!artifact || artifact.bookId !== bookId || typeof artifact.path !== "string") {
     return "artifact_identity_mismatch";
@@ -1238,6 +1270,10 @@ function validateArtifactContent(artifact, bookId) {
 
     if (isParquetArtifact(artifact.kind) && (!entry.isFile() || entry.size === 0)) {
       return "parquet_file_empty_or_not_file";
+    }
+    if (isParquetArtifact(artifact.kind)) {
+      const parquetReason = validateParquetFile(artifactPath, entry.size);
+      if (parquetReason) return parquetReason;
     }
     if (
       artifact.kind === "graphrag_context_json" ||
@@ -1279,6 +1315,7 @@ function validateGraphStageEvidence({
   artifacts,
   expectedStageFingerprints,
   expectedProviderFingerprint,
+  expectedCorpusContentHash,
   expectedProducerRunId,
   producer,
 }) {
@@ -1435,6 +1472,20 @@ function validateGraphStageEvidence({
     }
   }
 
+  if (expectedCorpusContentHash != null) {
+    const invalidArtifactCorpus = stageArtifacts.find((artifact) =>
+      (artifact.kind.startsWith("graphrag_") || artifact.kind === "lancedb_index") &&
+      artifact.metadata?.corpusContentHash !== expectedCorpusContentHash
+    );
+    if (invalidArtifactCorpus) {
+      return {
+        ok: false,
+        reason: `stage_artifact_corpus_mismatch:${stage}`,
+        artifactIds,
+      };
+    }
+  }
+
   const invalidPath = stageArtifacts.find((artifact) =>
     stage === "embed"
       ? artifact.path !== `books/${item.bookId}/output/lancedb`
@@ -1478,6 +1529,8 @@ function graphBuildEvidence(item) {
   const expectedStageFingerprints = job?.stageFingerprints ?? producer?.stageFingerprints;
   const expectedProviderFingerprint = job?.providerFingerprint ??
     producer?.providerFingerprint;
+  const expectedCorpusContentHash = job?.normalizedContentHash ?? job?.sourceHash ??
+    producer?.contentHash;
 
   for (const stage of graphCompletionStages) {
     const stageEvidence = validateGraphStageEvidence({
@@ -1487,6 +1540,7 @@ function graphBuildEvidence(item) {
       artifacts,
       expectedStageFingerprints,
       expectedProviderFingerprint,
+      expectedCorpusContentHash,
       expectedProducerRunId: graphProducerStages.includes(stage)
         ? producer?.stageProducerRunIds?.[stage]
         : undefined,
@@ -1755,42 +1809,72 @@ function recoverOrphanedRunningCheckpoint(item, checkpoint) {
   return recovered;
 }
 
-function terminalizeExhaustedRetryCheckpoint(item, checkpoint) {
+function providerRecoveryDelaySeconds(checkpoint) {
+  const lastAttempt = Math.max(
+    1,
+    checkpoint?.attempts ?? checkpoint?.commandChecks?.at(-1)?.attempts ?? 1,
+  );
+  const nextAttempt = Math.max(lastAttempt + 1, maxTransientCommandAttempts + 1);
+  return retryDelaySecondsForAttempt(nextAttempt);
+}
+
+function recoverProviderTransientCheckpoint(item, checkpoint) {
   if (
     !["failed", "pending"].includes(checkpoint.status) ||
-    checkpoint.retryable !== true ||
-    checkpoint.failureKind !== "transient" ||
-    !(checkpoint.retryExhausted === true || retryBudgetExhausted(checkpoint))
+    !checkpointHasTransientFailure(checkpoint)
   ) {
     return checkpoint;
   }
-  const terminal = {
+
+  const delaySeconds = checkpoint.nextRetryAt != null
+    ? Math.max(
+        0,
+        Math.ceil((epochMs(checkpoint.nextRetryAt) - Date.now()) / 1000),
+      )
+    : providerRecoveryDelaySeconds(checkpoint);
+  const nextRetryAt = checkpoint.nextRetryAt ?? isoAfterSeconds(delaySeconds);
+  const recovered = {
     ...checkpoint,
-    status: "failed",
-    failedAt: checkpoint.failedAt ?? now(),
-    retryable: false,
-    retryExhausted: true,
-    recoveryDecision: "stop_until_fixed",
-    nextRetryAt: undefined,
-    retryDelaySeconds: undefined,
+    status: "pending",
+    failedAt: undefined,
+    failureKind: "transient",
+    retryable: true,
+    retryExhausted: false,
+    recoveryDecision: "retry_same_run_id",
+    retryStartedAt: checkpoint.retryStartedAt ?? checkpoint.startedAt ?? now(),
+    nextRetryAt,
+    retryDelaySeconds: delaySeconds,
     runnerHeartbeatAt: now(),
+    metadata: {
+      ...(checkpoint.metadata ?? {}),
+      waitingForProviderRecovery: true,
+      providerRecoveryWaitStartedAt:
+        checkpoint.metadata?.providerRecoveryWaitStartedAt ?? now(),
+      providerRecoveryReason: checkpoint.retryExhausted === true
+        ? "legacy_retry_exhausted_transient"
+        : retryBudgetExhausted(checkpoint)
+          ? "retry_budget_window_elapsed"
+          : "transient_failure_recovered",
+    },
   };
   event({
     itemId: item.itemId,
-    event: "item_retry_exhausted",
-    status: "failed",
-    message: terminal.errorSummary,
-    failureKind: terminal.failureKind,
-    retryable: false,
-    attemptExhausted: true,
-    recoveryDecision: "stop_until_fixed",
-    failedStage: terminal.failedStage,
+    event: "item_provider_recovery_wait",
+    status: "pending",
+    message: recovered.errorSummary,
+    failureKind: "transient",
+    retryable: true,
+    attemptExhausted: false,
+    recoveryDecision: "retry_same_run_id",
+    failedStage: recovered.failedStage,
     metadata: {
+      nextRetryAt,
+      retryDelaySeconds: delaySeconds,
       retryBudgetSeconds,
-      elapsedRetrySeconds: elapsedRetrySeconds(terminal),
+      elapsedRetrySeconds: elapsedRetrySeconds(recovered),
     },
   });
-  return terminal;
+  return recovered;
 }
 
 function updateManifest(manifest, checkpoints) {
@@ -1969,8 +2053,17 @@ function migrateEventLog(checkpoints) {
       "item_failed",
     ].includes(sanitized.event);
     if (!isFailureEvent || !checkpoint) return sanitized;
-    const retryable = sanitized.retryable ?? check?.retryable ?? checkpoint.retryable;
-    const failureKind = sanitized.failureKind ?? check?.failureKind ?? checkpoint.failureKind;
+    const inferredFailure = classifyFailure(
+      [sanitized.message, check?.errorSummary, checkpoint.errorSummary]
+        .filter(Boolean)
+        .join("\n"),
+    );
+    const failureKind =
+      sanitized.failureKind ?? check?.failureKind ?? checkpoint.failureKind ??
+      inferredFailure.failureKind;
+    const retryable =
+      sanitized.retryable ?? check?.retryable ?? checkpoint.retryable ??
+      inferredFailure.retryable;
     const failedStage = sanitized.failedStage ?? check?.name ?? checkpoint.failedStage;
     const attemptExhausted = sanitized.attemptExhausted ??
       (sanitized.event === "command_failed" &&
@@ -1984,12 +2077,15 @@ function migrateEventLog(checkpoints) {
       retryAfterSeconds: sanitized.retryAfterSeconds ?? check?.retryAfterSeconds,
       attemptExhausted,
       providerStatusCode: sanitized.providerStatusCode ?? check?.providerStatusCode,
-      recoveryDecision: sanitized.event === "command_retry_exhausted"
-        ? "stop_until_fixed"
-        : attemptExhausted === true
-        ? "stop_until_fixed"
-        : sanitized.recoveryDecision ??
-          (retryable ? "retry_same_run_id" : "stop_until_fixed"),
+      recoveryDecision:
+        failureKind === "transient" && retryable
+          ? "retry_same_run_id"
+          : sanitized.event === "command_retry_exhausted"
+            ? "stop_until_fixed"
+            : attemptExhausted === true
+              ? "stop_until_fixed"
+              : sanitized.recoveryDecision ??
+                (retryable ? "retry_same_run_id" : "stop_until_fixed"),
       failedStage,
     });
   });
@@ -2073,7 +2169,7 @@ function assertNoBookScopedRawReports() {
       event: "raw_log_residual_detected",
       metadata: {
         sourceLocator: `graph_vault/books/${item.bookId}/output/reports`,
-        logCount: logNames.length,
+        logCount: residualNames.length,
       },
     });
   }
@@ -2789,33 +2885,10 @@ function main() {
         continue;
       }
       if (checkpoint?.status === "failed" && checkpoint.retryable === true) {
-        if (checkpoint.retryExhausted === true || retryBudgetExhausted(checkpoint)) {
-          event({
-            itemId: item.itemId,
-            event: "item_retry_exhausted",
-            status: "failed",
-            failureKind: checkpoint.failureKind ?? "transient",
-            retryable: false,
-            attemptExhausted: true,
-            recoveryDecision: "stop_until_fixed",
-            failedStage: checkpoint.failedStage,
-            message: checkpoint.errorSummary,
-            metadata: {
-              retryBudgetSeconds,
-              elapsedRetrySeconds: elapsedRetrySeconds(checkpoint),
-            },
-          });
-          const terminal = {
-            ...checkpoint,
-            retryable: false,
-            retryExhausted: true,
-            recoveryDecision: "stop_until_fixed",
-            nextRetryAt: undefined,
-            retryDelaySeconds: undefined,
-            runnerHeartbeatAt: now(),
-          };
-          saveCheckpoint(item, terminal);
-          checkpoints.set(item.itemId, terminal);
+        const recovered = recoverProviderTransientCheckpoint(item, checkpoint);
+        if (recovered !== checkpoint) {
+          saveCheckpoint(item, recovered);
+          checkpoints.set(item.itemId, recovered);
           manifest = updateManifest(manifest, Array.from(checkpoints.values()));
           continue;
         }
@@ -2833,11 +2906,11 @@ function main() {
         checkpoint?.status === "pending" &&
         checkpoint.retryable === true &&
         checkpoint.failureKind === "transient" &&
-        (checkpoint.retryExhausted === true || retryBudgetExhausted(checkpoint))
+        checkpoint.retryExhausted === true
       ) {
-        const terminal = terminalizeExhaustedRetryCheckpoint(item, checkpoint);
-        saveCheckpoint(item, terminal);
-        checkpoints.set(item.itemId, terminal);
+        const recovered = recoverProviderTransientCheckpoint(item, checkpoint);
+        saveCheckpoint(item, recovered);
+        checkpoints.set(item.itemId, recovered);
         manifest = updateManifest(manifest, Array.from(checkpoints.values()));
         continue;
       }
@@ -2912,7 +2985,34 @@ function main() {
           processedInPass = true;
           continue;
         }
-        const failed = {
+        const recoverableProviderFailure =
+          retryable && failureKind === "transient" && !failFast;
+        const providerRecoveryDelay = recoverableProviderFailure
+          ? providerRecoveryDelaySeconds(running)
+          : undefined;
+        const failed = recoverableProviderFailure ? {
+          ...running,
+          status: "pending",
+          failedAt: undefined,
+          errorSummary: redacted(error instanceof Error ? error.message : String(error)),
+          failureKind: "transient",
+          retryable: true,
+          retryExhausted: false,
+          recoveryDecision: "retry_same_run_id",
+          failedStage: commandCheck?.name,
+          retryStartedAt: running.retryStartedAt ?? running.startedAt ?? now(),
+          nextRetryAt: isoAfterSeconds(providerRecoveryDelay),
+          retryDelaySeconds: providerRecoveryDelay,
+          runnerHeartbeatAt: now(),
+          metadata: {
+            ...(running.metadata ?? {}),
+            waitingForProviderRecovery: true,
+            providerRecoveryWaitStartedAt: now(),
+            providerRecoveryReason: "transient_retry_budget_window_elapsed",
+            retryBudgetSeconds,
+            sourceName: item.sourceName,
+          },
+        } : {
           ...running,
           status: "failed",
           failedAt: now(),
@@ -2944,16 +3044,24 @@ function main() {
         manifest = updateManifest(manifest, Array.from(checkpoints.values()));
         event({
           itemId: item.itemId,
-          event: "item_failed",
-          status: "failed",
+          event: recoverableProviderFailure ? "item_provider_recovery_wait" : "item_failed",
+          status: failed.status,
           message: failed.errorSummary,
           failureKind: failed.failureKind,
           retryable: failed.retryable,
-          attemptExhausted: failed.retryExhausted,
+          attemptExhausted: recoverableProviderFailure ? false : failed.retryExhausted,
           providerStatusCode: commandCheck?.providerStatusCode,
           retryAfterSeconds: commandCheck?.retryAfterSeconds,
           recoveryDecision: failed.recoveryDecision,
           failedStage: failed.failedStage,
+          metadata: recoverableProviderFailure
+            ? {
+                nextRetryAt: failed.nextRetryAt,
+                retryDelaySeconds: failed.retryDelaySeconds,
+                retryBudgetSeconds,
+                elapsedRetrySeconds: elapsedRetrySeconds(failed),
+              }
+            : undefined,
         });
         if (failFast) throw error;
         processedInPass = true;

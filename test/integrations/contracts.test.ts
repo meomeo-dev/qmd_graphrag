@@ -232,11 +232,12 @@ export function batchItemCheckpointEnvelopeFixture() {
       expectedCommandCheckCount: 27,
       maxCommandAttempts: 3,
       failureKind: "transient",
-      retryable: false,
-      retryExhausted: true,
-      recoveryDecision: "stop_until_fixed",
+      retryable: true,
+      retryExhausted: false,
+      recoveryDecision: "retry_same_run_id",
       failedStage: "resume-book-1",
-      failedAt: "2026-05-23T00:02:00.000Z",
+      nextRetryAt: "2026-05-23T00:05:00.000Z",
+      retryDelaySeconds: 180,
       errorSummary: "Error code: 503 - Service temporarily unavailable",
       commandChecks: [{
         name: "resume-book-1",
@@ -248,12 +249,13 @@ export function batchItemCheckpointEnvelopeFixture() {
         startedAt: "2026-05-23T00:00:00.000Z",
         completedAt: "2026-05-23T00:02:00.000Z",
         failureKind: "transient",
-        retryable: false,
+        retryable: true,
         attemptExhausted: true,
         providerStatusCode: 503,
-        recoveryDecision: "stop_until_fixed",
+        recoveryDecision: "retry_same_run_id",
         errorSummary: "Error code: 503 - Service temporarily unavailable",
       }],
+      metadata: { waitingForProviderRecovery: true },
     },
   };
 }
@@ -1422,7 +1424,7 @@ describe("Data bus contracts", () => {
       .toBe(1);
     expect(checkpointEnvelope.kind).toBe("qmd.batch_run.item_checkpoint");
     expect(BatchItemCheckpointSchema.parse(checkpointEnvelope.payload).retryable)
-      .toBe(false);
+      .toBe(true);
     expect(eventEnvelope.kind).toBe("qmd.batch_run.event_log");
     expect(BatchEventLogSchema.parse(eventEnvelope.payload).failedStage)
       .toBe("resume-book-1");

@@ -1693,6 +1693,14 @@ export class FileBookJobStateRepository {
         input.providerFingerprint ??
         metadataString(input.metadata, "providerFingerprint") ??
         job?.providerFingerprint;
+      const corpusContentHash =
+        input.kind.startsWith("graphrag_") || input.kind === "lancedb_index"
+          ? job?.normalizedContentHash ?? job?.sourceHash
+          : undefined;
+      const metadata = sanitizeVaultMetadata({
+        ...(input.metadata ?? {}),
+        ...(corpusContentHash ? { corpusContentHash } : {}),
+      });
       assertHighCostFingerprint({
         subject: "artifact",
         stage: input.stage,
@@ -1707,7 +1715,7 @@ export class FileBookJobStateRepository {
         contentHash: input.contentHash,
         stageFingerprint,
         providerFingerprint,
-        metadata: input.metadata,
+        metadata,
       });
       return BookArtifactManifestSchema.parse({
         schemaVersion: SchemaVersion,
@@ -1724,7 +1732,7 @@ export class FileBookJobStateRepository {
           metadataString(input.metadata, "normalizationPolicyVersion"),
         producerRunId: input.producerRunId,
         createdAt: now,
-        metadata: sanitizeVaultMetadata(input.metadata),
+        metadata,
       });
     });
 
@@ -2114,6 +2122,9 @@ export class FileBookJobStateRepository {
             : { [checkpoint.stage]: checkpoint.runId },
         expectedStageFingerprints: job?.stageFingerprints,
         expectedProviderFingerprint: job?.providerFingerprint,
+        expectedCorpusContentHash: job == null
+          ? undefined
+          : job.normalizedContentHash ?? job.sourceHash,
       });
 
       result.set(checkpoint.stage, {
@@ -2256,6 +2267,7 @@ export class FileBookJobStateRepository {
         },
         expectedStageFingerprints: job.stageFingerprints,
         expectedProviderFingerprint: job.providerFingerprint,
+        expectedCorpusContentHash: job.normalizedContentHash ?? job.sourceHash,
       });
       if (!validation.isSatisfied) {
         throw new Error(
@@ -2519,6 +2531,7 @@ export class FileBookJobStateRepository {
       expectedProducerRunIds,
       expectedStageFingerprints: job.stageFingerprints,
       expectedProviderFingerprint: job.providerFingerprint,
+      expectedCorpusContentHash: job.normalizedContentHash ?? job.sourceHash,
     });
     if (!validation.isSatisfied) return false;
     try {

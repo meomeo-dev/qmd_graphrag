@@ -456,6 +456,7 @@ async function artifactForFile(
   producerRunId: string,
   stageFingerprint?: string,
   providerFingerprint?: string,
+  corpusContentHash?: string,
 ) {
   const contentHash = kind === "normalized_markdown"
     ? await hashContent(
@@ -473,6 +474,7 @@ async function artifactForFile(
     metadata: {
       ...(stageFingerprint ? { stageFingerprint } : {}),
       ...(providerFingerprint ? { providerFingerprint } : {}),
+      ...(corpusContentHash ? { corpusContentHash } : {}),
     },
     stageFingerprint,
     providerFingerprint,
@@ -524,6 +526,7 @@ async function maybeArtifactForPath(
   producerRunId: string,
   stageFingerprint?: string,
   providerFingerprint?: string,
+  corpusContentHash?: string,
 ) {
   try {
     const entry = await stat(path);
@@ -541,6 +544,7 @@ async function maybeArtifactForPath(
     producerRunId,
     stageFingerprint,
     providerFingerprint,
+    corpusContentHash,
   );
 }
 
@@ -551,6 +555,7 @@ async function maybeArtifactForDirectory(
   producerRunId: string,
   stageFingerprint?: string,
   providerFingerprint?: string,
+  corpusContentHash?: string,
 ) {
   try {
     const entry = await stat(path);
@@ -575,6 +580,7 @@ async function maybeArtifactForDirectory(
     metadata: {
       ...(stageFingerprint ? { stageFingerprint } : {}),
       ...(providerFingerprint ? { providerFingerprint } : {}),
+      ...(corpusContentHash ? { corpusContentHash } : {}),
     },
   };
 }
@@ -866,6 +872,7 @@ async function collectWorkspaceArtifacts(
   stageFingerprints: Record<BookStage, string>,
   providerFingerprint: string,
   expectedOutputProducer: GraphRagOutputProducerManifest | null,
+  corpusContentHash: string,
 ) {
   const normalizedPath = resolve(paths.normalizedPath);
   const outputDir = resolve(paths.outputDir);
@@ -903,6 +910,7 @@ async function collectWorkspaceArtifacts(
           outputRunId("graph_extract"),
           stageFingerprints.graph_extract,
           providerFingerprint,
+          corpusContentHash,
         )
       : null,
     canUseGraphOutput
@@ -913,6 +921,7 @@ async function collectWorkspaceArtifacts(
           outputRunId("graph_extract"),
           stageFingerprints.graph_extract,
           providerFingerprint,
+          corpusContentHash,
         )
       : null,
     canUseGraphOutput
@@ -923,6 +932,7 @@ async function collectWorkspaceArtifacts(
           outputRunId("graph_extract"),
           stageFingerprints.graph_extract,
           providerFingerprint,
+          corpusContentHash,
         )
       : null,
     canUseGraphOutput
@@ -933,6 +943,7 @@ async function collectWorkspaceArtifacts(
           outputRunId("graph_extract"),
           stageFingerprints.graph_extract,
           providerFingerprint,
+          corpusContentHash,
         )
       : null,
     canUseGraphOutput
@@ -943,6 +954,7 @@ async function collectWorkspaceArtifacts(
           outputRunId("graph_extract"),
           stageFingerprints.graph_extract,
           providerFingerprint,
+          corpusContentHash,
         )
       : null,
     canUseGraphOutput
@@ -953,6 +965,7 @@ async function collectWorkspaceArtifacts(
           outputRunId("graph_extract"),
           stageFingerprints.graph_extract,
           providerFingerprint,
+          corpusContentHash,
         )
       : null,
     canUseGraphOutput
@@ -963,6 +976,7 @@ async function collectWorkspaceArtifacts(
           outputRunId("graph_extract"),
           stageFingerprints.graph_extract,
           providerFingerprint,
+          corpusContentHash,
         )
       : null,
     canUseGraphOutput
@@ -973,6 +987,7 @@ async function collectWorkspaceArtifacts(
           outputRunId("community_report"),
           stageFingerprints.community_report,
           providerFingerprint,
+          corpusContentHash,
         )
       : null,
     canUseGraphOutput
@@ -985,6 +1000,7 @@ async function collectWorkspaceArtifacts(
                 outputRunId("embed"),
                 stageFingerprints.embed,
                 providerFingerprint,
+                corpusContentHash,
               )
             : null
         )
@@ -1363,6 +1379,7 @@ export async function syncGraphRagBookWorkspace(
     stageFingerprints,
     settings.providerBoundaryFingerprint,
     expectedOutputProducer,
+    normalizedContentHash,
   );
   const recordedArtifacts = await repo.recordArtifacts(job.bookId, artifacts);
   const byStage = groupArtifactsByStage(recordedArtifacts);

@@ -1,4 +1,4 @@
-import { readdir, readFile, realpath, stat } from "node:fs/promises";
+import { open, readdir, readFile, realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 
 import type {
@@ -202,6 +202,28 @@ function isParquetArtifact(kind: BookArtifactKind): boolean {
   return kind.startsWith("graphrag_") && kind.endsWith("_parquet");
 }
 
+async function validateParquetFile(
+  path: string,
+  size: number,
+): Promise<ArtifactValidationResult> {
+  if (size < 12) {
+    return { valid: false, reason: "parquet_file_too_small" };
+  }
+  const handle = await open(path, "r");
+  try {
+    const header = Buffer.alloc(4);
+    const footer = Buffer.alloc(4);
+    await handle.read(header, 0, 4, 0);
+    await handle.read(footer, 0, 4, size - 4);
+    if (header.toString("ascii") !== "PAR1" || footer.toString("ascii") !== "PAR1") {
+      return { valid: false, reason: "parquet_magic_mismatch" };
+    }
+    return { valid: true };
+  } finally {
+    await handle.close();
+  }
+}
+
 async function validateJsonObject(path: string): Promise<ArtifactValidationResult> {
   try {
     const parsed = JSON.parse(await readFile(path, "utf8"));
@@ -272,6 +294,11 @@ export async function validateArtifact(
     if (!artifactStat.isFile() || artifactStat.size === 0) {
       return { valid: false, reason: "parquet_file_empty_or_not_file" };
     }
+    const parquetValidation = await validateParquetFile(
+      artifactPath,
+      artifactStat.size,
+    );
+    if (!parquetValidation.valid) return parquetValidation;
   }
 
   if (
@@ -298,6 +325,7 @@ export async function validateBookArtifactSet(input: {
   expectedProducerRunIds?: Partial<Record<BookStage, string>>;
   expectedStageFingerprints?: Partial<Record<BookStage, string>>;
   expectedProviderFingerprint?: string;
+  expectedCorpusContentHash?: string;
 }): Promise<BookArtifactSetValidationResult> {
   const requiredKinds = input.requiredKinds ?? [];
   const allowedKinds = input.allowedKinds == null
@@ -345,6 +373,14 @@ export async function validateBookArtifactSet(input: {
     if (
       input.expectedProviderFingerprint != null &&
       artifact.providerFingerprint !== input.expectedProviderFingerprint
+    ) {
+      missingArtifactIds.push(artifactId);
+      continue;
+    }
+    if (
+      input.expectedCorpusContentHash != null &&
+      (artifact.kind.startsWith("graphrag_") || artifact.kind === "lancedb_index") &&
+      artifact.metadata?.corpusContentHash !== input.expectedCorpusContentHash
     ) {
       missingArtifactIds.push(artifactId);
       continue;

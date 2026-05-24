@@ -1077,6 +1077,10 @@ describe("GraphRAG EPUB batch runner", () => {
     }));
   }
 
+  async function writeMinimalParquetFixture(path: string): Promise<void> {
+    await writeFile(path, Buffer.from("PAR1fixturePAR1", "ascii"));
+  }
+
   async function writeCompleteLanceDbFixture(root: string): Promise<void> {
     for (const tableName of [
       "entity_description.lance",
@@ -1104,6 +1108,7 @@ describe("GraphRAG EPUB batch runner", () => {
     outputDir: string;
     outputRel: string;
     bookId: string;
+    corpusContentHash: string;
     artifactIds: Record<string, string>;
     stageFingerprints: Record<string, string>;
     providerFingerprint: string;
@@ -1134,6 +1139,7 @@ describe("GraphRAG EPUB batch runner", () => {
           ? "run-graph-extract"
           : "run-community-report",
         createdAt: "2026-05-23T00:00:00.000Z",
+        metadata: { corpusContentHash: input.corpusContentHash },
       });
     }
     artifacts.push({
@@ -1148,6 +1154,7 @@ describe("GraphRAG EPUB batch runner", () => {
       providerFingerprint: input.providerFingerprint,
       producerRunId: "run-embed",
       createdAt: "2026-05-23T00:00:00.000Z",
+      metadata: { corpusContentHash: input.corpusContentHash },
     });
     return artifacts;
   }
@@ -1188,6 +1195,7 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(script).toContain("\"command-timeout-seconds\"");
     expect(script).toContain("recovery-summary.json");
     expect(script).toContain("item_retry_deferred");
+    expect(script).toContain("item_provider_recovery_wait");
     expect(script).toContain("item_retry_window_deferred");
     expect(script).toContain("batch_wait_retry_window");
     expect(script).toContain("item_running_recovered");
@@ -1465,8 +1473,9 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(script).toContain("item.status !== \"completed\"");
     expect(script).toContain("item.recoveryDecision === \"retry_same_run_id\"");
     expect(script).toContain("checkpoint?.status === \"failed\" && checkpoint.retryable === false");
-    expect(script).toContain("event: \"item_retry_exhausted\"");
-    expect(script).toContain("checkpoint.retryExhausted === true || retryBudgetExhausted(checkpoint)");
+    expect(script).not.toContain("event: \"item_retry_exhausted\"");
+    expect(script).toContain("recoverProviderTransientCheckpoint(item, checkpoint)");
+    expect(script).toContain("transientBudgetAvailable(running)");
     expect(script).toContain("if (options.allowTransientBudget) {");
     expect(script).toContain("throw Object.assign(new Error(check.errorSummary)");
     expect(script).toContain("failedStage: name");
@@ -1611,18 +1620,10 @@ describe("GraphRAG EPUB batch runner", () => {
       retryable: true,
       attemptExhausted: true,
       providerStatusCode: 503,
-      recoveryDecision: "stop_until_fixed",
+      recoveryDecision: "retry_same_run_id",
       failedStage: "resume-book-1",
     });
-    expect(exhausted).toMatchObject({
-      failureKind: "transient",
-      retryable: true,
-      attemptExhausted: true,
-      providerStatusCode: 503,
-      recoveryDecision: "stop_until_fixed",
-      failedStage: "resume-book-1",
-      metadata: { migratedFromCheckpoint: true },
-    });
+    expect(exhausted).toBeUndefined();
     expect(recoverySummary).toMatchObject({
       schemaVersion: SchemaVersion,
       runId,
@@ -1635,10 +1636,12 @@ describe("GraphRAG EPUB batch runner", () => {
       },
     });
     expect(recoverySummary.items[0]).toMatchObject({
-      status: "failed",
+      status: "pending",
       failureKind: "transient",
       retryable: true,
+      retryExhausted: false,
       recoveryDecision: "retry_same_run_id",
+      waitingForProviderRecovery: true,
       failedStage: "resume-book-1",
       providerStatusCode: 503,
     });
@@ -2029,7 +2032,7 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(summary.counts).toMatchObject({ failed: 1, pending: 1 });
   });
 
-  test("status-json terminalizes exhausted retryable failures", async () => {
+  test("status-json projects exhausted transient failures as provider recovery wait", async () => {
     const tmpRoot = await mkProjectTmpDir("qmd-batch-status-exhausted-");
     const sourceDir = join(tmpRoot, "source");
     const stateRoot = join(tmpRoot, "graph_vault");
@@ -2141,16 +2144,17 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(result.stderr).toBe("");
     const summary = JSON.parse(result.stdout);
     expect(summary).toMatchObject({
-      recoveryDecision: "stop_until_fixed",
-      retryableItemCount: 0,
+      recoveryDecision: "retry_same_run_id",
+      retryableItemCount: 1,
     });
     expect(summary.items[0]).toMatchObject({
-      status: "failed",
+      status: "pending",
       qmdBuildStatus: { status: "pending" },
       graphBuildStatus: { status: "pending" },
-      retryable: false,
-      retryExhausted: true,
-      recoveryDecision: "stop_until_fixed",
+      retryable: true,
+      retryExhausted: false,
+      recoveryDecision: "retry_same_run_id",
+      waitingForProviderRecovery: true,
     });
     expect(checkpoint).toMatchObject({
       retryable: true,
@@ -2158,6 +2162,123 @@ describe("GraphRAG EPUB batch runner", () => {
       recoveryDecision: "retry_same_run_id",
     });
     expect(eventsExist).toBe(false);
+  });
+
+  test("status-json recovers legacy stop-until-fixed transient failures", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-legacy-stop-transient-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "legacy-stop-transient";
+    const sourceBytes = "legacy transient stop";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    const sourcePath = join(sourceDir, "Book.epub");
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        pendingItems: 0,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "failed",
+        sourceName: "Book.epub",
+        sourceRelativePath,
+        sourceHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        bookId: `book-${sourceHash.slice(0, 12)}`,
+        attempts: 3,
+        retryStartedAt: "2026-05-23T00:00:00.000Z",
+        failedAt: "2026-05-23T00:10:00.000Z",
+        failureKind: "transient",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "resume-book-1",
+        errorSummary: "Concurrency limit exceeded for account, please retry later",
+        commandChecks: [],
+      }),
+    );
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--status-json",
+      ]);
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+      proc.stderr.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary.recoveryDecision).toBe("retry_same_run_id");
+    expect(summary.retryableItemCount).toBe(1);
+    expect(summary.items[0]).toMatchObject({
+      status: "pending",
+      failureKind: "transient",
+      retryable: true,
+      retryExhausted: false,
+      recoveryDecision: "retry_same_run_id",
+      waitingForProviderRecovery: true,
+    });
   });
 
   test("status-json recovers orphaned running item to retryable pending", async () => {
@@ -2696,7 +2817,7 @@ describe("GraphRAG EPUB batch runner", () => {
       "documents.parquet", "text_units.parquet", "entities.parquet",
       "relationships.parquet", "communities.parquet", "community_reports.parquet",
     ]) {
-      await writeFile(join(outputDir, name), name, "utf8");
+      await writeMinimalParquetFixture(join(outputDir, name));
     }
     await writeFile(join(outputDir, "context.json"), "{}", "utf8");
     await writeFile(join(outputDir, "stats.json"), "{}", "utf8");
@@ -2708,6 +2829,7 @@ describe("GraphRAG EPUB batch runner", () => {
       artifactIds,
       stageFingerprints,
       providerFingerprint,
+      corpusContentHash: contentHash,
     });
     await writeFile(
       join(outputDir, "qmd_output_manifest.json"),
@@ -2961,7 +3083,7 @@ describe("GraphRAG EPUB batch runner", () => {
       "documents.parquet", "text_units.parquet", "entities.parquet",
       "relationships.parquet", "communities.parquet", "community_reports.parquet",
     ]) {
-      await writeFile(join(outputDir, name), name, "utf8");
+      await writeMinimalParquetFixture(join(outputDir, name));
     }
     await writeFile(join(outputDir, "context.json"), "{}", "utf8");
     await writeFile(join(outputDir, "stats.json"), "{}", "utf8");
@@ -2973,6 +3095,7 @@ describe("GraphRAG EPUB batch runner", () => {
       artifactIds,
       stageFingerprints,
       providerFingerprint,
+      corpusContentHash: contentHash,
     });
     await writeFile(
       join(outputDir, "qmd_output_manifest.json"),
@@ -3238,7 +3361,7 @@ describe("GraphRAG EPUB batch runner", () => {
       "documents.parquet", "text_units.parquet", "entities.parquet",
       "relationships.parquet", "communities.parquet", "community_reports.parquet",
     ]) {
-      await writeFile(join(outputDir, name), name, "utf8");
+      await writeMinimalParquetFixture(join(outputDir, name));
     }
     await writeFile(join(outputDir, "context.json"), "{}", "utf8");
     await writeFile(join(outputDir, "stats.json"), "{}", "utf8");
@@ -3250,6 +3373,7 @@ describe("GraphRAG EPUB batch runner", () => {
       artifactIds,
       stageFingerprints,
       providerFingerprint,
+      corpusContentHash: contentHash,
     }).then((items) => items.map((artifact) =>
       artifact.artifactId === artifactIds.reports
         ? { ...artifact, producerRunId: "wrong-community-report-run" }

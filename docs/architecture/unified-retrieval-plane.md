@@ -670,12 +670,11 @@ GraphRAG capability。
 - 非孤儿 `running` checkpoint 表示其他 runner 拥有当前 item；正式运行和
   `--status-json` 都只观测该 item，不抢占、不重写 attempts。
 - Provider 429、concurrency limit、timeout、502、503、504 属于 transient
-  failure。批量执行器对 transient failure 做有限重试；book-level retry budget
-  仍可用时，item 保持 `retryable=true` 和
-  `recoveryDecision=retry_same_run_id`。book-level retry budget 耗尽时，当前
-  item 在同一 run 内终止为 failed，写入 `failureKind=transient`、
-  `retryable=false`、`retryExhausted=true` 和
-  `recoveryDecision=stop_until_fixed`，并继续处理后续 pending item。
+  failure。批量执行器对 transient failure 做有限重试；短周期 retry budget
+  耗尽时，item 进入 provider recovery wait，保持 `retryable=true`、
+  `retryExhausted=false` 和 `recoveryDecision=retry_same_run_id`，写入
+  `nextRetryAt`、`retryDelaySeconds` 与 `waitingForProviderRecovery=true`。
+  下一次同一 `runId` 恢复运行到达 retry window 后继续该书闭环。
 - `failed` item 只有 `retryable=true` 时由同一 `runId` 自动重试；permanent
   failed item 保持 failed，不阻塞其他 pending item。
 - 批次完成条件只接受 `completedItems == totalItems`。`skippedItems` 和
@@ -706,12 +705,17 @@ validated checkpoint
 kind-specific validators 包括：
 
 - parquet content hash 校验。
+- parquet 文件必须通过 magic 校验；Python bridge 在 pyarrow 可用时校验
+  metadata 与 `row_count > 0`。
 - LanceDB required table 与非空 data fragment 校验。
 - LanceDB `qmd_row_count.json` 正行数校验。
 - `lancedb_index` artifact content hash 只覆盖 required table 的
   `data/*.lance` fragment 与 `qmd_row_count.json` sidecar。`_versions/**`
   与其他 vendor-volatile 文件不参与 canonical artifact hash。
 - GraphRAG output manifest 校验。
+- GraphRAG 与 LanceDB artifact 的 `contentHash` 表示 artifact 字节或目录哈希；
+  `metadata.corpusContentHash` 表示生产该 artifact 的规范化书内容哈希。
+  query-ready 校验必须同时验证二者，避免同书名或同 bookId 的旧产物误用。
 - vault-relative path 解析校验。
 
 显式 GraphRAG 查询拒绝规则：

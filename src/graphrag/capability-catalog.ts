@@ -156,6 +156,7 @@ async function validateQueryReadyArtifacts(
     expectedProducerRunIds,
     expectedStageFingerprints: book.stageFingerprints,
     expectedProviderFingerprint: book.providerFingerprint,
+    expectedCorpusContentHash: book.normalizedContentHash ?? book.sourceHash,
   });
   return validation.isSatisfied;
 }

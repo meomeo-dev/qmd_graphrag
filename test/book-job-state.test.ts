@@ -58,6 +58,10 @@ async function writeCompleteLanceDbFixture(root: string): Promise<void> {
   }
 }
 
+async function writeMinimalParquetFixture(path: string): Promise<void> {
+  await writeFile(path, Buffer.from("PAR1fixturePAR1", "ascii"));
+}
+
 function bookScopedOutputDir(graphVault: string, bookId: string): string {
   return join(graphVault, "books", bookId, "output");
 }
@@ -191,7 +195,7 @@ describe("FileBookJobStateRepository", () => {
       const reportsPath = join(outputDir, "community_reports.parquet");
       const lancedbPath = join(outputDir, "lancedb");
       await mkdir(outputDir, { recursive: true });
-      await writeFile(reportsPath, "reports", "utf8");
+      await writeMinimalParquetFixture(reportsPath);
       await writeCompleteLanceDbFixture(lancedbPath);
       const reportHash = await hashFile(reportsPath);
       const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
@@ -274,7 +278,7 @@ describe("FileBookJobStateRepository", () => {
       const lancedbPath = join(outputDir, "lancedb");
       await mkdir(outputDir, { recursive: true });
       await writeCompleteLanceDbFixture(lancedbPath);
-      await writeFile(reportsPath, "reports", "utf8");
+      await writeMinimalParquetFixture(reportsPath);
       const reportHash = await hashFile(reportsPath);
       const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
       const artifacts = await repo.recordArtifacts(job.bookId, [
@@ -355,7 +359,7 @@ describe("FileBookJobStateRepository", () => {
       const reportsPath = join(outputDir, "community_reports.parquet");
       const lancedbPath = join(outputDir, "lancedb");
       await mkdir(outputDir, { recursive: true });
-      await writeFile(reportsPath, "reports", "utf8");
+      await writeMinimalParquetFixture(reportsPath);
       await writeCompleteLanceDbFixture(lancedbPath);
       const artifacts = await repo.recordArtifacts(job.bookId, [
         {
@@ -441,7 +445,7 @@ describe("FileBookJobStateRepository", () => {
       const reportsPath = join(outputDir, "community_reports.parquet");
       const lancedbPath = join(outputDir, "lancedb");
       await mkdir(outputDir, { recursive: true });
-      await writeFile(reportsPath, "reports", "utf8");
+      await writeMinimalParquetFixture(reportsPath);
       await writeCompleteLanceDbFixture(lancedbPath);
       const artifacts = await repo.recordArtifacts(job.bookId, [
         {
@@ -1050,8 +1054,8 @@ describe("FileBookJobStateRepository", () => {
       const secondPath = join(root, "graph_vault", "output-b", "entities.parquet");
       await mkdir(join(root, "graph_vault", "output-a"), { recursive: true });
       await mkdir(join(root, "graph_vault", "output-b"), { recursive: true });
-      await writeFile(firstPath, "entities", "utf8");
-      await writeFile(secondPath, "entities", "utf8");
+      await writeMinimalParquetFixture(firstPath);
+      await writeMinimalParquetFixture(secondPath);
       const contentHash = await hashFile(firstPath);
       const first = await repo.recordArtifacts(job.bookId, [
         {
@@ -1202,7 +1206,7 @@ describe("FileBookJobStateRepository", () => {
 
       const artifactPath = join(root, "graph_vault", "output", "entities.parquet");
       await mkdir(join(root, "graph_vault", "output"), { recursive: true });
-      await writeFile(artifactPath, "entities", "utf8");
+      await writeMinimalParquetFixture(artifactPath);
       const contentHash = await hashFile(artifactPath);
       const first = await repo.recordArtifacts(job.bookId, [
         {
@@ -1602,7 +1606,7 @@ describe("FileBookJobStateRepository", () => {
       const lancedbPath = join(outputDir, "lancedb");
       await mkdir(outputDir, { recursive: true });
       await writeCompleteLanceDbFixture(lancedbPath);
-      await writeFile(reportsPath, "reports", "utf8");
+      await writeMinimalParquetFixture(reportsPath);
       const reportHash = await hashFile(reportsPath);
       const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
       const artifacts = await repo.recordArtifacts(job.bookId, [
@@ -1685,7 +1689,7 @@ describe("FileBookJobStateRepository", () => {
       const reportsPath = join(outputDir, "community_reports.parquet");
       const lancedbPath = join(outputDir, "lancedb");
       await mkdir(outputDir, { recursive: true });
-      await writeFile(reportsPath, "reports", "utf8");
+      await writeMinimalParquetFixture(reportsPath);
       await writeCompleteLanceDbFixture(lancedbPath);
       const artifacts = await repo.recordArtifacts(job.bookId, [
         {
@@ -1744,7 +1748,7 @@ describe("FileBookJobStateRepository", () => {
       const reportsPath = join(outputDir, "community_reports.parquet");
       const lancedbPath = join(outputDir, "lancedb");
       await mkdir(outputDir, { recursive: true });
-      await writeFile(reportsPath, "reports", "utf8");
+      await writeMinimalParquetFixture(reportsPath);
       await writeCompleteLanceDbFixture(lancedbPath);
       const artifacts = await repo.recordArtifacts(job.bookId, [
         {
@@ -1821,7 +1825,7 @@ describe("FileBookJobStateRepository", () => {
       await writeFile(sourcePath, "fixture epub content", "utf8");
       await mkdir(join(graphVault, "output"), { recursive: true });
       await writeCompleteLanceDbFixture(lancedbPath);
-      await writeFile(reportsPath, "reports", "utf8");
+      await writeMinimalParquetFixture(reportsPath);
 
       const job = await repo.registerBookSource({
         sourcePath,
@@ -1905,7 +1909,7 @@ describe("FileBookJobStateRepository", () => {
       const lancedbPath = join(outputDir, "lancedb");
       await mkdir(outputDir, { recursive: true });
       await writeCompleteLanceDbFixture(lancedbPath);
-      await writeFile(reportsPath, "reports", "utf8");
+      await writeMinimalParquetFixture(reportsPath);
       const reportHash = await hashFile(reportsPath);
       const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
       const artifacts = await repo.recordArtifacts(job.bookId, [

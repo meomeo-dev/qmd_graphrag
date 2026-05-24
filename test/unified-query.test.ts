@@ -211,8 +211,7 @@ items:
   );
   await writeFile(
     join(root, "books", bookId, "output", "community_reports.parquet"),
-    "reports",
-    "utf8",
+    Buffer.from("PAR1fixturePAR1", "ascii"),
   );
   const lancedbPath = join(root, "books", bookId, "output", "lancedb");
   await writeCompleteLanceDbFixture(lancedbPath);
@@ -236,6 +235,8 @@ items:
     providerFingerprint: ${providerFingerprint}
     producerRunId: run-community-report
     createdAt: 2026-05-21T00:00:00.000Z
+    metadata:
+      corpusContentHash: ${contentHash}
   - schemaVersion: ${SchemaVersion}
     artifactId: artifact-2
     bookId: ${bookId}
@@ -247,6 +248,8 @@ items:
     providerFingerprint: ${providerFingerprint}
     producerRunId: run-embed
     createdAt: 2026-05-21T00:00:00.000Z
+    metadata:
+      corpusContentHash: ${contentHash}
 `,
     "utf8",
   );

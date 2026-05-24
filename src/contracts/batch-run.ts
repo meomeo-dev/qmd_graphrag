@@ -134,18 +134,15 @@ export const BatchItemCheckpointSchema =
         }
       }
     }
-    if (
-      value.retryExhausted === true &&
-      (
-        value.retryable !== false ||
-        value.recoveryDecision !== "stop_until_fixed"
-      )
-    ) {
+    if (value.retryExhausted === true && value.failureKind !== "transient" && (
+      value.retryable !== false ||
+      value.recoveryDecision !== "stop_until_fixed"
+    )) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message:
-          "retryExhausted checkpoint requires retryable=false and " +
-          "recoveryDecision=stop_until_fixed",
+          "non-transient retryExhausted checkpoint requires retryable=false " +
+          "and recoveryDecision=stop_until_fixed",
         path: ["retryExhausted"],
       });
     }

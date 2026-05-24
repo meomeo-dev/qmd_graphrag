@@ -80,6 +80,8 @@ types:
       - records operator-facing recovery state without provider secrets
       - exposes retry policy, nextRetryAt, retryable item count, and item
         qmd/GraphRAG build status
+      - transient provider failures enter provider recovery wait with
+        recoveryDecision=retry_same_run_id instead of stop_until_fixed
       - exposes runner ownership and orphan recovery state for running items
       - reports qmd build status recomputed from 27 fixed command checks
       - reports GraphRAG build status from book-scoped producer lineage rather
@@ -984,6 +986,10 @@ types:
       - artifact identity excludes `producerRunId` to avoid duplicate entries
         across bootstrap and resume synchronization
       - stores artifact hash and normalization policy lineage when applicable
+      - GraphRAG and LanceDB artifacts store `metadata.corpusContentHash` so
+        consumers can bind artifact bytes to the producing book content
+      - GraphRAG parquet artifacts require non-empty Parquet validation with
+        `PAR1` magic
       - high-cost GraphRAG artifacts are accepted only from
         `books/<book_id>/output`
       - shared `graph_vault/output` is not a valid producer for per-book

@@ -349,6 +349,7 @@ async function validateQueryReadyArtifactsForRestore(
     expectedProducerRunIds,
     expectedStageFingerprints: book.stageFingerprints,
     expectedProviderFingerprint: book.providerFingerprint,
+    expectedCorpusContentHash: book.normalizedContentHash ?? book.sourceHash,
   });
   return validation.isSatisfied;
 }

@@ -1560,6 +1560,15 @@ state_and_recovery:
       checkpoints, and high-cost artifacts to agree on bookId, sourceHash,
       documentId, contentHash, providerFingerprint, stageFingerprints, and
       stageProducerRunIds. Host absolute outputDir values are stale.
+    artifact_hash_rule: >-
+      BookArtifactManifest.contentHash is the artifact byte or canonical
+      directory hash. GraphRAG and LanceDB artifacts also carry
+      metadata.corpusContentHash, which must equal the book normalizedContentHash
+      or sourceHash. query_ready validation checks both hashes.
+    parquet_validation_rule: >-
+      GraphRAG parquet artifacts must be non-empty Parquet files with valid
+      PAR1 magic. Python query bridge validates pyarrow metadata and positive
+      row count when pyarrow is available.
     query_ready_scope_rule: >-
       query_ready checkpoints publish graph capabilities only from book-scoped
       GraphRAG artifacts under books/<book_id>/output. Shared graph_vault/output
@@ -1569,11 +1578,12 @@ state_and_recovery:
       not stolen. Only missing, expired, or dead runner ownership is downgraded
       to pending recovery.
     retry_exhaustion_rule: >-
-      A transient item whose book-level retry budget is exhausted is terminal
-      within the same run. The item is marked retryable=false,
-      retryExhausted=true, and recoveryDecision=stop_until_fixed. Command-level
-      attemptExhausted does not by itself exhaust the book-level recovery
-      budget.
+      A transient item whose short retry budget is exhausted enters provider
+      recovery wait, not a terminal failed state. The item remains
+      retryable=true, retryExhausted=false, and
+      recoveryDecision=retry_same_run_id with nextRetryAt,
+      retryDelaySeconds, and waitingForProviderRecovery=true. Command-level
+      attemptExhausted does not exhaust book-level recovery.
     completed_item_rule: completed items are not reprocessed by the same run.
     completion_rule: >-
       A batch run is completed only when completedItems equals totalItems.
@@ -1586,15 +1596,16 @@ state_and_recovery:
     command_check_failure_rule: >-
       Failed commandChecks carry failureKind, retryable, providerStatusCode
       when available, attemptExhausted, the failed command name, and
-      recoveryDecision. Command retry exhaustion is always
-      recoveryDecision=stop_until_fixed at command level; book-level recovery
-      remains represented on the item checkpoint.
+      recoveryDecision. Command retry exhaustion records command-level
+      exhaustion only; transient book-level recovery remains represented on
+      the item checkpoint as retry_same_run_id.
     transient_failure_policy: >-
       429, concurrency limit, timeout, and 5xx provider failures are retried
-      with bounded backoff before the current item is marked failed with
-      failureKind=transient, retryable=true, retryExhausted=false, and
-      recoveryDecision=retry_same_run_id while the book-level retry budget
-      remains available. The batch continues pending items.
+      with bounded backoff. When the short retry budget elapses, the current
+      item remains pending with failureKind=transient, retryable=true,
+      retryExhausted=false, recoveryDecision=retry_same_run_id, and
+      waitingForProviderRecovery=true. The same runId resumes the item after
+      nextRetryAt. The batch continues pending items.
     permanent_failure_policy: >-
       Permanent failed items remain failed with retryable=false and
       recoveryDecision=stop_until_fixed. They do not block other pending items.

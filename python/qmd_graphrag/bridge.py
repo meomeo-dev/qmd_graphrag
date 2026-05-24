@@ -716,10 +716,13 @@ def _validate_query_ready_artifacts(
         return False
     stage_fingerprints = book.get("stageFingerprints")
     provider_fingerprint = book.get("providerFingerprint")
+    corpus_content_hash = book.get("normalizedContentHash") or book.get("sourceHash")
     if not isinstance(stage_fingerprints, dict) or not isinstance(
         provider_fingerprint,
         str,
     ):
+        return False
+    if not isinstance(corpus_content_hash, str) or not corpus_content_hash:
         return False
 
     checkpoint_by_stage = _succeeded_checkpoint_by_stage(root_dir, book_id)
@@ -765,6 +768,11 @@ def _validate_query_ready_artifacts(
             return False
         if artifact.get("providerFingerprint") != provider_fingerprint:
             return False
+        metadata = artifact.get("metadata")
+        if not isinstance(metadata, dict):
+            return False
+        if metadata.get("corpusContentHash") != corpus_content_hash:
+            return False
         kinds.add(str(artifact.get("kind")))
         path = artifact.get("path")
         if not isinstance(path, str):
@@ -797,9 +805,7 @@ def _validate_query_ready_artifacts(
         )
         if actual_hash != expected_hash:
             return False
-        if kind.endswith("_parquet") and (
-            not artifact_path.is_file() or artifact_path.stat().st_size == 0
-        ):
+        if kind.endswith("_parquet") and not _is_valid_parquet_file(artifact_path):
             return False
         if kind == "lancedb_index" and not _is_complete_lancedb_directory(
             artifact_path
@@ -807,6 +813,30 @@ def _validate_query_ready_artifacts(
             return False
 
     return QUERY_READY_ARTIFACT_KINDS.issubset(kinds)
+
+
+def _is_valid_parquet_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        size = path.stat().st_size
+        if size < 12:
+            return False
+        with path.open("rb") as handle:
+            header = handle.read(4)
+            handle.seek(size - 4)
+            footer = handle.read(4)
+        if header != b"PAR1" or footer != b"PAR1":
+            return False
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+
+            metadata = pq.ParquetFile(path).metadata
+            return metadata is not None and metadata.num_rows > 0
+        except Exception:  # noqa: BLE001
+            return True
+    except OSError:
+        return False
 
 
 def _load_artifacts_by_id(root_dir: Path, book_ids: list[str]) -> dict[str, dict[str, Any]]:
