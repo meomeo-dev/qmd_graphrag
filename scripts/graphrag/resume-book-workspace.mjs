@@ -182,7 +182,7 @@ async function queryReadyProducerArtifacts(runtimeApi, repo, sync) {
     );
   }
   const expectedCorpusContentHash = sync.job.normalizedContentHash ?? sync.job.sourceHash;
-  const artifacts = sync.artifacts.filter((artifact) =>
+  const artifacts = currentArtifactsForSync(sync.artifacts, sync).filter((artifact) =>
     (
       artifact.stage === "graph_extract" &&
       artifact.producerRunId === graphExtract.runId
@@ -247,8 +247,160 @@ function isLocalArtifactGateError(value) {
     message.includes("stage_fingerprint_mismatch") ||
     message.includes("provider_fingerprint_mismatch") ||
     message.includes("corpus_content_hash_mismatch") ||
-    message.includes("artifact_not_book_scoped_graph_output")
+    message.includes("artifact_not_book_scoped_graph_output") ||
+    message.includes("graphrag document identity is missing for query_ready") ||
+    message.includes("capabilityscope references unknown or not-ready graphcapabilityid") ||
+    message.includes("no graph_query capability is ready for book")
   );
+}
+
+function producerRunIdsFromCheckpoints(checkpoints) {
+  return Object.fromEntries(
+    ["graph_extract", "community_report", "embed", "query_ready"]
+      .flatMap((stage) => {
+        const checkpoint = checkpoints.find((item) =>
+          item.stage === stage &&
+          item.status === "succeeded" &&
+          typeof item.runId === "string"
+        );
+        return checkpoint == null ? [] : [[stage, checkpoint.runId]];
+      }),
+  );
+}
+
+function producerRunIdsFromManifest(manifest) {
+  const values = manifest?.stageProducerRunIds;
+  if (values == null || typeof values !== "object") return {};
+  return Object.fromEntries(
+    ["graph_extract", "community_report", "embed", "query_ready"]
+      .filter((stage) => typeof values[stage] === "string")
+      .map((stage) => [stage, values[stage]]),
+  );
+}
+
+function graphRagBookOutputLocator(bookId) {
+  return `books/${bookId}/output`;
+}
+
+function outputProducerManifestMatchesSync(manifest, sync) {
+  if (manifest == null || typeof manifest !== "object") return false;
+  const contentHash = sync.job.normalizedContentHash ?? sync.job.sourceHash;
+  const stages = ["graph_extract", "community_report", "embed", "query_ready"];
+  return manifest.schemaVersion === "1.0.0" &&
+    manifest.bookId === sync.job.bookId &&
+    manifest.sourceHash === sync.job.sourceHash &&
+    manifest.documentId === sync.job.documentId &&
+    manifest.contentHash === contentHash &&
+    manifest.providerFingerprint === sync.job.providerFingerprint &&
+    manifest.outputDir === graphRagBookOutputLocator(sync.job.bookId) &&
+    stages.every((stage) =>
+      manifest.stageFingerprints?.[stage] === sync.stageFingerprints[stage]
+    );
+}
+
+function mergeProducerRunIds(...items) {
+  return Object.assign({}, ...items);
+}
+
+function isArtifactCurrentForSync(artifact, sync) {
+  const expectedContentHash = sync.job.normalizedContentHash ?? sync.job.sourceHash;
+  if (artifact.bookId !== sync.job.bookId) return false;
+  if (artifact.stageFingerprint !== sync.stageFingerprints[artifact.stage]) {
+    return false;
+  }
+  if (artifact.providerFingerprint !== sync.job.providerFingerprint) {
+    return false;
+  }
+  if (
+    (String(artifact.kind).startsWith("graphrag_") ||
+      artifact.kind === "lancedb_index") &&
+    artifact.metadata?.corpusContentHash !== expectedContentHash
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function currentArtifactsForSync(artifacts, sync) {
+  return artifacts.filter((artifact) => isArtifactCurrentForSync(artifact, sync));
+}
+
+async function readOutputProducerManifest(outputDir) {
+  try {
+    return JSON.parse(
+      await readFile(resolve(outputDir, "qmd_output_manifest.json"), "utf8"),
+    );
+  } catch {
+    return null;
+  }
+}
+
+function localArtifactGateFailureCheckpoint(checkpoints) {
+  return checkpoints.find((item) =>
+    item.status === "failed" &&
+    typeof item.runId === "string" &&
+    isLocalArtifactGateError(item.errorSummary)
+  ) ?? null;
+}
+
+function localArtifactGateProjectionFailureCheckpoint(checkpoints) {
+  return checkpoints.find((item) =>
+    item.status === "failed" &&
+    isLocalArtifactGateError(item.errorSummary)
+  ) ?? null;
+}
+
+async function completeProducerStageFromEvidence({
+  runtimeApi,
+  repo,
+  sync,
+  stage,
+  producerRunId,
+  sourceMetadata,
+}) {
+  if (typeof producerRunId !== "string" || producerRunId.length === 0) {
+    return false;
+  }
+  const checkpoints = await repo.listStageCheckpoints(sync.job.bookId);
+  const existing = checkpoints.find((item) => item.stage === stage);
+  if (
+    existing?.status === "succeeded" &&
+    existing.runId === producerRunId
+  ) {
+    return false;
+  }
+  const artifacts = await repo.listArtifacts(sync.job.bookId);
+  const currentArtifacts = currentArtifactsForSync(artifacts, sync);
+  const artifactIds = await runtimeApi.assertGraphRagStageArtifactsReady({
+    stateRootDir: stateRoot,
+    bookId: sync.job.bookId,
+    stage,
+    producerRunId,
+    artifacts: currentArtifacts,
+    expectedStageFingerprints: sync.job.stageFingerprints,
+    expectedProviderFingerprint: sync.job.providerFingerprint,
+    expectedCorpusContentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
+  });
+  await repo.completeStage({
+    bookId: sync.job.bookId,
+    stage,
+    runId: producerRunId,
+    inputFingerprint: sync.stageFingerprints[stage],
+    contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
+    stageFingerprint: sync.stageFingerprints[stage],
+    providerFingerprint: sync.job.providerFingerprint,
+    artifactIds,
+    metadata: {
+      ...(existing?.metadata ?? {}),
+      recoveredFromLocalArtifactGateFailure: true,
+      graphWorkspace: "book_scoped",
+      repairMode: "producer_manifest_and_checkpoint_only",
+      sourceFailureStage: sourceMetadata?.stage,
+      sourceFailureRunId: sourceMetadata?.runId,
+      sourceFailureSummary: sourceMetadata?.errorSummary,
+    },
+  });
+  return true;
 }
 
 async function graphQueryScopeFromSync(sync, loadGraphQueryCapabilities) {
@@ -401,6 +553,42 @@ async function refreshOutputProducerManifestFromCheckpoints(
   }
 }
 
+async function restoreProducerManifestFromEvidence({
+  runtimeApi,
+  repo,
+  sync,
+  scopedOutputDir,
+}) {
+  const checkpoints = await repo.listStageCheckpoints(sync.job.bookId);
+  const currentManifest = await readOutputProducerManifest(scopedOutputDir);
+  const manifestProducerRunIds = outputProducerManifestMatchesSync(
+    currentManifest,
+    sync,
+  )
+    ? producerRunIdsFromManifest(currentManifest)
+    : {};
+  const producerRunIds = mergeProducerRunIds(
+    manifestProducerRunIds,
+    producerRunIdsFromCheckpoints(checkpoints),
+  );
+  for (const stage of ["graph_extract", "community_report", "embed", "query_ready"]) {
+    const producerRunId = producerRunIds[stage];
+    if (typeof producerRunId !== "string") continue;
+    await runtimeApi.writeGraphRagOutputProducerManifest({
+      outputDir: scopedOutputDir,
+      bookId: sync.job.bookId,
+      sourceHash: sync.job.sourceHash,
+      documentId: sync.job.documentId,
+      contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
+      stageFingerprints: sync.stageFingerprints,
+      providerFingerprint: sync.job.providerFingerprint,
+      producerRunId,
+      stage,
+    });
+  }
+  return producerRunIds;
+}
+
 async function repairLocalArtifactGateFailureIfPossible({
   runtimeApi,
   repo,
@@ -462,7 +650,14 @@ async function repairLocalArtifactGateFailureIfPossible({
 }
 
 async function runRepairLocalArtifactGateOnly(runtimeApi, repo) {
-  const { sourcePath, sourceIdentityPath } = await resolveWorkspaceInputs();
+  runtimeApi.setConfigSource({ configPath });
+  const projectConfig = runtimeApi.loadConfig();
+  await runtimeApi.writeManagedGraphRagSettings({
+    config: projectConfig,
+    graphVault: stateRoot,
+  });
+  const { sourcePath, sourceIdentityPath, normalizedPath } =
+    await resolveWorkspaceInputs();
   const sourceHash = await runtimeApi.hashFile(sourcePath);
   const bookId = runtimeApi.buildBookIdFromSourceHash(
     sourceIdentityPath,
@@ -483,13 +678,8 @@ async function runRepairLocalArtifactGateOnly(runtimeApi, repo) {
     });
     return;
   }
-  const checkpoints = await repo.listStageCheckpoints(bookId);
-  const checkpoint = checkpoints.find((item) =>
-    ["graph_extract", "community_report", "embed"].includes(item.stage) &&
-    item.status === "failed" &&
-    typeof item.runId === "string" &&
-    isLocalArtifactGateError(item.errorSummary)
-  );
+  let checkpoints = await repo.listStageCheckpoints(bookId);
+  let checkpoint = localArtifactGateFailureCheckpoint(checkpoints);
   if (checkpoint == null) {
     printJson({
       status: "blocked",
@@ -506,60 +696,158 @@ async function runRepairLocalArtifactGateOnly(runtimeApi, repo) {
     });
     return;
   }
-  const scopedOutputDir = runtimeApi.graphRagBookOutputDir({
-    stateRootDir: stateRoot,
-    bookId,
+
+  let { sync, scopedOutputDir } = await syncCurrentBook(
+    runtimeApi,
+    projectConfig,
+    sourcePath,
+    sourceIdentityPath,
+    normalizedPath,
+  );
+  let producerRunIds = await restoreProducerManifestFromEvidence({
+    runtimeApi,
+    repo,
+    sync,
+    scopedOutputDir,
   });
-  await runtimeApi.writeGraphRagOutputProducerManifest({
-    outputDir: scopedOutputDir,
-    bookId,
-    sourceHash: job.sourceHash,
-    documentId: job.documentId,
-    contentHash: job.normalizedContentHash ?? job.sourceHash,
-    stageFingerprints: job.stageFingerprints,
-    providerFingerprint: job.providerFingerprint,
-    producerRunId: checkpoint.runId,
-    stage: checkpoint.stage,
-  });
-  const artifacts = await repo.listArtifacts(bookId);
-  const artifactIds = await runtimeApi.assertGraphRagStageArtifactsReady({
-    stateRootDir: stateRoot,
-    bookId,
-    stage: checkpoint.stage,
-    producerRunId: checkpoint.runId,
-    artifacts,
-    expectedStageFingerprints: job.stageFingerprints,
-    expectedProviderFingerprint: job.providerFingerprint,
-    expectedCorpusContentHash: job.normalizedContentHash ?? job.sourceHash,
-  });
-  await repo.completeStage({
-    bookId,
-    stage: checkpoint.stage,
-    runId: checkpoint.runId,
-    inputFingerprint: checkpoint.inputFingerprint,
-    contentHash: job.normalizedContentHash ?? job.sourceHash,
-    stageFingerprint: job.stageFingerprints?.[checkpoint.stage] ??
-      checkpoint.stageFingerprint,
-    providerFingerprint: job.providerFingerprint ?? checkpoint.providerFingerprint,
-    artifactIds,
-    metadata: {
-      ...(checkpoint.metadata ?? {}),
-      recoveredFromLocalArtifactGateFailure: true,
-      graphWorkspace: "book_scoped",
-      repairMode: "producer_manifest_and_checkpoint_only",
-    },
-  });
+  let repairedCheckpointStages = [];
+  for (const stage of ["graph_extract", "community_report", "embed"]) {
+    const repaired = await completeProducerStageFromEvidence({
+      runtimeApi,
+      repo,
+      sync,
+      stage,
+      producerRunId: producerRunIds[stage],
+      sourceMetadata: checkpoint,
+    });
+    if (repaired) {
+      repairedCheckpointStages.push(stage);
+      ({ sync, scopedOutputDir } = await syncCurrentBook(
+        runtimeApi,
+        projectConfig,
+        sourcePath,
+        sourceIdentityPath,
+        normalizedPath,
+      ));
+      producerRunIds = mergeProducerRunIds(
+        producerRunIds,
+        await restoreProducerManifestFromEvidence({
+          runtimeApi,
+          repo,
+          sync,
+          scopedOutputDir,
+        }),
+      );
+    }
+  }
+  for (let repairPass = 0; repairPass < 3; repairPass += 1) {
+    const repaired = await repairLocalArtifactGateFailureIfPossible({
+      runtimeApi,
+      repo,
+      sync,
+      scopedOutputDir,
+    });
+    if (!repaired) break;
+    repairedCheckpointStages.push(sync.resumePlan.nextStage);
+    ({ sync, scopedOutputDir } = await syncCurrentBook(
+      runtimeApi,
+      projectConfig,
+      sourcePath,
+      sourceIdentityPath,
+      normalizedPath,
+    ));
+    producerRunIds = mergeProducerRunIds(
+      producerRunIds,
+      await restoreProducerManifestFromEvidence({
+        runtimeApi,
+        repo,
+        sync,
+        scopedOutputDir,
+      }),
+    );
+  }
+
+  checkpoints = await repo.listStageCheckpoints(bookId);
+  checkpoint = localArtifactGateProjectionFailureCheckpoint(checkpoints) ?? checkpoint;
+  let repairReason = "graph_query_capability_projection_missing";
+  let repairEvidenceLocator = `graph_vault/books/${bookId}/output/qmd_output_manifest.json`;
+  let repairedProjection = "graph_capability";
+  try {
+    await graphQueryScopeFromSync(sync, runtimeApi.loadGraphQueryCapabilities);
+    repairReason = "graph_identity_projection_missing";
+    repairedProjection = "document_identity_map";
+    repairEvidenceLocator =
+      `graph_vault/books/${bookId}/output/qmd_graph_text_unit_identity.json`;
+  } catch {
+    if (sync.resumePlan.nextStage === "query_ready") {
+      const queryReadyArtifacts = await queryReadyProducerArtifacts(
+        runtimeApi,
+        repo,
+        sync,
+      );
+      const runId = producerRunIds.query_ready ?? runtimeApi.createRunId("query_ready");
+      await repo.completeStage({
+        bookId,
+        stage: "query_ready",
+        runId,
+        inputFingerprint: sync.stageFingerprints.query_ready,
+        contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
+        stageFingerprint: sync.stageFingerprints.query_ready,
+        providerFingerprint: sync.job.providerFingerprint,
+        artifactIds: queryReadyArtifacts.artifactIds,
+        metadata: {
+          graphWorkspace: "book_scoped",
+          readinessSource: "local_artifact_gate_repair",
+          producerRunIds: queryReadyArtifacts.producerRunIds,
+          recoveredFromLocalArtifactGateFailure: true,
+          repairMode: "query_ready_projection_only",
+        },
+      });
+      producerRunIds = mergeProducerRunIds(producerRunIds, { query_ready: runId });
+      ({ sync, scopedOutputDir } = await syncCurrentBook(
+        runtimeApi,
+        projectConfig,
+        sourcePath,
+        sourceIdentityPath,
+        normalizedPath,
+      ));
+      await restoreProducerManifestFromEvidence({
+        runtimeApi,
+        repo,
+        sync,
+        scopedOutputDir,
+      });
+      repairReason = "graph_query_capability_projection_missing";
+      repairedProjection = "graph_capability";
+      repairEvidenceLocator =
+        `graph_vault/books/${bookId}/checkpoints.yaml#query_ready`;
+      await graphQueryScopeFromSync(sync, runtimeApi.loadGraphQueryCapabilities);
+    } else {
+      throw new Error(
+        `local artifact gate repair did not restore graph query capability: ` +
+        `nextStage=${sync.resumePlan.nextStage ?? "none"}`,
+      );
+    }
+  }
+  checkpoints = await repo.listStageCheckpoints(bookId);
+
   printJson({
     status: "repaired",
     bookId,
     startedStage: null,
-    nextStage: checkpoint.stage,
+    nextStage: sync.resumePlan.nextStage,
     completedStages: checkpoints
       .filter((item) => item.status === "succeeded")
       .map((item) => item.stage),
     queryResult: null,
     repairOnly: true,
     repairedLocalArtifactGate: true,
+    repairReason,
+    repairedProjection,
+    repairEvidenceLocator,
+    reusedProducerRunIds: producerRunIds,
+    repairedCheckpointStages,
+    repairedFailedStage: checkpoint?.stage,
   });
 }
 

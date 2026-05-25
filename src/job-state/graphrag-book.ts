@@ -1204,8 +1204,18 @@ export async function writeGraphRagOutputProducerManifest(input: {
   stage?: BookStage;
 }): Promise<void> {
   const previous = await readOutputProducerManifest(input.outputDir);
+  const previousMatches = outputProducerMatches({
+    manifest: previous,
+    bookId: input.bookId,
+    sourceHash: input.sourceHash,
+    documentId: input.documentId,
+    contentHash: input.contentHash,
+    stageFingerprints: input.stageFingerprints,
+    providerFingerprint: input.providerFingerprint,
+    outputDir: input.outputDir,
+  });
   const stageProducerRunIds = {
-    ...(previous?.stageProducerRunIds ?? {}),
+    ...(previousMatches ? previous?.stageProducerRunIds ?? {} : {}),
     ...(input.stage ? { [input.stage]: input.producerRunId } : {}),
   };
   const manifest: GraphRagOutputProducerManifest = {

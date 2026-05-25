@@ -160,12 +160,21 @@ export function hydrateBatchCheckpoint({
     .map((check) => check.errorSummary)
     .filter(Boolean);
   const latestFailureText = failedCheckTexts.at(-1) ?? checkpoint.errorSummary ?? "";
-  const failureText = isLocalArtifactGateFailureText(latestFailureText)
+  const combinedFailureText = [
+    checkpoint.errorSummary,
+    ...failedCheckTexts,
+  ].filter(Boolean).join("\n");
+  const hasDataCompatibilityFailure = [
+    checkpoint.errorSummary,
+    ...failedCheckTexts,
+  ].filter(Boolean).some((text) =>
+    classifyFailure(text).failureKind === "data_compatibility"
+  );
+  const failureText = hasDataCompatibilityFailure
+    ? combinedFailureText
+    : isLocalArtifactGateFailureText(latestFailureText)
     ? latestFailureText
-    : [
-        checkpoint.errorSummary,
-        ...failedCheckTexts,
-      ].filter(Boolean).join("\n");
+    : combinedFailureText;
   const canClassifyCheckpoint =
     checkpoint.status === "failed" ||
     (

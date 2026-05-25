@@ -70,8 +70,31 @@ graph_vault/catalog/batch-runs/<runId>/
 
 同一 runId 再次运行不会重跑已 completed item。`failed` item 只有在
 `retryable=true` 且 `recoveryDecision=retry_same_run_id` 时自动重试。`retryable=false`
-的 failed item 保持 failed，并继续处理其他 pending item。更换 runId 会创建新的
-批量审计记录，但单书仍由 `BookResumePlan.nextStage` 防止重复高成本 stage。
+的 failed item 默认保持 failed，并继续处理其他 pending item。唯一例外是本地
+query-ready / graph-query readiness gate 已被当前代码分类为可低成本修复时，执行器
+可把 `stop_until_fixed` item 重新打开为 `pending`，写入
+`item_local_artifact_gate_repair` 或等价 recovery event，并设置
+`recoveryDecision=continue_pending`。该 reopen 不得写入 `completed`，也不得绕过
+后续 qmd 与 GraphRAG query command checks。更换 runId 会创建新的批量审计记录，
+但单书仍由 `BookResumePlan.nextStage` 防止重复高成本 stage。
+
+本地 projection gate reopen 后，`BatchItemCheckpoint.metadata` 必须保留审计字段
+（audit fields）：
+
+- `reopenedFromStatus`：固定为历史状态，例如 `failed`。
+- `reopenedToStatus`：固定为 `pending`。
+- `reopenedFromRecoveryDecision`：历史恢复决策，例如 `stop_until_fixed`。
+- `repairReason`：`graph_identity_projection_missing` 或
+  `graph_query_capability_projection_missing`。
+- `repairFailureText`：redacted persisted failure text。
+- `repairedProjection`：`document_identity_map`、`graph_capability` 或二者。
+- `repairEvidenceLocator`：sidecar、manifest 或 validated capability source
+  locator。
+- `reusedProducerRunIds`：`graph_extract`、`community_report` 和 `embed` run ids。
+- `normalCommandChecksRequired`：固定为 `true`，表示 reopen 不等于 completed。
+
+`events.jsonl` 和 `recovery-summary.json` 必须投影同一事实，操作者不应通过 raw
+logs 才能判断为何从 `stop_until_fixed` 重新进入 pending repair。
 
 从临时批次迁移到正式批次时，可用 `--completed-manifest <path>` 导入调度种子。
 普通运行中导入只写入 checkpoint metadata 和 `importedCompletedItems` 统计，
@@ -120,6 +143,30 @@ runId 恢复；缺失/不完整证据或非 transient command check 降级为
   `graphTextUnitIds`。若 `qmd_graph_text_unit_identity.json` 已存在但 catalog
   缺少这些 graph fields，恢复必须先校验 sidecar 与 output manifest，再低成本修复
   catalog projection。
+- 历史 checkpoint 若因
+  `GraphRAG document identity is missing for query_ready` 或
+  `capabilityScope references unknown or not-ready graphCapabilityId(s)` 停在
+  `stop_until_fixed`，当前 failure classifier 必须把它重分类为本地 artifact
+  gate failure，并进入同一低成本 repair path。repair 只能补
+  `DocumentIdentityMap`、producer manifest 或 `query_ready` capability projection；
+  不能重跑 `graph_extract`、`community_report` 或 `embed`，也不能伪造已通过的
+  command check。
+
+必须有 focused regression 覆盖真实失败文本：
+
+- `GraphRAG document identity is missing for query_ready: doc-fd8875181a17`：
+  从 persisted `stop_until_fixed` checkpoint reopen 到 pending repair，利用
+  validated `qmd_graph_text_unit_identity.json` 或 book-scoped output 修复
+  `DocumentIdentityMap`，随后重新进入 `query_ready` 与 27 个 command checks。
+- `capabilityScope references unknown or not-ready graphCapabilityId(s):
+  book-356ff4920cdf-0bbd8bdb:graph_query`：仅在 validated `query_ready` lineage、
+  artifact lineage 和 document identity 均有效时，重建 graph capability
+  projection，并重新运行 `qmd query --graphrag` command check。
+- 两个回归都必须断言 `graph_extract`、`community_report`、`embed` producer
+  run ids 不变，且 checkpoint 未被直接写成 `completed`。
+- 负例必须证明 provider/network failure、mixed-book output、stale sidecar、
+  source/content mismatch、missing producer lineage 和 incomplete artifacts 不会
+  被本地 projection reopen。
 
 ## Provider 限流与重试
 
@@ -199,6 +246,10 @@ GraphRAG 输出生产者 manifest 必须保存在每本书的 book-scoped output
   sidecar 已存在，但 catalog 缺失或陈旧时，失败归类为
   `graph_identity_projection_missing`。同一 runId resume 只补 catalog projection
   并重试 `query_ready`，不得重跑 `graph_extract`、`community_report` 或 `embed`。
+- `graph_query_capability_projection_missing` 是 sibling 本地修复原因：当
+  `query_ready` checkpoint、artifact lineage 和 document identity 均有效，但
+  capability catalog 或 derived capability projection 尚未可读时，同一 runId resume
+  只能重建 capability projection 并重新运行查询检查。
 - identity repair 必须拒绝混书 output、source/content mismatch、空 text unit、
   text unit id 不存在、无效 `outputDir`、producer lineage 不一致，以及缺少有效
   sidecar 的多 GraphRAG document 歧义。

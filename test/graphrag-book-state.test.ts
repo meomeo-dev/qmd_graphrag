@@ -1039,6 +1039,80 @@ describe("syncGraphRagBookWorkspace", () => {
     }
   });
 
+  test("drops stale producer run ids when rewriting a producer manifest", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+      await writeFile(join(graphVault, "settings.yaml"), "vector_store: {}\n", "utf8");
+      await writeFile(join(graphVault, "prompts", "extract_graph.txt"), "prompt", "utf8");
+
+      const initial = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        recordRecoveredStages: false,
+      });
+      const outputDir = graphRagBookOutputDir({
+        stateRootDir: graphVault,
+        bookId: initial.job.bookId,
+      });
+      await mkdir(outputDir, { recursive: true });
+      await writeFile(
+        join(outputDir, "qmd_output_manifest.json"),
+        JSON.stringify({
+          schemaVersion: SchemaVersion,
+          bookId: "book-stale",
+          sourceHash: "stale-source",
+          documentId: "doc-stale",
+          contentHash: "stale-content",
+          stageFingerprints: initial.stageFingerprints,
+          providerFingerprint: initial.job.providerFingerprint,
+          outputDir: "books/book-stale/output",
+          producerRunId: "stale-query-ready",
+          stageProducerRunIds: {
+            graph_extract: "stale-graph-extract",
+            community_report: "stale-community-report",
+            embed: "stale-embed",
+          },
+        }, null, 2),
+        "utf8",
+      );
+
+      await writeGraphRagOutputProducerManifest({
+        outputDir,
+        bookId: initial.job.bookId,
+        sourceHash: initial.job.sourceHash,
+        documentId: initial.job.documentId,
+        contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+        stageFingerprints: initial.stageFingerprints,
+        providerFingerprint: initial.job.providerFingerprint!,
+        producerRunId: "current-query-ready",
+        stage: "query_ready",
+      });
+
+      const manifest = JSON.parse(await readFile(
+        join(outputDir, "qmd_output_manifest.json"),
+        "utf8",
+      ));
+      expect(manifest.bookId).toBe(initial.job.bookId);
+      expect(manifest.stageProducerRunIds).toEqual({
+        query_ready: "current-query-ready",
+      });
+      expect(JSON.stringify(manifest)).not.toContain("stale-");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("accepts pyarrow parquet artifacts produced by a real GraphRAG stage", async () => {
     const root = await createWorkspace();
     try {

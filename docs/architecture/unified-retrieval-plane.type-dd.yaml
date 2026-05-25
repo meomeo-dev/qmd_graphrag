@@ -372,6 +372,23 @@ typed_buses:
             Unclassified failure. Unknown must not be used for provider
             transport failures once the classifier can identify the provider
             taxonomy. Unknown remains stop_until_fixed until classified.
+        local_reopen_contract: >-
+          Persisted stop_until_fixed items may be reopened only when the current
+          classifier recognizes the failure text as a local query_ready or
+          graph_query projection gate and current validated artifacts prove that
+          repair can be attempted without rerunning high-cost GraphRAG stages.
+          Reopen changes the item to pending or continue_pending and never to
+          completed.
+        local_reopen_checkpoint_metadata:
+          - reopenedFromStatus
+          - reopenedToStatus
+          - reopenedFromRecoveryDecision
+          - repairReason
+          - repairFailureText
+          - repairedProjection
+          - repairEvidenceLocator
+          - reusedProducerRunIds
+          - normalCommandChecksRequired
       - name: batch_recovery_summary
         schema: src/contracts/batch-run.ts#BatchRecoverySummarySchema
         envelope: src/contracts/batch-run.ts#BatchRecoverySummaryEnvelopeSchema
@@ -1593,6 +1610,19 @@ state_and_recovery:
       Items with future nextRetryAt are deferred while other runnable items
       continue. The runner waits for the earliest retry window only when no
       other item can run.
+    local_projection_reopen_rule: >-
+      A stop_until_fixed item caused by missing query_ready document identity
+      or unknown/not-ready graph_query capability may be reopened by the same
+      runId after code fixes classify it as a local projection gate. The runner
+      must emit recovery evidence, run the normal resume and command checks,
+      and must not rerun graph_extract, community_report, or embed when their
+      producer checkpoints and artifacts remain valid.
+    local_projection_observability_rule: >-
+      Event log and recovery summary are projections of the reopened item
+      checkpoint. The checkpoint metadata records the original failure text,
+      previous status and recovery decision, repair reason, repaired projection,
+      repair evidence locator, reused producer run ids, and that normal command
+      checks remain required.
     runner_ownership_rule: >-
       Running checkpoints carry runnerSessionId, runnerHost, runnerPid, and
       runnerHeartbeatAt. Fresh remote ownership within the heartbeat TTL is
@@ -1931,6 +1961,28 @@ acceptance_requirements:
     query_ready without changing graph_extract, community_report, or embed
     producer run ids.
   - >-
+    Focused regression for persisted failure text
+    `GraphRAG document identity is missing for query_ready: doc-fd8875181a17`
+    reopens a stop_until_fixed checkpoint to pending/continue_pending, repairs
+    document_identity_map from validated sidecar or book-scoped output, preserves
+    graph_extract/community_report/embed producer run ids, and then requires the
+    normal query_ready and command-check path.
+  - >-
+    Focused regression for persisted failure text `capabilityScope references
+    unknown or not-ready graphCapabilityId(s):
+    book-356ff4920cdf-0bbd8bdb:graph_query` reopens only when validated
+    query_ready lineage, artifact lineage, and graph document identity are all
+    present, rebuilds graph_query capability projection, and reruns the normal
+    GraphRAG query command check without writing completed directly.
+  - >-
+    Local projection reopen tests assert BatchItemCheckpoint metadata includes
+    reopenedFromStatus, reopenedToStatus, reopenedFromRecoveryDecision,
+    repairReason, repairFailureText, repairedProjection, repairEvidenceLocator,
+    reusedProducerRunIds, and normalCommandChecksRequired=true.
+  - >-
     Negative tests reject multi-document ambiguous GraphRAG output without a
     valid sidecar, source/content mismatch, empty graph text unit ids, and text
     unit ids absent from text_units.parquet.
+  - >-
+    Negative reopen tests reject provider/network failure, mixed-book output,
+    stale sidecar, missing producer lineage, and incomplete artifacts.

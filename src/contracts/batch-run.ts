@@ -237,6 +237,15 @@ export const BatchRecoverySummaryItemSchema = z.object({
   runnerHeartbeatAt: z.string().datetime().optional(),
   orphanedRunnerDetectedAt: z.string().datetime().optional(),
   waitingForProviderRecovery: z.boolean().optional(),
+  reopenedFromStatus: BatchItemStatusSchema.optional(),
+  reopenedToStatus: BatchItemStatusSchema.optional(),
+  reopenedFromRecoveryDecision: BatchRecoveryDecisionSchema.optional(),
+  repairReason: z.string().min(1).optional(),
+  repairFailureText: z.string().max(1000).optional(),
+  repairedProjection: JsonValueSchema.optional(),
+  repairEvidenceLocator: z.string().min(1).optional(),
+  reusedProducerRunIds: z.record(z.string(), z.string().min(1)).optional(),
+  normalCommandChecksRequired: z.boolean().optional(),
   errorSummary: z.string().max(1000).optional(),
 });
 

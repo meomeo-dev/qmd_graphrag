@@ -714,14 +714,30 @@ GraphRAG capability。
   下一次同一 `runId` 恢复运行到达 retry window 后继续该书闭环。
 - `failed` item 只有 `retryable=true` 时由同一 `runId` 自动重试；permanent
   failed item 保持 failed，不阻塞其他 pending item。
+- `stop_until_fixed` 不是永久墓碑。当前代码发布后，若 persisted failure text
+  被分类为本地 query-ready / graph-query projection gate，且当前 book-scoped
+  artifacts、producer lineage、qmd corpus registration 与 identity evidence
+  满足准入条件，批量执行器必须把 item 重新打开为 pending repair，而不是要求
+  人工编辑 checkpoint。该 reopen 只能进入正常 resume / command-check 路径，
+  不能直接标记 completed。
 - 当 book-scoped GraphRAG outputs、producer lineage、qmd corpus registration
   和 identity sidecar 有效，但 `DocumentIdentityMap` 缺失或陈旧时，该失败归类为
   `graph_identity_projection_missing` 本地状态。恢复必须先低成本重建 catalog
   projection，再重试 `query_ready` capability 发布；不得重跑
   `graph_extract`、`community_report` 或 `embed`。
+- 当 `query_ready` lineage 与 `DocumentIdentityMap` 有效，但
+  `loadGraphQueryCapabilities` 仍无法返回当前书 `graph_query` capability 时，该失败
+  归类为 `graph_query_capability_projection_missing`。恢复只能重建 capability
+  projection 并重新运行 `qmd query --graphrag` 检查。
 - identity projection repair 必须写入可观测事件或 recovery summary evidence，
   至少包含 sidecar locator、graph text unit count、复用的 producer run ids、
   reopened checkpoint 或 next stage。
+- reopened item checkpoint 必须保留 machine-readable repair metadata：
+  `reopenedFromStatus`、`reopenedToStatus`、`reopenedFromRecoveryDecision`、
+  `repairReason`、`repairFailureText`、`repairedProjection`、
+  `repairEvidenceLocator`、`reusedProducerRunIds` 和
+  `normalCommandChecksRequired=true`。event log 与 recovery summary 只投影这些
+  checkpoint facts，不创建第二套恢复事实。
 - 批次完成条件只接受 `completedItems == totalItems`。`skippedItems` 和
   `importedCompletedItems` 是调度事实，不抵扣闭环完成。
 - 每个 completed checkpoint 必须包含 27 个固定名称的 command checks，且全部
@@ -816,6 +832,12 @@ kind-specific validators 包括：
   `qmd_graph_text_unit_identity.json` 已存在而 catalog 缺 graph fields 时，
   resume 可补齐 `DocumentIdentityMap` 并完成 `query_ready`；同时
   `graph_extract`、`community_report` 和 `embed` 的 producer run ids 不变。
+- 真实 failure text 回归必须固定两个历史形态：
+  `GraphRAG document identity is missing for query_ready: doc-fd8875181a17` 和
+  `capabilityScope references unknown or not-ready graphCapabilityId(s):
+  book-356ff4920cdf-0bbd8bdb:graph_query`。两者都必须从 persisted
+  `stop_until_fixed` checkpoint reopen 到 pending/continue_pending，走正常 resume
+  与 command checks，且不得直接 completed。
 
 ## 提交边界
 

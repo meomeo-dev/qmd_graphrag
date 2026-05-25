@@ -161,7 +161,10 @@ export function isLocalArtifactGateFailureText(text) {
     message.includes("stage_fingerprint_mismatch") ||
     message.includes("provider_fingerprint_mismatch") ||
     message.includes("corpus_content_hash_mismatch") ||
-    message.includes("artifact_not_book_scoped_graph_output")
+    message.includes("artifact_not_book_scoped_graph_output") ||
+    message.includes("graphrag document identity is missing for query_ready") ||
+    message.includes("capabilityscope references unknown or not-ready graphcapabilityid") ||
+    message.includes("no graph_query capability is ready for book")
   );
 }
 

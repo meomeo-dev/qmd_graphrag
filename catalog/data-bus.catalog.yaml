@@ -68,6 +68,9 @@ types:
       - redacts URL userinfo and URL query credentials before persistence
       - records failureKind, retryable, failedStage, providerStatusCode,
         retryAfterSeconds, and recoveryDecision
+      - local projection reopen events project checkpoint repair metadata,
+        including repairReason, repairedProjection, repairEvidenceLocator,
+        reusedProducerRunIds, reopenedFromStatus, and reopenedToStatus
       - records batch_stopped_after_non_transient_failure when an unresolved
         data_compatibility failure would otherwise start high-cost pending books
       - raw stdout, stderr, and GraphRAG report logs stay in temporary run logs
@@ -117,6 +120,9 @@ types:
       - identity repair evidence includes sidecar path, graph text unit count,
         reused producer run ids, reopened checkpoint, and next stage when
         available
+      - graph capability projection repair evidence includes the validated
+        query_ready lineage, graphCapabilityId, reused producer run ids, and
+        command check that must be rerun
       - status-json emits the same typed payload without running work
       - remote running items with fresh heartbeat are observed but not stolen;
         missing ownership, stale heartbeat beyond TTL, or a dead same-host
@@ -1084,6 +1090,16 @@ types:
         document_identity_map lacks graphDocumentId or graphTextUnitIds
       - this reason reopens only catalog/query_ready projection work and must
         not rerun graph_extract, community_report, or embed
+      - graph_query_capability_projection_missing is a local projection repair
+        reason when query_ready lineage and document identity are valid but the
+        current graph_query capability projection is missing or not ready
+      - stop_until_fixed items with these projection reasons reopen to pending
+        repair under the same runId; they must not be marked completed without
+        normal command checks
+      - reopened checkpoint metadata records reopenedFromStatus,
+        reopenedToStatus, reopenedFromRecoveryDecision, repairReason,
+        repairFailureText, repairedProjection, repairEvidenceLocator,
+        reusedProducerRunIds, and normalCommandChecksRequired
 
   - name: book_run_catalog
     schema: src/contracts/book-job.ts#BookJobRunCatalogSchema

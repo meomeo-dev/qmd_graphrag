@@ -1,0 +1,145 @@
+schemaVersion: 1
+caseId: graphrag-query-ready-recovery-reopen
+runId: graphrag-query-ready-recovery-reopen-run_1
+status: implementation_dev_audit_passed_ready_for_real_run
+trigger:
+  realRunId: epub-batch-20260525-full-real
+  failedItems:
+    - itemId: item-9f587b71073a-cff9f38d
+      bookId: book-9f587b71073a-ad95ce2f
+      error: >
+        GraphRAG document identity is missing for query_ready:
+        doc-fd8875181a17
+    - itemId: item-356ff4920cdf-c7e96dce
+      bookId: book-356ff4920cdf-0bbd8bdb
+      error: >
+        capabilityScope references unknown or not-ready graphCapabilityId(s):
+        book-356ff4920cdf-0bbd8bdb:graph_query
+baselinePolicy:
+  fixedBeforeAudit: true
+  mutableDuringRun: false
+  agentBaselineFiles:
+    design-agent-a: design-agent-a/baseline.md
+    design-agent-b: design-agent-b/baseline.md
+    design-agent-c: design-agent-c/baseline.md
+reports: {}
+finalReport: final-report.md
+designAudit:
+  result: pass
+  reports:
+    design-agent-a: design-agent-a/report.md
+    design-agent-b: design-agent-b/report.md
+    design-agent-c: design-agent-c/report.md
+  agentResults:
+    design-agent-a: fail
+    design-agent-b: fail
+    design-agent-c: fail
+  requiredDesignActions:
+    - add_focused_regression_contracts_for_two_real_failure_texts
+    - require_reopen_checkpoint_metadata_observability
+    - require_negative_reopen_tests
+designFix:
+  changedFiles:
+    - docs/operations/graphrag-epub-batch-runbook.md
+    - docs/architecture/unified-retrieval-plane.md
+    - docs/architecture/unified-retrieval-plane.type-dd.yaml
+    - catalog/data-bus.catalog.yaml
+  readyForReaudit: true
+designReaudit:
+  result: pass
+  reports:
+    design-agent-a: design-agent-a/reaudit-1.md
+    design-agent-b: design-agent-b/reaudit-1.md
+    design-agent-c: design-agent-c/reaudit-1.md
+implementation:
+  changedFiles:
+    - scripts/graphrag/batch-failure-classifier.mjs
+    - scripts/graphrag/resume-book-workspace.mjs
+    - scripts/graphrag/batch-epub-workflow.mjs
+    - scripts/graphrag/batch-checkpoint-hydration.mjs
+    - src/contracts/batch-run.ts
+    - src/job-state/graphrag-book.ts
+    - test/cli.test.ts
+    - test/graphrag-book-state.test.ts
+  verification:
+    focusedTests:
+      command: >
+        node ./node_modules/vitest/vitest.mjs run test/cli.test.ts
+        --testNamePattern "keeps batch state typed|keeps query_ready resume
+        stage|keeps transient and permanent provider recovery decisions
+        typed|classifies query-ready projection failures|repair-only validates
+        query-ready projection|normal run stops repair-only|reopens query-ready
+        .* projection gate failures|mixed data compatibility|mixed provider
+        failure|blocks repaired local projection output|status-json hydrates
+        event-proven repair-only blocked loops" --testTimeout 120000
+        --reporter=dot
+      result: pass
+      passedTests: 12
+    producerManifestTests:
+      command: >
+        node ./node_modules/vitest/vitest.mjs run
+        test/graphrag-book-state.test.ts --testNamePattern
+        "drops stale producer run ids|keeps producer manifest portable"
+        --testTimeout 120000 --reporter=dot
+      result: pass
+    fullCliTestFile:
+      command: >
+        node ./node_modules/vitest/vitest.mjs run test/cli.test.ts
+        --testTimeout 120000 --reporter=dot
+      result: pass
+      passedTests: 180
+    fullGraphRagBookStateTestFile:
+      command: >
+        node ./node_modules/vitest/vitest.mjs run
+        test/graphrag-book-state.test.ts --testTimeout 120000 --reporter=dot
+      result: pass
+      passedTests: 25
+    typecheck:
+      command: npm run test:types
+      result: pass
+devAudit:
+  baselinePolicy:
+    fixedBeforeAudit: true
+    mutableDuringRun: false
+    agentBaselineFiles:
+      dev-agent-a: dev-agent-a/baseline.md
+      dev-agent-b: dev-agent-b/baseline.md
+      dev-agent-c: dev-agent-c/baseline.md
+  result: fail
+  firstRoundReports:
+    dev-agent-a: dev-agent-a/report.md
+    dev-agent-b: dev-agent-b/report.md
+    dev-agent-c: dev-agent-c/report.md
+  requiredImplementationActions:
+    - data_compatibility_and_transient_failures_must_not_enter_local_repair
+    - repair_metadata_must_be_schema_validated_before_reopen
+    - producer_manifest_reuse_must_require_current_identity_match
+    - repair_reason_and_projection_values_must_match_runbook_type_dd_data_bus
+    - recovery_summary_must_project_repair_evidence
+    - second_real_failure_text_must_have_reopen_regression
+  repairRound: 1
+devReaudit:
+  round: 1
+  result: fail
+  reports:
+    dev-agent-a: dev-agent-a/reaudit-1.md
+    dev-agent-b: dev-agent-b/reaudit-1.md
+    dev-agent-c: dev-agent-c/reaudit-1.md
+  agentResults:
+    dev-agent-a: fail
+    dev-agent-b: obsolete_shutdown_before_completion
+    dev-agent-c: obsolete_pass_before_round_1_fix
+  requiredImplementationActions:
+    - permanent_provider_failures_with_provider_status_code_must_not_repair
+devReauditRound2:
+  round: 2
+  result: pass
+  reports:
+    dev-agent-a: dev-agent-a/reaudit-2.md
+    dev-agent-b: dev-agent-b/reaudit-2.md
+    dev-agent-c: dev-agent-c/reaudit-2.md
+  agentResults:
+    dev-agent-a: pass
+    dev-agent-b: pass
+    dev-agent-c: pass
+  decision: proceed_to_real_batch_resume

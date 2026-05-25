@@ -1786,6 +1786,41 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(script).toContain("markItemRunning(item, starting, checkpoints, manifest)");
   });
 
+  test("classifies query-ready projection failures as local artifact gates", () => {
+    expect(classifyFailure(
+      "GraphRAG document identity is missing for query_ready: doc-fd8875181a17",
+    )).toMatchObject({
+      failureKind: "permanent",
+      retryable: false,
+    });
+    expect(classifyFailure(
+      "capabilityScope references unknown or not-ready graphCapabilityId(s): " +
+      "book-356ff4920cdf-0bbd8bdb:graph_query",
+    )).toMatchObject({
+      failureKind: "permanent",
+      retryable: false,
+    });
+  });
+
+  test("repair-only validates query-ready projection without graph query calls", () => {
+    const script = readFileSync(
+      join(projectRoot, "scripts", "graphrag", "resume-book-workspace.mjs"),
+      "utf8",
+    );
+    const repairOnlyStart = script.indexOf(
+      "async function runRepairLocalArtifactGateOnly",
+    );
+    const runStart = script.indexOf("async function run()", repairOnlyStart);
+    const repairOnlyBody = script.slice(repairOnlyStart, runStart);
+
+    expect(repairOnlyStart).toBeGreaterThanOrEqual(0);
+    expect(repairOnlyBody).toContain("completeProducerStageFromEvidence");
+    expect(repairOnlyBody).toContain("graphQueryScopeFromSync");
+    expect(repairOnlyBody).toContain("graph_identity_projection_missing");
+    expect(repairOnlyBody).toContain("graph_query_capability_projection_missing");
+    expect(repairOnlyBody).not.toContain("runtime.graphQuery");
+  });
+
   test("status-json starts transient retry budget at first failure", async () => {
     const tmpRoot = await mkProjectTmpDir("qmd-batch-long-run-first-transient-");
     const sourceDir = join(tmpRoot, "source");
@@ -3603,6 +3638,14 @@ describe("GraphRAG EPUB batch runner", () => {
         "  queryResult: null,",
         "  repairOnly: true,",
         "  repairedLocalArtifactGate: true,",
+        "  repairReason: 'graph_identity_projection_missing',",
+        "  repairedProjection: 'document_identity_map',",
+        `  repairEvidenceLocator: 'graph_vault/books/${batchBookId(repairedHash, repairedRelativePath)}/output/qmd_graph_text_unit_identity.json',`,
+        "  reusedProducerRunIds: {",
+        "    graph_extract: 'run-graph-extract',",
+        "    community_report: 'run-community-report',",
+        "    embed: 'run-embed',",
+        "  },",
         "}));",
         "}",
       ].join("\n"),
@@ -3728,6 +3771,682 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(repairedCheckpoint.metadata?.localArtifactGateRepairBlockedReason)
       .toBeUndefined();
     await rm(tmpRoot, { recursive: true, force: true });
+  });
+
+  test.each([
+    {
+      name: "document identity",
+      failureText:
+        "GraphRAG document identity is missing for query_ready: doc-fd8875181a17",
+      repairReason: "graph_identity_projection_missing",
+      repairedProjection: "document_identity_map",
+      evidenceSuffix: "output/qmd_graph_text_unit_identity.json",
+    },
+    {
+      name: "graph capability",
+      failureText:
+        "capabilityScope references unknown or not-ready graphCapabilityId(s): " +
+        "book-356ff4920cdf-0bbd8bdb:graph_query",
+      repairReason: "graph_query_capability_projection_missing",
+      repairedProjection: "graph_capability",
+      evidenceSuffix: "checkpoints.yaml#query_ready",
+    },
+  ])("reopens query-ready $name projection gate failures with fixed repair metadata", async ({
+    failureText,
+    repairReason,
+    repairedProjection,
+    evidenceSuffix,
+  }) => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-query-ready-reopen-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "query-ready-reopen";
+    const sourceBytes = "query ready projection reopen";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    const sourcePath = join(sourceDir, "Book.epub");
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const bookId = batchBookId(sourceHash, sourceRelativePath);
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        pendingItems: 0,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "failed",
+        sourceName: "Book.epub",
+        sourceRelativePath,
+        sourceIdentityPath: sourceRelativePath,
+        sourceHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        bookId,
+        attempts: 1,
+        failedAt: "2026-05-23T00:10:00.000Z",
+        failureKind: "permanent",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "resume-book-1",
+        errorSummary: failureText,
+        commandChecks: [{
+          name: "resume-book-1",
+          status: "failed",
+          attempts: 1,
+          exitCode: 1,
+          stdoutBytes: 0,
+          stderrBytes: 128,
+          startedAt: "2026-05-23T00:00:00.000Z",
+          completedAt: "2026-05-23T00:01:00.000Z",
+          failureKind: "permanent",
+          retryable: false,
+          attemptExhausted: true,
+          recoveryDecision: "stop_until_fixed",
+          errorSummary: failureText,
+        }],
+      }),
+    );
+    const resumeScript = join(
+      tmpRoot,
+      "scripts",
+      "graphrag",
+      "resume-book-workspace.mjs",
+    );
+    await mkdir(dirname(resumeScript), { recursive: true });
+    await writeFile(
+      resumeScript,
+      [
+        "console.log(JSON.stringify({",
+        "  status: 'repaired',",
+        `  bookId: '${bookId}',`,
+        "  startedStage: null,",
+        "  nextStage: null,",
+        "  completedStages: ['graph_extract', 'community_report', 'embed', 'query_ready'],",
+        "  queryResult: null,",
+        "  repairOnly: true,",
+        "  repairedLocalArtifactGate: true,",
+        `  repairReason: '${repairReason}',`,
+        `  repairedProjection: '${repairedProjection}',`,
+        `  repairEvidenceLocator: 'graph_vault/books/${bookId}/${evidenceSuffix}',`,
+        "  reusedProducerRunIds: {",
+        "    graph_extract: 'run-graph-extract',",
+        "    community_report: 'run-community-report',",
+        "    embed: 'run-embed',",
+        "    query_ready: 'run-query-ready',",
+        "  },",
+        "}));",
+      ].join("\n"),
+    );
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+      ], {
+        env: {
+          ...process.env,
+          QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+          QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
+        },
+      });
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+      proc.stderr.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    const checkpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      "utf8",
+    ));
+    const events = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
+      "utf8",
+    ).trim().split("\n").map((line) => JSON.parse(line));
+    const summary = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "recovery-summary.json"),
+      "utf8",
+    ));
+    const expectedRepairMetadata = {
+      reopenedFromStatus: "failed",
+      reopenedToStatus: "pending",
+      reopenedFromRecoveryDecision: "stop_until_fixed",
+      repairReason,
+      repairFailureText: failureText,
+      repairedProjection,
+      repairEvidenceLocator: `graph_vault/books/${bookId}/${evidenceSuffix}`,
+      reusedProducerRunIds: {
+        graph_extract: "run-graph-extract",
+        community_report: "run-community-report",
+        embed: "run-embed",
+        query_ready: "run-query-ready",
+      },
+      normalCommandChecksRequired: true,
+    };
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toBe("");
+    expect(checkpoint.status).toBe("failed");
+    expect(checkpoint.failedStage).toBe("normalize-epub");
+    expect(checkpoint.commandChecks[0]?.name).toBe("normalize-epub");
+    expect(checkpoint.metadata).toMatchObject({
+      localArtifactGateRepairCompleted: true,
+      ...expectedRepairMetadata,
+      waitingForProviderRecovery: false,
+    });
+    expect(events.some((event) =>
+      event.itemId === itemId &&
+      event.event === "item_local_artifact_gate_repair_reopened" &&
+      event.status === "pending" &&
+      event.metadata?.normalCommandChecksRequired === true &&
+      event.metadata?.repairReason === repairReason &&
+      event.metadata?.repairedProjection === repairedProjection
+    )).toBe(true);
+    expect(summary.items[0]).toMatchObject({
+      status: "failed",
+      ...expectedRepairMetadata,
+    });
+    expect(events.some((event) =>
+      event.itemId === itemId &&
+      event.event === "item_start"
+    )).toBe(true);
+    expect(checkpoint.status).not.toBe("completed");
+    await rm(tmpRoot, { recursive: true, force: true });
+  });
+
+  test("mixed data compatibility and local projection text still stops batch", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-mixed-data-compat-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "mixed-data-compat";
+    const sourceBytes = "mixed data compatibility failure";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    const sourcePath = join(sourceDir, "Book.epub");
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const compatibilityError =
+      "GraphRAG community text-unit context references missing text units: tu-1";
+    const localProjectionError =
+      "GraphRAG document identity is missing for query_ready: doc-fd8875181a17";
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        pendingItems: 0,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "failed",
+        sourceName: "Book.epub",
+        sourceRelativePath,
+        sourceIdentityPath: sourceRelativePath,
+        sourceHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        bookId: batchBookId(sourceHash, sourceRelativePath),
+        attempts: 1,
+        failedAt: "2026-05-23T00:10:00.000Z",
+        failureKind: "data_compatibility",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "resume-book-2",
+        errorSummary: compatibilityError,
+        commandChecks: [{
+          name: "resume-book-2",
+          status: "failed",
+          attempts: 1,
+          exitCode: 1,
+          stdoutBytes: 0,
+          stderrBytes: 128,
+          startedAt: "2026-05-23T00:00:00.000Z",
+          completedAt: "2026-05-23T00:01:00.000Z",
+          failureKind: "permanent",
+          retryable: false,
+          attemptExhausted: true,
+          recoveryDecision: "stop_until_fixed",
+          errorSummary: localProjectionError,
+        }],
+      }),
+    );
+    const resumeScript = join(tmpRoot, "should-not-run.mjs");
+    await writeFile(
+      resumeScript,
+      "throw new Error('repair runner should not be invoked');\n",
+      "utf8",
+    );
+
+    const result = await new Promise<{ stderr: string; exitCode: number | null }>(
+      (resolveResult) => {
+        const proc = spawn(process.execPath, [
+          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+          "--source-dir",
+          sourceDir,
+          "--state-root",
+          stateRoot,
+          "--log-root",
+          logRoot,
+          "--config",
+          join(configDir, "index.yml"),
+          "--qmd-index-path",
+          join(tmpRoot, "index.sqlite"),
+          "--run-id",
+          runId,
+          "--skip-dotenv",
+        ], {
+          env: {
+            ...process.env,
+            QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+            QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
+          },
+        });
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+        proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+      },
+    );
+
+    const checkpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      "utf8",
+    ));
+    const events = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
+      "utf8",
+    ).trim().split("\n").map((line) => JSON.parse(line));
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toBe("");
+    expect(checkpoint).toMatchObject({
+      status: "failed",
+      failureKind: "data_compatibility",
+      retryable: false,
+      recoveryDecision: "stop_until_fixed",
+    });
+    expect(events.some((event) =>
+      event.event === "item_local_artifact_gate_repair"
+    )).toBe(false);
+    expect(events.some((event) =>
+      event.event === "batch_stopped_after_data_compatibility_failure" &&
+      event.itemId === itemId
+    )).toBe(true);
+  });
+
+  test("mixed provider failure and local projection text does not repair", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-mixed-provider-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "mixed-provider";
+    const sourceBytes = "mixed provider failure";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    const sourcePath = join(sourceDir, "Book.epub");
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const providerError = "HTTP 401 upstream unauthorized";
+    const localProjectionError =
+      "GraphRAG document identity is missing for query_ready: doc-fd8875181a17";
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        pendingItems: 0,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "failed",
+        sourceName: "Book.epub",
+        sourceRelativePath,
+        sourceIdentityPath: sourceRelativePath,
+        sourceHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        bookId: batchBookId(sourceHash, sourceRelativePath),
+        attempts: 1,
+        failedAt: "2026-05-23T00:10:00.000Z",
+        failureKind: "permanent",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "resume-book-1",
+        errorSummary: localProjectionError,
+        commandChecks: [{
+          name: "resume-book-1",
+          status: "failed",
+          attempts: 1,
+          exitCode: 1,
+          stdoutBytes: 0,
+          stderrBytes: 128,
+          startedAt: "2026-05-23T00:00:00.000Z",
+          completedAt: "2026-05-23T00:01:00.000Z",
+          failureKind: "permanent",
+          retryable: false,
+          attemptExhausted: true,
+          providerStatusCode: 401,
+          recoveryDecision: "stop_until_fixed",
+          errorSummary: providerError,
+        }],
+      }),
+    );
+    const resumeScript = join(tmpRoot, "should-not-run.mjs");
+    await writeFile(
+      resumeScript,
+      "throw new Error('repair runner should not be invoked');\n",
+      "utf8",
+    );
+
+    const result = await new Promise<{ stderr: string; exitCode: number | null }>(
+      (resolveResult) => {
+        const proc = spawn(process.execPath, [
+          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+          "--source-dir",
+          sourceDir,
+          "--state-root",
+          stateRoot,
+          "--log-root",
+          logRoot,
+          "--config",
+          join(configDir, "index.yml"),
+          "--qmd-index-path",
+          join(tmpRoot, "index.sqlite"),
+          "--run-id",
+          runId,
+          "--skip-dotenv",
+        ], {
+          env: {
+            ...process.env,
+            QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+            QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
+          },
+        });
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+        proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+      },
+    );
+
+    const checkpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      "utf8",
+    ));
+    const events = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
+      "utf8",
+    ).trim().split("\n").map((line) => JSON.parse(line));
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toBe("");
+    expect(checkpoint).toMatchObject({
+      status: "failed",
+      failureKind: "permanent",
+      retryable: false,
+      recoveryDecision: "stop_until_fixed",
+    });
+    expect(checkpoint.commandChecks[0]).toMatchObject({
+      providerStatusCode: 401,
+    });
+    expect(events.some((event) =>
+      event.event === "item_local_artifact_gate_repair"
+    )).toBe(false);
+    expect(events.some((event) =>
+      event.event === "item_failed_not_retryable" &&
+      event.itemId === itemId
+    )).toBe(true);
+  });
+
+  test("blocks repaired local projection output that lacks required metadata", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-repair-missing-meta-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "repair-missing-meta";
+    const sourceBytes = "missing repair metadata";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    const sourcePath = join(sourceDir, "Book.epub");
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const bookId = batchBookId(sourceHash, sourceRelativePath);
+    const failureText =
+      "GraphRAG document identity is missing for query_ready: doc-fd8875181a17";
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        pendingItems: 0,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "failed",
+        sourceName: "Book.epub",
+        sourceRelativePath,
+        sourceIdentityPath: sourceRelativePath,
+        sourceHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        bookId,
+        attempts: 1,
+        failedAt: "2026-05-23T00:10:00.000Z",
+        failureKind: "permanent",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "resume-book-1",
+        errorSummary: failureText,
+        commandChecks: [],
+      }),
+    );
+    const resumeScript = join(tmpRoot, "fake-repair-missing-meta.mjs");
+    await writeFile(
+      resumeScript,
+      [
+        "console.log(JSON.stringify({",
+        "  status: 'repaired',",
+        `  bookId: '${bookId}',`,
+        "  repairOnly: true,",
+        "  repairedLocalArtifactGate: true",
+        "}));",
+      ].join("\n"),
+    );
+
+    const result = await new Promise<{ stderr: string; exitCode: number | null }>(
+      (resolveResult) => {
+        const proc = spawn(process.execPath, [
+          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+          "--source-dir",
+          sourceDir,
+          "--state-root",
+          stateRoot,
+          "--log-root",
+          logRoot,
+          "--config",
+          join(configDir, "index.yml"),
+          "--qmd-index-path",
+          join(tmpRoot, "index.sqlite"),
+          "--run-id",
+          runId,
+          "--skip-dotenv",
+        ], {
+          env: {
+            ...process.env,
+            QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+            QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
+          },
+        });
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+        proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+      },
+    );
+
+    const checkpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      "utf8",
+    ));
+    const events = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
+      "utf8",
+    ).trim().split("\n").map((line) => JSON.parse(line));
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toBe("");
+    expect(checkpoint).toMatchObject({
+      status: "pending",
+      recoveryDecision: "continue_pending",
+      retryable: false,
+      metadata: {
+        localArtifactGateRepairBlocked: true,
+      },
+    });
+    expect(checkpoint.metadata?.localArtifactGateRepairCompleted).toBeUndefined();
+    expect(checkpoint.metadata?.repairReason).toBeUndefined();
+    expect(events.some((event) =>
+      event.event === "item_local_artifact_gate_repair_reopened"
+    )).toBe(false);
+    expect(events.some((event) =>
+      event.event === "item_local_artifact_gate_repair_blocked" &&
+      event.metadata?.repairedLocalArtifactGate === false
+    )).toBe(true);
   });
 
   test("status-json hydrates event-proven repair-only blocked loops", async () => {

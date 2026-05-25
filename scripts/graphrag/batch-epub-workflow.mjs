@@ -127,6 +127,32 @@ const failFast = Boolean(values["fail-fast"]);
 const migrateOnly = Boolean(values["migrate-only"]);
 const statusJson = Boolean(values["status-json"]);
 
+const RepairReasonSchema = z.enum([
+  "graph_identity_projection_missing",
+  "graph_query_capability_projection_missing",
+]);
+const RepairedProjectionSchema = z.union([
+  z.enum(["document_identity_map", "graph_capability"]),
+  z.array(z.enum(["document_identity_map", "graph_capability"]))
+    .min(1)
+    .max(2),
+]);
+const RepairMetadataSchema = z.object({
+  reopenedFromStatus: z.string().min(1),
+  reopenedToStatus: z.literal("pending"),
+  reopenedFromRecoveryDecision: z.string().min(1),
+  repairReason: RepairReasonSchema,
+  repairFailureText: z.string().min(1).max(1000),
+  repairedProjection: RepairedProjectionSchema,
+  repairEvidenceLocator: z.string().min(1),
+  reusedProducerRunIds: z.object({
+    graph_extract: z.string().min(1),
+    community_report: z.string().min(1),
+    embed: z.string().min(1),
+  }).passthrough(),
+  normalCommandChecksRequired: z.literal(true),
+});
+
 const batchRoot = join(stateRoot, "catalog", "batch-runs", runId);
 const itemRoot = join(batchRoot, "items");
 const eventsPath = join(batchRoot, "events.jsonl");
@@ -490,6 +516,15 @@ const BatchRecoverySummaryItemSchema = z.object({
   runnerHeartbeatAt: z.string().datetime().optional(),
   orphanedRunnerDetectedAt: z.string().datetime().optional(),
   waitingForProviderRecovery: z.boolean().optional(),
+  reopenedFromStatus: BatchItemStatusSchema.optional(),
+  reopenedToStatus: BatchItemStatusSchema.optional(),
+  reopenedFromRecoveryDecision: BatchRecoveryDecisionSchema.optional(),
+  repairReason: z.string().min(1).optional(),
+  repairFailureText: z.string().max(1000).optional(),
+  repairedProjection: JsonValueSchema.optional(),
+  repairEvidenceLocator: z.string().min(1).optional(),
+  reusedProducerRunIds: z.record(z.string(), z.string().min(1)).optional(),
+  normalCommandChecksRequired: z.boolean().optional(),
   errorSummary: z.string().max(1000).optional(),
 });
 const BatchRecoverySummarySchema = z.object({
@@ -600,16 +635,64 @@ function nextProviderRecoveryWaitCount(checkpoint) {
 }
 
 function checkpointFailureText(checkpoint) {
-  return [
+  return [...new Set([
     checkpoint?.errorSummary,
     ...(checkpoint?.commandChecks ?? [])
       .filter((check) => check.status === "failed")
       .map((check) => check.errorSummary),
-  ].filter(Boolean).join("\n");
+  ].filter(Boolean))].join("\n");
 }
 
 function checkpointHasLocalArtifactGateFailure(checkpoint) {
   return isLocalArtifactGateFailureText(checkpointFailureText(checkpoint));
+}
+
+function checkpointHasProviderStatusCode(checkpoint) {
+  if (Number.isInteger(checkpoint?.providerStatusCode)) return true;
+  return (checkpoint?.commandChecks ?? []).some((check) =>
+    check.status === "failed" && Number.isInteger(check.providerStatusCode)
+  );
+}
+
+function checkpointClassifiedFailure(checkpoint) {
+  const failure = classifyFailure(checkpointFailureText(checkpoint));
+  if (failure.failureKind !== "unknown") return failure;
+  return {
+    failureKind: checkpoint?.failureKind ?? "unknown",
+    retryable: checkpoint?.retryable ?? false,
+  };
+}
+
+function canRepairLocalArtifactGate(checkpoint) {
+  if (
+    checkpoint?.status !== "failed" ||
+    checkpoint.retryable !== false ||
+    checkpoint.recoveryDecision !== "stop_until_fixed"
+  ) {
+    return false;
+  }
+  if (!checkpointHasLocalArtifactGateFailure(checkpoint)) return false;
+  const failure = checkpointClassifiedFailure(checkpoint);
+  if (failure.providerStatusCode != null || checkpointHasProviderStatusCode(checkpoint)) {
+    return false;
+  }
+  if (
+    failure.failureKind === "transient" ||
+    failure.failureKind === "data_compatibility"
+  ) {
+    return false;
+  }
+  return checkpoint.failureKind !== "transient" &&
+    checkpoint.failureKind !== "data_compatibility";
+}
+
+function checkpointHasDataCompatibilityFailure(checkpoint) {
+  return checkpoint?.failureKind === "data_compatibility" ||
+    checkpointClassifiedFailure(checkpoint).failureKind === "data_compatibility";
+}
+
+function parseRepairMetadata(metadata) {
+  return RepairMetadataSchema.parse(withoutUndefined(metadata));
 }
 
 function checkpointHasTransientFailure(checkpoint) {
@@ -2487,6 +2570,15 @@ function buildRecoverySummary(manifest, checkpoints) {
       runnerHeartbeatAt: item.runnerHeartbeatAt,
       orphanedRunnerDetectedAt: item.orphanedRunnerDetectedAt,
       waitingForProviderRecovery,
+      reopenedFromStatus: item.metadata?.reopenedFromStatus,
+      reopenedToStatus: item.metadata?.reopenedToStatus,
+      reopenedFromRecoveryDecision: item.metadata?.reopenedFromRecoveryDecision,
+      repairReason: item.metadata?.repairReason,
+      repairFailureText: item.metadata?.repairFailureText,
+      repairedProjection: item.metadata?.repairedProjection,
+      repairEvidenceLocator: item.metadata?.repairEvidenceLocator,
+      reusedProducerRunIds: item.metadata?.reusedProducerRunIds,
+      normalCommandChecksRequired: item.metadata?.normalCommandChecksRequired,
       errorSummary: item.errorSummary ? redacted(item.errorSummary) : undefined,
     });
   });
@@ -3156,6 +3248,67 @@ function repairLocalArtifactGate(item, checkpoint) {
   const repairResult = runGraphResume(item, checkpoint, {
     repairLocalArtifactGateOnly: true,
   });
+  const repairFailureText = redacted(checkpointFailureText(checkpoint));
+  const repairMetadataCandidate = {
+    reopenedFromStatus: checkpoint.status,
+    reopenedToStatus: "pending",
+    reopenedFromRecoveryDecision: checkpoint.recoveryDecision ?? "stop_until_fixed",
+    repairReason: repairResult.resume?.repairReason,
+    repairFailureText,
+    repairedProjection: repairResult.resume?.repairedProjection,
+    repairEvidenceLocator: repairResult.resume?.repairEvidenceLocator,
+    reusedProducerRunIds: repairResult.resume?.reusedProducerRunIds,
+    normalCommandChecksRequired: true,
+  };
+  let repairMetadata = null;
+  try {
+    repairMetadata = parseRepairMetadata(repairMetadataCandidate);
+  } catch (error) {
+    if (repairResult?.status !== "blocked") {
+      const reason = redacted(error instanceof Error
+        ? error.message
+        : String(error));
+      event({
+        itemId: item.itemId,
+        event: "item_local_artifact_gate_repair_blocked",
+        status: "pending",
+        failureKind: checkpoint.failureKind ?? "permanent",
+        retryable: false,
+        recoveryDecision: "continue_pending",
+        failedStage: checkpoint.failedStage,
+        message: reason,
+        metadata: {
+          repairOnly: true,
+          repairedLocalArtifactGate: false,
+          resumeStatus: repairResult?.resume?.status,
+          reason,
+        },
+      });
+      return {
+        ...checkpoint,
+        status: "pending",
+        bookId: repairResult.bookId ?? checkpoint.bookId,
+        failedAt: undefined,
+        errorSummary: reason,
+        failureKind: checkpoint.failureKind ?? "permanent",
+        retryable: false,
+        retryExhausted: undefined,
+        recoveryDecision: "continue_pending",
+        failedStage: checkpoint.failedStage ?? "repair-local-artifact-gate",
+        nextRetryAt: undefined,
+        retryDelaySeconds: undefined,
+        runnerHeartbeatAt: now(),
+        commandChecks: [],
+        metadata: {
+          ...(checkpoint.metadata ?? {}),
+          localArtifactGateRepairCompleted: undefined,
+          localArtifactGateRepairBlocked: true,
+          localArtifactGateRepairBlockedReason: reason,
+          waitingForProviderRecovery: false,
+        },
+      };
+    }
+  }
   if (repairResult?.status === "blocked") {
     const reason = redacted(repairResult.resume?.reason ?? "repair blocked");
     event({
@@ -3172,6 +3325,7 @@ function repairLocalArtifactGate(item, checkpoint) {
         repairedLocalArtifactGate: false,
         resumeStatus: repairResult.resume?.status,
         reason,
+        ...(repairMetadata ?? {}),
       },
     });
     return {
@@ -3191,6 +3345,7 @@ function repairLocalArtifactGate(item, checkpoint) {
       commandChecks: [],
       metadata: {
         ...(checkpoint.metadata ?? {}),
+        ...(repairMetadata ?? {}),
         localArtifactGateRepairCompleted: undefined,
         localArtifactGateRepairBlocked: true,
         localArtifactGateRepairBlockedReason: reason,
@@ -3198,6 +3353,22 @@ function repairLocalArtifactGate(item, checkpoint) {
       },
     };
   }
+  event({
+    itemId: item.itemId,
+    event: "item_local_artifact_gate_repair_reopened",
+    status: "pending",
+    failureKind: checkpoint.failureKind ?? "permanent",
+    retryable: false,
+    recoveryDecision: "continue_pending",
+    failedStage: checkpoint.failedStage,
+    message: repairFailureText,
+    metadata: {
+      repairOnly: true,
+      repairedLocalArtifactGate: true,
+      resumeStatus: repairResult?.resume?.status,
+      ...repairMetadata,
+    },
+  });
   return {
     ...checkpoint,
     status: "pending",
@@ -3215,6 +3386,7 @@ function repairLocalArtifactGate(item, checkpoint) {
     commandChecks: [],
     metadata: {
       ...(checkpoint.metadata ?? {}),
+      ...repairMetadata,
       localArtifactGateRepairBlocked: undefined,
       localArtifactGateRepairBlockedReason: undefined,
       localArtifactGateRepairCompleted: true,
@@ -3526,12 +3698,11 @@ function shouldStopBatchAfterFailure(checkpoint) {
   return checkpoint?.status === "failed" &&
     checkpoint.retryable === false &&
     checkpoint.recoveryDecision === "stop_until_fixed" &&
-    checkpoint.failureKind === "data_compatibility";
+    checkpointHasDataCompatibilityFailure(checkpoint);
 }
 
 function shouldStopBatchBeforeProcessing(checkpoint) {
-  return shouldStopBatchAfterFailure(checkpoint) &&
-    !checkpointHasLocalArtifactGateFailure(checkpoint);
+  return shouldStopBatchAfterFailure(checkpoint);
 }
 
 function emitBatchStoppedAfterNonTransientFailure(checkpoint) {
@@ -3670,7 +3841,7 @@ function main() {
       let checkpoint = checkpoints.get(item.itemId);
       if (
         shouldStopBatchAfterFailure(checkpoint) &&
-        !checkpointHasLocalArtifactGateFailure(checkpoint)
+        !canRepairLocalArtifactGate(checkpoint)
       ) {
         if (!stopLoggedThisRun.has(checkpoint.itemId)) {
           emitBatchStoppedAfterNonTransientFailure(checkpoint);
@@ -3714,7 +3885,7 @@ function main() {
         });
       }
       if (checkpoint?.status === "failed" && checkpoint.retryable === false) {
-        if (checkpointHasLocalArtifactGateFailure(checkpoint)) {
+        if (canRepairLocalArtifactGate(checkpoint)) {
           event({
             itemId: item.itemId,
             event: "item_local_artifact_gate_repair",
