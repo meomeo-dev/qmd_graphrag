@@ -1,0 +1,88 @@
+schemaVersion: 1
+caseId: graphrag-artifact-gate-recovery
+runId: graphrag-artifact-gate-recovery-run_1
+status: passed
+scope: >
+  审计 GraphRAG 产物隔离、阶段门控、每书 QMD/GraphRAG 状态、
+  transient recovery、resume semantics、以及查询输出投影。
+baselinePolicy:
+  fixedBeforeAudit: true
+  mutableDuringRun: false
+  agentBaselineFiles:
+    agent-a: agent-a/baseline.md
+    agent-b: agent-b/baseline.md
+    agent-c: agent-c/baseline.md
+agents:
+  agent-a:
+    nickname: Herschel
+    agentId: 019e5fbe-c49f-73b0-a4d6-88d9d54db984
+    baselineFile: agent-a/baseline.md
+    reportFile: agent-a/report.md
+    status: passed
+  agent-b:
+    nickname: Faraday
+    agentId: 019e5fbe-e9f4-7b70-891c-c15d98eb695c
+    baselineFile: agent-b/baseline.md
+    reportFile: agent-b/report.md
+    status: passed
+  agent-c:
+    nickname: Schrodinger
+    agentId: 019e5fbf-0d0a-7653-a279-63ec082eb74b
+    baselineFile: agent-c/baseline.md
+    reportFile: agent-c/report.md
+    status: passed
+    firstResult: failed
+    firstReportFile: agent-c/report.md
+    rerunReportFile: agent-c/report-rerun-1.md
+    rerunResult: failed
+    rerun2ReportFile: agent-c/report-rerun-2.md
+    rerun2Result: passed
+fixes:
+  - reason: >
+      Agent C baseline 3 found a Type-DD documentation conflict: stale remote
+      heartbeat was described as observed but not recovered.
+    files:
+      - docs/architecture/unified-retrieval-plane.md
+      - docs/architecture/unified-retrieval-plane.type-dd.yaml
+    verification:
+      - command: >
+          node ./node_modules/vitest/vitest.mjs run test/cli.test.ts
+          --testNamePattern 'stale remote running|fresh remote running|orphaned
+          running|stale provider wait' --testTimeout 120000 --reporter=dot
+        status: passed
+  - reason: >
+      Agent C rerun found a second stale ownership rule in the same Type-DD
+      file that omitted remote heartbeat TTL recovery.
+    files:
+      - docs/architecture/unified-retrieval-plane.type-dd.yaml
+    verification:
+      - command: >
+          rg -n "even when the remote heartbeat is stale|Remote ownership is
+          observed but not stolen|Only missing ownership or a dead"
+          docs/architecture docs/operations catalog
+        status: passed
+      - command: >
+          node ./node_modules/vitest/vitest.mjs run test/cli.test.ts
+          --testNamePattern 'stale remote running|fresh remote running|orphaned
+          running|stale provider wait' --testTimeout 120000 --reporter=dot
+        status: passed
+localVerification:
+  - command: npm run test:types
+    status: passed
+  - command: .venv-graphrag/bin/python test/python/test_graphrag_bridge_scope.py
+    status: passed
+  - command: >
+      node ./node_modules/vitest/vitest.mjs run test/unified-query.test.ts
+      test/cli-graphrag-route.test.ts test/integrations/graphrag-cost.test.ts
+      --testTimeout 60000 --reporter=dot
+    status: passed
+  - command: >
+      node ./node_modules/vitest/vitest.mjs run test/book-job-state.test.ts
+      test/graphrag-book-state.test.ts test/integrations/contracts.test.ts
+      --testTimeout 120000 --reporter=dot
+    status: passed
+  - command: >
+      node ./node_modules/vitest/vitest.mjs run test/cli.test.ts
+      --testTimeout 120000 --reporter=dot
+    status: passed
+finalReport: final-report.md
