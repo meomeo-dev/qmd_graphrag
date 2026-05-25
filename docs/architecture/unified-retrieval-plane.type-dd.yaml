@@ -247,10 +247,14 @@ identity_model:
   book_id:
     description: Book-level GraphRAG processing identity.
     producer: src/job-state/fingerprint.ts#buildBookIdFromSourceHash
-    canonical_derivation: sourceHash
+    canonical_derivation: sourceHash + sourceIdentityPath
     display_fields:
       - bookDisplaySlug
-    invariant: Same source payload produces the same bookId across devices.
+    invariant: >-
+      Same source payload at the same canonical source identity produces the
+      same bookId. Duplicate payloads at different source identities remain
+      isolated so one book cannot reuse or overwrite another book's GraphRAG
+      artifacts.
   content_hash:
     description: Stable identity of normalized text content.
     producer: src/store.ts#hashContent
@@ -326,6 +330,14 @@ typed_buses:
           - scripts/graphrag/batch-epub-workflow.mjs#saveCheckpoint
         consumers:
           - scripts/graphrag/batch-epub-workflow.mjs#loadCheckpoint
+        identity_fields:
+          - sourceHash
+          - sourceIdentityPath
+          - bookId
+        required_status_fields:
+          - qmdBuildStatus
+          - graphBuildStatus
+          - graphQueryStatus
       - name: batch_event_log
         schema: src/contracts/batch-run.ts#BatchEventLogSchema
         envelope: src/contracts/batch-run.ts#BatchEventLogEnvelopeSchema
@@ -1566,9 +1578,10 @@ state_and_recovery:
       other item can run.
     runner_ownership_rule: >-
       Running checkpoints carry runnerSessionId, runnerHost, runnerPid, and
-      runnerHeartbeatAt. Fresh remote ownership is observed but not stolen.
-      Missing ownership, expired heartbeats, or dead local runner PIDs are
-      recovered to pending with recoveryDecision=retry_same_run_id.
+      runnerHeartbeatAt. Fresh remote ownership within the heartbeat TTL is
+      observed but not stolen. Missing ownership, heartbeat older than TTL,
+      or a dead local runner PID is recovered to pending with
+      recoveryDecision=retry_same_run_id.
     status_json_projection_rule: >-
       --status-json is a read-only projection. It recomputes recovery decisions,
       qmdBuildStatus, graphBuildStatus, and graphQueryStatus for stdout without
@@ -1576,7 +1589,14 @@ state_and_recovery:
     command_timeout_rule: >-
       Every spawned command has commandTimeoutSeconds. Timeout failures are
       classified as transient and enter the same bounded retry path as provider
-      rate limits and 5xx errors.
+      rate limits and 5xx errors. The batch default is 21600 seconds so a
+      large-book GraphRAG stage is not killed by the runner before provider
+      retries can report a typed transient failure.
+    retry_budget_start_rule: >-
+      retryBudgetSeconds starts at the first transient failure time, not at
+      the beginning of a book's normal qmd or GraphRAG processing. Long
+      successful GraphRAG work before the first provider outage must not
+      consume the recovery window.
     stage_report_health_rule: >-
       A GraphRAG stage is completed only when the stage-scoped
       indexing-engine.log segment contains no provider transient error and no
@@ -1593,6 +1613,7 @@ state_and_recovery:
       checkpoints, and high-cost artifacts to agree on bookId, sourceHash,
       documentId, contentHash, providerFingerprint, stageFingerprints, and
       stageProducerRunIds. Host absolute outputDir values are stale.
+      Stage checkpoint bookId and contentHash are fail-closed identity fields.
     artifact_hash_rule: >-
       BookArtifactManifest.contentHash is the artifact byte or canonical
       directory hash. GraphRAG and LanceDB artifacts also carry
@@ -1607,10 +1628,14 @@ state_and_recovery:
       query_ready checkpoints publish graph capabilities only from book-scoped
       GraphRAG artifacts under books/<book_id>/output. Shared graph_vault/output
       artifacts are invalid for query_ready capability publication.
+      query_ready also requires completed and validated graph_extract,
+      community_report, and embed producer checkpoints before publishing
+      capability.
     running_ownership_rule: >-
-      A fresh running checkpoint owned by another runner session is observed but
-      not stolen. Only missing, expired, or dead runner ownership is downgraded
-      to pending recovery.
+      A running checkpoint owned by another runner host is observed but not
+      stolen while its heartbeat is within TTL. Missing ownership, heartbeat
+      older than TTL, or a dead same-host runner PID is downgraded to pending
+      recovery with recoveryDecision=retry_same_run_id.
     retry_exhaustion_rule: >-
       A transient item whose short retry budget is exhausted enters provider
       recovery wait, not a terminal failed state. The item remains
@@ -1829,8 +1854,10 @@ design_decisions:
     validation_rule: >-
       Explicit capability catalog entries are consumed only when the
       corresponding query-ready checkpoint references validated community-report
-      and embedding artifacts. Artifact stage remains the producer stage
-      (`community_report` or `embed`) and is not rewritten to `query_ready`.
+      and embedding artifacts and the same book has validated graph_extract,
+      community_report, and embed producer checkpoints. Artifact stage remains
+      the producer stage (`community_report` or `embed`) and is not rewritten
+      to `query_ready`.
     merge_rule: >-
       Book-state derived capabilities are authoritative. Explicit catalog
       entries supplement only capability semantic keys that are absent from the

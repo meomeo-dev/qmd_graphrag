@@ -65,7 +65,7 @@ const { values } = parseArgs({
     "retry-max-delay-seconds": { type: "string", default: "300" },
     "retry-budget-seconds": { type: "string", default: "7200" },
     "max-provider-recovery-waits": { type: "string", default: "3" },
-    "command-timeout-seconds": { type: "string", default: "5400" },
+    "command-timeout-seconds": { type: "string", default: "21600" },
     "completed-manifest": { type: "string" },
     "migrate-only": { type: "boolean", default: false },
     "status-json": { type: "boolean", default: false },
@@ -117,7 +117,7 @@ const maxProviderRecoveryWaits = Math.max(
 );
 const commandTimeoutSeconds = Math.max(
   1,
-  Number.parseInt(String(values["command-timeout-seconds"]), 10) || 5400,
+  Number.parseInt(String(values["command-timeout-seconds"]), 10) || 21600,
 );
 const runnerHost = hostname();
 const runnerPid = process.pid;
@@ -328,15 +328,20 @@ const GraphRagOutputProducerManifestSchema = z.object({
   providerFingerprint: z.string().min(1),
   outputDir: BatchProjectRelativeLocatorSchema,
   producerRunId: z.string().min(1),
-  stageProducerRunIds: z.record(z.string(), z.string().min(1)).optional(),
+  stageProducerRunIds: z.record(z.string(), z.string().min(1)),
 });
-const BatchItemCheckpointSchema = z.object({
+const GraphRagOutputProducerManifestLegacySchema =
+  GraphRagOutputProducerManifestSchema.extend({
+    stageProducerRunIds: z.record(z.string(), z.string().min(1)).optional(),
+  });
+const BatchItemCheckpointBaseSchema = z.object({
   schemaVersion: z.literal(SchemaVersion),
   itemId: z.string().min(1),
   runId: z.string().min(1),
   status: BatchItemStatusSchema,
   sourceName: z.string().min(1),
   sourceRelativePath: BatchProjectRelativeLocatorSchema,
+  sourceIdentityPath: BatchProjectRelativeLocatorSchema,
   sourceHash: z.string().min(1),
   normalizedPath: BatchProjectRelativeLocatorSchema,
   bookId: z.string().min(1),
@@ -372,6 +377,12 @@ const BatchItemCheckpointSchema = z.object({
   errorSummary: z.string().max(1000).optional(),
   commandChecks: z.array(BatchCommandCheckSchema).default([]),
   metadata: z.record(z.string(), JsonValueSchema).optional(),
+});
+const BatchItemCheckpointInputSchema = BatchItemCheckpointBaseSchema;
+const BatchItemCheckpointSchema = BatchItemCheckpointBaseSchema.extend({
+  qmdBuildStatus: BatchBuildStatusSchema,
+  graphBuildStatus: BatchBuildStatusSchema,
+  graphQueryStatus: BatchBuildStatusSchema,
 }).superRefine((value, ctx) => {
   if (value.status === "running") {
     for (const field of [
@@ -557,7 +568,7 @@ function retryDelaySecondsForAttempt(attempt) {
 }
 
 function elapsedRetrySeconds(checkpoint) {
-  const start = epochMs(checkpoint.retryStartedAt ?? checkpoint.startedAt);
+  const start = epochMs(checkpoint.retryStartedAt);
   if (start === 0) return 0;
   return Math.max(0, Math.floor((Date.now() - start) / 1000));
 }
@@ -601,15 +612,6 @@ function checkpointHasLocalArtifactGateFailure(checkpoint) {
   return isLocalArtifactGateFailureText(checkpointFailureText(checkpoint));
 }
 
-function checkpointHasRecoverableDataCompatibilityFailure(checkpoint) {
-  if (checkpoint?.failureKind !== "data_compatibility") return false;
-  if (checkpoint.metadata?.recoveredFromGraphRagTextUnitContextCompat === true) {
-    return false;
-  }
-  const text = checkpointFailureText(checkpoint);
-  return text.includes("'float' object is not subscriptable");
-}
-
 function checkpointHasTransientFailure(checkpoint) {
   const failure = classifyFailure(checkpointFailureText(checkpoint));
   if (failure.failureKind !== "unknown") {
@@ -639,12 +641,31 @@ function runningCheckpointIsOrphaned(checkpoint) {
   ) {
     return true;
   }
-  const heartbeatAgeSeconds =
-    Math.max(0, Math.floor((Date.now() - epochMs(checkpoint.runnerHeartbeatAt)) / 1000));
-  if (heartbeatAgeSeconds > runnerHeartbeatTtlSeconds) return true;
-  if (checkpoint.runnerHost !== runnerHost) return false;
-  if (checkpoint.runnerSessionId === runnerSessionId) return false;
-  return !processAlive(checkpoint.runnerPid);
+  const heartbeatAt = epochMs(checkpoint.runnerHeartbeatAt);
+  if (heartbeatAt === 0) return true;
+  const heartbeatAgeMs = Date.now() - heartbeatAt;
+  if (heartbeatAgeMs > runnerHeartbeatTtlSeconds * 1000) return true;
+  if (checkpoint.runnerHost === runnerHost) {
+    if (checkpoint.runnerSessionId === runnerSessionId) return false;
+    return !processAlive(checkpoint.runnerPid);
+  }
+  // Remote process liveness cannot be verified safely from this host. A fresh
+  // remote heartbeat still owns the item; stale leases are recovered above.
+  return false;
+}
+
+function activeRunningBookCheckpoint(item, checkpoints) {
+  for (const checkpoint of checkpoints.values()) {
+    if (
+      checkpoint.itemId !== item.itemId &&
+      checkpoint.bookId === item.bookId &&
+      checkpoint.status === "running" &&
+      !runningCheckpointIsOrphaned(checkpoint)
+    ) {
+      return checkpoint;
+    }
+  }
+  return undefined;
 }
 
 function sha256File(path) {
@@ -731,10 +752,12 @@ function redactJsonValue(value) {
   if (Array.isArray(value)) return value.map((item) => redactJsonValue(item));
   if (value != null && typeof value === "object") {
     return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [
-        key,
-        redactJsonValue(item),
-      ]),
+      Object.entries(value)
+        .filter(([, item]) => item !== undefined)
+        .map(([key, item]) => [
+          key,
+          redactJsonValue(item),
+        ]),
     );
   }
   return value;
@@ -895,11 +918,21 @@ function loadCatalogBySourceHash() {
   const items = Array.isArray(catalog.items) ? catalog.items : [];
   return new Map(items
     .filter((item) => typeof item.sourceHash === "string")
-    .map((item) => [item.sourceHash, item]));
+    .map((item) => [
+      `${item.sourceHash}:${String(
+        item.sourceIdentityPath ?? item.metadata?.sourceIdentityPath ??
+          item.sourcePath ?? "",
+      ).normalize("NFKC").toLowerCase()}`,
+      item,
+    ]));
 }
 
-function normalizedPathFor(sourcePath, sourceHash, catalogByHash) {
-  const catalogItem = catalogByHash.get(sourceHash);
+function catalogKey(sourceHash, sourceIdentityPath) {
+  return `${sourceHash}:${String(sourceIdentityPath).normalize("NFKC").toLowerCase()}`;
+}
+
+function normalizedPathFor(sourcePath, sourceHash, sourceIdentityPath, catalogByHash) {
+  const catalogItem = catalogByHash.get(catalogKey(sourceHash, sourceIdentityPath));
   if (typeof catalogItem?.normalizedPath === "string") {
     return join(stateRoot, catalogItem.normalizedPath);
   }
@@ -924,8 +957,9 @@ function itemIdFor(sourceHash, sourceRelativePath) {
   return `item-${sourceHash.slice(0, 12)}-${sha256Text(sourceRelativePath).slice(0, 8)}`;
 }
 
-function defaultBookIdFor(sourceHash) {
-  return `book-${sourceHash.slice(0, 12)}`;
+function defaultBookIdFor(sourceHash, sourceRelativePath = "") {
+  const pathHash = sha256Text(String(sourceRelativePath).normalize("NFKC").toLowerCase());
+  return `book-${sourceHash.slice(0, 12)}-${pathHash.slice(0, 8)}`;
 }
 
 function discoverItems() {
@@ -936,9 +970,14 @@ function discoverItems() {
     .map((name) => {
       const sourcePath = join(sourceDir, name);
       const sourceHash = sha256File(sourcePath);
-      const catalogItem = catalogByHash.get(sourceHash);
-      const normalizedPath = normalizedPathFor(sourcePath, sourceHash, catalogByHash);
       const sourceRelativePath = relative(root, sourcePath);
+      const catalogItem = catalogByHash.get(catalogKey(sourceHash, sourceRelativePath));
+      const normalizedPath = normalizedPathFor(
+        sourcePath,
+        sourceHash,
+        sourceRelativePath,
+        catalogByHash,
+      );
       return {
         itemId: itemIdFor(sourceHash, sourceRelativePath),
         sourceName: name,
@@ -947,9 +986,10 @@ function discoverItems() {
         normalizedPath,
         normalizedRel: relative(root, normalizedPath),
         sourceRelativePath,
+        sourceIdentityPath: sourceRelativePath,
         bookId: typeof catalogItem?.bookId === "string"
           ? catalogItem.bookId
-          : defaultBookIdFor(sourceHash),
+          : defaultBookIdFor(sourceHash, sourceRelativePath),
       };
     });
 }
@@ -1030,6 +1070,7 @@ function defaultCheckpoint(item, completedSeed = new Map()) {
     status: seedMatches && migrateOnly ? "skipped" : "pending",
     sourceName: item.sourceName,
     sourceRelativePath: item.sourceRelativePath,
+    sourceIdentityPath: item.sourceIdentityPath,
     sourceHash: item.sourceHash,
     normalizedPath: item.normalizedRel,
     bookId: item.bookId,
@@ -1068,7 +1109,7 @@ function hydrateCheckpoint(item, checkpoint) {
     retryBudgetSeconds,
     maxProviderRecoveryWaits,
     commandTimeoutSeconds,
-    defaultBookId: defaultBookIdFor(item.sourceHash),
+    defaultBookId: defaultBookIdFor(item.sourceHash, item.sourceRelativePath),
     repairOnlyBlockedLoopObserved: repairOnlyBlockedLoopObserved(item.itemId),
   });
   return withoutUndefined({
@@ -1095,7 +1136,10 @@ function loadCheckpoint(item, completedSeed) {
   const path = itemPath(item);
   if (!existsSync(path)) {
     if (statusJson) {
-      return BatchItemCheckpointSchema.parse(defaultCheckpoint(item, completedSeed));
+      return BatchItemCheckpointSchema.parse(withBuildStatusSnapshot(
+        item,
+        defaultCheckpoint(item, completedSeed),
+      ));
     }
     const checkpoint = defaultCheckpoint(item, completedSeed);
     return writeTypedJson(
@@ -1111,7 +1155,9 @@ function loadCheckpoint(item, completedSeed) {
       hydrated,
     )),
   );
-  if (statusJson) return BatchItemCheckpointSchema.parse(checkpoint);
+  if (statusJson) {
+    return BatchItemCheckpointSchema.parse(withBuildStatusSnapshot(item, checkpoint));
+  }
   return writeTypedJson(
     path,
     BatchItemCheckpointSchema,
@@ -1152,6 +1198,15 @@ function readJsonSchemaIfExists(path, schema) {
   return parsed.success ? parsed.data : null;
 }
 
+function readGraphOutputProducerManifest(path) {
+  if (!existsSync(path)) return null;
+  const raw = readJson(path);
+  const current = GraphRagOutputProducerManifestSchema.safeParse(raw);
+  if (current.success) return current.data;
+  const legacy = GraphRagOutputProducerManifestLegacySchema.safeParse(raw);
+  return legacy.success ? legacy.data : null;
+}
+
 const graphStageArtifactKinds = {
   graph_extract: [
     "graphrag_documents_parquet",
@@ -1160,6 +1215,7 @@ const graphStageArtifactKinds = {
     "graphrag_relationships_parquet",
     "graphrag_communities_parquet",
     "graphrag_context_json",
+    "graphrag_stats_json",
   ],
   community_report: ["graphrag_community_reports_parquet"],
   embed: ["lancedb_index"],
@@ -1559,6 +1615,25 @@ function validateGraphStageEvidence({
     };
   }
 
+  if (checkpoint.bookId !== item.bookId) {
+    return {
+      ok: false,
+      reason: `stage_checkpoint_book_mismatch:${stage}`,
+      artifactIds: checkpointArtifactIds(checkpoint),
+    };
+  }
+
+  if (
+    expectedCorpusContentHash != null &&
+    checkpoint.contentHash !== expectedCorpusContentHash
+  ) {
+    return {
+      ok: false,
+      reason: `stage_checkpoint_content_mismatch:${stage}`,
+      artifactIds: checkpointArtifactIds(checkpoint),
+    };
+  }
+
   if (
     expectedStageFingerprints != null &&
     (
@@ -1758,10 +1833,7 @@ function graphBuildEvidence(item) {
     "output",
     "qmd_output_manifest.json",
   );
-  const producer = readJsonSchemaIfExists(
-    producerManifestPath,
-    GraphRagOutputProducerManifestSchema,
-  );
+  const producer = readGraphOutputProducerManifest(producerManifestPath);
   const job = readGraphJob(item);
   const expectedStageFingerprints = job?.stageFingerprints ?? producer?.stageFingerprints;
   const expectedProviderFingerprint = job?.providerFingerprint ??
@@ -1770,10 +1842,11 @@ function graphBuildEvidence(item) {
     producer?.contentHash;
 
   for (const stage of graphCompletionStages) {
+    const checkpoint = checkpoints.find((checkpoint) => checkpoint?.stage === stage);
     const stageEvidence = validateGraphStageEvidence({
       item,
       stage,
-      checkpoint: checkpoints.find((checkpoint) => checkpoint?.stage === stage),
+      checkpoint,
       artifacts,
       expectedStageFingerprints,
       expectedProviderFingerprint,
@@ -1787,6 +1860,8 @@ function graphBuildEvidence(item) {
       return {
         status: stageEvidence.failed === true
           ? "failed"
+          : checkpoint?.status === "running"
+            ? "running"
           : stageEvidence.reason === "real_graphrag_stage_missing"
             ? "pending"
             : "stale",
@@ -2030,6 +2105,49 @@ function commandCheckSetEvidence(checkpoint) {
   };
 }
 
+function reopenRecoveryFromStatus(reopenStatus) {
+  if (reopenStatus.status !== "failed") {
+    return {
+      recoveryDecision: "continue_pending",
+      failureKind: undefined,
+      retryable: undefined,
+      retryExhausted: undefined,
+      nextRetryAt: undefined,
+      retryDelaySeconds: undefined,
+    };
+  }
+  const failedCheck = reopenStatus.stage == null
+    ? null
+    : reopenStatus.commandChecks?.find((check) =>
+      check.name === reopenStatus.stage && check.status === "failed"
+    );
+  if (
+    failedCheck?.failureKind === "transient" &&
+    failedCheck.retryable === true
+  ) {
+    return {
+      recoveryDecision: "retry_same_run_id",
+      failureKind: "transient",
+      retryable: true,
+      retryExhausted: false,
+      nextRetryAt: failedCheck.nextRetryAt,
+      retryDelaySeconds: failedCheck.retryDelaySeconds,
+      retryBudgetSeconds,
+      waitingForProviderRecovery: true,
+    };
+  }
+  return {
+    recoveryDecision: "continue_pending",
+    failureKind: failedCheck?.failureKind,
+    retryable: failedCheck?.retryable,
+    retryExhausted: undefined,
+    nextRetryAt: undefined,
+    retryDelaySeconds: undefined,
+    retryBudgetSeconds: undefined,
+    waitingForProviderRecovery: false,
+  };
+}
+
 function downgradeCompletedIfClosedLoopInvalid(item, checkpoint) {
   if (checkpoint.status !== "completed") return checkpoint;
   const commandCheckStatus = commandCheckSetEvidence(checkpoint);
@@ -2056,11 +2174,18 @@ function downgradeCompletedIfClosedLoopInvalid(item, checkpoint) {
     : qmdBuildStatus.status !== "succeeded"
       ? qmdBuildStatus
       : graphQueryStatus;
+  const reopenRecovery = reopenRecoveryFromStatus({
+    ...reopenStatus,
+    commandChecks: checkpoint.commandChecks ?? [],
+  });
   event({
     itemId: item.itemId,
     event: "item_completed_reopened",
     status: "pending",
-    recoveryDecision: "continue_pending",
+    recoveryDecision: reopenRecovery.recoveryDecision,
+    failureKind: reopenRecovery.failureKind,
+    retryable: reopenRecovery.retryable,
+    attemptExhausted: reopenRecovery.retryExhausted,
     failedStage: reopenStatus.stage,
     metadata: {
       qmdBuildStatus,
@@ -2073,8 +2198,14 @@ function downgradeCompletedIfClosedLoopInvalid(item, checkpoint) {
     ...checkpoint,
     status: "pending",
     completedAt: undefined,
-    recoveryDecision: "continue_pending",
+    recoveryDecision: reopenRecovery.recoveryDecision,
+    failureKind: reopenRecovery.failureKind,
+    retryable: reopenRecovery.retryable,
+    retryExhausted: reopenRecovery.retryExhausted,
     failedStage: reopenStatus.stage,
+    nextRetryAt: reopenRecovery.nextRetryAt,
+    retryDelaySeconds: reopenRecovery.retryDelaySeconds,
+    retryBudgetSeconds: reopenRecovery.retryBudgetSeconds,
     qmdBuildStatus,
     graphBuildStatus,
     graphQueryStatus,
@@ -2083,6 +2214,9 @@ function downgradeCompletedIfClosedLoopInvalid(item, checkpoint) {
       reopenedFromCompleted: true,
       reopenReason: reopenStatus.reason,
       commandCheckStatus,
+      ...(reopenRecovery.waitingForProviderRecovery == null
+        ? {}
+        : { waitingForProviderRecovery: reopenRecovery.waitingForProviderRecovery }),
     },
   };
 }
@@ -2130,6 +2264,12 @@ function recoverOrphanedRunningCheckpoint(item, checkpoint) {
   return recovered;
 }
 
+function checkpointIsRecoveredRunnerOrphan(checkpoint) {
+  return checkpoint?.metadata?.orphanedRunnerRecovered === true &&
+    checkpoint.failedStage === "runner_orphaned" &&
+    checkpoint.metadata?.waitingForProviderRecovery !== true;
+}
+
 function providerRecoveryDelaySeconds(checkpoint) {
   const lastAttempt = Math.max(
     1,
@@ -2142,7 +2282,14 @@ function providerRecoveryDelaySeconds(checkpoint) {
 function recoverProviderTransientCheckpoint(item, checkpoint) {
   if (
     !["failed", "pending"].includes(checkpoint.status) ||
-    !checkpointHasTransientFailure(checkpoint)
+    !checkpointHasTransientFailure(checkpoint) ||
+    checkpointIsRecoveredRunnerOrphan(checkpoint)
+  ) {
+    return checkpoint;
+  }
+  if (
+    checkpoint.metadata?.waitingForProviderRecovery === true &&
+    !providerRecoveryWaitAvailable(checkpoint)
   ) {
     return checkpoint;
   }
@@ -2158,6 +2305,8 @@ function recoverProviderTransientCheckpoint(item, checkpoint) {
       )
     : providerRecoveryDelaySeconds(checkpoint);
   const nextRetryAt = checkpoint.nextRetryAt ?? isoAfterSeconds(delaySeconds);
+  const retryStartedAt = checkpoint.retryStartedAt ?? checkpoint.failedAt ?? now();
+  const retryProbe = { ...checkpoint, retryStartedAt };
   const recovered = {
     ...checkpoint,
     status: "pending",
@@ -2166,7 +2315,7 @@ function recoverProviderTransientCheckpoint(item, checkpoint) {
     retryable: true,
     retryExhausted: false,
     recoveryDecision: "retry_same_run_id",
-    retryStartedAt: checkpoint.retryStartedAt ?? checkpoint.startedAt ?? now(),
+    retryStartedAt,
     nextRetryAt,
     retryDelaySeconds: delaySeconds,
     runnerHeartbeatAt: now(),
@@ -2177,7 +2326,7 @@ function recoverProviderTransientCheckpoint(item, checkpoint) {
         checkpoint.metadata?.providerRecoveryWaitStartedAt ?? now(),
       providerRecoveryReason: checkpoint.retryExhausted === true
         ? "legacy_retry_exhausted_transient"
-        : retryBudgetExhausted(checkpoint)
+        : retryBudgetExhausted(retryProbe)
           ? "retry_budget_window_elapsed"
           : "transient_failure_recovered",
       providerRecoveryWaitCount: waitCount,
@@ -2233,6 +2382,15 @@ function updateManifest(manifest, checkpoints) {
   manifest.maxProviderRecoveryWaits = maxProviderRecoveryWaits;
   manifest.commandTimeoutSeconds = commandTimeoutSeconds;
   manifest.updatedAt = now();
+  const providerWaitLimitReached =
+    running === 0 &&
+    checkpoints.some((item) =>
+      item.status === "pending" &&
+      item.failureKind === "transient" &&
+      item.retryable === true &&
+      item.recoveryDecision === "retry_same_run_id" &&
+      item.metadata?.providerRecoveryWaitLimitReached === true
+    );
   if (failed > 0) {
     manifest.status = "failed";
     manifest.failedAt = manifest.failedAt ?? now();
@@ -2241,7 +2399,7 @@ function updateManifest(manifest, checkpoints) {
     manifest.status = "completed";
     manifest.completedAt = manifest.completedAt ?? now();
     delete manifest.failedAt;
-  } else if (pending === 0 && running === 0) {
+  } else if ((pending === 0 && running === 0) || providerWaitLimitReached) {
     manifest.status = "incomplete";
     delete manifest.completedAt;
     delete manifest.failedAt;
@@ -2256,6 +2414,29 @@ function updateManifest(manifest, checkpoints) {
     writeRecoverySummary(parsed, checkpoints);
   }
   return parsed;
+}
+
+function persistFailFastInterruptedManifest(manifest, checkpoints, reason) {
+  const refreshed = updateManifest(manifest, checkpoints);
+  const hasFailedItem = checkpoints.some((item) => item.status === "failed");
+  if (hasFailedItem) return refreshed;
+  const interrupted = BatchRunManifestSchema.parse(withoutUndefined({
+    ...refreshed,
+    status: "incomplete",
+    completedAt: undefined,
+    failedAt: undefined,
+    updatedAt: now(),
+    metadata: {
+      ...(refreshed.metadata ?? {}),
+      interruptedByFailFast: true,
+      interruptedReason: reason,
+    },
+  }));
+  if (!statusJson) {
+    writeTypedJson(manifestPath, BatchRunManifestSchema, interrupted);
+    writeRecoverySummary(interrupted, checkpoints);
+  }
+  return interrupted;
 }
 
 function buildRecoverySummary(manifest, checkpoints) {
@@ -2459,6 +2640,9 @@ function migrateEventLog(checkpoints) {
       if (check.status !== "failed" || !check.attemptExhausted) continue;
       const key = `${checkpoint.itemId}:${check.name}`;
       if (exhaustedEvents.has(key)) continue;
+      const recoveryDecision = check.retryable ?? checkpoint.retryable
+        ? "retry_same_run_id"
+        : "stop_until_fixed";
       migrated.push(BatchEventLogSchema.parse({
         schemaVersion: SchemaVersion,
         runId,
@@ -2470,7 +2654,7 @@ function migrateEventLog(checkpoints) {
         retryAfterSeconds: check.retryAfterSeconds,
         attemptExhausted: true,
         providerStatusCode: check.providerStatusCode,
-        recoveryDecision: "stop_until_fixed",
+        recoveryDecision,
         failedStage: check.name,
         at: checkpoint.failedAt ?? check.completedAt ?? now(),
         message: check.errorSummary ?? checkpoint.errorSummary,
@@ -2628,10 +2812,12 @@ function runCommand(item, name, command, args, options = {}) {
       Boolean(failure?.retryable) &&
       attempt < attempts &&
       (!options.allowTransientBudget || transientBudgetAvailable(options.checkpoint));
-    const recoveryDecision = shouldRetry
+    const recoveryDecision = failure?.retryable
       ? "retry_same_run_id"
       : "stop_until_fixed";
-    const nextRetryAt = shouldRetry ? isoAfterSeconds(retryDelaySeconds) : undefined;
+    const nextRetryAt = failure?.retryable
+      ? isoAfterSeconds(retryDelaySeconds)
+      : undefined;
     const check = {
       name,
       status: result.status === 0 ? "passed" : "failed",
@@ -2709,6 +2895,9 @@ function runCommand(item, name, command, args, options = {}) {
   }
   const summary = last?.check?.errorSummary ?? `${name} failed`;
   if (last?.check?.status === "failed") {
+    const exhaustedRecoveryDecision = last.check.retryable
+      ? "retry_same_run_id"
+      : "stop_until_fixed";
     const exhaustedEvent = {
       itemId: item.itemId,
       event: "command_attempt_budget_exhausted",
@@ -2718,7 +2907,7 @@ function runCommand(item, name, command, args, options = {}) {
       retryAfterSeconds: last.check.retryAfterSeconds,
       attemptExhausted: true,
       providerStatusCode: last.check.providerStatusCode,
-      recoveryDecision: "stop_until_fixed",
+      recoveryDecision: exhaustedRecoveryDecision,
       failedStage: name,
       message: last.check.errorSummary,
       metadata: {
@@ -2896,6 +3085,8 @@ function runGraphResume(item, checkpoint, options = {}) {
       stateRoot,
       "--source-path",
       item.sourcePath,
+      "--source-identity-path",
+      item.sourceIdentityPath,
       "--normalized-path",
       item.normalizedPath,
       "--qmd-index-path",
@@ -2988,12 +3179,12 @@ function repairLocalArtifactGate(item, checkpoint) {
       status: "pending",
       bookId: repairResult.bookId ?? checkpoint.bookId,
       failedAt: undefined,
-      errorSummary: undefined,
-      failureKind: undefined,
-      retryable: undefined,
+      errorSummary: reason,
+      failureKind: checkpoint.failureKind ?? "permanent",
+      retryable: false,
       retryExhausted: undefined,
       recoveryDecision: "continue_pending",
-      failedStage: undefined,
+      failedStage: checkpoint.failedStage ?? "repair-local-artifact-gate",
       nextRetryAt: undefined,
       retryDelaySeconds: undefined,
       runnerHeartbeatAt: now(),
@@ -3177,6 +3368,7 @@ function buildRecoverableTransientCheckpoint({ item, running, commandCheck, erro
   const retryDelaySeconds =
     commandCheck?.retryDelaySeconds ?? retryDelaySecondsForAttempt(running.attempts);
   const nextRetryAt = commandCheck?.nextRetryAt ?? isoAfterSeconds(retryDelaySeconds);
+  const retryStartedAt = running.retryStartedAt ?? commandCheck?.completedAt ?? now();
   return {
     ...running,
     status: "pending",
@@ -3187,7 +3379,7 @@ function buildRecoverableTransientCheckpoint({ item, running, commandCheck, erro
     retryExhausted: false,
     recoveryDecision: "retry_same_run_id",
     failedStage: commandCheck?.name,
-    retryStartedAt: running.retryStartedAt ?? running.startedAt ?? now(),
+    retryStartedAt,
     nextRetryAt,
     retryDelaySeconds,
     runnerHeartbeatAt: now(),
@@ -3212,7 +3404,7 @@ function markItemRunning(item, checkpoint, checkpoints, manifest) {
     status: "running",
     attempts: checkpoint.attempts + 1,
     startedAt: checkpoint.startedAt ?? startedAt,
-    retryStartedAt: checkpoint.retryStartedAt ?? startedAt,
+    retryStartedAt: checkpoint.retryStartedAt,
     nextRetryAt: undefined,
     retryDelaySeconds: undefined,
     failedAt: undefined,
@@ -3278,7 +3470,6 @@ function providerRecoveryWaitLimitReached(items, checkpoints) {
       checkpoint.retryable === true &&
       checkpoint.failureKind === "transient" &&
       checkpoint.metadata?.waitingForProviderRecovery === true &&
-      retryWindowDelayMs(checkpoint) > 0 &&
       !providerRecoveryWaitAvailable(checkpoint);
   });
 }
@@ -3291,10 +3482,28 @@ function eventProviderRecoveryWaitLimit(items, checkpoints) {
       checkpoint.retryable === true &&
       checkpoint.failureKind === "transient" &&
       checkpoint.metadata?.waitingForProviderRecovery === true &&
-      retryWindowDelayMs(checkpoint) > 0 &&
       !providerRecoveryWaitAvailable(checkpoint)
     );
   if (limited.length === 0) return false;
+  for (const { item, checkpoint } of limited) {
+    const updated = {
+      ...checkpoint,
+      retryExhausted: false,
+      recoveryDecision: "retry_same_run_id",
+      retryBudgetSeconds: checkpoint.retryBudgetSeconds ?? retryBudgetSeconds,
+      metadata: {
+        ...(checkpoint.metadata ?? {}),
+        waitingForProviderRecovery: true,
+        providerRecoveryReason: "provider_recovery_wait_limit_reached",
+        providerRecoveryWaitCount: providerRecoveryWaitCount(checkpoint),
+        maxProviderRecoveryWaits,
+        retryBudgetSeconds,
+        providerRecoveryWaitLimitReached: true,
+      },
+    };
+    saveCheckpoint(item, updated);
+    checkpoints.set(item.itemId, updated);
+  }
   const nextRetryAt = limited
     .map(({ checkpoint }) => checkpoint.nextRetryAt)
     .filter(Boolean)
@@ -3322,8 +3531,7 @@ function shouldStopBatchAfterFailure(checkpoint) {
 
 function shouldStopBatchBeforeProcessing(checkpoint) {
   return shouldStopBatchAfterFailure(checkpoint) &&
-    !checkpointHasLocalArtifactGateFailure(checkpoint) &&
-    !checkpointHasRecoverableDataCompatibilityFailure(checkpoint);
+    !checkpointHasLocalArtifactGateFailure(checkpoint);
 }
 
 function emitBatchStoppedAfterNonTransientFailure(checkpoint) {
@@ -3459,51 +3667,11 @@ function main() {
         });
         continue;
       }
-      const checkpoint = checkpoints.get(item.itemId);
+      let checkpoint = checkpoints.get(item.itemId);
       if (
         shouldStopBatchAfterFailure(checkpoint) &&
         !checkpointHasLocalArtifactGateFailure(checkpoint)
       ) {
-        if (checkpointHasRecoverableDataCompatibilityFailure(checkpoint)) {
-          const recovered = {
-            ...checkpoint,
-            status: "pending",
-            failedAt: undefined,
-            errorSummary: undefined,
-            failureKind: undefined,
-            retryable: undefined,
-            retryExhausted: undefined,
-            recoveryDecision: "continue_pending",
-            failedStage: undefined,
-            nextRetryAt: undefined,
-            retryDelaySeconds: undefined,
-            runnerHeartbeatAt: now(),
-            commandChecks: [],
-            metadata: {
-              ...(checkpoint.metadata ?? {}),
-              recoveredFromGraphRagTextUnitContextCompat: true,
-              waitingForProviderRecovery: false,
-            },
-          };
-          saveCheckpoint(item, recovered);
-          checkpoints.set(item.itemId, recovered);
-          manifest = updateManifest(manifest, Array.from(checkpoints.values()));
-          event({
-            itemId: item.itemId,
-            event: "item_data_compatibility_recovered",
-            status: "pending",
-            failureKind: "data_compatibility",
-            retryable: false,
-            recoveryDecision: "continue_pending",
-            failedStage: checkpoint.failedStage,
-            message: "GraphRAG text-unit context compatibility patch available",
-            metadata: {
-              policy: "retry_after_local_compatibility_patch",
-            },
-          });
-          processedInPass = true;
-          continue;
-        }
         if (!stopLoggedThisRun.has(checkpoint.itemId)) {
           emitBatchStoppedAfterNonTransientFailure(checkpoint);
           stopLoggedThisRun.add(checkpoint.itemId);
@@ -3516,13 +3684,34 @@ function main() {
         continue;
       }
       if (checkpoint?.status === "skipped") {
+        if (migrateOnly) {
+          event({
+            itemId: item.itemId,
+            event: "item_skipped",
+            status: "skipped",
+            metadata: checkpoint.metadata,
+          });
+          continue;
+        }
+        checkpoint = {
+          ...checkpoint,
+          status: "pending",
+          recoveryDecision: "continue_pending",
+          metadata: {
+            ...(checkpoint.metadata ?? {}),
+            reopenedSkippedForRealBuild: true,
+          },
+        };
+        saveCheckpoint(item, checkpoint);
+        checkpoints.set(item.itemId, checkpoint);
+        manifest = updateManifest(manifest, Array.from(checkpoints.values()));
         event({
           itemId: item.itemId,
-          event: "item_skipped",
-          status: "skipped",
+          event: "item_skipped_reopened",
+          status: "pending",
+          recoveryDecision: "continue_pending",
           metadata: checkpoint.metadata,
         });
-        continue;
       }
       if (checkpoint?.status === "failed" && checkpoint.retryable === false) {
         if (checkpointHasLocalArtifactGateFailure(checkpoint)) {
@@ -3654,6 +3843,25 @@ function main() {
           deferredForRetryWindow = true;
           continue;
         }
+        const activeBook = activeRunningBookCheckpoint(item, checkpoints);
+        if (activeBook != null) {
+          event({
+            itemId: item.itemId,
+            event: "item_book_running_observed",
+            status: "pending",
+            recoveryDecision: "continue_pending",
+            metadata: {
+              activeItemId: activeBook.itemId,
+              bookId: item.bookId,
+              runnerSessionId: activeBook.runnerSessionId,
+              runnerHost: activeBook.runnerHost,
+              runnerPid: activeBook.runnerPid,
+              runnerHeartbeatAt: activeBook.runnerHeartbeatAt,
+            },
+          });
+          deferredForRetryWindow = true;
+          continue;
+        }
         const running = markItemRunning(item, starting, checkpoints, manifest);
         const completed = runItem(item, running);
         checkpoints.set(item.itemId, completed);
@@ -3668,7 +3876,7 @@ function main() {
         const retryable = commandCheck?.retryable ?? false;
         const canRecoverInThisRun =
           retryable && failureKind === "transient" && transientBudgetAvailable(running);
-        if (canRecoverInThisRun && !failFast) {
+        if (canRecoverInThisRun) {
           const recoverable = buildRecoverableTransientCheckpoint({
             item,
             running,
@@ -3698,18 +3906,98 @@ function main() {
             },
           });
           processedInPass = true;
+          if (failFast) {
+            manifest = persistFailFastInterruptedManifest(
+              manifest,
+              Array.from(checkpoints.values()),
+              "recoverable_transient_failure",
+            );
+            throw error;
+          }
           continue;
         }
         const recoverableProviderFailure =
           retryable &&
-          failureKind === "transient" &&
-          !failFast;
+          failureKind === "transient";
         const providerRecoveryWaitStillAvailable =
           recoverableProviderFailure && providerRecoveryWaitAvailable(running);
+        if (recoverableProviderFailure && !providerRecoveryWaitStillAvailable) {
+          const waitCount = providerRecoveryWaitCount(running);
+          const delaySeconds = providerRecoveryDelaySeconds(running);
+          const nextRetryAt = running.nextRetryAt ?? isoAfterSeconds(delaySeconds);
+          const limited = {
+            ...running,
+            status: "pending",
+            failedAt: undefined,
+            errorSummary: redacted(error instanceof Error
+              ? error.message
+              : String(error)),
+            failureKind: "transient",
+            retryable: true,
+            retryExhausted: false,
+            recoveryDecision: "retry_same_run_id",
+            failedStage: commandCheck?.name,
+            retryStartedAt: running.retryStartedAt ?? commandCheck?.completedAt ?? now(),
+            nextRetryAt,
+            retryDelaySeconds: delaySeconds,
+            retryBudgetSeconds,
+            runnerHeartbeatAt: now(),
+            metadata: {
+              ...(running.metadata ?? {}),
+              waitingForProviderRecovery: true,
+              providerRecoveryWaitStartedAt:
+                running.metadata?.providerRecoveryWaitStartedAt ?? now(),
+              providerRecoveryReason: "provider_recovery_wait_limit_reached",
+              providerRecoveryWaitCount: waitCount,
+              maxProviderRecoveryWaits,
+              retryBudgetSeconds,
+              sourceName: item.sourceName,
+              providerRecoveryWaitLimitReached: true,
+            },
+          };
+          if (commandCheck) {
+            limited.commandChecks = [
+              ...(limited.commandChecks ?? []),
+              commandCheck.status === "failed"
+                ? {
+                    ...commandCheck,
+                    recoveryDecision: "retry_same_run_id",
+                    attemptExhausted: true,
+                  }
+                : commandCheck,
+            ];
+          }
+          saveCheckpoint(item, limited);
+          checkpoints.set(item.itemId, limited);
+          manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+          event({
+            itemId: item.itemId,
+            event: "item_provider_recovery_wait_limit_reached",
+            status: "pending",
+            message: limited.errorSummary,
+            failureKind: "transient",
+            retryable: true,
+            attemptExhausted: true,
+            providerStatusCode: commandCheck?.providerStatusCode,
+            retryAfterSeconds: commandCheck?.retryAfterSeconds,
+            recoveryDecision: "retry_same_run_id",
+            failedStage: limited.failedStage,
+            metadata: {
+              nextRetryAt,
+              retryDelaySeconds: delaySeconds,
+              retryBudgetSeconds,
+              providerRecoveryWaitCount: waitCount,
+              maxProviderRecoveryWaits,
+              retryPolicy: "scheduler_resume_same_run_after_provider_wait_limit",
+            },
+          });
+          stopAfterNonTransientFailure = true;
+          break;
+        }
         const providerRecoveryDelay = recoverableProviderFailure
           ? providerRecoveryDelaySeconds(running)
           : undefined;
-        const providerRecoveryWaitCount = recoverableProviderFailure
+        const recoveryWaitCount = recoverableProviderFailure
           ? nextProviderRecoveryWaitCount(running)
           : undefined;
         const failed = recoverableProviderFailure ? {
@@ -3722,7 +4010,7 @@ function main() {
           retryExhausted: false,
           recoveryDecision: "retry_same_run_id",
           failedStage: commandCheck?.name,
-          retryStartedAt: running.retryStartedAt ?? running.startedAt ?? now(),
+          retryStartedAt: running.retryStartedAt ?? commandCheck?.completedAt ?? now(),
           nextRetryAt: isoAfterSeconds(providerRecoveryDelay),
           retryDelaySeconds: providerRecoveryDelay,
           runnerHeartbeatAt: now(),
@@ -3733,7 +4021,7 @@ function main() {
             providerRecoveryReason: providerRecoveryWaitStillAvailable
               ? "transient_retry_budget_window_elapsed"
               : "provider_recovery_wait_limit_reached",
-            providerRecoveryWaitCount,
+            providerRecoveryWaitCount: recoveryWaitCount,
             maxProviderRecoveryWaits,
             retryBudgetSeconds,
             sourceName: item.sourceName,
@@ -3786,13 +4074,22 @@ function main() {
                 retryDelaySeconds: failed.retryDelaySeconds,
                 retryBudgetSeconds,
                 elapsedRetrySeconds: elapsedRetrySeconds(failed),
-                providerRecoveryWaitCount,
+                providerRecoveryWaitCount: recoveryWaitCount,
                 maxProviderRecoveryWaits,
                 waitLimitReached: !providerRecoveryWaitStillAvailable,
               }
             : undefined,
         });
-        if (failFast) throw error;
+        if (failFast) {
+          manifest = persistFailFastInterruptedManifest(
+            manifest,
+            Array.from(checkpoints.values()),
+            recoverableProviderFailure
+              ? "provider_recovery_wait"
+              : "command_failure",
+          );
+          throw error;
+        }
         if (shouldStopBatchAfterFailure(failed)) {
           if (!stopLoggedThisRun.has(failed.itemId)) {
             emitBatchStoppedAfterNonTransientFailure(failed);

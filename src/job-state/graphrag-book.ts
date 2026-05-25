@@ -40,6 +40,9 @@ import {
   upsertStoreCollection,
 } from "../store.js";
 import {
+  GRAPH_EXTRACT_CORE_ARTIFACT_KINDS,
+  GRAPH_EXTRACT_ARTIFACT_KINDS,
+  QUERY_READY_ARTIFACT_KINDS,
   hashDirectoryContents,
   hashLanceDbDirectoryContents,
   isCompleteLanceDbDirectory,
@@ -54,23 +57,29 @@ import { assertManagedGraphRagSettings } from "../graphrag/settings-projection.j
 
 const GRAPHRAG_NORMALIZATION_POLICY_VERSION = "graphrag-normalized-markdown-v1";
 
-const GRAPH_EXTRACT_KINDS = [
-  "graphrag_documents_parquet",
-  "graphrag_text_units_parquet",
-  "graphrag_entities_parquet",
-  "graphrag_relationships_parquet",
-  "graphrag_communities_parquet",
-  "graphrag_context_json",
-] as const;
-
 const GRAPH_RAG_STAGE_ARTIFACT_REQUIREMENTS: StageArtifactRequirementMap = {
   ingest: ["source_epub"],
   normalize: ["normalized_markdown"],
-  graph_extract: GRAPH_EXTRACT_KINDS,
+  graph_extract: GRAPH_EXTRACT_CORE_ARTIFACT_KINDS,
   community_report: ["graphrag_community_reports_parquet"],
   embed: ["lancedb_index"],
-  query_ready: ["graphrag_community_reports_parquet", "lancedb_index"],
+  query_ready: QUERY_READY_ARTIFACT_KINDS,
 };
+
+const QUERY_READY_PRODUCER_STAGES = [
+  "graph_extract",
+  "community_report",
+  "embed",
+] as const satisfies readonly BookStage[];
+
+const QUERY_READY_PRODUCER_REQUIRED_KINDS = {
+  graph_extract: GRAPH_EXTRACT_CORE_ARTIFACT_KINDS,
+  community_report: ["graphrag_community_reports_parquet"],
+  embed: ["lancedb_index"],
+} as const satisfies Record<
+  (typeof QUERY_READY_PRODUCER_STAGES)[number],
+  readonly BookArtifactKind[]
+>;
 
 export type GraphRagBookWorkspacePaths = {
   stateRootDir: string;
@@ -148,7 +157,7 @@ type GraphRagOutputProducerManifest = {
   providerFingerprint: string;
   outputDir: string;
   producerRunId: string;
-  stageProducerRunIds?: Partial<Record<BookStage, string>>;
+  stageProducerRunIds: Partial<Record<BookStage, string>>;
 };
 
 function stripKnownBookExtension(path: string): string {
@@ -1024,6 +1033,7 @@ async function readOutputProducerManifest(
       typeof parsed.providerFingerprint !== "string" ||
       typeof parsed.outputDir !== "string" ||
       typeof parsed.producerRunId !== "string" ||
+      parsed.stageProducerRunIds == null ||
       parsed.stageFingerprints == null
     ) {
       return null;
@@ -1154,9 +1164,6 @@ async function bootstrapRecoveredStages(input: {
       stage,
       runId,
       inputFingerprint: expectedFingerprint,
-      contentHash: input.artifacts.find((artifact) =>
-        artifactIds.includes(artifact.artifactId)
-      )?.contentHash,
       stageFingerprint: input.stageFingerprints[stage],
       providerFingerprint: input.artifacts.find((artifact) =>
         artifactIds.includes(artifact.artifactId)
@@ -1174,7 +1181,10 @@ async function bootstrapRecoveredStages(input: {
   if (input.highCostStages) {
     await maybeComplete(
       "graph_extract",
-      hasKinds(byStage.get("graph_extract") ?? [], GRAPH_EXTRACT_KINDS),
+      hasKinds(
+        byStage.get("graph_extract") ?? [],
+        GRAPH_EXTRACT_CORE_ARTIFACT_KINDS,
+      ),
     );
     await maybeComplete(
       "community_report",
@@ -1185,6 +1195,7 @@ async function bootstrapRecoveredStages(input: {
     await maybeComplete("embed", hasKinds(byStage.get("embed") ?? [], ["lancedb_index"]));
     await maybeComplete(
       "query_ready",
+      hasKinds(byStage.get("graph_extract") ?? [], GRAPH_EXTRACT_CORE_ARTIFACT_KINDS) &&
       hasKinds(byStage.get("community_report") ?? [], [
         "graphrag_community_reports_parquet",
       ]) && hasKinds(byStage.get("embed") ?? [], ["lancedb_index"]),
@@ -1250,6 +1261,65 @@ function gateArtifactsForStageReadiness(input: {
   );
 }
 
+async function assertQueryReadyProducerArtifacts(input: {
+  stateRootDir: string;
+  bookId: string;
+  artifacts: readonly BookArtifactManifest[];
+  expectedProducerRunIds: Partial<Record<BookStage, string>>;
+  expectedStageFingerprints?: Partial<Record<BookStage, string>>;
+  expectedProviderFingerprint?: string;
+  expectedCorpusContentHash?: string;
+}): Promise<void> {
+  for (const stage of QUERY_READY_PRODUCER_STAGES) {
+    const producerRunId = input.expectedProducerRunIds[stage];
+    if (producerRunId == null) {
+      throw new Error(
+        "query_ready artifact readiness requires completed GraphRAG " +
+          `producer run id for ${stage}`,
+      );
+    }
+    if (input.expectedStageFingerprints?.[stage] == null) {
+      throw new Error(
+        "query_ready artifact readiness requires producer lineage " +
+          `fingerprint for ${stage}`,
+      );
+    }
+    const requiredKinds = QUERY_READY_PRODUCER_REQUIRED_KINDS[stage];
+    const producerArtifacts = gateArtifactsForProducerRun(
+      input.artifacts,
+      stage,
+      producerRunId,
+      requiredKinds,
+    );
+    const validation = await validateBookArtifactSet({
+      graphVault: input.stateRootDir,
+      bookId: input.bookId,
+      artifactIds: producerArtifacts.map((artifact) => artifact.artifactId),
+      artifacts: input.artifacts,
+      requiredKinds,
+      allowedKinds: requiredKinds,
+      requireBookScopedGraphOutput: true,
+      expectedProducerRunIds: { [stage]: producerRunId },
+      expectedStageFingerprints: input.expectedStageFingerprints,
+      expectedProviderFingerprint: input.expectedProviderFingerprint,
+      expectedCorpusContentHash: input.expectedCorpusContentHash,
+    });
+    if (!validation.isSatisfied) {
+      throw new Error(
+        "query_ready producer did not produce valid book-scoped artifacts: " +
+          JSON.stringify({
+            bookId: input.bookId,
+            stage,
+            producerRunId,
+            missingArtifactIds: validation.missingArtifactIds,
+            missingArtifactKinds: validation.missingArtifactKinds,
+            invalidArtifacts: validation.invalidArtifacts,
+          }),
+      );
+    }
+  }
+}
+
 export async function assertGraphRagStageArtifactsReady(input: {
   stateRootDir: string;
   bookId: string;
@@ -1267,6 +1337,7 @@ export async function assertGraphRagStageArtifactsReady(input: {
     : { [input.stage]: input.producerRunId };
   if (input.stage === "query_ready") {
     if (
+      expectedProducerRunIds?.graph_extract == null ||
       expectedProducerRunIds?.community_report == null ||
       expectedProducerRunIds?.embed == null
     ) {
@@ -1275,6 +1346,7 @@ export async function assertGraphRagStageArtifactsReady(input: {
       );
     }
     if (
+      input.expectedStageFingerprints?.graph_extract == null ||
       input.expectedStageFingerprints?.community_report == null ||
       input.expectedStageFingerprints?.embed == null ||
       input.expectedProviderFingerprint == null ||
@@ -1284,6 +1356,15 @@ export async function assertGraphRagStageArtifactsReady(input: {
         "query_ready artifact readiness requires producer lineage fingerprints",
       );
     }
+    await assertQueryReadyProducerArtifacts({
+      stateRootDir: input.stateRootDir,
+      bookId: input.bookId,
+      artifacts: input.artifacts,
+      expectedProducerRunIds,
+      expectedStageFingerprints: input.expectedStageFingerprints,
+      expectedProviderFingerprint: input.expectedProviderFingerprint,
+      expectedCorpusContentHash: input.expectedCorpusContentHash,
+    });
   }
   const stageArtifacts = gateArtifactsForStageReadiness({
     artifacts: input.artifacts,
@@ -1331,7 +1412,7 @@ export async function syncGraphRagBookWorkspace(
 ): Promise<GraphRagBookWorkspaceState> {
   const repo = new FileBookJobStateRepository(input.stateRootDir);
   const sourcePath = resolve(input.sourcePath);
-  const sourceIdentityPath = basename(input.sourceIdentityPath ?? sourcePath);
+  const sourceIdentityPath = input.sourceIdentityPath ?? basename(sourcePath);
   const normalizedPath = resolve(input.normalizedPath);
   const bootstrapRunId = createRunId("bootstrap");
   const settingsPath = resolve(input.settingsPath);

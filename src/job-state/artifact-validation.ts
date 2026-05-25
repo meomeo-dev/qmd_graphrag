@@ -19,6 +19,20 @@ export const REQUIRED_LANCEDB_TABLES = [
   "text_unit_text.lance",
 ] as const;
 
+export const GRAPH_EXTRACT_CORE_ARTIFACT_KINDS = [
+  "graphrag_documents_parquet",
+  "graphrag_text_units_parquet",
+  "graphrag_entities_parquet",
+  "graphrag_relationships_parquet",
+  "graphrag_communities_parquet",
+  "graphrag_context_json",
+  "graphrag_stats_json",
+] as const satisfies readonly BookArtifactKind[];
+
+export const GRAPH_EXTRACT_ARTIFACT_KINDS = [
+  ...GRAPH_EXTRACT_CORE_ARTIFACT_KINDS,
+] as const satisfies readonly BookArtifactKind[];
+
 export const QUERY_READY_ARTIFACT_KINDS = [
   "graphrag_community_reports_parquet",
   "lancedb_index",

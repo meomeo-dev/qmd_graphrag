@@ -5,20 +5,6 @@ export function classifyFailure(text) {
   const retryAfterSeconds = retryAfterMatch
     ? Number.parseInt(retryAfterMatch[1], 10)
     : undefined;
-  if (isLocalArtifactGateFailureText(message)) {
-    return {
-      failureKind: "permanent",
-      retryable: false,
-      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
-    };
-  }
-  if (isGraphRagDataCompatibilityFailureText(message)) {
-    return {
-      failureKind: "data_compatibility",
-      retryable: false,
-      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
-    };
-  }
   if (
     providerStatusCode === 429 ||
     (providerStatusCode != null &&
@@ -48,6 +34,20 @@ export function classifyFailure(text) {
     return {
       failureKind: "transient",
       retryable: true,
+      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+    };
+  }
+  if (isGraphRagDataCompatibilityFailureText(message)) {
+    return {
+      failureKind: "data_compatibility",
+      retryable: false,
+      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+    };
+  }
+  if (isLocalArtifactGateFailureText(message)) {
+    return {
+      failureKind: "permanent",
+      retryable: false,
       ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
     };
   }
@@ -169,7 +169,9 @@ function extractProviderStatusCode(message) {
   const patterns = [
     /\bhttp\s+([45]\d\d)\b/iu,
     /\bstatus\s+code[:\s-]*([45]\d\d)\b/iu,
+    /\bstatus_code[:=\s-]*([45]\d\d)\b/iu,
     /\berror\s+code[:\s-]*([45]\d\d)\b/iu,
+    /\berror_code[:=\s-]*([45]\d\d)\b/iu,
     /\bstatus[:\s-]*([45]\d\d)\b/iu,
     /\bcode[:\s-]*([45]\d\d)\b/iu,
     /\(([45]\d\d)\)/iu,

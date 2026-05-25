@@ -230,12 +230,16 @@ export function batchItemCheckpointEnvelopeFixture() {
       status: "failed",
       sourceName: "Book.epub",
       sourceRelativePath: "inbox/books/Book.epub",
+      sourceIdentityPath: "inbox/books/Book.epub",
       sourceHash: "sha256:source",
       normalizedPath: "graph_vault/input/book.md",
       bookId: "book-fixture",
       attempts: 1,
       expectedCommandCheckCount: 27,
       maxCommandAttempts: 3,
+      qmdBuildStatus: { status: "pending" },
+      graphBuildStatus: { status: "pending" },
+      graphQueryStatus: { status: "pending" },
       failureKind: "transient",
       retryable: true,
       retryExhausted: false,
@@ -321,7 +325,7 @@ export function batchRecoverySummaryEnvelopeFixture() {
         retryMaxDelaySeconds: 300,
         retryBudgetSeconds: 7200,
         maxProviderRecoveryWaits: 3,
-        commandTimeoutSeconds: 5400,
+        commandTimeoutSeconds: 21600,
       },
       recoveryDecision: "retry_same_run_id",
       retryableItemCount: 1,
@@ -372,6 +376,58 @@ async function writeCompleteLanceDbFixture(root: string): Promise<void> {
       "utf8",
     );
   }
+}
+
+async function writeGraphExtractCoreFixture(input: {
+  graphVault: string;
+  bookId: string;
+  artifactPrefix: string;
+}): Promise<Array<{
+  artifactId: string;
+  kind: string;
+  path: string;
+  contentHash: string;
+}>> {
+  const outputDir = join(input.graphVault, "books", input.bookId, "output");
+  await mkdir(outputDir, { recursive: true });
+  const parquetSpecs = [
+    ["documents", "graphrag_documents_parquet", "documents.parquet"],
+    ["text-units", "graphrag_text_units_parquet", "text_units.parquet"],
+    ["entities", "graphrag_entities_parquet", "entities.parquet"],
+    ["relationships", "graphrag_relationships_parquet", "relationships.parquet"],
+    ["communities", "graphrag_communities_parquet", "communities.parquet"],
+  ] as const;
+  for (const [, , fileName] of parquetSpecs) {
+    await writeFile(join(outputDir, fileName), MinimalParquetFixture);
+  }
+  await writeFile(join(outputDir, "context.json"), "{}", "utf8");
+  await writeFile(join(outputDir, "stats.json"), "{}", "utf8");
+
+  const artifacts = [];
+  for (const [name, kind, fileName] of parquetSpecs) {
+    const path = `books/${input.bookId}/output/${fileName}`;
+    artifacts.push({
+      artifactId: `${input.artifactPrefix}-${name}`,
+      kind,
+      path,
+      contentHash: await hashFile(join(input.graphVault, path)),
+    });
+  }
+  const contextPath = `books/${input.bookId}/output/context.json`;
+  artifacts.push({
+    artifactId: `${input.artifactPrefix}-context`,
+    kind: "graphrag_context_json",
+    path: contextPath,
+    contentHash: await hashFile(join(input.graphVault, contextPath)),
+  });
+  const statsPath = `books/${input.bookId}/output/stats.json`;
+  artifacts.push({
+    artifactId: `${input.artifactPrefix}-stats`,
+    kind: "graphrag_stats_json",
+    path: statsPath,
+    contentHash: await hashFile(join(input.graphVault, statsPath)),
+  });
+  return artifacts;
 }
 
 describe("GraphRAG contracts", () => {
@@ -448,6 +504,7 @@ describe("GraphRAG contracts", () => {
   test("accepts a standard index request", () => {
     const parsed = GraphRagIndexRequestSchema.parse({
       rootDir: "/tmp/graphrag-root",
+      reportDir: "/tmp/qmd-logs/graphrag-reports/book-1/graph_extract",
       method: "standard",
       indexScope: {
         bookId: "book-1",
@@ -1385,14 +1442,18 @@ describe("Data bus contracts", () => {
     const parsed = parseBatchItemCheckpoint(legacy, {
       sourceHash: "sha256:legacy-source",
       bookId: "book-legacy",
+      sourceIdentityPath: "inbox/books/Legacy.epub",
     });
     expect(parsed.sourceHash).toBe("sha256:legacy-source");
     expect(parsed.bookId).toBe("book-legacy");
+    expect(parsed.sourceIdentityPath).toBe("inbox/books/Legacy.epub");
     expect(parsed.commandChecks[0]?.name).toBe("resume-book-1");
 
     const hydrated = hydrateBatchCheckpoint({
       item: {
         sourceHash: "sha256:legacy-source",
+        sourceIdentityPath: "inbox/books/Legacy.epub",
+        sourceRelativePath: "inbox/books/Legacy.epub",
         bookId: "book-legacy",
       },
       checkpoint: legacy,
@@ -1427,6 +1488,7 @@ describe("Data bus contracts", () => {
       status: "failed",
       sourceName: "Repair.epub",
       sourceRelativePath: "inbox/books/Repair.epub",
+      sourceIdentityPath: "inbox/books/Repair.epub",
       sourceHash: "sha256:repair-source",
       normalizedPath: "graph_vault/input/repair.md",
       bookId: "book-repair",
@@ -1458,6 +1520,8 @@ describe("Data bus contracts", () => {
     const hydrated = hydrateBatchCheckpoint({
       item: {
         sourceHash: "sha256:repair-source",
+        sourceIdentityPath: "inbox/books/Repair.epub",
+        sourceRelativePath: "inbox/books/Repair.epub",
         bookId: "book-repair",
       },
       checkpoint: legacy,
@@ -1479,6 +1543,10 @@ describe("Data bus contracts", () => {
       sourceHash: "sha256:repair-source",
       bookId: "book-repair",
       recoveryDecision: "continue_pending",
+      errorSummary: "resume-book did not reach ready after 24 passes",
+      failureKind: "permanent",
+      retryable: false,
+      failedStage: "repair-local-artifact-gate",
       expectedCommandCheckCount: 27,
       maxResumePasses: 24,
       metadata: {
@@ -1487,11 +1555,7 @@ describe("Data bus contracts", () => {
       },
     });
     expect(hydrated.failedAt).toBeUndefined();
-    expect(hydrated.errorSummary).toBeUndefined();
-    expect(hydrated.failureKind).toBeUndefined();
-    expect(hydrated.retryable).toBeUndefined();
     expect(hydrated.retryExhausted).toBeUndefined();
-    expect(hydrated.failedStage).toBeUndefined();
     expect(hydrated.commandChecks).toEqual([]);
   });
 
@@ -1503,6 +1567,7 @@ describe("Data bus contracts", () => {
       status: "failed",
       sourceName: "Normal.epub",
       sourceRelativePath: "inbox/books/Normal.epub",
+      sourceIdentityPath: "inbox/books/Normal.epub",
       sourceHash: "sha256:normal-source",
       normalizedPath: "graph_vault/input/normal.md",
       bookId: "book-normal",
@@ -1534,6 +1599,8 @@ describe("Data bus contracts", () => {
     const hydrated = hydrateBatchCheckpoint({
       item: {
         sourceHash: "sha256:normal-source",
+        sourceIdentityPath: "inbox/books/Normal.epub",
+        sourceRelativePath: "inbox/books/Normal.epub",
         bookId: "book-normal",
       },
       checkpoint: legacy,
@@ -2135,8 +2202,12 @@ describe("Data bus contracts", () => {
         promptFingerprint: "prompt",
         modelFingerprint: "model",
         stageFingerprints: {
+          ingest: "stage-ingest",
           normalize: "stage-normalize",
           graph_extract: "stage-graph-extract",
+          community_report: "stage-community-report",
+          embed: "stage-embed",
+          query_ready: "stage-query-ready",
         },
         providerFingerprint: "provider-openai-responses-jina",
         overallStatus: "succeeded",
@@ -2150,14 +2221,23 @@ describe("Data bus contracts", () => {
       payload: {
         schemaVersion: SchemaVersion,
         bookId: "book-1",
-        stage: "query_ready",
+        stage: "graph_extract",
         status: "succeeded",
         attemptCount: 1,
-        inputFingerprint: "input",
+        runId: "run-graph-extract",
+        inputFingerprint: "stage-graph-extract",
         contentHash: "sha256:content",
-        stageFingerprint: "stage-query-ready",
+        stageFingerprint: "stage-graph-extract",
         providerFingerprint: "provider-openai-responses-jina",
-        artifactIds: ["artifact-1"],
+        artifactIds: [
+          "artifact-documents",
+          "artifact-text-units",
+          "artifact-entities",
+          "artifact-relationships",
+          "artifact-communities",
+          "artifact-context",
+          "artifact-stats",
+        ],
       },
     });
     const artifact = DataBusEnvelopeSchema.parse({
@@ -2165,15 +2245,18 @@ describe("Data bus contracts", () => {
       kind: "book.artifact_manifest",
       payload: {
         schemaVersion: SchemaVersion,
-        artifactId: "artifact-1",
+        artifactId: "artifact-stats",
         bookId: "book-1",
-        stage: "query_ready",
-        kind: "query_snapshot",
-        path: "books/book-1/artifacts.yaml",
+        stage: "graph_extract",
+        kind: "graphrag_stats_json",
+        path: "books/book-1/output/stats.json",
         contentHash: "sha256:artifact",
-        stageFingerprint: "stage-query-ready",
+        stageFingerprint: "stage-graph-extract",
         providerFingerprint: "provider-openai-responses-jina",
-        producerRunId: "run-1",
+        producerRunId: "run-graph-extract",
+        metadata: {
+          corpusContentHash: "sha256:content",
+        },
         createdAt: "2026-05-21T00:00:00.000Z",
       },
     });
@@ -2182,14 +2265,14 @@ describe("Data bus contracts", () => {
       kind: "book.run_record",
       payload: {
         schemaVersion: SchemaVersion,
-        runId: "run-1",
+        runId: "run-query-ready",
         bookId: "book-1",
         stage: "query_ready",
         status: "succeeded",
         attemptCount: 1,
         startedAt: "2026-05-21T00:00:00.000Z",
-        inputFingerprint: "input",
-        artifactIds: ["artifact-1"],
+        inputFingerprint: "stage-query-ready",
+        artifactIds: ["artifact-community-report", "artifact-lancedb"],
       },
     });
     const resumePlan = DataBusEnvelopeSchema.parse({
@@ -2201,7 +2284,12 @@ describe("Data bus contracts", () => {
         nextStage: null,
         canQuery: true,
         staleStages: [],
-        completedStages: ["query_ready"],
+        completedStages: [
+          "graph_extract",
+          "community_report",
+          "embed",
+          "query_ready",
+        ],
         stageStates: [{
           stage: "query_ready",
           checkpointStatus: "succeeded",
@@ -2237,8 +2325,12 @@ describe("Data bus contracts", () => {
           promptFingerprint: "prompt",
           modelFingerprint: "model",
           stageFingerprints: {
+            ingest: "stage-ingest",
             normalize: "stage-normalize",
             graph_extract: "stage-graph-extract",
+            community_report: "stage-community-report",
+            embed: "stage-embed",
+            query_ready: "stage-query-ready",
           },
           providerFingerprint: "provider-openai-responses-jina",
           overallStatus: "succeeded",
@@ -2252,18 +2344,68 @@ describe("Data bus contracts", () => {
       kind: "book.stage_checkpoint_list",
       payload: {
         schemaVersion: SchemaVersion,
-        items: [{
-          schemaVersion: SchemaVersion,
-          bookId: "book-1",
-          stage: "query_ready",
-          status: "succeeded",
-          attemptCount: 1,
-          inputFingerprint: "input",
-          contentHash: "sha256:content",
-          stageFingerprint: "stage-query-ready",
-          providerFingerprint: "provider-openai-responses-jina",
-          artifactIds: ["artifact-1"],
-        }],
+        items: [
+          {
+            schemaVersion: SchemaVersion,
+            bookId: "book-1",
+            stage: "graph_extract",
+            status: "succeeded",
+            attemptCount: 1,
+            runId: "run-graph-extract",
+            inputFingerprint: "stage-graph-extract",
+            contentHash: "sha256:content",
+            stageFingerprint: "stage-graph-extract",
+            providerFingerprint: "provider-openai-responses-jina",
+            artifactIds: [
+              "artifact-documents",
+              "artifact-text-units",
+              "artifact-entities",
+              "artifact-relationships",
+              "artifact-communities",
+              "artifact-context",
+              "artifact-stats",
+            ],
+          },
+          {
+            schemaVersion: SchemaVersion,
+            bookId: "book-1",
+            stage: "community_report",
+            status: "succeeded",
+            attemptCount: 1,
+            runId: "run-community-report",
+            inputFingerprint: "stage-community-report",
+            contentHash: "sha256:content",
+            stageFingerprint: "stage-community-report",
+            providerFingerprint: "provider-openai-responses-jina",
+            artifactIds: ["artifact-community-report"],
+          },
+          {
+            schemaVersion: SchemaVersion,
+            bookId: "book-1",
+            stage: "embed",
+            status: "succeeded",
+            attemptCount: 1,
+            runId: "run-embed",
+            inputFingerprint: "stage-embed",
+            contentHash: "sha256:content",
+            stageFingerprint: "stage-embed",
+            providerFingerprint: "provider-openai-responses-jina",
+            artifactIds: ["artifact-lancedb"],
+          },
+          {
+            schemaVersion: SchemaVersion,
+            bookId: "book-1",
+            stage: "query_ready",
+            status: "succeeded",
+            attemptCount: 1,
+            runId: "run-query-ready",
+            inputFingerprint: "stage-query-ready",
+            contentHash: "sha256:content",
+            stageFingerprint: "stage-query-ready",
+            providerFingerprint: "provider-openai-responses-jina",
+            artifactIds: ["artifact-community-report", "artifact-lancedb"],
+          },
+        ],
       },
     });
     const artifactList = DataBusEnvelopeSchema.parse({
@@ -2271,19 +2413,50 @@ describe("Data bus contracts", () => {
       kind: "book.artifact_manifest_list",
       payload: {
         schemaVersion: SchemaVersion,
-        items: [{
-          schemaVersion: SchemaVersion,
-          artifactId: "artifact-1",
-          bookId: "book-1",
-          stage: "query_ready",
-          kind: "query_snapshot",
-          path: "books/book-1/artifacts.yaml",
-          contentHash: "sha256:artifact",
-          stageFingerprint: "stage-query-ready",
-          providerFingerprint: "provider-openai-responses-jina",
-          producerRunId: "run-1",
-          createdAt: "2026-05-21T00:00:00.000Z",
-        }],
+        items: [
+          {
+            schemaVersion: SchemaVersion,
+            artifactId: "artifact-stats",
+            bookId: "book-1",
+            stage: "graph_extract",
+            kind: "graphrag_stats_json",
+            path: "books/book-1/output/stats.json",
+            contentHash: "sha256:stats",
+            stageFingerprint: "stage-graph-extract",
+            providerFingerprint: "provider-openai-responses-jina",
+            producerRunId: "run-graph-extract",
+            metadata: { corpusContentHash: "sha256:content" },
+            createdAt: "2026-05-21T00:00:00.000Z",
+          },
+          {
+            schemaVersion: SchemaVersion,
+            artifactId: "artifact-community-report",
+            bookId: "book-1",
+            stage: "community_report",
+            kind: "graphrag_community_reports_parquet",
+            path: "books/book-1/output/community_reports.parquet",
+            contentHash: "sha256:community-report",
+            stageFingerprint: "stage-community-report",
+            providerFingerprint: "provider-openai-responses-jina",
+            producerRunId: "run-community-report",
+            metadata: { corpusContentHash: "sha256:content" },
+            createdAt: "2026-05-21T00:00:00.000Z",
+          },
+          {
+            schemaVersion: SchemaVersion,
+            artifactId: "artifact-lancedb",
+            bookId: "book-1",
+            stage: "embed",
+            kind: "lancedb_index",
+            path: "books/book-1/output/lancedb",
+            contentHash: "sha256:lancedb",
+            stageFingerprint: "stage-embed",
+            providerFingerprint: "provider-openai-responses-jina",
+            producerRunId: "run-embed",
+            metadata: { corpusContentHash: "sha256:content" },
+            createdAt: "2026-05-21T00:00:00.000Z",
+          },
+        ],
       },
     });
     const runCatalog = DataBusEnvelopeSchema.parse({
@@ -2293,7 +2466,7 @@ describe("Data bus contracts", () => {
         schemaVersion: SchemaVersion,
         items: [{
           schemaVersion: SchemaVersion,
-          runId: "run-1",
+          runId: "run-query-ready",
           bookId: "book-1",
           stage: "query_ready",
           status: "succeeded",
@@ -2306,14 +2479,14 @@ describe("Data bus contracts", () => {
       kind: "book.run_record",
       payload: {
         schemaVersion: SchemaVersion,
-        runId: "run-1",
+        runId: "run-query-ready",
         bookId: "book-1",
         stage: "query_ready",
         status: "succeeded",
         attemptCount: 1,
         startedAt: "2026-05-21T00:00:00.000Z",
-        inputFingerprint: "input",
-        artifactIds: ["artifact-1"],
+        inputFingerprint: "stage-query-ready",
+        artifactIds: ["artifact-community-report", "artifact-lancedb"],
       },
     });
     const parsedRunRecord = BookJobRunRecordEnvelopeSchema.parse(runRecord);
@@ -2332,7 +2505,7 @@ describe("Data bus contracts", () => {
           contentHash: "sha256:content",
           ready: true,
           readinessSource: "validated_checkpoint_plus_validated_manifest",
-          artifactIds: ["artifact-1"],
+          artifactIds: ["artifact-community-report", "artifact-lancedb"],
           createdAt: "2026-05-21T00:00:00.000Z",
         }],
       },
@@ -2864,6 +3037,11 @@ items:
       join(graphVault, "books", "book-123", "output", "community_reports.parquet"),
       MinimalParquetFixture,
     );
+    const graphExtractArtifacts = await writeGraphExtractCoreFixture({
+      graphVault,
+      bookId: "book-123",
+      artifactPrefix: "artifact-graph",
+    });
     const reportHash = await hashFile(
       join(graphVault, "books", "book-123", "output", "community_reports.parquet"),
     );
@@ -2873,6 +3051,19 @@ items:
       `
 schemaVersion: ${SchemaVersion}
 items:
+  - schemaVersion: ${SchemaVersion}
+    bookId: book-123
+    stage: graph_extract
+    status: succeeded
+    attemptCount: 1
+    runId: run-graph-extract
+    inputFingerprint: stage-graph-extract
+    contentHash: ${contentHash}
+    stageFingerprint: stage-graph-extract
+    providerFingerprint: provider-openai-responses-jina
+    artifactIds:
+${graphExtractArtifacts.map((artifact) => `      - ${artifact.artifactId}`).join("\n")}
+    finishedAt: 2026-05-21T00:00:00.000Z
   - schemaVersion: ${SchemaVersion}
     bookId: book-123
     stage: community_report
@@ -2920,6 +3111,19 @@ items:
       `
 schemaVersion: ${SchemaVersion}
 items:
+${graphExtractArtifacts.map((artifact) => `  - schemaVersion: ${SchemaVersion}
+    artifactId: ${artifact.artifactId}
+    bookId: book-123
+    stage: graph_extract
+    kind: ${artifact.kind}
+    path: ${artifact.path}
+    contentHash: ${artifact.contentHash}
+    stageFingerprint: stage-graph-extract
+    providerFingerprint: provider-openai-responses-jina
+    producerRunId: run-graph-extract
+    metadata:
+      corpusContentHash: ${contentHash}
+    createdAt: 2026-05-21T00:00:00.000Z`).join("\n")}
   - schemaVersion: ${SchemaVersion}
     artifactId: artifact-1
     bookId: book-123

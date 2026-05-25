@@ -2645,28 +2645,6 @@ function evidenceMetadataNumber(
   return typeof value === "number" ? value : undefined;
 }
 
-function outputRowsFromUnifiedAnswer(answer: UnifiedAnswer): OutputRow[] {
-  return answer.evidence.map((evidence) => {
-    const path = evidenceMetadataString(evidence, "path") ?? evidence.locator?.path
-      ?? evidence.evidenceId;
-    const title = evidenceMetadataString(evidence, "title") ?? path;
-    const fullText = evidenceMetadataString(evidence, "fullText") ?? evidence.quote ?? "";
-    return {
-      file: path,
-      displayPath: path,
-      title,
-      body: fullText,
-      chunkPos: evidenceMetadataNumber(evidence, "chunkPos"),
-      chunkLen: evidenceMetadataNumber(evidence, "chunkLen"),
-      score: evidence.score ?? 0,
-      context: evidenceMetadataString(evidence, "context") ?? null,
-      hash: evidence.contentHash ?? undefined,
-      docid: evidenceMetadataString(evidence, "docid") ?? evidence.documentId ?? undefined,
-      explain: undefined,
-    };
-  });
-}
-
 function formatRouteRefusals(decision: QueryRouteDecision): string {
   return decision.refusalReasons.length > 0
     ? decision.refusalReasons.join(", ")
@@ -2693,6 +2671,171 @@ function outputRouteDecisionSummary(decision: QueryRouteDecision, format: Output
   }
 }
 
+function evidenceDisplayPath(evidence: EvidenceRef): string {
+  return evidence.locator?.uri ?? evidence.locator?.path ??
+    evidenceMetadataString(evidence, "path") ?? evidence.evidenceId;
+}
+
+function evidenceTitle(evidence: EvidenceRef): string {
+  return evidenceMetadataString(evidence, "title") ?? evidenceDisplayPath(evidence);
+}
+
+function evidenceBody(evidence: EvidenceRef): string {
+  return evidenceMetadataString(evidence, "fullText") ?? evidence.quote ?? "";
+}
+
+function evidenceDocid(evidence: EvidenceRef): string {
+  return evidenceMetadataString(evidence, "docid") ?? evidence.documentId ??
+    evidence.evidenceId;
+}
+
+function unifiedEvidenceReference(evidence: EvidenceRef): Record<string, unknown> {
+  return {
+    evidenceId: evidence.evidenceId,
+    graphCapabilityId: evidence.graphCapabilityId,
+    sourceId: evidence.sourceId,
+    documentId: evidence.documentId,
+    contentHash: evidence.contentHash,
+    chunkId: evidence.chunkId,
+    bookId: evidence.bookId,
+    graphTextUnitId: evidence.graphTextUnitId,
+    artifactId: evidence.artifactId,
+    locator: evidence.locator,
+    score: evidence.score ?? null,
+    metadata: evidence.metadata ?? {},
+  };
+}
+
+function xmlEscape(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function unifiedReferenceSummary(evidence: EvidenceRef): string {
+  return [
+    `evidenceId=${evidence.evidenceId}`,
+    evidence.sourceId ? `sourceId=${evidence.sourceId}` : undefined,
+    evidence.documentId ? `documentId=${evidence.documentId}` : undefined,
+    evidence.contentHash ? `contentHash=${evidence.contentHash}` : undefined,
+    evidence.bookId ? `bookId=${evidence.bookId}` : undefined,
+    evidence.graphCapabilityId
+      ? `graphCapabilityId=${evidence.graphCapabilityId}`
+      : undefined,
+    evidence.graphTextUnitId ? `graphTextUnitId=${evidence.graphTextUnitId}` : undefined,
+    evidence.artifactId ? `artifactId=${evidence.artifactId}` : undefined,
+    evidence.score == null ? undefined : `score=${evidence.score}`,
+  ].filter(Boolean).join(" ");
+}
+
+function outputUnifiedAnswerEvidence(answer: UnifiedAnswer, opts: OutputOptions): void {
+  const evidence = answer.evidence.slice(0, opts.limit);
+  if (opts.format === "files") {
+    for (const item of evidence) {
+      console.log([
+        evidenceDocid(item),
+        item.score ?? "",
+        evidenceDisplayPath(item),
+        item.sourceId ?? "",
+        item.documentId ?? "",
+        item.contentHash ?? "",
+        item.bookId ?? "",
+        item.graphCapabilityId ?? "",
+        item.graphTextUnitId ?? "",
+        item.artifactId ?? "",
+      ].map(String).map(escapeCSV).join(","));
+    }
+    return;
+  }
+
+  if (opts.format === "csv") {
+    console.log([
+      "evidenceId",
+      "score",
+      "path",
+      "title",
+      "sourceId",
+      "documentId",
+      "contentHash",
+      "bookId",
+      "graphCapabilityId",
+      "graphTextUnitId",
+      "artifactId",
+      "locator",
+      "quote",
+    ].join(","));
+    for (const item of evidence) {
+      console.log([
+        item.evidenceId,
+        item.score ?? "",
+        evidenceDisplayPath(item),
+        evidenceTitle(item),
+        item.sourceId ?? "",
+        item.documentId ?? "",
+        item.contentHash ?? "",
+        item.bookId ?? "",
+        item.graphCapabilityId ?? "",
+        item.graphTextUnitId ?? "",
+        item.artifactId ?? "",
+        item.locator == null ? "" : JSON.stringify(item.locator),
+        item.quote ?? "",
+      ].map(String).map(escapeCSV).join(","));
+    }
+    return;
+  }
+
+  if (opts.format === "md") {
+    console.log(`# Answer\n\n${answer.answerText}\n`);
+    console.log("## Evidence\n");
+    for (const item of evidence) {
+      console.log(`### ${evidenceTitle(item)}\n`);
+      console.log("```json");
+      console.log(JSON.stringify(unifiedEvidenceReference(item), null, 2));
+      console.log("```\n");
+      if (item.quote) console.log(`${item.quote}\n`);
+    }
+    return;
+  }
+
+  if (opts.format === "xml") {
+    console.log(`<answer route="${xmlEscape(answer.routeDecision.selectedRoute)}">`);
+    console.log(`  <text>${xmlEscape(answer.answerText)}</text>`);
+    console.log("  <evidence>");
+    for (const item of evidence) {
+      console.log(
+        `    <item evidenceId="${xmlEscape(item.evidenceId)}"` +
+          ` sourceId="${xmlEscape(item.sourceId ?? "")}"` +
+          ` documentId="${xmlEscape(item.documentId ?? "")}"` +
+          ` contentHash="${xmlEscape(item.contentHash ?? "")}"` +
+          ` bookId="${xmlEscape(item.bookId ?? "")}"` +
+          ` graphCapabilityId="${xmlEscape(item.graphCapabilityId ?? "")}"` +
+          ` graphTextUnitId="${xmlEscape(item.graphTextUnitId ?? "")}"` +
+          ` artifactId="${xmlEscape(item.artifactId ?? "")}"` +
+          ` score="${xmlEscape(String(item.score ?? ""))}">`,
+      );
+      console.log(`      <locator>${xmlEscape(JSON.stringify(item.locator ?? {}))}</locator>`);
+      console.log(`      <quote>${xmlEscape(item.quote ?? "")}</quote>`);
+      console.log("    </item>");
+    }
+    console.log("  </evidence>");
+    console.log("</answer>");
+    return;
+  }
+
+  console.log(answer.answerText);
+  if (evidence.length > 0) {
+    console.log();
+    console.log("Evidence:");
+    for (const item of evidence) {
+      console.log(`- ${evidenceDisplayPath(item)} ${c.dim}${unifiedReferenceSummary(item)}${c.reset}`);
+      if (item.score != null) console.log(`  Score: ${formatScore(item.score)}`);
+      if (item.quote) console.log(`  ${item.quote}`);
+    }
+  }
+}
+
 function outputUnifiedAnswer(answer: UnifiedAnswer, opts: OutputOptions): void {
   if (opts.format === "json") {
     console.log(JSON.stringify(answer, null, 2));
@@ -2703,18 +2846,7 @@ function outputUnifiedAnswer(answer: UnifiedAnswer, opts: OutputOptions): void {
     outputRouteDecisionSummary(answer.routeDecision, opts.format);
   }
 
-  if (answer.routeDecision.selectedRoute === "graphrag") {
-    console.log(answer.answerText);
-    return;
-  }
-
-  const rows = outputRowsFromUnifiedAnswer(answer);
-  if (rows.length === 0) {
-    printEmptySearchResults(opts.format);
-    return;
-  }
-
-  outputResults(rows, opts.displayQuery ?? answer.query, { ...opts, limit: rows.length });
+  outputUnifiedAnswerEvidence(answer, opts);
 }
 
 // Resolve -c collection filter: supports single string, array, or undefined.

@@ -12,6 +12,30 @@ function hasRepairOnlyDidNotReachReadyFailure(checkpoint) {
   );
 }
 
+function currentRetryPolicy({
+  expectedCommandCheckCount,
+  maxCommandAttempts,
+  maxTransientCommandAttempts,
+  maxResumePasses,
+  retryBaseDelaySeconds,
+  retryMaxDelaySeconds,
+  retryBudgetSeconds,
+  maxProviderRecoveryWaits,
+  commandTimeoutSeconds,
+}) {
+  return {
+    expectedCommandCheckCount,
+    maxCommandAttempts,
+    maxTransientCommandAttempts,
+    maxResumePasses,
+    retryBaseDelaySeconds,
+    retryMaxDelaySeconds,
+    retryBudgetSeconds,
+    maxProviderRecoveryWaits,
+    commandTimeoutSeconds,
+  };
+}
+
 export function hydrateBatchCheckpoint({
   item,
   checkpoint,
@@ -27,6 +51,17 @@ export function hydrateBatchCheckpoint({
   defaultBookId,
   repairOnlyBlockedLoopObserved = false,
 }) {
+  const policy = currentRetryPolicy({
+    expectedCommandCheckCount,
+    maxCommandAttempts,
+    maxTransientCommandAttempts,
+    maxResumePasses,
+    retryBaseDelaySeconds,
+    retryMaxDelaySeconds,
+    retryBudgetSeconds,
+    maxProviderRecoveryWaits,
+    commandTimeoutSeconds,
+  });
   if (
     checkpoint.status === "failed" &&
     checkpoint.failedStage === "repair-local-artifact-gate" &&
@@ -39,28 +74,18 @@ export function hydrateBatchCheckpoint({
     return {
       ...checkpoint,
       status: "pending",
+      sourceIdentityPath: checkpoint.sourceIdentityPath ?? item.sourceIdentityPath ??
+        item.sourceRelativePath,
       sourceHash: checkpoint.sourceHash ?? item.sourceHash,
-      bookId: checkpoint.bookId ?? item.bookId ?? defaultBookId,
-      expectedCommandCheckCount:
-        checkpoint.expectedCommandCheckCount ?? expectedCommandCheckCount,
-      maxCommandAttempts: checkpoint.maxCommandAttempts ?? maxCommandAttempts,
-      maxTransientCommandAttempts:
-        checkpoint.maxTransientCommandAttempts ?? maxTransientCommandAttempts,
-      maxResumePasses: checkpoint.maxResumePasses ?? maxResumePasses,
-      retryBaseDelaySeconds:
-        checkpoint.retryBaseDelaySeconds ?? retryBaseDelaySeconds,
-      retryMaxDelaySeconds: checkpoint.retryMaxDelaySeconds ?? retryMaxDelaySeconds,
-      retryBudgetSeconds: checkpoint.retryBudgetSeconds ?? retryBudgetSeconds,
-      maxProviderRecoveryWaits:
-        checkpoint.maxProviderRecoveryWaits ?? maxProviderRecoveryWaits,
-      commandTimeoutSeconds: checkpoint.commandTimeoutSeconds ?? commandTimeoutSeconds,
+      bookId: item.bookId ?? defaultBookId,
+      ...policy,
       failedAt: undefined,
-      errorSummary: undefined,
-      failureKind: undefined,
-      retryable: undefined,
+      errorSummary: checkpoint.errorSummary,
+      failureKind: checkpoint.failureKind ?? "permanent",
+      retryable: false,
       retryExhausted: undefined,
       recoveryDecision: "continue_pending",
-      failedStage: undefined,
+      failedStage: checkpoint.failedStage ?? "repair-local-artifact-gate",
       nextRetryAt: undefined,
       retryDelaySeconds: undefined,
       commandChecks: [],
@@ -79,21 +104,11 @@ export function hydrateBatchCheckpoint({
   ) {
     return {
       ...checkpoint,
+      sourceIdentityPath: checkpoint.sourceIdentityPath ?? item.sourceIdentityPath ??
+        item.sourceRelativePath,
       sourceHash: checkpoint.sourceHash ?? item.sourceHash,
-      bookId: checkpoint.bookId ?? item.bookId ?? defaultBookId,
-      expectedCommandCheckCount:
-        checkpoint.expectedCommandCheckCount ?? expectedCommandCheckCount,
-      maxCommandAttempts: checkpoint.maxCommandAttempts ?? maxCommandAttempts,
-      maxTransientCommandAttempts:
-        checkpoint.maxTransientCommandAttempts ?? maxTransientCommandAttempts,
-      maxResumePasses: checkpoint.maxResumePasses ?? maxResumePasses,
-      retryBaseDelaySeconds:
-        checkpoint.retryBaseDelaySeconds ?? retryBaseDelaySeconds,
-      retryMaxDelaySeconds: checkpoint.retryMaxDelaySeconds ?? retryMaxDelaySeconds,
-      retryBudgetSeconds: checkpoint.retryBudgetSeconds ?? retryBudgetSeconds,
-      maxProviderRecoveryWaits:
-        checkpoint.maxProviderRecoveryWaits ?? maxProviderRecoveryWaits,
-      commandTimeoutSeconds: checkpoint.commandTimeoutSeconds ?? commandTimeoutSeconds,
+      bookId: item.bookId ?? defaultBookId,
+      ...policy,
       failedAt: undefined,
       errorSummary: undefined,
       failureKind: undefined,
@@ -170,21 +185,11 @@ export function hydrateBatchCheckpoint({
   return {
     ...checkpoint,
     status,
+    sourceIdentityPath: checkpoint.sourceIdentityPath ?? item.sourceIdentityPath ??
+      item.sourceRelativePath,
     sourceHash: checkpoint.sourceHash ?? item.sourceHash,
-    bookId: checkpoint.bookId ?? item.bookId ?? defaultBookId,
-    expectedCommandCheckCount:
-      checkpoint.expectedCommandCheckCount ?? expectedCommandCheckCount,
-    maxCommandAttempts: checkpoint.maxCommandAttempts ?? maxCommandAttempts,
-    maxTransientCommandAttempts:
-      checkpoint.maxTransientCommandAttempts ?? maxTransientCommandAttempts,
-    maxResumePasses: checkpoint.maxResumePasses ?? maxResumePasses,
-    retryBaseDelaySeconds:
-      checkpoint.retryBaseDelaySeconds ?? retryBaseDelaySeconds,
-    retryMaxDelaySeconds: checkpoint.retryMaxDelaySeconds ?? retryMaxDelaySeconds,
-    retryBudgetSeconds: checkpoint.retryBudgetSeconds ?? retryBudgetSeconds,
-    maxProviderRecoveryWaits:
-      checkpoint.maxProviderRecoveryWaits ?? maxProviderRecoveryWaits,
-    commandTimeoutSeconds: checkpoint.commandTimeoutSeconds ?? commandTimeoutSeconds,
+    bookId: item.bookId ?? defaultBookId,
+    ...policy,
     failureKind: knownFailure
       ? inferredFailure.failureKind
       : checkpoint.failureKind ?? inferredFailure?.failureKind,

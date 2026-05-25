@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -95,6 +95,11 @@ process.stdin.on("end", () => {
     process.exit(1);
   }
   const scope = request.capabilityScope || {};
+  const artifactIds = scope.artifactIds || [];
+  const reportArtifactId =
+    artifactIds.find((artifactId) => String(artifactId).includes("report")) ||
+    artifactIds[0] ||
+    "artifact-cli-report";
   const response = {
     schemaVersion: "${SchemaVersion}",
     method: request.method || "local",
@@ -107,7 +112,7 @@ process.stdin.on("end", () => {
       bookId: (scope.selectedBookIds || ["book-cli"])[0],
       contentHash: (scope.contentHashes || ["content-cli"])[0],
       graphTextUnitId: "tu-cli",
-      artifactId: (scope.artifactIds || ["artifact-cli-report"])[0],
+      artifactId: reportArtifactId,
       locator: { path: "graph/books/book-cli/community-report.md", lineStart: 3 },
       quote: "Graph-only CLI projected evidence",
       score: 0.97,
@@ -147,6 +152,14 @@ async function writeMinimalParquetFixture(path: string): Promise<void> {
   await writeFile(path, MinimalParquetFixture);
 }
 
+const GraphExtractArtifactKinds = [
+  ["documents.parquet", "graphrag_documents_parquet"],
+  ["text_units.parquet", "graphrag_text_units_parquet"],
+  ["entities.parquet", "graphrag_entities_parquet"],
+  ["relationships.parquet", "graphrag_relationships_parquet"],
+  ["communities.parquet", "graphrag_communities_parquet"],
+] as const;
+
 type GraphBookFixture = {
   bookId: string;
   sourceId: string;
@@ -154,6 +167,7 @@ type GraphBookFixture = {
   documentId: string;
   contentHash: string;
   normalizedPath: string;
+  graphExtractArtifactIds: string[];
   reportArtifactId: string;
   lancedbArtifactId: string;
   reportHash: string;
@@ -177,7 +191,9 @@ function checkpointFixture(input: GraphBookFixture, stage: string) {
     contentHash: input.contentHash,
     stageFingerprint: input.stageFingerprints[stage],
     providerFingerprint: input.providerFingerprint,
-    artifactIds: stage === "community_report"
+    artifactIds: stage === "graph_extract"
+      ? input.graphExtractArtifactIds
+      : stage === "community_report"
       ? [input.reportArtifactId]
       : stage === "embed"
         ? [input.lancedbArtifactId]
@@ -196,6 +212,15 @@ async function writeGraphBookFixture(
   await mkdir(outputDir, { recursive: true });
   const reportPath = join(outputDir, "community_reports.parquet");
   const lancedbPath = join(outputDir, "lancedb");
+  for (const [fileName] of GraphExtractArtifactKinds) {
+    await writeMinimalParquetFixture(join(outputDir, fileName));
+  }
+  await writeFile(join(outputDir, "context.json"), "{}", "utf8");
+  await writeFile(
+    join(outputDir, "stats.json"),
+    JSON.stringify({ schemaVersion: SchemaVersion, bookId: input.bookId, documents: 1 }),
+    "utf8",
+  );
   await writeMinimalParquetFixture(reportPath);
   await writeLanceDbFixture(lancedbPath);
   const fixture = {
@@ -209,6 +234,7 @@ async function writeGraphBookFixture(
     YAML.stringify({
       schemaVersion: SchemaVersion,
       items: [
+        checkpointFixture(fixture, "graph_extract"),
         checkpointFixture(fixture, "community_report"),
         checkpointFixture(fixture, "embed"),
         checkpointFixture(fixture, "query_ready"),
@@ -221,6 +247,50 @@ async function writeGraphBookFixture(
     YAML.stringify({
       schemaVersion: SchemaVersion,
       items: [
+        ...await Promise.all(GraphExtractArtifactKinds.map(
+          async ([fileName, kind], index) => ({
+            schemaVersion: SchemaVersion,
+            artifactId: fixture.graphExtractArtifactIds[index],
+            bookId: fixture.bookId,
+            stage: "graph_extract",
+            kind,
+            path: `books/${fixture.bookId}/output/${fileName}`,
+            contentHash: await hashFile(join(outputDir, fileName)),
+            stageFingerprint: fixture.stageFingerprints.graph_extract,
+            providerFingerprint: fixture.providerFingerprint,
+            producerRunId: fixture.runIds.graph_extract,
+            createdAt: "2026-05-22T00:00:00.000Z",
+            metadata: { corpusContentHash: fixture.contentHash },
+          }),
+        )),
+        {
+          schemaVersion: SchemaVersion,
+          artifactId: fixture.graphExtractArtifactIds[5]!,
+          bookId: fixture.bookId,
+          stage: "graph_extract",
+          kind: "graphrag_context_json",
+          path: `books/${fixture.bookId}/output/context.json`,
+          contentHash: await hashFile(join(outputDir, "context.json")),
+          stageFingerprint: fixture.stageFingerprints.graph_extract,
+          providerFingerprint: fixture.providerFingerprint,
+          producerRunId: fixture.runIds.graph_extract,
+          createdAt: "2026-05-22T00:00:00.000Z",
+          metadata: { corpusContentHash: fixture.contentHash },
+        },
+        {
+          schemaVersion: SchemaVersion,
+          artifactId: fixture.graphExtractArtifactIds[6]!,
+          bookId: fixture.bookId,
+          stage: "graph_extract",
+          kind: "graphrag_stats_json",
+          path: `books/${fixture.bookId}/output/stats.json`,
+          contentHash: await hashFile(join(outputDir, "stats.json")),
+          stageFingerprint: fixture.stageFingerprints.graph_extract,
+          providerFingerprint: fixture.providerFingerprint,
+          producerRunId: fixture.runIds.graph_extract,
+          createdAt: "2026-05-22T00:00:00.000Z",
+          metadata: { corpusContentHash: fixture.contentHash },
+        },
         {
           schemaVersion: SchemaVersion,
           artifactId: fixture.reportArtifactId,
@@ -301,13 +371,27 @@ async function createWorkspace(options: {
   const secondReportArtifactId = "artifact-cli-second-report";
   const lancedbArtifactId = "artifact-cli-lancedb";
   const secondLancedbArtifactId = "artifact-cli-second-lancedb";
+  const graphExtractArtifactIds = [
+    "artifact-cli-documents",
+    "artifact-cli-text-units",
+    "artifact-cli-entities",
+    "artifact-cli-relationships",
+    "artifact-cli-communities",
+    "artifact-cli-context",
+    "artifact-cli-stats",
+  ];
+  const secondGraphExtractArtifactIds = graphExtractArtifactIds.map((item) =>
+    item.replace("artifact-cli-", "artifact-cli-second-")
+  );
   const providerFingerprint = "provider-openai-responses-jina";
   const stageFingerprints = {
+    graph_extract: "stage-graph-extract",
     community_report: "stage-community-report",
     embed: "stage-embed",
     query_ready: "stage-query-ready",
   };
   const secondStageFingerprints = {
+    graph_extract: "stage-second-graph-extract",
     community_report: "stage-second-community-report",
     embed: "stage-second-embed",
     query_ready: "stage-second-query-ready",
@@ -395,6 +479,7 @@ async function createWorkspace(options: {
     documentId,
     contentHash,
     normalizedPath: relativePath,
+    graphExtractArtifactIds,
     reportArtifactId,
     lancedbArtifactId,
     graphTextUnitId: "tu-cli",
@@ -402,6 +487,7 @@ async function createWorkspace(options: {
     stageFingerprints,
     providerFingerprint,
     runIds: {
+      graph_extract: "run-cli-graph-extract",
       community_report: "run-cli-community-report",
       embed: "run-cli-embed",
       query_ready: "run-cli-query-ready",
@@ -415,6 +501,7 @@ async function createWorkspace(options: {
       documentId: secondDocumentId,
       contentHash: secondContentHash,
       normalizedPath: secondRelativePath,
+      graphExtractArtifactIds: secondGraphExtractArtifactIds,
       reportArtifactId: secondReportArtifactId,
       lancedbArtifactId: secondLancedbArtifactId,
       graphTextUnitId: "tu-cli-second",
@@ -422,6 +509,7 @@ async function createWorkspace(options: {
       stageFingerprints: secondStageFingerprints,
       providerFingerprint,
       runIds: {
+        graph_extract: "run-cli-second-graph-extract",
         community_report: "run-cli-second-community-report",
         embed: "run-cli-second-embed",
         query_ready: "run-cli-second-query-ready",
@@ -570,9 +658,57 @@ describe("CLI GraphRAG unified route", () => {
     expect(answer.answerText).toBe("GraphRAG CLI answer from fake bridge");
     expect(answer.evidence[0].graphCapabilityId).toBe("book-cli:graph_query");
     expect(answer.evidence[0].quote).toContain("Graph-only CLI");
-    expect(answer.evidence[0].metadata.requestDataDir).toBe(
-      join(workspace.graphVault, "books", "book-cli", "output"),
-    );
+    expect(answer.routeDecision.selectedBookIds).toEqual(["book-cli"]);
+    expect(answer.evidence[0].metadata?.title).toBe("CLI Graph Community Report");
+    expect(JSON.stringify(answer)).not.toContain(workspace.graphVault);
+  }, 30000);
+
+  test("qmd query --graphrag non-json formats project unified evidence", async () => {
+    const workspace = await createWorkspace();
+    const baseArgs = [
+      "query",
+      "--graphrag",
+      "--no-rerank",
+      "How do architecture decisions relate across chapters?",
+    ];
+
+    const markdown = await runQmd(workspace, [...baseArgs, "--md"]);
+    expect(markdown.exitCode, markdown.stderr).toBe(0);
+    expect(markdown.stdout).toContain("# Answer");
+    expect(markdown.stdout).toContain("GraphRAG CLI answer from fake bridge");
+    expect(markdown.stdout).toContain("graphCapabilityId");
+    expect(markdown.stdout).toContain("book-cli:graph_query");
+    expect(markdown.stdout).toContain("documentId");
+    expect(markdown.stdout).toContain("contentHash");
+    expect(markdown.stdout).toContain("artifact-cli-report");
+    expect(markdown.stdout).toContain("Graph-only CLI projected evidence");
+    expect(markdown.stdout).not.toContain(workspace.graphVault);
+
+    const csv = await runQmd(workspace, [...baseArgs, "--csv"]);
+    expect(csv.exitCode, csv.stderr).toBe(0);
+    expect(csv.stdout).toContain("evidenceId,score,path,title,sourceId");
+    expect(csv.stdout).toContain("cli-graph-evidence-1");
+    expect(csv.stdout).toContain("book-cli:graph_query");
+    expect(csv.stdout).toContain("artifact-cli-report");
+    expect(csv.stdout).toContain("Graph-only CLI projected evidence");
+    expect(csv.stdout).not.toContain(workspace.graphVault);
+
+    const xml = await runQmd(workspace, [...baseArgs, "--xml"]);
+    expect(xml.exitCode, xml.stderr).toBe(0);
+    expect(xml.stdout).toContain('<answer route="graphrag">');
+    expect(xml.stdout).toContain("GraphRAG CLI answer from fake bridge");
+    expect(xml.stdout).toContain('evidenceId="cli-graph-evidence-1"');
+    expect(xml.stdout).toContain('graphCapabilityId="book-cli:graph_query"');
+    expect(xml.stdout).toContain('artifactId="artifact-cli-report"');
+    expect(xml.stdout).not.toContain(workspace.graphVault);
+
+    const files = await runQmd(workspace, [...baseArgs, "--files"]);
+    expect(files.exitCode, files.stderr).toBe(0);
+    expect(files.stdout).toContain("book-cli:graph_query");
+    expect(files.stdout).toContain("doc-");
+    expect(files.stdout).toContain("sha256:");
+    expect(files.stdout).toContain("artifact-cli-report");
+    expect(files.stdout).not.toContain(workspace.graphVault);
   }, 30000);
 
   test("qmd query --mode auto upgrades to GraphRAG when coverage and intent match", async () => {
@@ -596,9 +732,70 @@ describe("CLI GraphRAG unified route", () => {
     expect(answer.routeDecision.reasonCode).toBe("graph_upgrade");
     expect(answer.routeDecision.refusalReasons).toEqual([]);
     expect(answer.answerText).toBe("GraphRAG CLI answer from fake bridge");
-    expect(answer.evidence[0].metadata.requestDataDir).toBe(
-      join(workspace.graphVault, "books", "book-cli", "output"),
+    expect(answer.routeDecision.selectedBookIds).toEqual(["book-cli"]);
+    expect(answer.routeDecision.graphArtifactIds).toEqual(expect.arrayContaining([
+      "artifact-cli-documents",
+      "artifact-cli-text-units",
+      "artifact-cli-entities",
+      "artifact-cli-relationships",
+      "artifact-cli-communities",
+      "artifact-cli-context",
+      "artifact-cli-stats",
+      "artifact-cli-report",
+      "artifact-cli-lancedb",
+    ]));
+    expect(JSON.stringify(answer)).not.toContain(workspace.graphVault);
+  }, 30000);
+
+  test("qmd query --mode auto does not upgrade when stats artifact is missing", async () => {
+    const workspace = await createWorkspace();
+    const artifactsPath = join(
+      workspace.graphVault,
+      "books",
+      "book-cli",
+      "artifacts.yaml",
     );
+    const checkpointsPath = join(
+      workspace.graphVault,
+      "books",
+      "book-cli",
+      "checkpoints.yaml",
+    );
+    for (const path of [artifactsPath, checkpointsPath]) {
+      const parsed = YAML.parse(readFileSync(path, "utf8")) as {
+        items: Array<Record<string, unknown>>;
+      };
+      parsed.items = parsed.items.filter((item) =>
+        item.artifactId !== "artifact-cli-stats"
+      );
+      for (const item of parsed.items) {
+        if (Array.isArray(item.artifactIds)) {
+          item.artifactIds = item.artifactIds.filter((artifactId) =>
+            artifactId !== "artifact-cli-stats"
+          );
+        }
+      }
+      await writeFile(path, YAML.stringify(parsed), "utf8");
+    }
+
+    const result = await runQmd(workspace, [
+      "query",
+      "--mode",
+      "auto",
+      "--json",
+      "--no-rerank",
+      [
+        "intent: relationships across chapters",
+        "lex: architecture decisions relate across chapters",
+      ].join("\n"),
+    ]);
+
+    expect(result.exitCode, result.stderr).toBe(0);
+    const answer = JSON.parse(result.stdout);
+    expect(answer.routeDecision.requestedRoute).toBe("auto");
+    expect(answer.routeDecision.selectedRoute).toBe("qmd");
+    expect(answer.routeDecision.refusalReasons).toContain("no_graph_ready_candidate");
+    expect(answer.routeDecision.graphCapabilityIds).toEqual([]);
   }, 30000);
 
   test("qmd query --graphrag rejects multiple books without a graph book id", async () => {
@@ -642,12 +839,8 @@ describe("CLI GraphRAG unified route", () => {
     expect(result.exitCode, result.stderr).toBe(0);
     const answer = JSON.parse(result.stdout);
     expect(answer.routeDecision.selectedBookIds).toEqual(["book-cli-second"]);
-    expect(answer.evidence[0].metadata.requestDataDir).toBe(
-      join(workspace.graphVault, "books", "book-cli-second", "output"),
-    );
-    expect(answer.evidence[0].metadata.requestDataDir).not.toBe(
-      join(workspace.graphVault, "output"),
-    );
+    expect(answer.evidence[0].bookId).toBe("book-cli-second");
+    expect(JSON.stringify(answer)).not.toContain(workspace.graphVault);
   }, 30000);
 
   test("qmd query --mode auto rejects ambiguous multi-book graph upgrade", async () => {

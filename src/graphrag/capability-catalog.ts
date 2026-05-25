@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import YAML from "yaml";
 
 import {
+  type BookArtifactKind,
   BookArtifactManifestListSchema,
   BookJobCatalogSchema,
   BookJobCheckpointListSchema,
@@ -20,10 +21,43 @@ import {
 import { SchemaVersion } from "../contracts/common.js";
 import type { QmdRetrievalCandidate } from "../contracts/qmd-query.js";
 import {
+  GRAPH_EXTRACT_CORE_ARTIFACT_KINDS,
   QUERY_READY_ARTIFACT_KINDS,
   validateBookArtifactSet,
 } from "../job-state/artifact-validation.js";
 import { sanitizeVaultMetadata } from "../vault/metadata.js";
+
+const QUERY_READY_PRODUCER_REQUIRED_KINDS = {
+  graph_extract: GRAPH_EXTRACT_CORE_ARTIFACT_KINDS,
+  community_report: ["graphrag_community_reports_parquet"],
+  embed: ["lancedb_index"],
+} as const satisfies Record<
+  "graph_extract" | "community_report" | "embed",
+  readonly string[]
+>;
+
+const QUERY_READY_LINEAGE_ARTIFACT_KINDS = [
+  ...GRAPH_EXTRACT_CORE_ARTIFACT_KINDS,
+  ...QUERY_READY_ARTIFACT_KINDS,
+] as const satisfies readonly BookArtifactKind[];
+
+function uniqueStrings(values: readonly string[]): string[] {
+  return [...new Set(values)];
+}
+
+function filterArtifactIdsByKinds(
+  artifactIds: readonly string[],
+  artifacts: readonly BookArtifactManifest[],
+  kinds: readonly BookArtifactKind[],
+): string[] {
+  const kindSet = new Set<BookArtifactKind>(kinds);
+  return artifactIds.filter((artifactId) => {
+    const artifact = artifacts.find((candidate) =>
+      candidate.artifactId === artifactId
+    );
+    return artifact != null && kindSet.has(artifact.kind);
+  });
+}
 
 export type ResolveGraphCapabilitiesInput = {
   graphVault: string;
@@ -119,15 +153,39 @@ async function validateQueryReadyArtifacts(
       .filter((checkpoint) => checkpoint.status === "succeeded")
       .map((checkpoint) => [checkpoint.stage, checkpoint]),
   );
+  const graphExtractRunId = checkpointByStage.get("graph_extract")?.runId;
   const communityReportRunId = checkpointByStage.get("community_report")?.runId;
   const embedRunId = checkpointByStage.get("embed")?.runId;
-  if (communityReportRunId == null || embedRunId == null) {
+  if (
+    graphExtractRunId == null ||
+    communityReportRunId == null ||
+    embedRunId == null
+  ) {
     return false;
   }
   const expectedProducerRunIds: Partial<Record<BookStage, string>> = {
+    graph_extract: graphExtractRunId,
     community_report: communityReportRunId,
     embed: embedRunId,
   };
+  const expectedContentHash = book.normalizedContentHash ?? book.sourceHash;
+
+  for (const stage of [
+    "graph_extract",
+    "community_report",
+    "embed",
+    "query_ready",
+  ] as const) {
+    const checkpoint = checkpointByStage.get(stage);
+    if (
+      checkpoint == null ||
+      checkpoint.contentHash !== expectedContentHash ||
+      checkpoint.stageFingerprint !== book.stageFingerprints[stage] ||
+      checkpoint.providerFingerprint !== book.providerFingerprint
+    ) {
+      return false;
+    }
+  }
 
   const artifactsRaw = await readYaml(join(graphVault, "books", bookId, "artifacts.yaml"));
   if (artifactsRaw == null) return false;
@@ -145,10 +203,35 @@ async function validateQueryReadyArtifacts(
     return false;
   }
 
-  const validation = await validateBookArtifactSet({
+  for (const stage of ["graph_extract", "community_report", "embed"] as const) {
+    const checkpoint = checkpointByStage.get(stage);
+    if (checkpoint == null) return false;
+    const producerValidation = await validateBookArtifactSet({
+      graphVault,
+      bookId,
+      artifactIds: filterArtifactIdsByKinds(
+        checkpoint.artifactIds,
+        artifacts,
+        QUERY_READY_PRODUCER_REQUIRED_KINDS[stage],
+      ),
+      artifacts,
+      requiredKinds: QUERY_READY_PRODUCER_REQUIRED_KINDS[stage],
+      allowedKinds: QUERY_READY_PRODUCER_REQUIRED_KINDS[stage],
+      requireBookScopedGraphOutput: true,
+      expectedProducerRunIds: { [stage]: checkpoint.runId },
+      expectedStageFingerprints: book.stageFingerprints,
+      expectedProviderFingerprint: book.providerFingerprint,
+      expectedCorpusContentHash: expectedContentHash,
+    });
+    if (!producerValidation.isSatisfied) return false;
+  }
+
+  const queryReadyCheckpoint = checkpointByStage.get("query_ready");
+  if (queryReadyCheckpoint == null) return false;
+  const queryReadyValidation = await validateBookArtifactSet({
     graphVault,
     bookId,
-    artifactIds,
+    artifactIds: queryReadyCheckpoint.artifactIds,
     artifacts,
     requiredKinds: QUERY_READY_ARTIFACT_KINDS,
     allowedKinds: QUERY_READY_ARTIFACT_KINDS,
@@ -156,31 +239,67 @@ async function validateQueryReadyArtifacts(
     expectedProducerRunIds,
     expectedStageFingerprints: book.stageFingerprints,
     expectedProviderFingerprint: book.providerFingerprint,
-    expectedCorpusContentHash: book.normalizedContentHash ?? book.sourceHash,
+    expectedCorpusContentHash: expectedContentHash,
+  });
+  if (!queryReadyValidation.isSatisfied) return false;
+
+  const validation = await validateBookArtifactSet({
+    graphVault,
+    bookId,
+    artifactIds,
+    artifacts,
+    requiredKinds: QUERY_READY_LINEAGE_ARTIFACT_KINDS,
+    allowedKinds: QUERY_READY_LINEAGE_ARTIFACT_KINDS,
+    requireBookScopedGraphOutput: true,
+    expectedProducerRunIds,
+    expectedStageFingerprints: book.stageFingerprints,
+    expectedProviderFingerprint: book.providerFingerprint,
+    expectedCorpusContentHash: expectedContentHash,
   });
   return validation.isSatisfied;
 }
 
-async function loadQueryReadyCheckpointArtifactIds(
+async function loadQueryReadyLineageArtifactIds(
   graphVault: string,
   bookId: string,
 ): Promise<string[] | null> {
   const checkpointsRaw = await readYaml(
     join(graphVault, "books", bookId, "checkpoints.yaml"),
   );
-  if (checkpointsRaw == null) return null;
-  const raw = checkpointsRaw as { items?: unknown[] };
-  const queryReady = (raw.items ?? []).find(
-    (checkpoint): checkpoint is Record<string, unknown> =>
-      typeof checkpoint === "object" &&
-      checkpoint != null &&
-      (checkpoint as Record<string, unknown>).stage === "query_ready" &&
-      (checkpoint as Record<string, unknown>).status === "succeeded",
+  const checkpointsResult = BookJobCheckpointListSchema.safeParse(checkpointsRaw);
+  if (!checkpointsResult.success) return null;
+  const checkpointByStage = new Map(
+    checkpointsResult.data.items
+      .filter((checkpoint) => checkpoint.status === "succeeded")
+      .map((checkpoint) => [checkpoint.stage, checkpoint]),
   );
-  const artifactIds = Array.isArray(queryReady?.artifactIds)
-    ? queryReady.artifactIds.map(String).filter((item) => item.length > 0)
-    : [];
-  return artifactIds.length > 0 ? artifactIds : null;
+  const artifactsRaw = await readYaml(join(graphVault, "books", bookId, "artifacts.yaml"));
+  const artifactsResult = BookArtifactManifestListSchema.safeParse(artifactsRaw);
+  if (!artifactsResult.success) return null;
+  const artifacts = artifactsResult.data.items;
+  const ids = [
+    ...filterArtifactIdsByKinds(
+      checkpointByStage.get("graph_extract")?.artifactIds ?? [],
+      artifacts,
+      QUERY_READY_PRODUCER_REQUIRED_KINDS.graph_extract,
+    ),
+    ...filterArtifactIdsByKinds(
+      checkpointByStage.get("community_report")?.artifactIds ?? [],
+      artifacts,
+      QUERY_READY_PRODUCER_REQUIRED_KINDS.community_report,
+    ),
+    ...filterArtifactIdsByKinds(
+      checkpointByStage.get("embed")?.artifactIds ?? [],
+      artifacts,
+      QUERY_READY_PRODUCER_REQUIRED_KINDS.embed,
+    ),
+    ...filterArtifactIdsByKinds(
+      checkpointByStage.get("query_ready")?.artifactIds ?? [],
+      artifacts,
+      QUERY_READY_ARTIFACT_KINDS,
+    ),
+  ];
+  return ids.length > 0 ? uniqueStrings(ids) : null;
 }
 
 function isSubsetOf(
@@ -216,24 +335,31 @@ async function filterValidatedCapabilities(
     if (!capabilityHasGraphIdentity(capability, identities)) {
       continue;
     }
-    const queryReadyArtifactIds = await loadQueryReadyCheckpointArtifactIds(
+    const lineageArtifactIds = await loadQueryReadyLineageArtifactIds(
       graphVault,
       capability.bookId,
     );
     if (
-      queryReadyArtifactIds == null ||
-      !isSubsetOf(capability.artifactIds, queryReadyArtifactIds)
+      lineageArtifactIds == null ||
+      !isSubsetOf(capability.artifactIds, lineageArtifactIds)
     ) {
       continue;
     }
     if (!(await validateQueryReadyArtifacts(
       graphVault,
       capability.bookId,
-      capability.artifactIds,
+      lineageArtifactIds,
     ))) {
       continue;
     }
-    result.push(capability);
+    result.push(GraphCapabilitySchema.parse({
+      ...capability,
+      artifactIds: lineageArtifactIds,
+      metadata: sanitizeVaultMetadata({
+        ...(capability.metadata ?? {}),
+        lineageProjectionSource: "validated_checkpoint_plus_validated_manifest",
+      }),
+    }));
   }
   return result;
 }
@@ -269,15 +395,15 @@ async function deriveCapabilitiesFromBookState(
   const capabilities: GraphCapability[] = [];
 
   for (const book of books) {
-    const queryReadyArtifactIds = await loadQueryReadyCheckpointArtifactIds(
+    const lineageArtifactIds = await loadQueryReadyLineageArtifactIds(
       graphVault,
       book.bookId,
     );
-    if (queryReadyArtifactIds == null) continue;
+    if (lineageArtifactIds == null) continue;
     if (!(await validateQueryReadyArtifacts(
       graphVault,
       book.bookId,
-      queryReadyArtifactIds,
+      lineageArtifactIds,
     ))) {
       continue;
     }
@@ -315,7 +441,7 @@ async function deriveCapabilitiesFromBookState(
       contentHash,
       ready: true,
       readinessSource: "validated_checkpoint_plus_validated_manifest",
-      artifactIds: queryReadyArtifactIds,
+      artifactIds: lineageArtifactIds,
       createdAt: new Date(0).toISOString(),
       metadata: sanitizeVaultMetadata({
         projectionSource: "book_state",
@@ -403,103 +529,12 @@ function capabilitySemanticKey(capability: GraphCapability): string {
   ].join("\0");
 }
 
-function graphIdentityMatchesCapability(
-  identity: DocumentIdentityMap,
-  capability: GraphCapability,
-): boolean {
-  return identity.canonicalBookId === capability.bookId &&
-    identity.documentId === capability.documentId &&
-    identity.contentHash === capability.contentHash &&
-    identity.sourceId === capability.sourceId;
-}
-
-function metadataString(
-  metadata: DocumentIdentityMap["metadata"],
-  key: string,
-): string | null {
-  const value = metadata?.[key];
-  return typeof value === "string" && value.length > 0 ? value : null;
-}
-
-function parseQmdVirtualPath(value: string): {
-  collection: string;
-  relativePath: string;
-} | null {
-  if (!value.startsWith("qmd://")) return null;
-  const withoutScheme = value.slice("qmd://".length);
-  const slashIndex = withoutScheme.indexOf("/");
-  if (slashIndex < 0) return null;
-  const collection = withoutScheme.slice(0, slashIndex);
-  const relativePath = withoutScheme.slice(slashIndex + 1);
-  if (!collection || !relativePath) return null;
-  return { collection, relativePath };
-}
-
-function parseDisplayPath(value: string): {
-  collection: string;
-  relativePath: string;
-} | null {
-  const parts = value.split("/").filter((part) => part.length > 0);
-  if (parts.length < 2) return null;
-  return {
-    collection: parts[0]!,
-    relativePath: parts.slice(1).join("/"),
-  };
-}
-
-function candidateQmdLocations(
-  candidate: QmdRetrievalCandidate,
-): Array<{ collection: string; relativePath: string }> {
-  const locations: Array<{ collection: string; relativePath: string }> = [];
-  const addLocation = (location: { collection: string; relativePath: string } | null) => {
-    if (location == null) return;
-    if (locations.some((item) =>
-      item.collection === location.collection &&
-      item.relativePath === location.relativePath
-    )) {
-      return;
-    }
-    locations.push(location);
-  };
-
-  const candidatePath = parseQmdVirtualPath(candidate.path);
-  addLocation(candidatePath);
-  if (candidate.collection != null) {
-    addLocation({
-      collection: candidate.collection,
-      relativePath: candidatePath?.relativePath ?? candidate.path,
-    });
-  }
-
-  const metadataPath = candidate.metadata?.path;
-  if (typeof metadataPath === "string") {
-    addLocation(parseQmdVirtualPath(metadataPath));
-    addLocation(parseDisplayPath(metadataPath));
-  }
-
-  return locations;
-}
-
-function candidateMatchesIdentityQmdLocation(
-  candidate: QmdRetrievalCandidate,
-  identity: DocumentIdentityMap,
-): boolean {
-  const qmdCollection = metadataString(identity.metadata, "qmdCollection");
-  const qmdRelativePath = metadataString(identity.metadata, "qmdRelativePath");
-  if (qmdCollection == null || qmdRelativePath == null) return false;
-  return candidateQmdLocations(candidate).some((location) =>
-    location.collection === qmdCollection &&
-    location.relativePath === qmdRelativePath
-  );
-}
-
 function candidateMatchesCapability(input: {
   candidate: QmdRetrievalCandidate;
   capability: GraphCapability;
   uniqueContentHashes: ReadonlySet<string>;
-  identities: readonly DocumentIdentityMap[];
 }): boolean {
-  const { candidate, capability, uniqueContentHashes, identities } = input;
+  const { candidate, capability, uniqueContentHashes } = input;
   if (candidate.documentId != null && candidate.documentId === capability.documentId) {
     return true;
   }
@@ -513,11 +548,7 @@ function candidateMatchesCapability(input: {
   ) {
     return true;
   }
-
-  return identities.some((identity) =>
-    graphIdentityMatchesCapability(identity, capability) &&
-    candidateMatchesIdentityQmdLocation(candidate, identity)
-  );
+  return false;
 }
 
 export async function resolveCandidateGraphCapabilities(input: {
@@ -527,12 +558,6 @@ export async function resolveCandidateGraphCapabilities(input: {
   const capabilities = await loadGraphQueryCapabilities({
     graphVault: input.graphVault,
   });
-  const identityRaw = await readYaml(
-    join(resolve(input.graphVault), "catalog", "document-identity-map.yaml"),
-  );
-  const identities = identityRaw == null
-    ? []
-    : DocumentIdentityCatalogSchema.parse(identityRaw).items;
   const contentHashCounts = new Map<string, number>();
   for (const capability of capabilities) {
     contentHashCounts.set(
@@ -553,7 +578,6 @@ export async function resolveCandidateGraphCapabilities(input: {
         candidate,
         capability,
         uniqueContentHashes,
-        identities,
       }),
     );
     if (matches.length > 0) {

@@ -167,11 +167,54 @@ async function writeValidatedQueryReadyArtifacts(
     });
   }
   await writeFile(booksPath, YAML.stringify(booksCatalog), "utf8");
+  const graphExtractFiles = [
+    ["documents.parquet", "graphrag_documents_parquet"],
+    ["text_units.parquet", "graphrag_text_units_parquet"],
+    ["entities.parquet", "graphrag_entities_parquet"],
+    ["relationships.parquet", "graphrag_relationships_parquet"],
+    ["communities.parquet", "graphrag_communities_parquet"],
+  ] as const;
+  for (const [fileName] of graphExtractFiles) {
+    await writeFile(
+      join(root, "books", bookId, "output", fileName),
+      MinimalParquetFixture,
+    );
+  }
+  await writeFile(
+    join(root, "books", bookId, "output", "context.json"),
+    "{}",
+    "utf8",
+  );
+  await writeFile(
+    join(root, "books", bookId, "output", "stats.json"),
+    JSON.stringify({ schemaVersion: SchemaVersion, bookId, documents: 1 }),
+    "utf8",
+  );
+  const graphExtractArtifactIds = [
+    ...graphExtractFiles.map(([fileName]) =>
+      `artifact-graph-${fileName.replace(/[^a-z0-9]+/giu, "-")}`
+    ),
+    "artifact-graph-context-json",
+    "artifact-graph-stats-json",
+  ];
   await writeFile(
     join(root, "books", bookId, "checkpoints.yaml"),
     `
 schemaVersion: ${SchemaVersion}
 items:
+  - schemaVersion: ${SchemaVersion}
+    bookId: ${bookId}
+    stage: graph_extract
+    status: succeeded
+    attemptCount: 1
+    runId: run-graph-extract
+    inputFingerprint: stage-graph-extract
+    contentHash: ${contentHash}
+    stageFingerprint: stage-graph-extract
+    providerFingerprint: ${providerFingerprint}
+    artifactIds:
+${graphExtractArtifactIds.map((artifactId) => `      - ${artifactId}`).join("\n")}
+    finishedAt: 2026-05-21T00:00:00.000Z
   - schemaVersion: ${SchemaVersion}
     bookId: ${bookId}
     stage: community_report
@@ -229,6 +272,45 @@ items:
     `
 schemaVersion: ${SchemaVersion}
 items:
+${(await Promise.all(graphExtractFiles.map(async ([fileName, kind]) => `  - schemaVersion: ${SchemaVersion}
+    artifactId: artifact-graph-${fileName.replace(/[^a-z0-9]+/giu, "-")}
+    bookId: ${bookId}
+    stage: graph_extract
+    kind: ${kind}
+    path: books/${bookId}/output/${fileName}
+    contentHash: ${await hashFile(join(root, "books", bookId, "output", fileName))}
+    stageFingerprint: stage-graph-extract
+    providerFingerprint: ${providerFingerprint}
+    producerRunId: run-graph-extract
+    createdAt: 2026-05-21T00:00:00.000Z
+    metadata:
+      corpusContentHash: ${contentHash}`))).join("\n")}
+  - schemaVersion: ${SchemaVersion}
+    artifactId: artifact-graph-context-json
+    bookId: ${bookId}
+    stage: graph_extract
+    kind: graphrag_context_json
+    path: books/${bookId}/output/context.json
+    contentHash: ${await hashFile(join(root, "books", bookId, "output", "context.json"))}
+    stageFingerprint: stage-graph-extract
+    providerFingerprint: ${providerFingerprint}
+    producerRunId: run-graph-extract
+    createdAt: 2026-05-21T00:00:00.000Z
+    metadata:
+      corpusContentHash: ${contentHash}
+  - schemaVersion: ${SchemaVersion}
+    artifactId: artifact-graph-stats-json
+    bookId: ${bookId}
+    stage: graph_extract
+    kind: graphrag_stats_json
+    path: books/${bookId}/output/stats.json
+    contentHash: ${await hashFile(join(root, "books", bookId, "output", "stats.json"))}
+    stageFingerprint: stage-graph-extract
+    providerFingerprint: ${providerFingerprint}
+    producerRunId: run-graph-extract
+    createdAt: 2026-05-21T00:00:00.000Z
+    metadata:
+      corpusContentHash: ${contentHash}
   - schemaVersion: ${SchemaVersion}
     artifactId: artifact-1
     bookId: ${bookId}
@@ -407,6 +489,57 @@ describe("unified query routing", () => {
     expect(projected?.contentHash).toBe("content-hash-without-identity");
     expect(projected?.metadata?.qmdDocumentIdSource).toBe("qmd_sqlite_projection");
     expect(projected?.metadata?.qmdChunkSeq).toBe(2);
+  });
+
+  test("does not bind graph identity by path when content hash is ambiguous", () => {
+    const [projected] = toQmdRetrievalCandidates([{
+      file: "qmd://books/book-one.md",
+      displayPath: "books/book-one.md",
+      title: "Book One",
+      body: "first chunk",
+      bestChunk: "first chunk",
+      bestChunkPos: 0,
+      bestChunkSeq: 0,
+      score: 0.8,
+      context: null,
+      docid: "docid-1",
+      hash: "shared-content-hash",
+    }], {
+      identities: [
+        {
+          schemaVersion: SchemaVersion,
+          sourceId: "source-1",
+          sourceHash: "source-hash-1",
+          canonicalBookId: "book-1",
+          documentId: "doc-1",
+          contentHash: "shared-content-hash",
+          normalizationPolicyVersion: "graphrag-normalized-markdown-v1",
+          normalizedPath: "books/book-one.md",
+          chunkIds: [],
+          graphDocumentId: "graph-doc-1",
+          graphTextUnitIds: ["tu-1"],
+          metadata: { qmdCorpusRegistered: true },
+        },
+        {
+          schemaVersion: SchemaVersion,
+          sourceId: "source-2",
+          sourceHash: "source-hash-2",
+          canonicalBookId: "book-2",
+          documentId: "doc-2",
+          contentHash: "shared-content-hash",
+          normalizationPolicyVersion: "graphrag-normalized-markdown-v1",
+          normalizedPath: "books/book-two.md",
+          chunkIds: [],
+          graphDocumentId: "graph-doc-2",
+          graphTextUnitIds: ["tu-2"],
+          metadata: { qmdCorpusRegistered: true },
+        },
+      ],
+    });
+
+    expect(projected?.sourceId).toBeNull();
+    expect(projected?.documentId).not.toBe("doc-1");
+    expect(projected?.metadata?.qmdDocumentIdSource).toBe("qmd_sqlite_projection");
   });
 
   test("does not use bestChunkPos as qmd chunk identity", () => {
@@ -743,7 +876,7 @@ items:
     expect(candidateCapabilities.get("cand-1")?.[0]?.bookId).toBe(bookId);
   });
 
-  test("matches qmd candidates to graph capabilities by qmd collection path", async () => {
+  test("does not match qmd candidates to graph capabilities by qmd collection path", async () => {
     const root = await mkdtemp(join(tmpdir(), "qmd-vault-qmd-path-match-"));
     const bookId = "book-1";
     await mkdir(join(root, "catalog"), { recursive: true });
@@ -804,10 +937,7 @@ items:
       })],
     });
 
-    expect(candidateCapabilities.get("cand-1")?.[0]?.bookId).toBe(bookId);
-    expect(candidateCapabilities.get("cand-1")?.[0]?.contentHash).toBe(
-      "graph-normalized-hash",
-    );
+    expect(candidateCapabilities.has("cand-1")).toBe(false);
   });
 
   test("loads query-ready capabilities from community-report and embed artifacts", async () => {
@@ -823,7 +953,17 @@ items:
     const capabilities = await loadGraphQueryCapabilities({ graphVault: root });
 
     expect(capabilities).toHaveLength(1);
-    expect(capabilities[0]?.artifactIds).toEqual(["artifact-1", "artifact-2"]);
+    expect(capabilities[0]?.artifactIds).toEqual(expect.arrayContaining([
+      "artifact-graph-documents-parquet",
+      "artifact-graph-text-units-parquet",
+      "artifact-graph-entities-parquet",
+      "artifact-graph-relationships-parquet",
+      "artifact-graph-communities-parquet",
+      "artifact-graph-context-json",
+      "artifact-graph-stats-json",
+      "artifact-1",
+      "artifact-2",
+    ]));
   });
 
   test("does not derive capability when graph identity map is absent", async () => {

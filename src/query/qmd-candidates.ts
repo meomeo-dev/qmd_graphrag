@@ -141,17 +141,6 @@ function findDocumentIdentity(
   const contentMatches = identities.filter((identity) =>
     identity.contentHash === result.hash
   );
-  if (contentMatches.length === 0) return null;
-
-  const pathMatches = contentMatches.filter((identity) =>
-    identity.normalizedPath != null &&
-    (
-      result.displayPath.endsWith(identity.normalizedPath) ||
-      identity.normalizedPath.endsWith(result.displayPath) ||
-      result.displayPath.endsWith(identity.normalizedPath.replace(/^input\//u, ""))
-    )
-  );
-  if (pathMatches.length === 1) return pathMatches[0]!;
   if (contentMatches.length === 1) return contentMatches[0]!;
   return null;
 }

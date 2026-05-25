@@ -56,11 +56,38 @@ export const BookArtifactKindSchema = z.enum([
   "query_snapshot",
 ]);
 
-export const BookJobSchema = z.object({
+function backfillSourceIdentityPath(value: unknown): unknown {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.sourceIdentityPath === "string" && raw.sourceIdentityPath) {
+    return value;
+  }
+  const metadata = raw.metadata;
+  const metadataRecord = metadata != null &&
+      typeof metadata === "object" &&
+      !Array.isArray(metadata)
+    ? metadata as Record<string, unknown>
+    : {};
+  const sourceIdentityPath =
+    typeof metadataRecord.sourceIdentityPath === "string" &&
+      metadataRecord.sourceIdentityPath
+      ? metadataRecord.sourceIdentityPath
+      : typeof metadataRecord.sourceName === "string" && metadataRecord.sourceName
+        ? metadataRecord.sourceName
+        : typeof raw.sourcePath === "string" && raw.sourcePath
+          ? raw.sourcePath
+          : undefined;
+  return sourceIdentityPath == null ? value : { ...raw, sourceIdentityPath };
+}
+
+export const BookJobSchema = z.preprocess(backfillSourceIdentityPath, z.object({
   schemaVersion: z.literal(SchemaVersion),
   bookId: z.string().min(1),
   documentId: z.string().min(1),
   sourcePath: VaultRelativePathSchema,
+  sourceIdentityPath: z.string().min(1),
   sourceHash: z.string().min(1),
   normalizedContentHash: z.string().min(1).optional(),
   normalizedPath: VaultRelativePathSchema.optional(),
@@ -76,7 +103,7 @@ export const BookJobSchema = z.object({
   createdAt: z.string().min(1),
   updatedAt: z.string().min(1),
   metadata: z.record(z.string(), JsonValueSchema).optional(),
-});
+}));
 
 function hasHighCostFingerprintFields(
   value: {

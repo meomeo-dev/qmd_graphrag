@@ -74,10 +74,13 @@ export function buildBookId(sourcePath: string): string {
 }
 
 export function buildBookIdFromSourceHash(
-  _sourcePath: string,
+  sourcePath: string,
   sourceHash: string,
 ): string {
-  return `book-${sourceHash.slice(0, 12)}`;
+  const pathHash = createHash("sha256")
+    .update(sourcePath.normalize("NFKC").toLowerCase())
+    .digest("hex");
+  return `book-${sourceHash.slice(0, 12)}-${pathHash.slice(0, 8)}`;
 }
 
 export function buildDocumentId(input: {

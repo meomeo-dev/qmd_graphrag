@@ -1,5 +1,6 @@
 import { SchemaVersion } from "../contracts/common.js";
 import type { GraphRagQueryResponse } from "../contracts/graphrag.js";
+import type { JsonValue } from "../contracts/common.js";
 import type {
   QmdRetrievalCandidate,
   QmdSearchResult,
@@ -11,6 +12,13 @@ import {
   type QueryRouteDecision,
   type UnifiedAnswer,
 } from "../contracts/unified-query.js";
+import { sanitizeVaultMetadata } from "../vault/metadata.js";
+
+function sanitizeGraphRagMetadata(
+  metadata?: Record<string, JsonValue>,
+): Record<string, JsonValue> | undefined {
+  return sanitizeVaultMetadata(metadata);
+}
 
 export function buildEvidenceRefsFromQmdResults(
   candidates: QmdRetrievalCandidate[],
@@ -86,7 +94,7 @@ export function buildEvidenceRefsFromGraphRagResponse(
       locator: item.locator ?? null,
       quote: item.quote,
       score: item.score,
-      metadata: item.metadata,
+      metadata: sanitizeGraphRagMetadata(item.metadata),
     }),
   );
 }

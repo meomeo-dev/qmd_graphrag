@@ -302,7 +302,9 @@ GraphRAG 失败时不得写入 `graph_query` capability。qmd corpus registratio
 - `sourceLocator`：源文件定位信息，不参与 canonical identity。
 - `documentId`：qmd 文档身份，绑定 sourceId、contentHash、
   normalizationPolicyVersion。
-- `bookId`：书级处理身份，由 `sourceHash` 派生。
+- `bookId`：书级处理身份，由 `sourceHash + sourceIdentityPath` 派生。
+- `sourceIdentityPath`：源文件的 canonical identity locator；参与 `bookId`
+  隔离，不参与 `sourceId` 或 `documentId`。
 - `bookDisplaySlug`：书名展示和工作区可读性字段，不参与去重 identity。
 - `contentHash`：规范化文本内容 hash，包含 normalization policy version。
 - `chunkId`：qmd chunk 身份，基于 contentHash、chunk strategy、seq、pos。
@@ -313,6 +315,7 @@ GraphRAG 失败时不得写入 `graph_query` capability。qmd corpus registratio
 
 ```text
 sourceHash -> sourceId
+sourceHash + sourceIdentityPath -> bookId
 sourceId -> canonicalBookId
 sourceId -> documentId
 documentId -> contentHash
@@ -322,10 +325,11 @@ documentId + contentHash -> graphTextUnitId[]
 canonicalBookId -> graph_vault workspace
 ```
 
-路径只作为 locator。不同设备路径不得改变 `sourceId`、`bookId`、
-`documentId`、`contentHash` 或成本去重 key。内容相同但文件名不同的源文件
-共享 canonical book identity；展示名通过 alias 记录。规范化内容变化产生
-新的 `contentHash` 与 `documentId`。
+路径只作为 locator。不同设备路径不得改变 `sourceId`、`documentId`、
+`contentHash` 或成本去重 key。`sourceIdentityPath` 是 `bookId` 的稳定身份
+分区：同一源内容在同一 canonical identity 下共享 `bookId`；同一源内容在不同
+identity 下保持独立 `bookId`，避免一本书复用或覆盖另一书的 GraphRAG 产物。
+规范化内容变化产生新的 `contentHash` 与 `documentId`。
 
 qmd chunk 与 GraphRAG text unit 都是一等 evidence identity。GraphRAG
 readiness 与 query scope 使用 `sourceId/documentId/contentHash/bookId` 和
@@ -334,11 +338,13 @@ validated capability 判断。`DocumentIdentityMap` 持久化
 生产者、消费者和查询证据回连。GraphRAG 内部 document title 只作为 frame
 裁剪 locator，不参与 readiness 或权限判断。
 
-`query_ready` 只引用已验证的查询产物，不改写产物生产阶段。community report
-artifact 的 producer stage 必须是 `community_report`，LanceDB artifact 的
-producer stage 必须是 `embed`。`query_ready` checkpoint 引用这些上游产物，
-并且只有在 `DocumentIdentityMap` 已写入 `graphDocumentId` 与非空
-`graphTextUnitIds` 时发布 graph capability。
+`query_ready` 只引用已验证的查询产物，不改写产物生产阶段。它必须先验证
+`graph_extract`、`community_report`、`embed` 三个 producer checkpoint 及其
+artifact 证据。community report artifact 的 producer stage 必须是
+`community_report`，LanceDB artifact 的 producer stage 必须是 `embed`。
+`query_ready` checkpoint 引用查询产物，并且只有在 `DocumentIdentityMap`
+已写入 `graphDocumentId`、非空 `graphTextUnitIds` 且 qmd corpus registration
+存在时发布 graph capability。
 
 成本去重 key 为：
 
@@ -658,10 +664,10 @@ GraphRAG capability。
 
 - `BatchRunManifest` 保存于 `graph_vault/catalog/batch-runs/<runId>/manifest.json`。
 - `BatchItemCheckpoint` 保存每本 EPUB 的 `pending/running/completed/failed`
-  状态、source locator、normalized locator、sourceHash、bookId、attempts、
-  expectedCommandCheckCount、failureKind、retryable、retryExhausted、
-  recoveryDecision、failedStage、startedAt、completedAt、failedAt 和 redacted
-  error summary。
+  状态、source locator、normalized locator、sourceHash、sourceIdentityPath、
+  bookId、attempts、expectedCommandCheckCount、failureKind、retryable、
+  retryExhausted、recoveryDecision、failedStage、startedAt、completedAt、
+  failedAt 和 redacted error summary。
 - `BatchEventLog` 保存于 `graph_vault/catalog/batch-runs/<runId>/events.jsonl`。
 - 批量恢复时先读取 batch manifest，再读取单书 `BookResumePlan.nextStage`。
 - 已 `completed` 的批量 item 不重跑；单书 checkpoint 不完整时以
@@ -671,7 +677,10 @@ GraphRAG capability。
   manifest、stage checkpoint 与 artifact 的 producer run、fingerprint 和
   provider identity 必须一致。
 - 非孤儿 `running` checkpoint 表示其他 runner 拥有当前 item；正式运行和
-  `--status-json` 都只观测该 item，不抢占、不重写 attempts。
+  `--status-json` 都只观测该 item，不抢占、不重写 attempts。fresh remote
+  runner heartbeat 在 TTL 内不由本机自动抢占；缺失 ownership、
+  `runnerHeartbeatAt` 超过 TTL，或本机 `runnerPid` 已死亡时，降级为
+  pending recovery，并保留 `recoveryDecision=retry_same_run_id`。
 - Provider 429、concurrency limit、timeout、502、503、504 属于 transient
   failure。批量执行器对 transient failure 做有限重试；短周期 retry budget
   耗尽时，item 进入 provider recovery wait，保持 `retryable=true`、
@@ -688,9 +697,10 @@ GraphRAG capability。
 active vault 目录必须保持 canonical：
 
 - `graph_vault/books/<bookId>` 和 `graph_vault/sources/<bookId>` 使用
-  `book-<sourceHash前12位>`。
-- 同一 `sourceHash` 的路径型、文件名型、截断书名型 legacy 目录必须合并到
-  canonical 目录。
+  `book-<sourceHash前12位>-<sourceIdentityPathHash前8位>`。
+- 同一 `sourceHash + sourceIdentityPath` 可推导出的路径型、文件名型、截断
+  书名型 legacy 目录必须合并到 canonical 目录。任意同 hash 但不同
+  source identity 的目录不得被宽扫描误合并。
 - 合并后 legacy 目录移动到 `graph_vault/archive/legacy-books/` 或
   `graph_vault/archive/legacy-sources/`，不留在 active 区。
 - 合并必须重写 job、checkpoint、artifact、run record、run catalog 和 typed
@@ -703,6 +713,7 @@ query-ready 判定规则：
 validated checkpoint
   + validated artifact manifest
   + kind-specific artifact validators
+  + graph_extract/community_report/embed producer checkpoints
 ```
 
 kind-specific validators 包括：

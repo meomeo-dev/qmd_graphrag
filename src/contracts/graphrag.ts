@@ -79,7 +79,7 @@ export const GraphRagIndexRequestSchema = z.object({
   rootDir: z.string().min(1),
   inputDir: z.string().min(1).optional(),
   dataDir: z.string().min(1).optional(),
-  reportDir: z.string().min(1).optional(),
+  reportDir: z.string().min(1),
   method: GraphRagIndexMethodSchema,
   indexScope: GraphRagIndexScopeSchema.optional(),
   verbose: z.boolean().optional(),

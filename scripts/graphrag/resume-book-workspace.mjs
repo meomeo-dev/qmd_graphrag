@@ -54,6 +54,7 @@ const { values } = parseArgs({
   options: {
     "state-root": { type: "string" },
     "source-path": { type: "string" },
+    "source-identity-path": { type: "string" },
     "normalized-path": { type: "string" },
     "qmd-index-path": { type: "string" },
     config: { type: "string" },
@@ -71,6 +72,9 @@ const stateRoot = resolve(required(values["state-root"], "state-root"));
 const requestedSourcePath = values["source-path"]
   ? resolve(values["source-path"])
   : null;
+const requestedSourceIdentityPath = values["source-identity-path"]
+  ? String(values["source-identity-path"])
+  : null;
 const requestedNormalizedPath = values["normalized-path"]
   ? resolve(values["normalized-path"])
   : null;
@@ -87,6 +91,9 @@ const configPath = values.config
 const reportRoot = values["report-root"]
   ? resolve(values["report-root"])
   : null;
+if (reportRoot == null) {
+  throw new Error("missing required argument: --report-root");
+}
 
 let GraphRagWorkflowNameSchemaRef;
 
@@ -159,18 +166,27 @@ function indexScopeFromSync(sync) {
 async function queryReadyProducerArtifacts(runtimeApi, repo, sync) {
   const checkpoints = await repo.listStageCheckpoints(sync.job.bookId);
   const checkpointByStage = new Map(checkpoints.map((item) => [item.stage, item]));
+  const graphExtract = checkpointByStage.get("graph_extract");
   const communityReport = checkpointByStage.get("community_report");
   const embed = checkpointByStage.get("embed");
   if (
+    graphExtract?.status !== "succeeded" ||
     communityReport?.status !== "succeeded" ||
     embed?.status !== "succeeded" ||
+    typeof graphExtract.runId !== "string" ||
     typeof communityReport.runId !== "string" ||
     typeof embed.runId !== "string"
   ) {
-    throw new Error("query_ready requires completed community_report and embed stages");
+    throw new Error(
+      "query_ready requires completed graph_extract, community_report and embed stages",
+    );
   }
   const expectedCorpusContentHash = sync.job.normalizedContentHash ?? sync.job.sourceHash;
   const artifacts = sync.artifacts.filter((artifact) =>
+    (
+      artifact.stage === "graph_extract" &&
+      artifact.producerRunId === graphExtract.runId
+    ) ||
     (
       artifact.kind === "graphrag_community_reports_parquet" &&
       artifact.stage === "community_report" &&
@@ -189,6 +205,7 @@ async function queryReadyProducerArtifacts(runtimeApi, repo, sync) {
     producerRunId: "query_ready-readiness",
     artifacts,
     expectedProducerRunIds: {
+      graph_extract: graphExtract.runId,
       community_report: communityReport.runId,
       embed: embed.runId,
     },
@@ -199,6 +216,7 @@ async function queryReadyProducerArtifacts(runtimeApi, repo, sync) {
   return {
     artifactIds,
     producerRunIds: {
+      graph_extract: graphExtract.runId,
       community_report: communityReport.runId,
       embed: embed.runId,
     },
@@ -276,7 +294,7 @@ async function loadSingleBookDefaults() {
       : null;
   const sourceIdentityPath =
     typeof job.metadata?.sourceIdentityPath === "string"
-      ? basename(job.metadata.sourceIdentityPath)
+      ? job.metadata.sourceIdentityPath
       : typeof job.metadata?.sourceName === "string"
         ? job.metadata.sourceName
         : sourcePath == null
@@ -294,7 +312,7 @@ async function resolveWorkspaceInputs() {
   if (requestedSourcePath && requestedNormalizedPath) {
     return {
       sourcePath: requestedSourcePath,
-      sourceIdentityPath: basename(requestedSourcePath),
+      sourceIdentityPath: requestedSourceIdentityPath ?? basename(requestedSourcePath),
       normalizedPath: requestedNormalizedPath,
     };
   }
@@ -310,7 +328,8 @@ async function resolveWorkspaceInputs() {
   }
   return {
     sourcePath,
-    sourceIdentityPath: defaults.sourceIdentityPath ?? sourcePath,
+    sourceIdentityPath: requestedSourceIdentityPath ?? defaults.sourceIdentityPath ??
+      sourcePath,
     normalizedPath,
   };
 }
@@ -781,15 +800,13 @@ async function run() {
   try {
     const stageLogStartOffset = await runtimeApi.graphRagIndexLogOffset(
       scopedOutputDir,
-      reportRoot ? join(reportRoot, sync.job.bookId, nextStage) : undefined,
+      join(reportRoot, sync.job.bookId, nextStage),
     );
     const indexResult = await runtime.graphIndex({
       rootDir: stateRoot,
       inputDir: scopedInputDir,
       dataDir: scopedOutputDir,
-      ...(reportRoot
-        ? { reportDir: join(reportRoot, sync.job.bookId, nextStage) }
-        : {}),
+      reportDir: join(reportRoot, sync.job.bookId, nextStage),
       method: "standard",
       indexScope: indexScopeFromSync(sync),
       skipValidation: true,
@@ -802,7 +819,7 @@ async function run() {
     });
     const stageReportHealth = await runtimeApi.assertGraphRagStageReportHealthy({
       outputDir: scopedOutputDir,
-      reportDir: reportRoot ? join(reportRoot, sync.job.bookId, nextStage) : undefined,
+      reportDir: join(reportRoot, sync.job.bookId, nextStage),
       stage: nextStage,
       logStartOffset: stageLogStartOffset,
     });

@@ -79,6 +79,8 @@ import {
   normalizePortableVaultRelativePath,
 } from "../vault/path.js";
 import {
+  GRAPH_EXTRACT_CORE_ARTIFACT_KINDS,
+  GRAPH_EXTRACT_ARTIFACT_KINDS,
   QUERY_READY_ARTIFACT_KINDS,
   validateArtifact,
   validateBookArtifactSet,
@@ -119,6 +121,21 @@ const EMPTY_DOCUMENT_IDENTITY_CATALOG: DocumentIdentityCatalog = {
 };
 
 const NormalizationPolicyVersion = "graphrag-normalized-markdown-v1";
+
+const QUERY_READY_PRODUCER_STAGES = [
+  "graph_extract",
+  "community_report",
+  "embed",
+] as const satisfies readonly BookStage[];
+
+const QUERY_READY_PRODUCER_REQUIRED_KINDS = {
+  graph_extract: GRAPH_EXTRACT_CORE_ARTIFACT_KINDS,
+  community_report: ["graphrag_community_reports_parquet"],
+  embed: ["lancedb_index"],
+} as const satisfies Record<
+  (typeof QUERY_READY_PRODUCER_STAGES)[number],
+  readonly BookArtifactKind[]
+>;
 
 const SINGLETON_ARTIFACT_KINDS = new Set<BookArtifactKind>([
   "source_epub",
@@ -512,7 +529,7 @@ function migrateLegacyStageCheckpoint(
     artifacts?: readonly BookArtifactManifest[];
     job?: BookJob | null;
   },
-): BookJobStageCheckpoint {
+): BookJobStageCheckpoint | null {
   const raw = value as Record<string, unknown>;
   const stage = BookStageSchema.parse(raw.stage);
   const artifactIds = Array.isArray(raw.artifactIds)
@@ -524,7 +541,7 @@ function migrateLegacyStageCheckpoint(
   const firstArtifact = stageArtifacts[0];
   const contentHash = typeof raw.contentHash === "string"
     ? raw.contentHash
-    : firstArtifact?.contentHash ?? input.job?.normalizedContentHash ?? input.job?.sourceHash;
+    : firstArtifact?.contentHash;
   const stageFingerprint = typeof raw.stageFingerprint === "string"
     ? raw.stageFingerprint
     : firstArtifact?.stageFingerprint ??
@@ -539,6 +556,9 @@ function migrateLegacyStageCheckpoint(
       (HIGH_COST_STAGES.has(stage)
         ? createDeterministicHash(["legacy-provider", input.bookId, stage])
         : undefined);
+  if (HIGH_COST_STAGES.has(stage) && contentHash == null) {
+    return null;
+  }
   return BookJobStageCheckpointSchema.parse({
     ...raw,
     bookId: typeof raw.bookId === "string" ? raw.bookId : input.bookId,
@@ -559,9 +579,12 @@ function migrateLegacyStageCheckpointList(
 ): BookJobCheckpointList {
   const raw = value as Record<string, unknown>;
   const items = Array.isArray(raw.items) ? raw.items : [];
+  const migrated = items
+    .map((item) => migrateLegacyStageCheckpoint(item, input))
+    .filter((item): item is BookJobStageCheckpoint => item != null);
   return BookJobCheckpointListSchema.parse({
     schemaVersion: SchemaVersion,
-    items: items.map((item) => migrateLegacyStageCheckpoint(item, input)),
+    items: migrated,
   });
 }
 
@@ -785,9 +808,13 @@ function buildResumePlan(
 function producerRunIdsForQueryReady(
   checkpointByStage: ReadonlyMap<BookStage, BookJobStageCheckpoint>,
 ): Partial<Record<BookStage, string>> | undefined {
+  const graphExtract = checkpointByStage.get("graph_extract");
   const communityReport = checkpointByStage.get("community_report");
   const embed = checkpointByStage.get("embed");
   if (
+    graphExtract?.status !== "succeeded" ||
+    typeof graphExtract.runId !== "string" ||
+    graphExtract.runId.length === 0 ||
     communityReport?.status !== "succeeded" ||
     typeof communityReport.runId !== "string" ||
     communityReport.runId.length === 0 ||
@@ -798,9 +825,33 @@ function producerRunIdsForQueryReady(
     return undefined;
   }
   return {
+    graph_extract: graphExtract.runId,
     community_report: communityReport.runId,
     embed: embed.runId,
   };
+}
+
+function expectedCheckpointContentHash(
+  job: BookJob | null | undefined,
+  stage: BookStage,
+): string | undefined {
+  if (job == null) return undefined;
+  if (stage === "ingest") return job.sourceHash;
+  return job.normalizedContentHash ?? job.sourceHash;
+}
+
+function filterArtifactIdsByKinds(
+  artifactIds: readonly string[],
+  artifacts: readonly BookArtifactManifest[],
+  kinds: readonly BookArtifactKind[],
+): string[] {
+  const kindSet = new Set<BookArtifactKind>(kinds);
+  return artifactIds.filter((artifactId) => {
+    const artifact = artifacts.find((candidate) =>
+      candidate.artifactId === artifactId
+    );
+    return artifact != null && kindSet.has(artifact.kind);
+  });
 }
 
 type ArtifactStageValidity = {
@@ -849,8 +900,6 @@ export class FileBookJobStateRepository {
       sourceHash,
       bookId,
     );
-    await this.migrateBookDirectorySourceHashAliases(sourceHash, bookId);
-    await this.migrateBookCatalogSourceHashAliases(sourceHash, bookId);
     const existing = await this.getBookJob(bookId);
     const normalizedPath = input.normalizedPath != null
       ? normalizePortableVaultRelativePath(input.normalizedPath)
@@ -909,6 +958,7 @@ export class FileBookJobStateRepository {
       bookId,
       documentId,
       sourcePath: canonicalSourcePath,
+      sourceIdentityPath,
       sourceHash,
       normalizedContentHash: input.normalizedContentHash ?? existing?.normalizedContentHash,
       normalizedPath,
@@ -1010,6 +1060,7 @@ export class FileBookJobStateRepository {
       createdAt: now,
       metadata: mergeJobMetadata(job.metadata, {
         bookId: job.bookId,
+        sourceIdentityPath: job.sourceIdentityPath,
       }),
     });
 
@@ -1018,7 +1069,9 @@ export class FileBookJobStateRepository {
       SourceDocumentCatalogSchema,
       EMPTY_SOURCE_DOCUMENT_CATALOG,
     );
-    const items = catalog.items.filter((item) => item.sourceId !== sourceId);
+    const items = catalog.items.filter((item) =>
+      item.metadata?.bookId !== job.bookId
+    );
     items.push(source);
     items.sort((left, right) => left.sourceId.localeCompare(right.sourceId));
     await writeYamlFile(this.sourceDocumentCatalogPath(), {
@@ -1036,11 +1089,13 @@ export class FileBookJobStateRepository {
       EMPTY_DOCUMENT_IDENTITY_CATALOG,
     );
     const existingIdentity = catalog.items.find((item) =>
+      item.canonicalBookId === job.bookId &&
       item.documentId === job.documentId
     );
     const aliases = [
       ...(existingIdentity?.aliases ?? []),
       existingIdentity?.normalizedPath ?? null,
+      job.sourceIdentityPath,
       metadataString(job.metadata, "sourceIdentityPath") ?? null,
       metadataString(job.metadata, "sourceName") ?? null,
       normalizedPath,
@@ -1060,12 +1115,13 @@ export class FileBookJobStateRepository {
       aliases: [...new Set(aliases)],
       metadata: mergeJobMetadata(job.metadata, {
         bookId: job.bookId,
+        sourceIdentityPath: job.sourceIdentityPath,
         normalizedPath: normalizedPath ?? null,
       }),
     });
 
     const items = catalog.items.filter((item) =>
-      item.documentId !== identity.documentId
+      item.canonicalBookId !== job.bookId
     );
     items.push(identity);
     items.sort((left, right) => left.documentId.localeCompare(right.documentId));
@@ -1314,52 +1370,6 @@ export class FileBookJobStateRepository {
     );
   }
 
-  private async migrateBookCatalogSourceHashAliases(
-    sourceHash: string,
-    currentBookId: string,
-  ): Promise<void> {
-    const catalog = await readBookJobCatalogFile(this.bookCatalogPath());
-    for (const item of catalog.items) {
-      if (item.sourceHash === sourceHash && item.bookId !== currentBookId) {
-        await this.remapBookIdentity(item.bookId, currentBookId);
-      }
-    }
-  }
-
-  private async migrateBookDirectorySourceHashAliases(
-    sourceHash: string,
-    currentBookId: string,
-  ): Promise<void> {
-    let entries;
-    try {
-      entries = await readdir(this.booksDir, { withFileTypes: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-      throw error;
-    }
-
-    for (const entry of entries) {
-      if (!entry.isDirectory() || entry.name === currentBookId) {
-        continue;
-      }
-
-      let job: BookJob;
-      try {
-        const raw = await readFile(this.bookJobPath(entry.name), "utf8");
-        job = migrateLegacyBookJob(YAML.parse(raw));
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-          continue;
-        }
-        throw error;
-      }
-
-      if (job.sourceHash === sourceHash) {
-        await this.remapBookIdentity(entry.name, currentBookId);
-      }
-    }
-  }
-
   async recordDocumentChunks(input: RecordDocumentChunksInput): Promise<void> {
     await this.ensureLayout();
     if (input.chunkIds.length === 0) {
@@ -1438,6 +1448,7 @@ export class FileBookJobStateRepository {
     const parsed = BookJobSchema.parse({
       ...job,
       sourcePath: normalizePortableVaultRelativePath(job.sourcePath),
+      sourceIdentityPath: job.sourceIdentityPath,
       normalizedPath: job.normalizedPath == null
         ? undefined
         : normalizePortableVaultRelativePath(job.normalizedPath),
@@ -1597,7 +1608,11 @@ export class FileBookJobStateRepository {
       }
     }
     await this.repairCheckpointRunRecordStageConsistency(bookId, list.items);
-    return list.items;
+    const job = await this.getBookJob(bookId);
+    return list.items.filter((checkpoint) =>
+      checkpoint.bookId === bookId &&
+      checkpoint.contentHash === expectedCheckpointContentHash(job, checkpoint.stage)
+    );
   }
 
   async getStageCheckpoint(
@@ -1619,16 +1634,84 @@ export class FileBookJobStateRepository {
   private async queryReadyProducerRunIds(
     bookId: string,
   ): Promise<Partial<Record<BookStage, string>> | undefined> {
+    const graphExtractRunId = await this.getStageCheckpointRunId(
+      bookId,
+      "graph_extract",
+    );
     const communityReportRunId = await this.getStageCheckpointRunId(
       bookId,
       "community_report",
     );
     const embedRunId = await this.getStageCheckpointRunId(bookId, "embed");
-    if (communityReportRunId == null || embedRunId == null) return undefined;
+    if (
+      graphExtractRunId == null ||
+      communityReportRunId == null ||
+      embedRunId == null
+    ) {
+      return undefined;
+    }
     return {
+      graph_extract: graphExtractRunId,
       community_report: communityReportRunId,
       embed: embedRunId,
     };
+  }
+
+  private async validateQueryReadyProducerStages(
+    job: BookJob,
+    artifacts: readonly BookArtifactManifest[],
+  ): Promise<void> {
+    const checkpoints = await Promise.all(
+      QUERY_READY_PRODUCER_STAGES.map(async (stage) => ({
+        stage,
+        checkpoint: await this.getStageCheckpoint(job.bookId, stage),
+      })),
+    );
+    const missingStages = checkpoints
+      .filter(({ checkpoint }) =>
+        checkpoint == null || checkpoint.status !== "succeeded" ||
+        checkpoint.runId == null
+      )
+      .map(({ stage }) => stage);
+    if (missingStages.length > 0) {
+      throw new Error(
+        "query_ready checkpoint requires completed GraphRAG producer stages: " +
+          missingStages.join(","),
+      );
+    }
+
+    for (const { stage, checkpoint } of checkpoints) {
+      if (checkpoint == null || checkpoint.runId == null) continue;
+      const requiredKinds = QUERY_READY_PRODUCER_REQUIRED_KINDS[stage];
+      const validation = await validateBookArtifactSet({
+        graphVault: this.rootDir,
+        bookId: job.bookId,
+        artifactIds: filterArtifactIdsByKinds(
+          checkpoint.artifactIds,
+          artifacts,
+          requiredKinds,
+        ),
+        artifacts,
+        requiredKinds,
+        allowedKinds: requiredKinds,
+        requireBookScopedGraphOutput: true,
+        expectedProducerRunIds: { [stage]: checkpoint.runId },
+        expectedStageFingerprints: job.stageFingerprints,
+        expectedProviderFingerprint: job.providerFingerprint,
+        expectedCorpusContentHash: job.normalizedContentHash ?? job.sourceHash,
+      });
+      if (!validation.isSatisfied) {
+        throw new Error(
+          "query_ready checkpoint requires valid GraphRAG producer evidence: " +
+            JSON.stringify({
+              stage,
+              missingArtifactIds: validation.missingArtifactIds,
+              missingArtifactKinds: validation.missingArtifactKinds,
+              invalidArtifacts: validation.invalidArtifacts,
+            }),
+        );
+      }
+    }
   }
 
   async startStage(input: StartStageInput): Promise<BookJobStageCheckpoint> {
@@ -2131,6 +2214,7 @@ export class FileBookJobStateRepository {
           ),
         expectedProducerRunIds: checkpoint.stage === "query_ready"
           ? queryReadyProducerRunIds ?? {
+              graph_extract: "__missing_query_ready_producer__",
               community_report: "__missing_query_ready_producer__",
               embed: "__missing_query_ready_producer__",
             }
@@ -2214,11 +2298,26 @@ export class FileBookJobStateRepository {
           artifactIds.includes(artifact.artifactId) && artifact.stage === input.stage
         );
     const firstStageArtifact = stageArtifacts[0];
+    const expectedContentHash = expectedCheckpointContentHash(job, input.stage);
+    if (
+      input.contentHash != null &&
+      expectedContentHash != null &&
+      input.contentHash !== expectedContentHash
+    ) {
+      throw new Error(
+        "stage checkpoint contentHash does not match registered book content: " +
+          JSON.stringify({
+            bookId: input.bookId,
+            stage: input.stage,
+            expectedContentHash,
+            actualContentHash: input.contentHash,
+          }),
+      );
+    }
     const checkpointContentHash =
       input.contentHash ??
-      firstStageArtifact?.contentHash ??
-      job?.normalizedContentHash ??
-      job?.sourceHash;
+      expectedContentHash ??
+      firstStageArtifact?.contentHash;
     const checkpointStageFingerprint =
       input.stageFingerprint ??
       firstStageArtifact?.stageFingerprint ??
@@ -2263,17 +2362,8 @@ export class FileBookJobStateRepository {
           `query_ready checkpoint requires registered book state: ${input.bookId}`,
         );
       }
-      const communityReportRunId = await this.getStageCheckpointRunId(
-        input.bookId,
-        "community_report",
-      );
-      const embedRunId = await this.getStageCheckpointRunId(input.bookId, "embed");
-      if (communityReportRunId == null || embedRunId == null) {
-        throw new Error(
-          "query_ready checkpoint requires completed GraphRAG producer stages",
-        );
-      }
       const artifacts = await this.listArtifacts(input.bookId);
+      await this.validateQueryReadyProducerStages(job, artifacts);
       const validation = await validateBookArtifactSet({
         graphVault: this.rootDir,
         bookId: input.bookId,
@@ -2282,10 +2372,7 @@ export class FileBookJobStateRepository {
         requiredKinds: QUERY_READY_ARTIFACT_KINDS,
         allowedKinds: QUERY_READY_ARTIFACT_KINDS,
         requireBookScopedGraphOutput: true,
-        expectedProducerRunIds: {
-          community_report: communityReportRunId,
-          embed: embedRunId,
-        },
+        expectedProducerRunIds: await this.queryReadyProducerRunIds(input.bookId),
         expectedStageFingerprints: job.stageFingerprints,
         expectedProviderFingerprint: job.providerFingerprint,
         expectedCorpusContentHash: job.normalizedContentHash ?? job.sourceHash,
@@ -2392,6 +2479,29 @@ export class FileBookJobStateRepository {
     checkpoint: BookJobStageCheckpoint,
     createdAt: string,
   ): Promise<void> {
+    const artifacts = await this.listArtifacts(job.bookId);
+    const producerCheckpoints = await Promise.all(
+      QUERY_READY_PRODUCER_STAGES.map(async (stage) => ({
+        stage,
+        checkpoint: await this.getStageCheckpoint(job.bookId, stage),
+      })),
+    );
+    const lineageArtifactIds = [
+      ...producerCheckpoints.flatMap(({ stage, checkpoint: producerCheckpoint }) =>
+        producerCheckpoint == null
+          ? []
+          : filterArtifactIdsByKinds(
+              producerCheckpoint.artifactIds,
+              artifacts,
+              QUERY_READY_PRODUCER_REQUIRED_KINDS[stage],
+            )
+      ),
+      ...filterArtifactIdsByKinds(
+        checkpoint.artifactIds,
+        artifacts,
+        QUERY_READY_ARTIFACT_KINDS,
+      ),
+    ];
     const base = {
       schemaVersion: SchemaVersion,
       bookId: job.bookId,
@@ -2400,7 +2510,7 @@ export class FileBookJobStateRepository {
       contentHash: job.normalizedContentHash ?? job.sourceHash,
       ready: true,
       readinessSource: "validated_checkpoint_plus_validated_manifest" as const,
-      artifactIds: checkpoint.artifactIds,
+      artifactIds: [...new Set(lineageArtifactIds)],
       createdAt,
     };
 
@@ -2542,6 +2652,11 @@ export class FileBookJobStateRepository {
   ): Promise<boolean> {
     const expectedProducerRunIds = await this.queryReadyProducerRunIds(job.bookId);
     if (expectedProducerRunIds == null) return false;
+    try {
+      await this.validateQueryReadyProducerStages(job, artifacts);
+    } catch {
+      return false;
+    }
     const validation = await validateBookArtifactSet({
       graphVault: this.rootDir,
       bookId: job.bookId,

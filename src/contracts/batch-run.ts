@@ -81,6 +81,7 @@ const BatchItemCheckpointObjectSchema = z.object({
   status: BatchItemStatusSchema,
   sourceName: z.string().min(1),
   sourceRelativePath: BatchProjectRelativeLocatorSchema,
+  sourceIdentityPath: BatchProjectRelativeLocatorSchema,
   sourceHash: z.string().min(1),
   normalizedPath: BatchProjectRelativeLocatorSchema,
   bookId: z.string().min(1),
@@ -118,8 +119,15 @@ const BatchItemCheckpointObjectSchema = z.object({
   metadata: z.record(z.string(), JsonValueSchema).optional(),
 });
 
+const BatchItemCheckpointPersistedObjectSchema =
+  BatchItemCheckpointObjectSchema.extend({
+    qmdBuildStatus: BatchBuildStatusSchema,
+    graphBuildStatus: BatchBuildStatusSchema,
+    graphQueryStatus: BatchBuildStatusSchema,
+  });
+
 export const BatchItemCheckpointSchema =
-  BatchItemCheckpointObjectSchema.superRefine((value, ctx) => {
+  BatchItemCheckpointPersistedObjectSchema.superRefine((value, ctx) => {
     if (value.status === "running") {
       for (const field of [
         "runnerSessionId",
@@ -266,19 +274,24 @@ export const BatchRecoverySummarySchema = z.object({
 });
 
 export const BatchItemCheckpointInputSchema = BatchItemCheckpointObjectSchema.extend({
+  sourceIdentityPath: BatchProjectRelativeLocatorSchema.optional(),
   sourceHash: z.string().min(1).optional(),
   bookId: z.string().min(1).optional(),
 });
 
 export function parseBatchItemCheckpoint(
   value: unknown,
-  defaults: { sourceHash: string; bookId: string },
+  defaults: { sourceHash: string; bookId: string; sourceIdentityPath: string },
 ) {
   const parsed = BatchItemCheckpointInputSchema.parse(value);
   return BatchItemCheckpointSchema.parse({
     ...parsed,
+    sourceIdentityPath: parsed.sourceIdentityPath ?? defaults.sourceIdentityPath,
     sourceHash: parsed.sourceHash ?? defaults.sourceHash,
     bookId: parsed.bookId ?? defaults.bookId,
+    qmdBuildStatus: parsed.qmdBuildStatus ?? { status: "pending" },
+    graphBuildStatus: parsed.graphBuildStatus ?? { status: "pending" },
+    graphQueryStatus: parsed.graphQueryStatus ?? { status: "pending" },
   });
 }
 

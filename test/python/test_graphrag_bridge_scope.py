@@ -179,13 +179,44 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
     book_dir = root / "books" / book_id
     output_dir = book_dir / "output"
     lancedb_dir = output_dir / "lancedb"
+    graph_extract_files = [
+        ("documents.parquet", "graphrag_documents_parquet"),
+        ("text_units.parquet", "graphrag_text_units_parquet"),
+        ("entities.parquet", "graphrag_entities_parquet"),
+        ("relationships.parquet", "graphrag_relationships_parquet"),
+        ("communities.parquet", "graphrag_communities_parquet"),
+    ]
+    for file_name, _kind in graph_extract_files:
+        (output_dir / file_name).parent.mkdir(parents=True, exist_ok=True)
+        (output_dir / file_name).write_bytes(
+            base64.b64decode(MINIMAL_PARQUET_FIXTURE)
+        )
+    (output_dir / "context.json").write_text("{}", encoding="utf-8")
+    (output_dir / "stats.json").write_text(
+        json.dumps({"schemaVersion": "1.0.0", "bookId": book_id}),
+        encoding="utf-8",
+    )
     _write_complete_lancedb_fixture(lancedb_dir)
     reports_path = output_dir / "community_reports.parquet"
     reports_path.write_bytes(base64.b64decode(MINIMAL_PARQUET_FIXTURE))
     report_hash = _hash_file(reports_path)
     lancedb_hash = _bridge_hash_lancedb_directory_contents(lancedb_dir)
-    artifact_ids = [artifact_prefix, f"{artifact_prefix}-lancedb"]
+    graph_extract_artifact_ids = [
+        f"{artifact_prefix}-documents",
+        f"{artifact_prefix}-text-units",
+        f"{artifact_prefix}-entities",
+        f"{artifact_prefix}-relationships",
+        f"{artifact_prefix}-communities",
+        f"{artifact_prefix}-context",
+        f"{artifact_prefix}-stats",
+    ]
+    artifact_ids = [
+        *graph_extract_artifact_ids,
+        artifact_prefix,
+        f"{artifact_prefix}-lancedb",
+    ]
     provider_fingerprint = "provider-openai-responses-jina"
+    content_hash = f"content-{book_id.rsplit('-', 1)[-1]}"
     (book_dir / "checkpoints.yaml").write_text(
         yaml.safe_dump(
             {
@@ -194,12 +225,26 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
                     {
                         "schemaVersion": "1.0.0",
                         "bookId": book_id,
+                        "stage": "graph_extract",
+                        "status": "succeeded",
+                        "attemptCount": 1,
+                        "runId": "run-graph-extract",
+                        "inputFingerprint": "stage-graph-extract",
+                        "contentHash": content_hash,
+                        "stageFingerprint": "stage-graph-extract",
+                        "providerFingerprint": provider_fingerprint,
+                        "artifactIds": graph_extract_artifact_ids,
+                        "finishedAt": "2026-05-21T00:00:00.000Z",
+                    },
+                    {
+                        "schemaVersion": "1.0.0",
+                        "bookId": book_id,
                         "stage": "community_report",
                         "status": "succeeded",
                         "attemptCount": 1,
                         "runId": "run-community-report",
                         "inputFingerprint": "stage-community-report",
-                        "contentHash": f"content-{book_id.rsplit('-', 1)[-1]}",
+                        "contentHash": content_hash,
                         "stageFingerprint": "stage-community-report",
                         "providerFingerprint": provider_fingerprint,
                         "artifactIds": [artifact_prefix],
@@ -213,7 +258,7 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
                         "attemptCount": 1,
                         "runId": "run-embed",
                         "inputFingerprint": "stage-embed",
-                        "contentHash": f"content-{book_id.rsplit('-', 1)[-1]}",
+                        "contentHash": content_hash,
                         "stageFingerprint": "stage-embed",
                         "providerFingerprint": provider_fingerprint,
                         "artifactIds": [f"{artifact_prefix}-lancedb"],
@@ -225,11 +270,12 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
                         "stage": "query_ready",
                         "status": "succeeded",
                         "attemptCount": 1,
+                        "runId": "run-query-ready",
                         "inputFingerprint": "fp",
-                        "contentHash": f"content-{book_id.rsplit('-', 1)[-1]}",
+                        "contentHash": content_hash,
                         "stageFingerprint": "stage-query-ready",
                         "providerFingerprint": provider_fingerprint,
-                        "artifactIds": artifact_ids,
+                        "artifactIds": [artifact_prefix, f"{artifact_prefix}-lancedb"],
                         "finishedAt": "2026-05-21T00:00:00.000Z",
                     }
                 ],
@@ -242,6 +288,54 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
             {
                 "schemaVersion": "1.0.0",
                 "items": [
+                    *[
+                        {
+                            "schemaVersion": "1.0.0",
+                            "artifactId": artifact_id,
+                            "bookId": book_id,
+                            "stage": "graph_extract",
+                            "kind": kind,
+                            "path": f"books/{book_id}/output/{file_name}",
+                            "contentHash": _hash_file(output_dir / file_name),
+                            "stageFingerprint": "stage-graph-extract",
+                            "providerFingerprint": provider_fingerprint,
+                            "producerRunId": "run-graph-extract",
+                            "createdAt": "2026-05-21T00:00:00.000Z",
+                            "metadata": {"corpusContentHash": content_hash},
+                        }
+                        for artifact_id, (file_name, kind) in zip(
+                            graph_extract_artifact_ids[:5],
+                            graph_extract_files,
+                        )
+                    ],
+                    {
+                        "schemaVersion": "1.0.0",
+                        "artifactId": graph_extract_artifact_ids[5],
+                        "bookId": book_id,
+                        "stage": "graph_extract",
+                        "kind": "graphrag_context_json",
+                        "path": f"books/{book_id}/output/context.json",
+                        "contentHash": _hash_file(output_dir / "context.json"),
+                        "stageFingerprint": "stage-graph-extract",
+                        "providerFingerprint": provider_fingerprint,
+                        "producerRunId": "run-graph-extract",
+                        "createdAt": "2026-05-21T00:00:00.000Z",
+                        "metadata": {"corpusContentHash": content_hash},
+                    },
+                    {
+                        "schemaVersion": "1.0.0",
+                        "artifactId": graph_extract_artifact_ids[6],
+                        "bookId": book_id,
+                        "stage": "graph_extract",
+                        "kind": "graphrag_stats_json",
+                        "path": f"books/{book_id}/output/stats.json",
+                        "contentHash": _hash_file(output_dir / "stats.json"),
+                        "stageFingerprint": "stage-graph-extract",
+                        "providerFingerprint": provider_fingerprint,
+                        "producerRunId": "run-graph-extract",
+                        "createdAt": "2026-05-21T00:00:00.000Z",
+                        "metadata": {"corpusContentHash": content_hash},
+                    },
                     {
                         "schemaVersion": "1.0.0",
                         "artifactId": artifact_prefix,
@@ -254,9 +348,7 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
                         "providerFingerprint": provider_fingerprint,
                         "producerRunId": "run-community-report",
                         "createdAt": "2026-05-21T00:00:00.000Z",
-                        "metadata": {
-                            "corpusContentHash": f"content-{book_id.rsplit('-', 1)[-1]}"
-                        },
+                        "metadata": {"corpusContentHash": content_hash},
                     },
                     {
                         "schemaVersion": "1.0.0",
@@ -270,15 +362,27 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
                         "providerFingerprint": provider_fingerprint,
                         "producerRunId": "run-embed",
                         "createdAt": "2026-05-21T00:00:00.000Z",
-                        "metadata": {
-                            "corpusContentHash": f"content-{book_id.rsplit('-', 1)[-1]}"
-                        },
+                        "metadata": {"corpusContentHash": content_hash},
                     },
                 ],
             }
         ),
         encoding="utf-8",
     )
+
+
+def _lineage_artifact_ids(artifact_prefix: str) -> list[str]:
+    return [
+        f"{artifact_prefix}-documents",
+        f"{artifact_prefix}-text-units",
+        f"{artifact_prefix}-entities",
+        f"{artifact_prefix}-relationships",
+        f"{artifact_prefix}-communities",
+        f"{artifact_prefix}-context",
+        f"{artifact_prefix}-stats",
+        artifact_prefix,
+        f"{artifact_prefix}-lancedb",
+    ]
 
 
 def _write_complete_lancedb_fixture(root: Path) -> None:
@@ -568,6 +672,7 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                             "rootDir": str(root),
                             "inputDir": str(root / "books" / "book-1" / "input"),
                             "dataDir": str(root / "books" / "book-1" / "output"),
+                            "reportDir": str(root / "logs" / "book-1" / "graph_extract"),
                             "method": "standard",
                             "skipValidation": True,
                             "workflows": ["load_input_documents"],
@@ -593,9 +698,7 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                 },
                 "reporting": {
                     "type": "file",
-                    "base_dir": str(
-                        (root / "books" / "book-1" / "output" / "reports").resolve()
-                    ),
+                    "base_dir": str((root / "logs" / "book-1" / "graph_extract").resolve()),
                 },
                 "cache": {
                     "type": "json",
@@ -678,7 +781,7 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                     "sourceId": "sha256:source-1",
                     "documentId": "doc-1",
                     "contentHash": "content-1",
-                    "artifactIds": ["artifact-1", "artifact-1-lancedb"],
+                    "artifactIds": _lineage_artifact_ids("artifact-1"),
                 },
             )
 
@@ -695,7 +798,7 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                         "sourceId": "sha256:source-1",
                         "documentId": "doc-1",
                         "contentHash": "content-other",
-                        "artifactIds": ["artifact-1", "artifact-1-lancedb"],
+                        "artifactIds": _lineage_artifact_ids("artifact-1"),
                     },
                 )
 
@@ -715,7 +818,7 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                         "sourceId": "sha256:source-1",
                         "documentId": "doc-1",
                         "contentHash": "content-1",
-                        "artifactIds": ["artifact-1", "artifact-1-lancedb"],
+                        "artifactIds": _lineage_artifact_ids("artifact-1"),
                     }
                 ],
             )
@@ -735,7 +838,7 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                         "sourceId": "sha256:source-1",
                         "contentHash": "content-1",
                         "qmdDocumentId": "doc-1",
-                        "artifactIds": ["artifact-1", "artifact-1-lancedb"],
+                        "artifactIds": _lineage_artifact_ids("artifact-1"),
                         "graphDocumentId": "doc-1",
                         "documentId": "doc-1",
                         "graphTextUnitIds": ["tu-1"],
@@ -764,7 +867,7 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                         "sourceId": "sha256:source-1",
                         "documentId": "doc-1",
                         "contentHash": "content-1",
-                        "artifactIds": ["artifact-1", "artifact-1-lancedb"],
+                        "artifactIds": _lineage_artifact_ids("artifact-1"),
                     }
                 ],
             )
@@ -788,7 +891,7 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                         "sourceId": "sha256:source-1",
                         "documentId": "doc-1",
                         "contentHash": "content-1",
-                        "artifactIds": ["artifact-1", "artifact-1-lancedb"],
+                        "artifactIds": _lineage_artifact_ids("artifact-1"),
                     }
                 ],
             )
@@ -803,7 +906,7 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                     {
                         "capabilityId": "book-1:graph_query",
                         "bookId": "book-1",
-                        "artifactIds": ["artifact-1", "artifact-1-lancedb"],
+                        "artifactIds": _lineage_artifact_ids("artifact-1"),
                     }
                 ],
             )
@@ -814,7 +917,7 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                 "book-1:graph_query:tu-1",
             )
             self.assertEqual(evidence[0]["graphTextUnitId"], "tu-1")
-            self.assertEqual(evidence[0]["artifactId"], "artifact-1")
+            self.assertEqual(evidence[0]["artifactId"], "artifact-1-text-units")
             self.assertEqual(evidence[0]["metadata"]["scope"], "graph_text_unit")
             self.assertEqual(evidence[0]["quote"], "one")
 
@@ -908,7 +1011,7 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
             self.assertEqual(capabilities[0]["capabilityId"], "book-1:graph_query")
             self.assertEqual(
                 capabilities[0]["artifactIds"],
-                ["artifact-1", "artifact-1-lancedb"],
+                _lineage_artifact_ids("artifact-1"),
             )
             self.assertEqual(capabilities[0]["sourceId"], "sha256:source-1")
             self.assertEqual(capabilities[0]["documentId"], "doc-1")
@@ -921,7 +1024,7 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                     "sourceIds": ["sha256:source-1"],
                     "documentIds": ["doc-1"],
                     "contentHashes": ["content-1"],
-                    "artifactIds": ["artifact-1", "artifact-1-lancedb"],
+                    "artifactIds": _lineage_artifact_ids("artifact-1"),
                 },
                 capabilities,
             )
@@ -988,7 +1091,7 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                         "sourceIds": ["sha256:source-1"],
                         "documentIds": ["doc-other"],
                         "contentHashes": ["content-1"],
-                        "artifactIds": ["artifact-1", "artifact-1-lancedb"],
+                        "artifactIds": _lineage_artifact_ids("artifact-1"),
                     },
                     capabilities,
                 )

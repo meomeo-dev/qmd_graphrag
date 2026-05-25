@@ -50,12 +50,14 @@ decisions:
       as current evidence.
   mutable_observability_sidecars:
     rule: >-
-      GraphRAG stats.json is a mutable observability sidecar that later
-      workflows may rewrite. It can be cataloged for diagnostics but it is not a
-      hard completion requirement for graph_extract.
+      GraphRAG stats.json is a stage-scoped observability artifact that later
+      workflows may rewrite only by producing a new graph_extract run and
+      checkpoint. It is cataloged for diagnostics and is a hard completion
+      requirement for graph_extract.
     invariant: >-
-      A later workflow must not make an already validated graph_extract
-      checkpoint stale only because stats.json changed.
+      An already validated graph_extract checkpoint remains valid only while
+      the referenced stats.json artifact content hash, producer run, and
+      fingerprint remain valid.
 consequences:
   - Existing failed checkpoints caused by the old Parquet gate can be repaired
     by re-running status or resume after the validator fix; no graph_vault reset

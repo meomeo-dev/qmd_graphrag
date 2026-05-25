@@ -339,6 +339,7 @@ describe("GraphRAG provider cost accounting", () => {
 
   test("records index lineage only from explicit index scope", async () => {
     const graphVault = await mkdtemp(join(tmpdir(), "qmd-graphrag-cost-index-"));
+    const reportDir = join(graphVault, "books", "book-index", "output", "reports");
     const { reportArtifactId, lancedbArtifactId } =
       await writeValidatedGraphVault(graphVault);
     mockedBridge.mockResolvedValueOnce({
@@ -353,6 +354,7 @@ describe("GraphRAG provider cost accounting", () => {
 
     await runGraphRagIndex({
       rootDir: graphVault,
+      reportDir,
       method: "standard",
       indexScope: {
         bookId: "book-index",
@@ -389,6 +391,7 @@ describe("GraphRAG provider cost accounting", () => {
       command: "graphrag_index",
       request: expect.objectContaining({
         rootDir: graphVault,
+        reportDir,
         method: "standard",
         skipValidation: true,
         workflows: ["load_input_documents", "create_base_text_units"],
@@ -405,6 +408,7 @@ describe("GraphRAG provider cost accounting", () => {
 
   test("rejects GraphRAG index responses with workflow errors", async () => {
     const graphVault = await mkdtemp(join(tmpdir(), "qmd-graphrag-cost-index-"));
+    const reportDir = join(graphVault, "books", "book-index", "output", "reports");
     mockedBridge.mockResolvedValueOnce({
       schemaVersion: SchemaVersion,
       method: "standard",
@@ -418,6 +422,7 @@ describe("GraphRAG provider cost accounting", () => {
 
     await expect(runGraphRagIndex({
       rootDir: graphVault,
+      reportDir,
       method: "standard",
       skipValidation: true,
       workflows: ["load_input_documents"],

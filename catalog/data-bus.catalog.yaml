@@ -39,6 +39,9 @@ types:
     storage: graph_vault/catalog/batch-runs/<run_id>/items/<item_id>.json
     notes:
       - one checkpoint per EPUB item
+      - sourceIdentityPath is a first-class field; sourceHash plus
+        sourceIdentityPath derives the per-book bookId used for GraphRAG
+        workspace isolation
       - completed items are skipped on resume
       - retryable failed items resume through the same runId
       - data_compatibility failures are non-retryable and stop the current
@@ -109,6 +112,9 @@ types:
         commandChecks; checkpoint top-level fields remain the recovery state
         source of truth
       - status-json emits the same typed payload without running work
+      - remote running items with fresh heartbeat are observed but not stolen;
+        missing ownership, stale heartbeat beyond TTL, or a dead same-host
+        runner PID is projected as orphan recovery
 
   - name: source_document
     schema: src/contracts/corpus.ts#SourceDocumentSchema
@@ -381,7 +387,8 @@ types:
     storage: graph_vault/catalog/graph-capabilities.yaml
     notes:
       - catalog entries are accepted only when corresponding query-ready
-        checkpoint artifact manifests validate
+        checkpoint artifact manifests validate and the same book has validated
+        graph_extract, community_report, and embed producer checkpoints
       - artifact stage remains producer stage and is not rewritten to
         query_ready
       - explicit catalog supplements absent capability semantic keys and does
@@ -953,6 +960,10 @@ types:
       - src/job-state/graphrag-book.ts#syncGraphRagBookWorkspace
       - src/job-state/repository.ts#FileBookJobStateRepository.getResumePlan
     storage: file
+    notes:
+      - sourceIdentityPath is a first-class field used with sourceHash to
+        derive bookId and isolate duplicate source payloads at different
+        canonical source identities
 
   - name: book_job_catalog
     schema: src/contracts/book-job.ts#BookJobCatalogSchema
@@ -980,6 +991,10 @@ types:
     notes:
       - checkpoint success is valid only when required artifact manifests remain
         present and their paths resolve from graph_vault
+      - query_ready success requires validated graph_extract,
+        community_report, and embed producer checkpoints before capability
+        publication
+      - checkpoint bookId and contentHash are fail-closed identity fields
 
   - name: book_stage_checkpoint_list
     schema: src/contracts/book-job.ts#BookJobCheckpointListSchema

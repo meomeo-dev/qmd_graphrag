@@ -889,7 +889,7 @@ describe("syncGraphRagBookWorkspace", () => {
     }
   });
 
-  test("keeps graph_extract ready when mutable stats sidecar changes", async () => {
+  test("rejects graph_extract readiness when stats sidecar changes", async () => {
     const root = await createWorkspace();
     try {
       const graphVault = join(root, "graph_vault");
@@ -938,15 +938,13 @@ describe("syncGraphRagBookWorkspace", () => {
       });
       await writeFile(join(outputDir, "stats.json"), '{"workflows":{"later":1}}', "utf8");
 
-      const artifactIds = await assertGraphRagStageArtifactsReady({
+      await expect(assertGraphRagStageArtifactsReady({
         stateRootDir: graphVault,
         bookId: initial.job.bookId,
         stage: "graph_extract",
         producerRunId: "graph-run",
         artifacts: synced.artifacts,
-      });
-
-      expect(artifactIds).toHaveLength(6);
+      })).rejects.toThrow("GraphRAG stage did not produce valid book-scoped artifacts");
       expect(
         synced.artifacts.some((artifact) =>
           artifact.kind === "graphrag_stats_json" &&
@@ -954,51 +952,6 @@ describe("syncGraphRagBookWorkspace", () => {
         ),
       ).toBe(true);
 
-      const repo = new FileBookJobStateRepository(graphVault);
-      await repo.completeStage({
-        bookId: initial.job.bookId,
-        stage: "ingest",
-        runId: "ingest-run",
-        inputFingerprint: synced.stageFingerprints.ingest,
-        stageFingerprint: synced.stageFingerprints.ingest,
-        providerFingerprint: synced.job.providerFingerprint,
-        artifactIds: synced.artifacts
-          .filter((artifact) => artifact.stage === "ingest")
-          .map((artifact) => artifact.artifactId),
-      });
-      await repo.completeStage({
-        bookId: initial.job.bookId,
-        stage: "normalize",
-        runId: "normalize-run",
-        inputFingerprint: synced.stageFingerprints.normalize,
-        stageFingerprint: synced.stageFingerprints.normalize,
-        providerFingerprint: synced.job.providerFingerprint,
-        artifactIds: synced.artifacts
-          .filter((artifact) => artifact.stage === "normalize")
-          .map((artifact) => artifact.artifactId),
-      });
-      await repo.completeStage({
-        bookId: initial.job.bookId,
-        stage: "graph_extract",
-        runId: "graph-run",
-        inputFingerprint: synced.stageFingerprints.graph_extract,
-        stageFingerprint: synced.stageFingerprints.graph_extract,
-        providerFingerprint: synced.job.providerFingerprint,
-        artifactIds: synced.artifacts
-          .filter((artifact) => artifact.stage === "graph_extract")
-          .map((artifact) => artifact.artifactId),
-      });
-      const resumed = await syncGraphRagBookWorkspace({
-        stateRootDir: graphVault,
-        sourcePath,
-        normalizedPath,
-        settingsPath: join(graphVault, "settings.yaml"),
-        promptsDir: join(graphVault, "prompts"),
-        outputDir: join(graphVault, "output"),
-        recordRecoveredStages: false,
-      });
-      expect(resumed.resumePlan.completedStages).toContain("graph_extract");
-      expect(resumed.resumePlan.nextStage).toBe("community_report");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1148,6 +1101,7 @@ describe("syncGraphRagBookWorkspace", () => {
         producerRunId: "real-query-ready",
         artifacts: syncedArtifacts.artifacts,
         expectedProducerRunIds: {
+          graph_extract: "real-graph-extract",
           community_report: "real-community-report",
           embed: "real-embed",
         },
@@ -1169,6 +1123,7 @@ describe("syncGraphRagBookWorkspace", () => {
         producerRunId: "real-query-ready",
         artifacts: syncedArtifacts.artifacts,
         expectedProducerRunIds: {
+          graph_extract: "real-graph-extract",
           community_report: "old-community-report",
           embed: "real-embed",
         },
@@ -1177,7 +1132,7 @@ describe("syncGraphRagBookWorkspace", () => {
         expectedCorpusContentHash:
           syncedArtifacts.job.normalizedContentHash ?? syncedArtifacts.job.sourceHash,
       })).rejects.toThrow(
-        "GraphRAG stage did not produce valid book-scoped artifacts",
+        "query_ready producer did not produce valid book-scoped artifacts",
       );
       const qmdStore = createStore(join(root, ".qmd", "index.sqlite"));
       try {

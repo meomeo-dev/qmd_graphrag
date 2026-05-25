@@ -26,6 +26,23 @@ QUERY_READY_ARTIFACT_KINDS = {
     "graphrag_community_reports_parquet",
     "lancedb_index",
 }
+GRAPH_EXTRACT_CORE_ARTIFACT_KINDS = {
+    "graphrag_documents_parquet",
+    "graphrag_text_units_parquet",
+    "graphrag_entities_parquet",
+    "graphrag_relationships_parquet",
+    "graphrag_communities_parquet",
+    "graphrag_context_json",
+    "graphrag_stats_json",
+}
+QUERY_READY_PRODUCER_REQUIRED_KINDS = {
+    "graph_extract": GRAPH_EXTRACT_CORE_ARTIFACT_KINDS,
+    "community_report": {"graphrag_community_reports_parquet"},
+    "embed": {"lancedb_index"},
+}
+QUERY_READY_LINEAGE_ARTIFACT_KINDS = (
+    GRAPH_EXTRACT_CORE_ARTIFACT_KINDS | QUERY_READY_ARTIFACT_KINDS
+)
 PRODUCER_STAGE_BY_ARTIFACT_KIND = {
     "source_epub": "ingest",
     "normalized_markdown": "normalize",
@@ -547,6 +564,29 @@ def _succeeded_checkpoint_by_stage(
     }
 
 
+def _unique_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def _filter_artifact_ids_by_kinds(
+    artifact_ids: list[str],
+    artifacts_by_id: dict[str, dict[str, Any]],
+    kinds: set[str],
+) -> list[str]:
+    return [
+        artifact_id
+        for artifact_id in artifact_ids
+        if str((artifacts_by_id.get(artifact_id) or {}).get("kind") or "") in kinds
+    ]
+
+
 def _derive_graph_query_capability(
     root_dir: Path,
     book: dict[str, Any],
@@ -565,7 +605,7 @@ def _derive_graph_query_capability(
     identity_metadata = identity.get("metadata") or {}
     if identity_metadata.get("qmdCorpusRegistered") is not True:
         raise ValueError(f"book {book_id} identity is not registered in qmd corpus")
-    artifact_ids = _load_query_ready_artifact_ids(root_dir, book_id) or []
+    artifact_ids = _load_query_ready_lineage_artifact_ids(root_dir, book_id) or []
     source_id = identity.get("sourceId")
     document_id = identity.get("documentId")
     content_hash = identity.get("contentHash")
@@ -801,7 +841,9 @@ def _validate_index_scope(root_dir: Path, index_scope: dict[str, Any] | None) ->
         )
 
     if artifact_ids:
-        ready_artifact_ids = set(_load_query_ready_artifact_ids(root_dir, book_id) or [])
+        ready_artifact_ids = set(
+            _load_query_ready_lineage_artifact_ids(root_dir, book_id) or []
+        )
         if ready_artifact_ids and not artifact_ids.issubset(ready_artifact_ids):
             raise ValueError("indexScope artifactIds outside query-ready artifact scope")
 
@@ -846,16 +888,34 @@ def _load_graph_capabilities(
             continue
         book_id = str(item.get("bookId") or "")
         artifact_ids = [str(value) for value in item.get("artifactIds") or []]
+        lineage_artifact_ids = _load_query_ready_lineage_artifact_ids(
+            root_dir,
+            book_id,
+        ) or []
         identity_failure = _capability_identity_failure(root_dir, item)
         if identity_failure is not None:
             raise ValueError(identity_failure)
-        if not book_id or not _validate_query_ready_artifacts(
+        if (
+            not book_id
+            or not artifact_ids
+            or not set(artifact_ids).issubset(set(lineage_artifact_ids))
+            or not _validate_query_ready_artifacts(
             root_dir,
             book_id,
-            artifact_ids,
+            lineage_artifact_ids,
+            )
         ):
             continue
-        item = {**item, "artifactIds": artifact_ids}
+        item = {
+            **item,
+            "artifactIds": lineage_artifact_ids,
+            "metadata": {
+                **(item.get("metadata") or {}),
+                "lineageProjectionSource": (
+                    "validated_checkpoint_plus_validated_manifest"
+                ),
+            },
+        }
         capabilities.append(item)
     resolved_ids = {str(item.get("capabilityId")) for item in capabilities}
     missing = sorted(requested_ids - resolved_ids)
@@ -881,6 +941,42 @@ def _load_query_ready_artifact_ids(root_dir: Path, book_id: str) -> list[str] | 
             ]
             return artifact_ids or None
     return None
+
+
+def _load_query_ready_lineage_artifact_ids(
+    root_dir: Path,
+    book_id: str,
+) -> list[str] | None:
+    checkpoint_by_stage = _succeeded_checkpoint_by_stage(root_dir, book_id)
+    artifacts_by_id = _load_artifacts_by_id(root_dir, [book_id])
+    ids: list[str] = []
+    for stage, kinds in QUERY_READY_PRODUCER_REQUIRED_KINDS.items():
+        checkpoint = checkpoint_by_stage.get(stage) or {}
+        ids.extend(
+            _filter_artifact_ids_by_kinds(
+                [
+                    str(item)
+                    for item in checkpoint.get("artifactIds", [])
+                    if item is not None
+                ],
+                artifacts_by_id,
+                kinds,
+            )
+        )
+    query_ready = checkpoint_by_stage.get("query_ready") or {}
+    ids.extend(
+        _filter_artifact_ids_by_kinds(
+            [
+                str(item)
+                for item in query_ready.get("artifactIds", [])
+                if item is not None
+            ],
+            artifacts_by_id,
+            QUERY_READY_ARTIFACT_KINDS,
+        )
+    )
+    ids = _unique_strings(ids)
+    return ids or None
 
 
 def _validate_query_ready_artifacts(
@@ -914,6 +1010,7 @@ def _validate_query_ready_artifacts(
 
     checkpoint_by_stage = _succeeded_checkpoint_by_stage(root_dir, book_id)
     expected_producer_run_ids = {
+        "graph_extract": checkpoint_by_stage.get("graph_extract", {}).get("runId"),
         "community_report": checkpoint_by_stage.get("community_report", {}).get(
             "runId"
         ),
@@ -921,9 +1018,21 @@ def _validate_query_ready_artifacts(
     }
     if not all(isinstance(value, str) and value for value in expected_producer_run_ids.values()):
         return False
+    for stage in ("graph_extract", "community_report", "embed", "query_ready"):
+        checkpoint = checkpoint_by_stage.get(stage)
+        if not isinstance(checkpoint, dict):
+            return False
+        if checkpoint.get("contentHash") != corpus_content_hash:
+            return False
+        if checkpoint.get("stageFingerprint") != stage_fingerprints.get(stage):
+            return False
+        if checkpoint.get("providerFingerprint") != provider_fingerprint:
+            return False
 
-    checkpoint_artifact_ids = set(_load_query_ready_artifact_ids(root_dir, book_id) or [])
-    if not artifact_ids or not set(artifact_ids).issubset(checkpoint_artifact_ids):
+    lineage_artifact_ids = set(
+        _load_query_ready_lineage_artifact_ids(root_dir, book_id) or []
+    )
+    if not artifact_ids or not set(artifact_ids).issubset(lineage_artifact_ids):
         return False
 
     artifacts = yaml.safe_load(artifacts_path.read_text(encoding="utf-8")) or {}
@@ -936,19 +1045,100 @@ def _validate_query_ready_artifacts(
     if any(item is None for item in selected):
         return False
 
+    for stage, required_kinds in QUERY_READY_PRODUCER_REQUIRED_KINDS.items():
+        producer_checkpoint = checkpoint_by_stage.get(stage) or {}
+        producer_artifact_ids = _filter_artifact_ids_by_kinds(
+            [
+                str(item)
+                for item in producer_checkpoint.get("artifactIds", [])
+                if item is not None
+            ],
+            by_id,
+            required_kinds,
+        )
+        if not _validate_artifact_subset(
+            root_dir,
+            book_id,
+            producer_artifact_ids,
+            by_id,
+            required_kinds,
+            required_kinds,
+            stage_fingerprints,
+            provider_fingerprint,
+            corpus_content_hash,
+            {stage: str(producer_checkpoint.get("runId") or "")},
+        ):
+            return False
+
+    query_ready_checkpoint = checkpoint_by_stage.get("query_ready") or {}
+    query_ready_artifact_ids = _filter_artifact_ids_by_kinds(
+        [
+            str(item)
+            for item in query_ready_checkpoint.get("artifactIds", [])
+            if item is not None
+        ],
+        by_id,
+        QUERY_READY_ARTIFACT_KINDS,
+    )
+    if not _validate_artifact_subset(
+        root_dir,
+        book_id,
+        query_ready_artifact_ids,
+        by_id,
+        QUERY_READY_ARTIFACT_KINDS,
+        QUERY_READY_ARTIFACT_KINDS,
+        stage_fingerprints,
+        provider_fingerprint,
+        corpus_content_hash,
+        expected_producer_run_ids,
+    ):
+        return False
+
+    return _validate_artifact_subset(
+        root_dir,
+        book_id,
+        artifact_ids,
+        by_id,
+        QUERY_READY_LINEAGE_ARTIFACT_KINDS,
+        QUERY_READY_LINEAGE_ARTIFACT_KINDS,
+        stage_fingerprints,
+        provider_fingerprint,
+        corpus_content_hash,
+        expected_producer_run_ids,
+    )
+
+
+def _validate_artifact_subset(
+    root_dir: Path,
+    book_id: str,
+    artifact_ids: list[str],
+    artifacts_by_id: dict[str, dict[str, Any]],
+    required_kinds: set[str],
+    allowed_kinds: set[str],
+    stage_fingerprints: dict[str, Any],
+    provider_fingerprint: str,
+    corpus_content_hash: str,
+    expected_producer_run_ids: dict[str, str],
+) -> bool:
+    if not artifact_ids:
+        return False
+    selected = [artifacts_by_id.get(artifact_id) for artifact_id in artifact_ids]
+    if any(item is None for item in selected):
+        return False
+
     kinds = set()
     for artifact in selected:
         assert artifact is not None
         if artifact.get("bookId") != book_id:
             return False
         kind = str(artifact.get("kind"))
-        if kind not in QUERY_READY_ARTIFACT_KINDS:
+        if kind not in allowed_kinds:
             return False
         expected_stage = PRODUCER_STAGE_BY_ARTIFACT_KIND.get(kind)
         if expected_stage is not None and artifact.get("stage") != expected_stage:
             return False
         expected_run_id = expected_producer_run_ids.get(str(artifact.get("stage")))
-        if artifact.get("producerRunId") != expected_run_id:
+        if expected_run_id is not None and artifact.get("producerRunId") != expected_run_id:
             return False
         expected_stage_fingerprint = stage_fingerprints.get(str(artifact.get("stage")))
         if artifact.get("stageFingerprint") != expected_stage_fingerprint:
@@ -999,7 +1189,7 @@ def _validate_query_ready_artifacts(
         ):
             return False
 
-    return QUERY_READY_ARTIFACT_KINDS.issubset(kinds)
+    return required_kinds.issubset(kinds)
 
 
 def _is_valid_parquet_file(path: Path) -> bool:
@@ -1630,6 +1820,8 @@ async def _run_graphrag_index(request: dict[str, Any]) -> dict[str, Any]:
     input_dir = request.get("inputDir")
     data_dir = request.get("dataDir")
     report_dir = request.get("reportDir")
+    if not report_dir:
+        raise ValueError("GraphRAG index request requires reportDir")
     method = request["method"]
     verbose = bool(request.get("verbose", False))
     skip_validation = bool(request.get("skipValidation", False))
