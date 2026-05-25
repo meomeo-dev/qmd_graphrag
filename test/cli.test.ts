@@ -1434,6 +1434,7 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(contract).toContain("providerRecoveryReason");
     expect(contract).toContain("recoveryDecision: BatchRecoveryDecisionSchema");
     expect(script).toContain("\"completed-manifest\"");
+    expect(script).toContain("\"heartbeat-interval-seconds\"");
     expect(script).toContain("\"fail-fast\"");
     expect(script).toContain("\"migrate-only\"");
     expect(script).toContain("\"status-json\"");
@@ -1441,6 +1442,11 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(script).toContain("\"max-transient-command-attempts\"");
     expect(script).toContain("\"command-timeout-seconds\"");
     expect(script).toContain("default: \"21600\"");
+    expect(script).toContain("startCommandHeartbeatMonitor");
+    expect(script).toContain("currentCommandStartedAt");
+    expect(script).toContain("withJsonFileLock");
+    expect(script).toContain("withCheckpointPersistenceInvariants");
+    expect(script).toContain("renameSync");
     expect(script).toContain("const start = epochMs(checkpoint.retryStartedAt)");
     expect(script).toContain("recovery-summary.json");
     expect(script).toContain("item_retry_deferred");
@@ -1501,6 +1507,168 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(safeError).toBeGreaterThan(failStage);
     expect(script).toContain('console.error("[redacted]")');
   });
+
+  test("updates batch checkpoint heartbeat while long commands run", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-command-heartbeat-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "command-heartbeat-fixture";
+    const sourceBytes = "heartbeat fixture";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    const sourcePath = join(sourceDir, "Book.epub");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const normalizedPath = join(
+      stateRoot,
+      "input",
+      `book-${sourceHash.slice(0, 10)}.md`,
+    );
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const checkpointPath = join(
+      stateRoot,
+      "catalog",
+      "batch-runs",
+      runId,
+      "items",
+      `${itemId}.json`,
+    );
+
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(dirname(normalizedPath), { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(normalizedPath, "# Book\n\nHeartbeat fixture.\n");
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const resumeScript = join(tmpRoot, "fake-slow-resume.mjs");
+    await writeFile(
+      resumeScript,
+      [
+        "setTimeout(() => {",
+        "  console.log(JSON.stringify({ status: 'blocked', reason: 'test blocked' }));",
+        "}, 3000);",
+      ].join("\n"),
+    );
+
+    const resultPromise = new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--heartbeat-interval-seconds",
+        "1",
+        "--max-resume-passes",
+        "1",
+      ], {
+        env: {
+          ...process.env,
+          QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+          QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
+        },
+      });
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => { stdout += String(chunk); });
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    let heartbeatCheckpoint: Record<string, unknown> | null = null;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await sleep(250);
+      if (!existsSync(checkpointPath)) continue;
+      const checkpoint = JSON.parse(readFileSync(checkpointPath, "utf8"));
+      if (checkpoint.currentCommand === "resume-book-1") {
+        heartbeatCheckpoint = checkpoint;
+        break;
+      }
+    }
+
+    const statusDuringRun = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--status-json",
+      ]);
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => { stdout += String(chunk); });
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+    const result = await resultPromise;
+    const finalCheckpoint = JSON.parse(readFileSync(checkpointPath, "utf8"));
+    const recoverySummary = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "recovery-summary.json"),
+      "utf8",
+    ));
+    const events = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
+      "utf8",
+    ).trim().split("\n").map((line) => JSON.parse(line));
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(heartbeatCheckpoint).toMatchObject({
+      status: "running",
+      currentCommand: "resume-book-1",
+    });
+    const statusSummary = JSON.parse(statusDuringRun.stdout);
+    expect(statusDuringRun.exitCode).toBe(0);
+    expect(statusDuringRun.stderr).toBe("");
+    expect(statusSummary.items[0]).toMatchObject({
+      status: "running",
+      currentCommand: "resume-book-1",
+    });
+    expect(heartbeatCheckpoint?.currentCommandStartedAt).toEqual(expect.any(String));
+    expect(heartbeatCheckpoint?.runnerHeartbeatAt).toEqual(expect.any(String));
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toBe("");
+    expect(finalCheckpoint.currentCommand).toBeUndefined();
+    expect(finalCheckpoint.currentCommandStartedAt).toBeUndefined();
+    expect(finalCheckpoint.commandChecks).toHaveLength(1);
+    expect(finalCheckpoint.commandChecks[0]).toMatchObject({
+      name: "resume-book-1",
+      status: "passed",
+    });
+    expect(recoverySummary.items[0].currentCommand).toBeUndefined();
+    expect(recoverySummary.items[0].currentCommandStartedAt).toBeUndefined();
+    expect(events.some((event) =>
+      event.event === "command_start" &&
+      event.command === "resume-book-1"
+    )).toBe(true);
+  }, 15000);
 
   test("rejects raw log directories that still resolve inside graph_vault", async () => {
     const tmpRoot = await mkdtemp(join(tmpdir(), "qmd-batch-log-root-"));

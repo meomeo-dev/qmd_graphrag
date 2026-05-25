@@ -1658,6 +1658,8 @@ describe("Data bus contracts", () => {
     );
     expect(parsedRecoverySummary.recoveryDecision).toBe("retry_same_run_id");
     expect(parsedRecoverySummary.items[0]?.retryAfterSeconds).toBe(180);
+    expect(parsedRecoverySummary.retryPolicy.heartbeatIntervalSeconds)
+      .toBeUndefined();
   });
 
   test("rejects non-portable batch locators", () => {

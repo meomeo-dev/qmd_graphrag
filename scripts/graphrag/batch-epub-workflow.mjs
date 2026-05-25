@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -10,6 +10,7 @@ import {
   realpathSync,
   openSync,
   rmSync,
+  renameSync,
   statSync,
   closeSync,
   readSync,
@@ -67,6 +68,7 @@ const { values } = parseArgs({
     "max-provider-recovery-waits": { type: "string", default: "3" },
     "command-timeout-seconds": { type: "string", default: "21600" },
     "completed-manifest": { type: "string" },
+    "heartbeat-interval-seconds": { type: "string", default: "30" },
     "migrate-only": { type: "boolean", default: false },
     "status-json": { type: "boolean", default: false },
     "skip-dotenv": { type: "boolean", default: false },
@@ -119,10 +121,15 @@ const commandTimeoutSeconds = Math.max(
   1,
   Number.parseInt(String(values["command-timeout-seconds"]), 10) || 21600,
 );
+const heartbeatIntervalSeconds = Math.max(
+  1,
+  Number.parseInt(String(values["heartbeat-interval-seconds"]), 10) || 30,
+);
 const runnerHost = hostname();
 const runnerPid = process.pid;
 const runnerSessionId = randomUUID();
 const runnerHeartbeatTtlSeconds = Math.max(commandTimeoutSeconds * 2, 3600);
+const jsonFileLockStaleMs = 120000;
 const failFast = Boolean(values["fail-fast"]);
 const migrateOnly = Boolean(values["migrate-only"]);
 const statusJson = Boolean(values["status-json"]);
@@ -387,6 +394,8 @@ const BatchItemCheckpointBaseSchema = z.object({
   runnerPid: z.number().int().positive().optional(),
   runnerHeartbeatAt: z.string().datetime().optional(),
   orphanedRunnerDetectedAt: z.string().datetime().optional(),
+  currentCommand: z.string().min(1).optional(),
+  currentCommandStartedAt: z.string().datetime().optional(),
   nextRetryAt: z.string().datetime().optional(),
   retryDelaySeconds: z.number().int().nonnegative().optional(),
   failureKind: BatchFailureKindSchema.optional(),
@@ -463,6 +472,7 @@ const BatchRunManifestSchema = z.object({
   retryBudgetSeconds: z.number().int().positive().optional(),
   maxProviderRecoveryWaits: z.number().int().positive().optional(),
   commandTimeoutSeconds: z.number().int().positive().optional(),
+  heartbeatIntervalSeconds: z.number().int().positive().optional(),
   startedAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
   completedAt: z.string().datetime().optional(),
@@ -515,6 +525,8 @@ const BatchRecoverySummaryItemSchema = z.object({
   runnerPid: z.number().int().positive().optional(),
   runnerHeartbeatAt: z.string().datetime().optional(),
   orphanedRunnerDetectedAt: z.string().datetime().optional(),
+  currentCommand: z.string().min(1).optional(),
+  currentCommandStartedAt: z.string().datetime().optional(),
   waitingForProviderRecovery: z.boolean().optional(),
   reopenedFromStatus: BatchItemStatusSchema.optional(),
   reopenedToStatus: BatchItemStatusSchema.optional(),
@@ -553,6 +565,7 @@ const BatchRecoverySummarySchema = z.object({
     retryBudgetSeconds: z.number().int().positive(),
     maxProviderRecoveryWaits: z.number().int().positive(),
     commandTimeoutSeconds: z.number().int().positive(),
+    heartbeatIntervalSeconds: z.number().int().positive().optional(),
   }),
   recoveryDecision: BatchRecoveryDecisionSchema,
   retryableItemCount: z.number().int().nonnegative(),
@@ -967,11 +980,64 @@ function readJson(path) {
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
+function writeJsonAtomic(path, text) {
+  mkdirSync(dirname(path), { recursive: true });
+  const temporaryPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(temporaryPath, text, "utf8");
+  renameSync(temporaryPath, path);
+}
+
+function lockPathFor(path) {
+  return `${path}.lock`;
+}
+
+function removeStaleJsonLock(path) {
+  try {
+    const lockPath = path;
+    const entry = statSync(lockPath);
+    if (Date.now() - entry.mtimeMs > jsonFileLockStaleMs) {
+      unlinkSync(lockPath);
+    }
+  } catch {
+    // Missing or concurrently removed locks are expected under contention.
+  }
+}
+
+function withJsonFileLock(path, callback) {
+  const lockPath = lockPathFor(path);
+  for (;;) {
+    let fd = null;
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      fd = openSync(lockPath, "wx");
+      return callback();
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      removeStaleJsonLock(lockPath);
+      sleep(25);
+    } finally {
+      if (fd != null) {
+        try {
+          closeSync(fd);
+        } catch {
+          // Best-effort cleanup only; the stale lock sweeper handles leftovers.
+        }
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          // Another process may have already removed a stale lock.
+        }
+      }
+    }
+  }
+}
+
 function writeTypedJson(path, schema, value) {
   const parsed = schema.parse(withoutUndefined(value));
   if (statusJson) return parsed;
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(parsed, null, 2) + "\n", "utf8");
+  withJsonFileLock(path, () => {
+    writeJsonAtomic(path, JSON.stringify(parsed, null, 2) + "\n");
+  });
   return parsed;
 }
 
@@ -1102,6 +1168,7 @@ function makeManifest(items) {
     retryBudgetSeconds,
     maxProviderRecoveryWaits,
     commandTimeoutSeconds,
+    heartbeatIntervalSeconds,
     startedAt: now(),
     updatedAt: now(),
     itemIds: items.map((item) => item.itemId),
@@ -1129,6 +1196,7 @@ function loadManifest(items) {
     manifest.retryBudgetSeconds = retryBudgetSeconds;
     manifest.maxProviderRecoveryWaits = maxProviderRecoveryWaits;
     manifest.commandTimeoutSeconds = commandTimeoutSeconds;
+    manifest.heartbeatIntervalSeconds = heartbeatIntervalSeconds;
     return manifest;
   }
   if (statusJson) {
@@ -1167,6 +1235,7 @@ function defaultCheckpoint(item, completedSeed = new Map()) {
     retryBudgetSeconds,
     maxProviderRecoveryWaits,
     commandTimeoutSeconds,
+    heartbeatIntervalSeconds,
     recoveryDecision: "none",
     commandChecks: [],
     metadata: seedMatches
@@ -1239,12 +1308,14 @@ function loadCheckpoint(item, completedSeed) {
     )),
   );
   if (statusJson) {
-    return BatchItemCheckpointSchema.parse(withBuildStatusSnapshot(item, checkpoint));
+    return BatchItemCheckpointSchema.parse(
+      withCheckpointPersistenceInvariants(withBuildStatusSnapshot(item, checkpoint)),
+    );
   }
   return writeTypedJson(
     path,
     BatchItemCheckpointSchema,
-    withBuildStatusSnapshot(item, checkpoint),
+    withCheckpointPersistenceInvariants(withBuildStatusSnapshot(item, checkpoint)),
   );
 }
 
@@ -1257,12 +1328,219 @@ function withBuildStatusSnapshot(item, checkpoint) {
   };
 }
 
+function withCheckpointPersistenceInvariants(checkpoint) {
+  if (checkpoint.status === "running") return checkpoint;
+  return {
+    ...checkpoint,
+    currentCommand: undefined,
+    currentCommandStartedAt: undefined,
+  };
+}
+
 function saveCheckpoint(item, checkpoint) {
   return writeTypedJson(
     itemPath(item),
     BatchItemCheckpointSchema,
-    withBuildStatusSnapshot(item, checkpoint),
+    withCheckpointPersistenceInvariants(withBuildStatusSnapshot(item, checkpoint)),
   );
+}
+
+function heartbeatMonitorScript() {
+  return String.raw`
+const fs = require("node:fs");
+
+const [
+  checkpointPath,
+  stopPath,
+  runnerSessionId,
+  runnerHost,
+  runnerPidText,
+  command,
+  commandStartedAt,
+  intervalMsText,
+] = process.argv.slice(1);
+const runnerPid = Number.parseInt(runnerPidText, 10);
+const intervalMs = Math.max(100, Number.parseInt(intervalMsText, 10) || 30000);
+const lockStaleMs = 120000;
+let lifelineAlive = true;
+
+function sleep(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+try {
+  const lifeline = fs.createReadStream(null, { fd: 3, autoClose: false });
+  const stop = () => {
+    lifelineAlive = false;
+    process.exit(0);
+  };
+  lifeline.on("end", stop);
+  lifeline.on("close", stop);
+  lifeline.on("error", stop);
+  lifeline.resume();
+} catch {
+  lifelineAlive = false;
+}
+
+function readCheckpoint() {
+  try {
+    return JSON.parse(fs.readFileSync(checkpointPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function parentAlive() {
+  if (!lifelineAlive) return false;
+  if (!Number.isInteger(runnerPid) || runnerPid <= 0) return false;
+  try {
+    process.kill(runnerPid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function writeJsonAtomic(path, text) {
+  const temporaryPath = path + "." + process.pid + "." + Date.now() + ".tmp";
+  fs.writeFileSync(temporaryPath, text, "utf8");
+  fs.renameSync(temporaryPath, path);
+}
+
+function withCheckpointLock(callback) {
+  const lockPath = checkpointPath + ".lock";
+  for (;;) {
+    let fd = null;
+    try {
+      fd = fs.openSync(lockPath, "wx");
+      return callback();
+    } catch (error) {
+      if (error && error.code !== "EEXIST") throw error;
+      try {
+        const entry = fs.statSync(lockPath);
+        if (Date.now() - entry.mtimeMs > lockStaleMs) fs.unlinkSync(lockPath);
+      } catch {
+        // Missing or concurrently removed locks are expected under contention.
+      }
+      sleep(25);
+    } finally {
+      if (fd != null) {
+        try {
+          fs.closeSync(fd);
+        } catch {}
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {}
+      }
+    }
+  }
+}
+
+function writeHeartbeat() {
+  if (fs.existsSync(stopPath) || !parentAlive()) return false;
+  return withCheckpointLock(() => {
+    if (fs.existsSync(stopPath) || !parentAlive()) return false;
+    const checkpoint = readCheckpoint();
+    if (checkpoint == null) return true;
+    if (
+      checkpoint.status !== "running" ||
+      checkpoint.runnerSessionId !== runnerSessionId ||
+      checkpoint.runnerHost !== runnerHost ||
+      checkpoint.runnerPid !== runnerPid
+    ) {
+      return false;
+    }
+    const updated = {
+      ...checkpoint,
+      runnerHeartbeatAt: new Date().toISOString(),
+      currentCommand: command,
+      currentCommandStartedAt: commandStartedAt,
+    };
+    writeJsonAtomic(checkpointPath, JSON.stringify(updated, null, 2) + "\n");
+    return true;
+  });
+}
+
+if (!writeHeartbeat()) process.exit(0);
+const timer = setInterval(() => {
+  if (!writeHeartbeat()) {
+    clearInterval(timer);
+    process.exit(0);
+  }
+}, intervalMs);
+`;
+}
+
+function startCommandHeartbeatMonitor(item, command, commandStartedAt) {
+  if (statusJson) return null;
+  const intervalMs = heartbeatIntervalSeconds * 1000;
+  const safeCommand = command.replace(/[^A-Za-z0-9_.-]/gu, "_");
+  const stopPath = join(
+    logRoot,
+    `${item.itemId}-${safeCommand}-${runnerSessionId}.heartbeat-stop`,
+  );
+  rmSync(stopPath, { force: true });
+  const monitor = spawn(process.execPath, [
+    "-e",
+    heartbeatMonitorScript(),
+    itemPath(item),
+    stopPath,
+    runnerSessionId,
+    runnerHost,
+    String(runnerPid),
+    command,
+    commandStartedAt,
+    String(intervalMs),
+  ], {
+    cwd: root,
+    detached: true,
+    stdio: ["ignore", "ignore", "ignore", "pipe"],
+    windowsHide: true,
+  });
+  const lifeline = monitor.stdio[3];
+  lifeline?.unref?.();
+  monitor.unref();
+  return {
+    stop() {
+      try {
+        writeFileSync(stopPath, "stop\n", "utf8");
+      } catch {
+        // Best-effort only; closing the lifeline below is the primary shutdown.
+      }
+      try {
+        lifeline?.destroy?.();
+      } catch {
+        // Closing the parent side of the pipe releases the monitor lifeline.
+      }
+    },
+  };
+}
+
+function clearCommandHeartbeat(item, command) {
+  if (statusJson || !existsSync(itemPath(item))) return;
+  try {
+    withJsonFileLock(itemPath(item), () => {
+      const checkpoint = BatchItemCheckpointSchema.parse(readJson(itemPath(item)));
+      if (
+        checkpoint.status !== "running" ||
+        checkpoint.runnerSessionId !== runnerSessionId ||
+        checkpoint.runnerHost !== runnerHost ||
+        checkpoint.runnerPid !== runnerPid ||
+        checkpoint.currentCommand !== command
+      ) {
+        return;
+      }
+      const cleaned = BatchItemCheckpointSchema.parse(withoutUndefined({
+        ...withBuildStatusSnapshot(item, checkpoint),
+        runnerHeartbeatAt: now(),
+        currentCommand: undefined,
+        currentCommandStartedAt: undefined,
+      }));
+      writeJsonAtomic(itemPath(item), JSON.stringify(cleaned, null, 2) + "\n");
+    });
+  } catch {
+    return;
+  }
 }
 
 function readYamlFileIfExists(path) {
@@ -2464,6 +2742,7 @@ function updateManifest(manifest, checkpoints) {
   manifest.retryBudgetSeconds = retryBudgetSeconds;
   manifest.maxProviderRecoveryWaits = maxProviderRecoveryWaits;
   manifest.commandTimeoutSeconds = commandTimeoutSeconds;
+  manifest.heartbeatIntervalSeconds = heartbeatIntervalSeconds;
   manifest.updatedAt = now();
   const providerWaitLimitReached =
     running === 0 &&
@@ -2569,6 +2848,8 @@ function buildRecoverySummary(manifest, checkpoints) {
       runnerPid: item.runnerPid,
       runnerHeartbeatAt: item.runnerHeartbeatAt,
       orphanedRunnerDetectedAt: item.orphanedRunnerDetectedAt,
+      currentCommand: item.currentCommand,
+      currentCommandStartedAt: item.currentCommandStartedAt,
       waitingForProviderRecovery,
       reopenedFromStatus: item.metadata?.reopenedFromStatus,
       reopenedToStatus: item.metadata?.reopenedToStatus,
@@ -2615,6 +2896,7 @@ function buildRecoverySummary(manifest, checkpoints) {
       retryBudgetSeconds,
       maxProviderRecoveryWaits,
       commandTimeoutSeconds,
+      heartbeatIntervalSeconds,
     },
     recoveryDecision: recoveryDecisionForBatch(checkpoints),
     retryableItemCount: retryableItems.length,
@@ -2871,21 +3153,28 @@ function runCommand(item, name, command, args, options = {}) {
       command: name,
       metadata: { attempt },
     });
-    const result = spawnSync(command, args, {
-      cwd: root,
-      encoding: "utf8",
-      maxBuffer: options.maxBuffer ?? 128 * 1024 * 1024,
-      shell: process.platform === "win32",
-      timeout: commandTimeoutSeconds * 1000,
-      env: {
-        ...process.env,
-        INDEX_PATH: qmdIndexPath,
-        QMD_CONFIG_DIR: dirname(configPath),
-        QMD_GRAPH_VAULT: stateRoot,
-        QMD_DOCTOR_DEVICE_PROBE: "0",
-        ...(options.env ?? {}),
-      },
-    });
+    const heartbeatMonitor = startCommandHeartbeatMonitor(item, name, startedAt);
+    let result;
+    try {
+      result = spawnSync(command, args, {
+        cwd: root,
+        encoding: "utf8",
+        maxBuffer: options.maxBuffer ?? 128 * 1024 * 1024,
+        shell: process.platform === "win32",
+        timeout: commandTimeoutSeconds * 1000,
+        env: {
+          ...process.env,
+          INDEX_PATH: qmdIndexPath,
+          QMD_CONFIG_DIR: dirname(configPath),
+          QMD_GRAPH_VAULT: stateRoot,
+          QMD_DOCTOR_DEVICE_PROBE: "0",
+          ...(options.env ?? {}),
+        },
+      });
+    } finally {
+      heartbeatMonitor?.stop();
+      clearCommandHeartbeat(item, name);
+    }
     const completedAt = now();
     const stdout = result.stdout ?? "";
     const stderr = result.stderr ?? "";
