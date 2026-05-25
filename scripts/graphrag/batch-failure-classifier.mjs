@@ -44,36 +44,7 @@ export function classifyFailure(text) {
       ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
     };
   }
-  const transient =
-    message.includes("concurrency limit") ||
-    message.includes("partial-output") ||
-    message.includes("partial output") ||
-    message.includes("no report found for community") ||
-    message.includes("community report extraction error") ||
-    message.includes("error generating community report") ||
-    message.includes("graphrag stage report") ||
-    message.includes("rate limit") ||
-    message.includes("temporarily unavailable") ||
-    message.includes("kind=server_error") ||
-    message.includes("kind=rate_limit_exceeded") ||
-    message.includes("kind=timeout") ||
-    message.includes("stream_read_error") ||
-    message.includes("timeout") ||
-    message.includes("timed out") ||
-    message.includes("service unavailable") ||
-    message.includes("gateway timeout") ||
-    message.includes("bad gateway") ||
-    message.includes("network error") ||
-    message.includes("fetch failed") ||
-    message.includes("connection reset") ||
-    message.includes("connection aborted") ||
-    message.includes("connection refused") ||
-    message.includes("socket hang up") ||
-    message.includes("econnreset") ||
-    message.includes("econnrefused") ||
-    message.includes("etimedout") ||
-    message.includes("eai_again");
-  if (transient) {
+  if (isProviderTransientFailureText(message)) {
     return {
       failureKind: "transient",
       retryable: true,
@@ -85,6 +56,66 @@ export function classifyFailure(text) {
     retryable: false,
     ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
   };
+}
+
+export function isProviderTransientFailureText(text) {
+  const message = String(text ?? "").toLowerCase();
+  return [
+    "concurrency limit",
+    "partial-output",
+    "partial output",
+    "no report found for community",
+    "community report extraction error",
+    "error generating community report",
+    "graphrag stage report",
+    "rate limit",
+    "temporarily unavailable",
+    "kind=server_error",
+    "kind=rate_limit_exceeded",
+    "kind=timeout",
+    "stream_read_error",
+    "timeout",
+    "timed out",
+    "service unavailable",
+    "gateway timeout",
+    "bad gateway",
+    "apiconnectionerror",
+    "api connection error",
+    "connectionerror",
+    "connecterror",
+    "connecttimeout",
+    "readtimeout",
+    "clientconnectorerror",
+    "serverdisconnectederror",
+    "remote protocol error",
+    "jin_aiexception",
+    "jina_aiexception",
+    "jina_ai exception",
+    "cannot connect to host",
+    "network error",
+    "fetch failed",
+    "connection reset",
+    "connection reset by peer",
+    "read reset",
+    "connection aborted",
+    "connection refused",
+    "connection error",
+    "socket hang up",
+    "ssl error",
+    "tls error",
+    "temporary failure in name resolution",
+    "getaddrinfo",
+    "dns",
+    "httpx.",
+    "aiohttp.",
+    "urllib3.",
+    "econnreset",
+    "econnrefused",
+    "enotfound",
+    "etimedout",
+    "eai_again",
+    "eai_nodata",
+  ].some((token) => message.includes(token));
 }
 
 export function isGraphRagDataCompatibilityFailureText(text) {

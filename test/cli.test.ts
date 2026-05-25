@@ -1191,6 +1191,8 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(contract).toContain("runnerSessionId");
     expect(contract).toContain("providerStatusCode");
     expect(contract).toContain("retryAfterSeconds");
+    expect(contract).toContain("providerRecoveryWaitCount");
+    expect(contract).toContain("providerRecoveryReason");
     expect(contract).toContain("recoveryDecision: BatchRecoveryDecisionSchema");
     expect(script).toContain("\"completed-manifest\"");
     expect(script).toContain("\"fail-fast\"");
@@ -1212,6 +1214,7 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(script).toContain("BatchRunManifestSchema.parse");
     expect(script).toContain("withBuildStatusSnapshot(item, checkpoint)");
     expect(script).toContain("BatchEventLogSchema.parse");
+    expect(script).toContain("command_attempt_budget_exhausted");
     expect(script).toContain("command_retry_exhausted");
     expect(script).toContain("batch_incomplete");
     expect(script).toContain("validateCommandChecks(checks)");
@@ -1467,6 +1470,28 @@ describe("GraphRAG EPUB batch runner", () => {
       retryable: true,
     });
     expect(classifyFailure(
+      "litellm.APIConnectionError: Jina_aiException - Cannot connect to host " +
+      "api.jina.ai:443 ssl:<ssl.SSLContext object> [None]",
+    )).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+    });
+    expect(classifyFailure("httpx.ConnectError: [Errno 8] nodename nor servname"))
+      .toMatchObject({
+        failureKind: "transient",
+        retryable: true,
+      });
+    expect(classifyFailure("aiohttp.ClientConnectorError: getaddrinfo failed"))
+      .toMatchObject({
+        failureKind: "transient",
+        retryable: true,
+      });
+    expect(classifyFailure("urllib3 ReadTimeoutError: read reset by peer"))
+      .toMatchObject({
+        failureKind: "transient",
+        retryable: true,
+      });
+    expect(classifyFailure(
       "Responses API transient error kind=server_error status_code=unknown",
     )).toMatchObject({
       failureKind: "transient",
@@ -1484,7 +1509,8 @@ describe("GraphRAG EPUB batch runner", () => {
     });
     expect(classifyFailure(
       "GraphRAG stage did not produce valid book-scoped artifacts: " +
-      "{\"missingArtifactKinds\":[\"graphrag_documents_parquet\"]}",
+      "{\"missingArtifactKinds\":[\"graphrag_documents_parquet\"]} " +
+      "litellm.APIConnectionError",
     )).toMatchObject({
       failureKind: "permanent",
       retryable: false,
@@ -1492,7 +1518,8 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(classifyFailure(
       "GraphRAG index workflow failed: " +
       "[{\"workflow\":\"create_community_reports_text\"," +
-      "\"errorMessage\":\"'float' object is not subscriptable\"}]",
+      "\"errorMessage\":\"'float' object is not subscriptable\"}] " +
+      "Cannot connect to host api.jina.ai",
     )).toMatchObject({
       failureKind: "data_compatibility",
       retryable: false,
@@ -2460,7 +2487,7 @@ describe("GraphRAG EPUB batch runner", () => {
         commandChecks: [],
         metadata: {
           waitingForProviderRecovery: true,
-          providerRecoveryWaitCount: 1,
+          providerRecoveryWaitCount: 9,
           maxProviderRecoveryWaits: 1,
         },
       }),
@@ -2509,6 +2536,10 @@ describe("GraphRAG EPUB batch runner", () => {
       failureKind: "transient",
       retryable: true,
       recoveryDecision: "retry_same_run_id",
+      metadata: {
+        providerRecoveryWaitCount: 1,
+        maxProviderRecoveryWaits: 1,
+      },
     });
   });
 
@@ -2626,6 +2657,149 @@ describe("GraphRAG EPUB batch runner", () => {
       retryExhausted: false,
       recoveryDecision: "retry_same_run_id",
       waitingForProviderRecovery: true,
+      providerRecoveryWaitCount: 1,
+      maxProviderRecoveryWaits: 3,
+      providerRecoveryReason: "retry_budget_window_elapsed",
+    });
+  });
+
+  test("status-json recovers legacy Jina APIConnectionError as provider transient", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-legacy-jina-transient-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "legacy-jina-transient";
+    const sourceBytes = "legacy jina transient";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    const sourcePath = join(sourceDir, "Book.epub");
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const errorSummary =
+      "Error: GraphRAG index workflow failed: " +
+      "[{\"workflow\":\"generate_text_embeddings\",\"errorMessage\":\"" +
+      "litellm.APIConnectionError: Jina_aiException - Cannot connect to host " +
+      "api.jina.ai:443 ssl:<ssl.SSLContext object> [None]\"}]";
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        pendingItems: 0,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "failed",
+        sourceName: "Book.epub",
+        sourceRelativePath,
+        sourceHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        bookId: `book-${sourceHash.slice(0, 12)}`,
+        attempts: 3,
+        retryStartedAt: "2026-05-23T00:00:00.000Z",
+        failedAt: "2026-05-23T00:10:00.000Z",
+        failureKind: "unknown",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "resume-book-2",
+        errorSummary,
+        commandChecks: [{
+          name: "resume-book-2",
+          status: "failed",
+          attempts: 12,
+          exitCode: 1,
+          stdoutBytes: 0,
+          stderrBytes: errorSummary.length,
+          startedAt: "2026-05-23T00:00:00.000Z",
+          completedAt: "2026-05-23T00:10:00.000Z",
+          failureKind: "unknown",
+          retryable: false,
+          attemptExhausted: true,
+          recoveryDecision: "stop_until_fixed",
+          errorSummary,
+        }],
+      }),
+    );
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--status-json",
+      ]);
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+      proc.stderr.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary.recoveryDecision).toBe("retry_same_run_id");
+    expect(summary.retryableItemCount).toBe(1);
+    expect(summary.items[0]).toMatchObject({
+      status: "pending",
+      failureKind: "transient",
+      retryable: true,
+      retryExhausted: false,
+      recoveryDecision: "retry_same_run_id",
+      failedStage: "resume-book-2",
+      waitingForProviderRecovery: true,
+      providerRecoveryWaitCount: 1,
+      maxProviderRecoveryWaits: 3,
+      providerRecoveryReason: "retry_budget_window_elapsed",
     });
   });
 
@@ -3519,6 +3693,11 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toBe("");
     expect(events.some((event) =>
+      event.event === "batch_stopped_after_data_compatibility_failure" &&
+      event.itemId === firstItemId &&
+      event.failureKind === "data_compatibility"
+    )).toBe(true);
+    expect(events.some((event) =>
       event.event === "batch_stopped_after_non_transient_failure" &&
       event.itemId === firstItemId &&
       event.failureKind === "data_compatibility"
@@ -3692,6 +3871,10 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toBe("");
     expect(events.some((event) =>
+      event.event === "batch_stopped_after_data_compatibility_failure" &&
+      event.itemId === failedItemId
+    )).toBe(true);
+    expect(events.some((event) =>
       event.event === "batch_stopped_after_non_transient_failure" &&
       event.itemId === failedItemId
     )).toBe(true);
@@ -3813,6 +3996,9 @@ describe("GraphRAG EPUB batch runner", () => {
       recoveryDecision: "stop_until_fixed",
     });
     expect(summary.items[0].waitingForProviderRecovery).toBe(false);
+    expect(summary.items[0].providerRecoveryWaitCount).toBeUndefined();
+    expect(summary.items[0].maxProviderRecoveryWaits).toBeUndefined();
+    expect(summary.items[0].providerRecoveryReason).toBeUndefined();
   });
 
   test("status-json does not steal fresh remote running items", async () => {

@@ -342,10 +342,24 @@ typed_buses:
           - recoveryDecision
           - failedStage
         failure_kind_contract:
+          transient: >-
+            Recoverable provider or runtime availability failure. This includes
+            OpenAI Responses, LiteLLM, Jina embedding/rerank, and GraphRAG
+            provider failures caused by rate limits, 5xx responses, timeout,
+            DNS, TLS, connect, reset, read, or stream transport errors. It uses
+            retryable=true and recoveryDecision=retry_same_run_id.
+          permanent: >-
+            Deterministic local validation or operator-action failure. It uses
+            retryable=false and recoveryDecision=stop_until_fixed, but it does
+            not globally stop unrelated pending books.
           data_compatibility: >-
             Deterministic GraphRAG data-shape incompatibility after a real
             stage execution. It is non-retryable until local code or upstream
             data compatibility handling changes.
+          unknown: >-
+            Unclassified failure. Unknown must not be used for provider
+            transport failures once the classifier can identify the provider
+            taxonomy. Unknown remains stop_until_fixed until classified.
       - name: batch_recovery_summary
         schema: src/contracts/batch-run.ts#BatchRecoverySummarySchema
         envelope: src/contracts/batch-run.ts#BatchRecoverySummaryEnvelopeSchema
@@ -364,6 +378,10 @@ typed_buses:
           - retryAfterSeconds
           - recoveryDecision
           - failedStage
+        provider_recovery_observability_fields:
+          - providerRecoveryWaitCount
+          - maxProviderRecoveryWaits
+          - providerRecoveryReason
 
   corpus_bus:
     role: Whole-corpus ingestion and document identity.
@@ -1632,13 +1650,16 @@ state_and_recovery:
     recovery_summary_projection_rule: >-
       batch_recovery_summary is an operator-facing projection. It reads
       providerStatusCode and retryAfterSeconds from the latest failed
-      commandCheck, waitingForProviderRecovery from checkpoint metadata, and
-      qmd/GraphRAG build status from recomputed evidence. It must not become
-      a second source of truth for checkpoint state.
+      commandCheck, providerRecoveryWaitCount, maxProviderRecoveryWaits,
+      providerRecoveryReason, and waitingForProviderRecovery from checkpoint
+      metadata, and qmd/GraphRAG build status from recomputed evidence. It must
+      not become a second source of truth for checkpoint state.
     transient_failure_policy: >-
-      429, concurrency limit, timeout, and 5xx provider failures are retried
-      with bounded backoff. When the short retry budget elapses, the current
-      item remains pending with failureKind=transient, retryable=true,
+      429, concurrency limit, timeout, DNS, TLS, connect, reset, OpenAI
+      Responses stream failures, LiteLLM APIConnectionError, Jina
+      Cannot-connect failures, and 5xx provider failures are retried with
+      bounded backoff. When the short retry budget elapses, the current item
+      remains pending with failureKind=transient, retryable=true,
       retryExhausted=false, recoveryDecision=retry_same_run_id, and
       waitingForProviderRecovery=true. The same runId resumes the item after
       nextRetryAt. The batch continues pending items.

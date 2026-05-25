@@ -470,6 +470,9 @@ const BatchRecoverySummaryItemSchema = z.object({
   nextRetryAt: z.string().datetime().optional(),
   retryDelaySeconds: z.number().int().nonnegative().optional(),
   retryBudgetSeconds: z.number().int().positive().optional(),
+  providerRecoveryWaitCount: z.number().int().nonnegative().optional(),
+  maxProviderRecoveryWaits: z.number().int().positive().optional(),
+  providerRecoveryReason: z.string().min(1).optional(),
   runnerSessionId: z.string().min(1).optional(),
   runnerHost: z.string().min(1).optional(),
   runnerPid: z.number().int().positive().optional(),
@@ -568,7 +571,10 @@ function retryBudgetExhausted(checkpoint) {
 }
 
 function providerRecoveryWaitCount(checkpoint) {
-  return Number(checkpoint?.metadata?.providerRecoveryWaitCount ?? 0);
+  return Math.min(
+    maxProviderRecoveryWaits,
+    Number(checkpoint?.metadata?.providerRecoveryWaitCount ?? 0),
+  );
 }
 
 function providerRecoveryWaitAvailable(checkpoint) {
@@ -576,7 +582,10 @@ function providerRecoveryWaitAvailable(checkpoint) {
 }
 
 function nextProviderRecoveryWaitCount(checkpoint) {
-  return providerRecoveryWaitCount(checkpoint) + 1;
+  return Math.min(
+    maxProviderRecoveryWaits,
+    providerRecoveryWaitCount(checkpoint) + 1,
+  );
 }
 
 function checkpointFailureText(checkpoint) {
@@ -2257,6 +2266,12 @@ function buildRecoverySummary(manifest, checkpoints) {
     const failedCommands = (item.commandChecks ?? [])
       .filter((check) => check.status === "failed");
     const failedCommand = failedCommands.at(-1);
+    const waitingForProviderRecovery =
+      item.status === "pending" &&
+      item.failureKind === "transient" &&
+      item.retryable === true &&
+      item.recoveryDecision === "retry_same_run_id" &&
+      item.metadata?.waitingForProviderRecovery === true;
     return withoutUndefined({
       itemId: item.itemId,
       sourceName: item.sourceName,
@@ -2276,17 +2291,21 @@ function buildRecoverySummary(manifest, checkpoints) {
       nextRetryAt: item.nextRetryAt,
       retryDelaySeconds: item.retryDelaySeconds,
       retryBudgetSeconds: item.retryBudgetSeconds,
+      providerRecoveryWaitCount: waitingForProviderRecovery
+        ? providerRecoveryWaitCount(item)
+        : undefined,
+      maxProviderRecoveryWaits: waitingForProviderRecovery
+        ? Number(item.metadata?.maxProviderRecoveryWaits ?? maxProviderRecoveryWaits)
+        : undefined,
+      providerRecoveryReason: waitingForProviderRecovery
+        ? item.metadata?.providerRecoveryReason
+        : undefined,
       runnerSessionId: item.runnerSessionId,
       runnerHost: item.runnerHost,
       runnerPid: item.runnerPid,
       runnerHeartbeatAt: item.runnerHeartbeatAt,
       orphanedRunnerDetectedAt: item.orphanedRunnerDetectedAt,
-      waitingForProviderRecovery:
-        item.status === "pending" &&
-        item.failureKind === "transient" &&
-        item.retryable === true &&
-        item.recoveryDecision === "retry_same_run_id" &&
-        item.metadata?.waitingForProviderRecovery === true,
+      waitingForProviderRecovery,
       errorSummary: item.errorSummary ? redacted(item.errorSummary) : undefined,
     });
   });
@@ -2690,9 +2709,9 @@ function runCommand(item, name, command, args, options = {}) {
   }
   const summary = last?.check?.errorSummary ?? `${name} failed`;
   if (last?.check?.status === "failed") {
-    event({
+    const exhaustedEvent = {
       itemId: item.itemId,
-      event: "command_retry_exhausted",
+      event: "command_attempt_budget_exhausted",
       command: name,
       failureKind: last.check.failureKind,
       retryable: last.check.retryable,
@@ -2708,6 +2727,15 @@ function runCommand(item, name, command, args, options = {}) {
         maxAttempts: attempts,
         retryBudgetSeconds,
         commandTimeoutSeconds,
+      },
+    };
+    event(exhaustedEvent);
+    event({
+      ...exhaustedEvent,
+      event: "command_retry_exhausted",
+      metadata: {
+        ...exhaustedEvent.metadata,
+        compatibilityEvent: "command_attempt_budget_exhausted",
       },
     });
   }
@@ -3299,9 +3327,9 @@ function shouldStopBatchBeforeProcessing(checkpoint) {
 }
 
 function emitBatchStoppedAfterNonTransientFailure(checkpoint) {
-  event({
+  const stoppedEvent = {
     itemId: checkpoint.itemId,
-    event: "batch_stopped_after_non_transient_failure",
+    event: "batch_stopped_after_data_compatibility_failure",
     status: "failed",
     failureKind: checkpoint.failureKind ?? "unknown",
     retryable: false,
@@ -3310,6 +3338,15 @@ function emitBatchStoppedAfterNonTransientFailure(checkpoint) {
     message: checkpoint.errorSummary,
     metadata: {
       policy: "stop_current_runner_until_fixed",
+    },
+  };
+  event(stoppedEvent);
+  event({
+    ...stoppedEvent,
+    event: "batch_stopped_after_non_transient_failure",
+    metadata: {
+      ...stoppedEvent.metadata,
+      compatibilityEvent: "batch_stopped_after_data_compatibility_failure",
     },
   });
 }

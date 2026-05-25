@@ -87,10 +87,16 @@ types:
         qmd/GraphRAG build status
       - transient provider failures enter provider recovery wait with
         recoveryDecision=retry_same_run_id instead of stop_until_fixed
+      - exposes providerRecoveryWaitCount, maxProviderRecoveryWaits, and
+        providerRecoveryReason so operators do not need to inspect raw metadata
+      - Jina, LiteLLM, OpenAI Responses, and GraphRAG provider connection
+        failures are transient when the failure is DNS, TLS, connect, reset,
+        timeout, rate-limit, or upstream 5xx related
       - data_compatibility failures are exposed as operator action required
         rather than provider recovery wait
       - exposes runner ownership and orphan recovery state for running items
-      - reports qmd build status recomputed from 27 fixed command checks
+      - reports qmd build status recomputed from qmd-native command checks;
+        the full 27 command checks remain the completed item acceptance gate
       - reports GraphRAG build status from book-scoped producer lineage rather
         than persisted status strings
       - exposes providerStatusCode when the failed command came from an
