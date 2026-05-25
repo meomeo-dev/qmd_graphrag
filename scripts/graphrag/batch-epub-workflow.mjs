@@ -850,6 +850,25 @@ function writeTypedJson(path, schema, value) {
   return parsed;
 }
 
+function repairOnlyBlockedLoopObserved(itemId) {
+  if (!existsSync(eventsPath)) return false;
+  return readFileSync(eventsPath, "utf8")
+    .split(/\r?\n/u)
+    .some((line) => {
+      if (!line.trim()) return false;
+      try {
+        const item = JSON.parse(line);
+        return item.itemId === itemId &&
+          item.event === "local_artifact_gate_repair_pass_completed" &&
+          item.metadata?.resumeStatus === "blocked" &&
+          typeof item.metadata?.command === "string" &&
+          item.metadata.command.startsWith("repair-local-artifact-gate-");
+      } catch {
+        return false;
+      }
+    });
+}
+
 function loadCatalogBySourceHash() {
   const catalogPath = join(stateRoot, "catalog", "books.yaml");
   if (!existsSync(catalogPath)) return new Map();
@@ -1031,8 +1050,9 @@ function hydrateCheckpoint(item, checkpoint) {
     maxProviderRecoveryWaits,
     commandTimeoutSeconds,
     defaultBookId: defaultBookIdFor(item.sourceHash),
+    repairOnlyBlockedLoopObserved: repairOnlyBlockedLoopObserved(item.itemId),
   });
-  return {
+  return withoutUndefined({
     ...hydrated,
     errorSummary: hydrated.errorSummary ? redacted(hydrated.errorSummary) : undefined,
     qmdBuildStatus: hydrated.qmdBuildStatus == null
@@ -1049,7 +1069,7 @@ function hydrateCheckpoint(item, checkpoint) {
       ...check,
       errorSummary: check.errorSummary ? redacted(check.errorSummary) : undefined,
     })),
-  };
+  });
 }
 
 function loadCheckpoint(item, completedSeed) {
@@ -2511,6 +2531,12 @@ function qmdRunner() {
 }
 
 function resumeRunnerArgs() {
+  if (
+    process.env.QMD_GRAPHRAG_TEST_RESUME_RUNNER === "1" &&
+    process.env.QMD_GRAPHRAG_RESUME_RUNNER
+  ) {
+    return [process.env.QMD_GRAPHRAG_RESUME_RUNNER];
+  }
   const scriptPath = join(root, "scripts", "graphrag", "resume-book-workspace.mjs");
   const tsxCli = join(root, "node_modules", "tsx", "dist", "cli.mjs");
   const useSourceRuntime = existsSync(join(root, ".git")) && existsSync(tsxCli);
@@ -2875,7 +2901,12 @@ function runGraphResume(item, checkpoint, options = {}) {
       (resume.status === "ready" && resume.nextStage == null) ||
       (options.repairLocalArtifactGateOnly && resume.status === "repaired")
     ) {
-      return resume.bookId;
+      return options.repairLocalArtifactGateOnly
+        ? { status: "repaired", bookId: resume.bookId, resume }
+        : resume.bookId;
+    }
+    if (options.repairLocalArtifactGateOnly && resume.status === "blocked") {
+      return { status: "blocked", bookId: resume.bookId, resume };
     }
   }
 
@@ -2886,13 +2917,55 @@ function runGraphResume(item, checkpoint, options = {}) {
 }
 
 function repairLocalArtifactGate(item, checkpoint) {
-  const repairedBookId = runGraphResume(item, checkpoint, {
+  const repairResult = runGraphResume(item, checkpoint, {
     repairLocalArtifactGateOnly: true,
   });
+  if (repairResult?.status === "blocked") {
+    const reason = redacted(repairResult.resume?.reason ?? "repair blocked");
+    event({
+      itemId: item.itemId,
+      event: "item_local_artifact_gate_repair_blocked",
+      status: "pending",
+      failureKind: checkpoint.failureKind ?? "permanent",
+      retryable: false,
+      recoveryDecision: "continue_pending",
+      failedStage: checkpoint.failedStage,
+      message: reason,
+      metadata: {
+        repairOnly: true,
+        repairedLocalArtifactGate: false,
+        resumeStatus: repairResult.resume?.status,
+        reason,
+      },
+    });
+    return {
+      ...checkpoint,
+      status: "pending",
+      bookId: repairResult.bookId ?? checkpoint.bookId,
+      failedAt: undefined,
+      errorSummary: undefined,
+      failureKind: undefined,
+      retryable: undefined,
+      retryExhausted: undefined,
+      recoveryDecision: "continue_pending",
+      failedStage: undefined,
+      nextRetryAt: undefined,
+      retryDelaySeconds: undefined,
+      runnerHeartbeatAt: now(),
+      commandChecks: [],
+      metadata: {
+        ...(checkpoint.metadata ?? {}),
+        localArtifactGateRepairCompleted: undefined,
+        localArtifactGateRepairBlocked: true,
+        localArtifactGateRepairBlockedReason: reason,
+        waitingForProviderRecovery: false,
+      },
+    };
+  }
   return {
     ...checkpoint,
     status: "pending",
-    bookId: repairedBookId ?? checkpoint.bookId,
+    bookId: repairResult?.bookId ?? checkpoint.bookId,
     failedAt: undefined,
     errorSummary: undefined,
     failureKind: undefined,
@@ -2906,6 +2979,8 @@ function repairLocalArtifactGate(item, checkpoint) {
     commandChecks: [],
     metadata: {
       ...(checkpoint.metadata ?? {}),
+      localArtifactGateRepairBlocked: undefined,
+      localArtifactGateRepairBlockedReason: undefined,
       localArtifactGateRepairCompleted: true,
       waitingForProviderRecovery: false,
     },
@@ -3267,10 +3342,23 @@ function main() {
   }
 
   let processedInPass = true;
+  const repairBlockedThisRun = new Set();
   while (processedInPass) {
     processedInPass = false;
     let deferredForRetryWindow = false;
     for (const item of items) {
+      if (repairBlockedThisRun.has(item.itemId)) {
+        event({
+          itemId: item.itemId,
+          event: "item_local_artifact_gate_repair_blocked_skip",
+          status: "pending",
+          recoveryDecision: "continue_pending",
+          metadata: {
+            reason: "repair blocked earlier in this runner invocation",
+          },
+        });
+        continue;
+      }
       const checkpoint = checkpoints.get(item.itemId);
       if (checkpoint?.status === "completed") {
         event({ itemId: item.itemId, event: "item_skip_completed", status: "completed" });
@@ -3302,7 +3390,11 @@ function main() {
             saveCheckpoint(item, repaired);
             checkpoints.set(item.itemId, repaired);
             manifest = updateManifest(manifest, Array.from(checkpoints.values()));
-            processedInPass = true;
+            if (repaired.metadata?.localArtifactGateRepairBlocked === true) {
+              repairBlockedThisRun.add(item.itemId);
+            } else {
+              processedInPass = true;
+            }
           } catch (error) {
             const failed = {
               ...checkpoint,

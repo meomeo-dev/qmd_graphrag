@@ -1419,6 +1419,149 @@ describe("Data bus contracts", () => {
     });
   });
 
+  test("hydrates legacy repair-only blocked loops back to pending", () => {
+    const legacy = {
+      schemaVersion: SchemaVersion,
+      itemId: "item-repair-loop",
+      runId: "run-repair-loop",
+      status: "failed",
+      sourceName: "Repair.epub",
+      sourceRelativePath: "inbox/books/Repair.epub",
+      sourceHash: "sha256:repair-source",
+      normalizedPath: "graph_vault/input/repair.md",
+      bookId: "book-repair",
+      attempts: 2,
+      failedAt: "2026-05-23T00:00:00.000Z",
+      failureKind: "permanent",
+      retryable: false,
+      retryExhausted: true,
+      recoveryDecision: "stop_until_fixed",
+      failedStage: "repair-local-artifact-gate",
+      errorSummary: "resume-book did not reach ready after 24 passes",
+      commandChecks: [{
+        name: "repair-local-artifact-gate-24",
+        status: "failed",
+        attempts: 1,
+        exitCode: 1,
+        stdoutBytes: 0,
+        stderrBytes: 64,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        completedAt: "2026-05-23T00:01:00.000Z",
+        failureKind: "permanent",
+        retryable: false,
+        attemptExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        errorSummary: "resume-book did not reach ready after 24 passes",
+      }],
+    };
+
+    const hydrated = hydrateBatchCheckpoint({
+      item: {
+        sourceHash: "sha256:repair-source",
+        bookId: "book-repair",
+      },
+      checkpoint: legacy,
+      expectedCommandCheckCount: 27,
+      maxCommandAttempts: 3,
+      maxTransientCommandAttempts: 5,
+      maxResumePasses: 24,
+      retryBaseDelaySeconds: 5,
+      retryMaxDelaySeconds: 300,
+      retryBudgetSeconds: 1800,
+      maxProviderRecoveryWaits: 3,
+      commandTimeoutSeconds: 600,
+      defaultBookId: "book-repair",
+      repairOnlyBlockedLoopObserved: true,
+    });
+
+    expect(hydrated).toMatchObject({
+      status: "pending",
+      sourceHash: "sha256:repair-source",
+      bookId: "book-repair",
+      recoveryDecision: "continue_pending",
+      expectedCommandCheckCount: 27,
+      maxResumePasses: 24,
+      metadata: {
+        recoveredFromRepairOnlyBlockedLoop: true,
+        waitingForProviderRecovery: false,
+      },
+    });
+    expect(hydrated.failedAt).toBeUndefined();
+    expect(hydrated.errorSummary).toBeUndefined();
+    expect(hydrated.failureKind).toBeUndefined();
+    expect(hydrated.retryable).toBeUndefined();
+    expect(hydrated.retryExhausted).toBeUndefined();
+    expect(hydrated.failedStage).toBeUndefined();
+    expect(hydrated.commandChecks).toEqual([]);
+  });
+
+  test("does not hydrate non-repair did-not-reach-ready failures", () => {
+    const legacy = {
+      schemaVersion: SchemaVersion,
+      itemId: "item-non-repair-loop",
+      runId: "run-non-repair-loop",
+      status: "failed",
+      sourceName: "Normal.epub",
+      sourceRelativePath: "inbox/books/Normal.epub",
+      sourceHash: "sha256:normal-source",
+      normalizedPath: "graph_vault/input/normal.md",
+      bookId: "book-normal",
+      attempts: 2,
+      failedAt: "2026-05-23T00:00:00.000Z",
+      failureKind: "permanent",
+      retryable: false,
+      retryExhausted: true,
+      recoveryDecision: "stop_until_fixed",
+      failedStage: "repair-local-artifact-gate",
+      errorSummary: "resume-book did not reach ready after 24 passes",
+      commandChecks: [{
+        name: "resume-book-24",
+        status: "failed",
+        attempts: 1,
+        exitCode: 1,
+        stdoutBytes: 0,
+        stderrBytes: 64,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        completedAt: "2026-05-23T00:01:00.000Z",
+        failureKind: "permanent",
+        retryable: false,
+        attemptExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        errorSummary: "resume-book did not reach ready after 24 passes",
+      }],
+    };
+
+    const hydrated = hydrateBatchCheckpoint({
+      item: {
+        sourceHash: "sha256:normal-source",
+        bookId: "book-normal",
+      },
+      checkpoint: legacy,
+      expectedCommandCheckCount: 27,
+      maxCommandAttempts: 3,
+      maxTransientCommandAttempts: 5,
+      maxResumePasses: 24,
+      retryBaseDelaySeconds: 5,
+      retryMaxDelaySeconds: 300,
+      retryBudgetSeconds: 1800,
+      maxProviderRecoveryWaits: 3,
+      commandTimeoutSeconds: 600,
+      defaultBookId: "book-normal",
+    });
+
+    expect(hydrated).toMatchObject({
+      status: "failed",
+      failureKind: "permanent",
+      retryable: false,
+      retryExhausted: true,
+      recoveryDecision: "stop_until_fixed",
+      failedStage: "repair-local-artifact-gate",
+      errorSummary: "resume-book did not reach ready after 24 passes",
+    });
+    expect(hydrated.metadata?.recoveredFromRepairOnlyBlockedLoop).toBeUndefined();
+    expect(hydrated.commandChecks[0]?.name).toBe("resume-book-24");
+  });
+
   test("accepts batch execution bus envelopes with real schemas", () => {
     const manifestEnvelope = DataBusEnvelopeSchema.parse(
       batchRunManifestEnvelopeFixture(),

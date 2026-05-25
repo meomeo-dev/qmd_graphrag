@@ -1221,6 +1221,7 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(script).toContain("repair-local-artifact-gate-");
     expect(script).toContain("--repair-local-artifact-gate-only");
     expect(script).toContain("item_local_artifact_gate_repair");
+    expect(script).toContain("item_local_artifact_gate_repair_blocked");
     expect(script).toContain("localArtifactGateRepairCompleted");
     expect(script).toContain("qmd-query-graphrag-json");
     expect(script).toContain("redactLog(stdout)");
@@ -2758,6 +2759,451 @@ describe("GraphRAG EPUB batch runner", () => {
       recoveryDecision: "stop_until_fixed",
       waitingForProviderRecovery: false,
     });
+  });
+
+  test("normal run stops repair-only when local artifact gate is blocked", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-repair-blocked-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "repair-blocked";
+    const blockedBytes = "repair blocked local gate";
+    const repairedBytes = "repair repaired local gate";
+    const blockedHash = createHash("sha256").update(blockedBytes).digest("hex");
+    const repairedHash = createHash("sha256").update(repairedBytes).digest("hex");
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    const repairedSourcePath = join(sourceDir, "A-Repaired.epub");
+    const blockedSourcePath = join(sourceDir, "B-Blocked.epub");
+    await writeFile(blockedSourcePath, blockedBytes);
+    await writeFile(repairedSourcePath, repairedBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const blockedRelativePath = relative(projectRoot, blockedSourcePath);
+    const repairedRelativePath = relative(projectRoot, repairedSourcePath);
+    const blockedItemId = `item-${blockedHash.slice(0, 12)}-${
+      createHash("sha256").update(blockedRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const repairedItemId = `item-${repairedHash.slice(0, 12)}-${
+      createHash("sha256").update(repairedRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const blockedErrorSummary =
+      "GraphRAG stage did not produce valid book-scoped artifacts: " +
+      JSON.stringify({
+        bookId: `book-${blockedHash.slice(0, 12)}`,
+        stage: "graph_extract",
+        missingArtifactKinds: ["graphrag_documents_parquet"],
+      });
+    const repairedErrorSummary =
+      "GraphRAG stage did not produce valid book-scoped artifacts: " +
+      JSON.stringify({
+        bookId: `book-${repairedHash.slice(0, 12)}`,
+        stage: "graph_extract",
+        missingArtifactKinds: ["graphrag_documents_parquet"],
+      });
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 2,
+        pendingItems: 0,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 2,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [blockedItemId, repairedItemId],
+      }),
+    );
+    await writeFile(
+      join(
+        stateRoot,
+        "catalog",
+        "batch-runs",
+        runId,
+        "items",
+        `${blockedItemId}.json`,
+      ),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId: blockedItemId,
+        runId,
+        status: "failed",
+        sourceName: "B-Blocked.epub",
+        sourceRelativePath: blockedRelativePath,
+        sourceHash: blockedHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        bookId: `book-${blockedHash.slice(0, 12)}`,
+        attempts: 1,
+        failedAt: "2026-05-23T00:10:00.000Z",
+        failureKind: "permanent",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "resume-book-1",
+        errorSummary: blockedErrorSummary,
+        commandChecks: [],
+        metadata: {
+          localArtifactGateRepairCompleted: true,
+        },
+      }),
+    );
+    await writeFile(
+      join(
+        stateRoot,
+        "catalog",
+        "batch-runs",
+        runId,
+        "items",
+        `${repairedItemId}.json`,
+      ),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId: repairedItemId,
+        runId,
+        status: "failed",
+        sourceName: "A-Repaired.epub",
+        sourceRelativePath: repairedRelativePath,
+        sourceHash: repairedHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book-2.md"),
+        bookId: `book-${repairedHash.slice(0, 12)}`,
+        attempts: 1,
+        failedAt: "2026-05-23T00:10:00.000Z",
+        failureKind: "permanent",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "resume-book-1",
+        errorSummary: repairedErrorSummary,
+        commandChecks: [],
+        metadata: {
+          localArtifactGateRepairBlocked: true,
+          localArtifactGateRepairBlockedReason: "old blocked reason",
+        },
+      }),
+    );
+    const resumeScript = join(
+      tmpRoot,
+      "scripts",
+      "graphrag",
+      "resume-book-workspace.mjs",
+    );
+    await mkdir(dirname(resumeScript), { recursive: true });
+    await writeFile(
+      resumeScript,
+      [
+        "import { writeFileSync } from 'node:fs';",
+        "import { basename } from 'node:path';",
+        "const sourceIndex = process.argv.indexOf('--source-path');",
+        "const sourcePath = sourceIndex >= 0 ? process.argv[sourceIndex + 1] : '';",
+        "const sourceName = basename(sourcePath);",
+        "const marker = process.env.QMD_FAKE_RESUME_MARKER;",
+        "const isRepairOnly = process.argv.includes('--repair-local-artifact-gate-only');",
+        "if (marker) writeFileSync(marker, `${sourceName}:${isRepairOnly}\\n`, { flag: 'a' });",
+        "if (sourceName === 'B-Blocked.epub') {",
+        "console.log(JSON.stringify({",
+        "  status: 'blocked',",
+        `  bookId: 'book-${blockedHash.slice(0, 12)}',`,
+        "  startedStage: null,",
+        "  nextStage: null,",
+        "  completedStages: ['ingest', 'normalize', 'graph_extract'],",
+        "  queryResult: null,",
+        "  repairOnly: true,",
+        "  repairedLocalArtifactGate: false,",
+        "  reason: 'local artifact gate failure checkpoint not found',",
+        "}));",
+        "} else {",
+        "console.log(JSON.stringify({",
+        "  status: 'repaired',",
+        `  bookId: 'book-${repairedHash.slice(0, 12)}',`,
+        "  startedStage: null,",
+        "  nextStage: null,",
+        "  completedStages: ['ingest', 'normalize', 'graph_extract'],",
+        "  queryResult: null,",
+        "  repairOnly: true,",
+        "  repairedLocalArtifactGate: true,",
+        "}));",
+        "}",
+      ].join("\n"),
+    );
+    const markerPath = join(tmpRoot, "fake-resume-count.txt");
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--max-resume-passes",
+        "24",
+      ], {
+        env: {
+          ...process.env,
+          QMD_FAKE_RESUME_MARKER: markerPath,
+          QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+          QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
+        },
+      });
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+      proc.stderr.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    const blockedCheckpoint = JSON.parse(readFileSync(
+      join(
+        stateRoot,
+        "catalog",
+        "batch-runs",
+        runId,
+        "items",
+        `${blockedItemId}.json`,
+      ),
+      "utf8",
+    ));
+    const repairedCheckpoint = JSON.parse(readFileSync(
+      join(
+        stateRoot,
+        "catalog",
+        "batch-runs",
+        runId,
+        "items",
+        `${repairedItemId}.json`,
+      ),
+      "utf8",
+    ));
+    const events = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
+      "utf8",
+    ).trim().split("\n").map((line) => JSON.parse(line));
+    const blockedRepairStarts = events.filter((event) =>
+      event.itemId === blockedItemId &&
+      event.event === "command_start" &&
+      event.command?.startsWith("repair-local-artifact-gate-")
+    );
+    const blockedSkips = events.filter((event) =>
+      event.itemId === blockedItemId &&
+      event.event === "item_local_artifact_gate_repair_blocked_skip"
+    );
+    const repairedNormalizeStarts = events.filter((event) =>
+      event.itemId === repairedItemId &&
+      event.event === "command_start" &&
+      event.command === "normalize-epub"
+    );
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).not.toContain("did not reach ready after 24 passes");
+    expect(readFileSync(markerPath, "utf8").trim().split("\n")).toEqual([
+      "A-Repaired.epub:true",
+      "B-Blocked.epub:true",
+    ]);
+    expect(blockedRepairStarts).toHaveLength(1);
+    expect(blockedSkips.length).toBeGreaterThanOrEqual(1);
+    expect(repairedNormalizeStarts.length).toBeGreaterThanOrEqual(1);
+    expect(events.some((event) =>
+      event.itemId === blockedItemId &&
+      event.event === "item_local_artifact_gate_repair_blocked"
+    )).toBe(true);
+    expect(blockedCheckpoint).toMatchObject({
+      status: "pending",
+      recoveryDecision: "continue_pending",
+      metadata: {
+        localArtifactGateRepairBlocked: true,
+        localArtifactGateRepairBlockedReason:
+          "local artifact gate failure checkpoint not found",
+      },
+    });
+    expect(blockedCheckpoint.metadata?.localArtifactGateRepairCompleted)
+      .toBeUndefined();
+    expect(blockedCheckpoint.failedAt).toBeUndefined();
+    expect(blockedCheckpoint.errorSummary).toBeUndefined();
+    expect(blockedCheckpoint.failureKind).toBeUndefined();
+    expect(blockedCheckpoint.retryable).toBeUndefined();
+    expect(blockedCheckpoint.retryExhausted).toBeUndefined();
+    expect(repairedCheckpoint.metadata?.localArtifactGateRepairCompleted).toBe(true);
+    expect(repairedCheckpoint.metadata?.localArtifactGateRepairBlocked)
+      .toBeUndefined();
+    expect(repairedCheckpoint.metadata?.localArtifactGateRepairBlockedReason)
+      .toBeUndefined();
+    await rm(tmpRoot, { recursive: true, force: true });
+  });
+
+  test("status-json hydrates event-proven repair-only blocked loops", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-repair-loop-hydrate-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "repair-loop-hydrate";
+    const sourceBytes = "event proven repair loop";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    const sourcePath = join(sourceDir, "Book.epub");
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        pendingItems: 0,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "failed",
+        sourceName: "Book.epub",
+        sourceRelativePath,
+        sourceHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        bookId: `book-${sourceHash.slice(0, 12)}`,
+        attempts: 3,
+        failedAt: "2026-05-23T00:10:00.000Z",
+        failureKind: "permanent",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "repair-local-artifact-gate",
+        errorSummary: "resume-book did not reach ready after 24 passes",
+        commandChecks: [{
+          name: "resume-book-1",
+          status: "failed",
+          attempts: 1,
+          exitCode: 1,
+          stdoutBytes: 0,
+          stderrBytes: 128,
+          startedAt: "2026-05-23T00:00:00.000Z",
+          completedAt: "2026-05-23T00:01:00.000Z",
+          failureKind: "permanent",
+          retryable: false,
+          attemptExhausted: true,
+          recoveryDecision: "stop_until_fixed",
+          errorSummary: "GraphRAG stage did not produce valid book-scoped artifacts",
+        }],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
+      [
+        JSON.stringify({
+          schemaVersion: SchemaVersion,
+          runId,
+          itemId,
+          event: "local_artifact_gate_repair_pass_completed",
+          status: "running",
+          at: "2026-05-23T00:09:00.000Z",
+          metadata: {
+            pass: 24,
+            command: "repair-local-artifact-gate-24",
+            resumeStatus: "blocked",
+            nextStage: null,
+          },
+        }),
+      ].join("\n") + "\n",
+    );
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--status-json",
+      ]);
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+      proc.stderr.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary.recoveryDecision).toBe("continue_pending");
+    expect(summary.items[0]).toMatchObject({
+      status: "pending",
+      recoveryDecision: "continue_pending",
+      waitingForProviderRecovery: false,
+    });
+    expect(summary.items[0].failureKind).toBeUndefined();
+    expect(summary.items[0].retryable).toBeUndefined();
+    expect(summary.items[0].failedStage).toBeUndefined();
   });
 
   test("status-json recovers orphaned running item to retryable pending", async () => {
