@@ -649,6 +649,84 @@ describe("FileBookJobStateRepository", () => {
     }
   });
 
+  test("preserves graph identity when registering the same book again", async () => {
+    const root = await createFixtureDir();
+    try {
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "same source content", "utf8");
+
+      const job = await repo.registerBookSource({
+        sourcePath,
+        normalizedPath: "input/book.md",
+        normalizedContentHash: "same-normalized-content",
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+      });
+      await repo.recordDocumentChunks({
+        documentId: job.documentId,
+        contentHash: "same-normalized-content",
+        chunkIds: ["chunk-1"],
+      });
+      await repo.recordQmdCorpusRegistration({
+        documentId: job.documentId,
+        contentHash: "same-normalized-content",
+        collection: "books",
+        relativePath: "book.md",
+      });
+      await repo.recordGraphTextUnitIdentity({
+        schemaVersion: SchemaVersion,
+        bookId: job.bookId,
+        sourceId: `sha256:${job.sourceHash}`,
+        sourceHash: job.sourceHash,
+        documentId: job.documentId,
+        contentHash: "same-normalized-content",
+        normalizedPath: "input/book.md",
+        graphDocumentId: "graph-doc-1",
+        graphTextUnitIds: ["tu-1"],
+      });
+
+      await repo.registerBookSource({
+        sourcePath,
+        normalizedPath: "input/book.md",
+        normalizedContentHash: "same-normalized-content",
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+        metadata: {
+          qmdCorpusRegistered: false,
+          qmdCollection: "wrong",
+          qmdRelativePath: "wrong.md",
+        },
+      });
+
+      const catalog = YAML.parse(await readFile(
+        join(graphVault, "catalog", "document-identity-map.yaml"),
+        "utf8",
+      )) as {
+        items: Array<{
+          documentId: string;
+          chunkIds: string[];
+          graphDocumentId?: string;
+          graphTextUnitIds?: string[];
+          metadata?: Record<string, unknown>;
+        }>;
+      };
+      const identity = catalog.items.find((item) => item.documentId === job.documentId);
+
+      expect(identity?.chunkIds).toEqual(["chunk-1"]);
+      expect(identity?.metadata?.qmdCorpusRegistered).toBe(true);
+      expect(identity?.metadata?.qmdCollection).toBe("books");
+      expect(identity?.metadata?.qmdRelativePath).toBe("book.md");
+      expect(identity?.graphDocumentId).toBe("graph-doc-1");
+      expect(identity?.graphTextUnitIds).toEqual(["tu-1"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("rejects non-portable normalized paths", async () => {
     const root = await createFixtureDir();
     try {
@@ -2360,6 +2438,12 @@ describe("FileBookJobStateRepository", () => {
           sourceName: "Book",
           OPENAI_API_KEY: "opaque-redaction-marker",
           workspaceRoot: root,
+          rawProviderRequest: {
+            safeLooking: "must-not-persist",
+          },
+          providerResponse: {
+            content: "must-not-persist",
+          },
           nested: {
             token: "opaque-redaction-marker",
             safe: "kept",
@@ -2391,6 +2475,9 @@ describe("FileBookJobStateRepository", () => {
       expect(jobRaw).not.toContain("OPENAI_API_KEY");
       expect(jobRaw).not.toContain("opaque-redaction-marker");
       expect(jobRaw).not.toContain(root);
+      expect(jobRaw).not.toContain("rawProviderRequest");
+      expect(jobRaw).not.toContain("providerResponse");
+      expect(jobRaw).not.toContain("must-not-persist");
       expect(jobRaw).toContain("safe: kept");
       expect(checkpointRaw).not.toContain("Bearer redaction-sentinel");
       expect(checkpointRaw).not.toContain(root);

@@ -1,0 +1,120 @@
+schemaVersion: 1
+caseId: graphrag-query-ready-identity
+runId: graphrag-query-ready-identity-run_1
+status: dev_audit_passed_ready_for_real_epub_resume
+trigger:
+  realRunId: epub-batch-20260525-full-real
+  failedBook: A Philosophy of Software Design (John K. Ousterhout).epub
+  failedBookId: book-9f587b71073a-ad95ce2f
+  failedItemId: item-9f587b71073a-cff9f38d
+  failedStage: resume-book-1
+  error: >
+    GraphRAG document identity is missing for query_ready: doc-fd8875181a17
+baselinePolicy:
+  fixedBeforeAudit: true
+  mutableDuringRun: false
+  agentBaselineFiles:
+    design-agent-a: design-agent-a/baseline.md
+    design-agent-b: design-agent-b/baseline.md
+    design-agent-c: design-agent-c/baseline.md
+reports:
+  design-agent-a: design-agent-a/report.md
+  design-agent-b: design-agent-b/report.md
+  design-agent-c: design-agent-c/report.md
+finalReport: final-report.md
+designFixSummary: design-fix-summary.md
+designAudit:
+  completedAt: "2026-05-25T00:00:00.000Z"
+  result: fail
+  agentResults:
+    design-agent-a: fail
+    design-agent-b: fail
+    design-agent-c: fail
+  requiredDesignActions:
+    - define_graph_identity_projection_repair
+    - define_sidecar_as_repair_evidence
+    - define_non_destructive_identity_map_merge
+    - define_fail_closed_ambiguity_and_mismatch_rules
+    - define_low_cost_resume_without_high_cost_stage_rerun
+    - define_real_failure_acceptance
+    - define_generated_runtime_output_commit_boundary
+designFix:
+  completedAt: "2026-05-25T16:32:36Z"
+  changedFiles:
+    - docs/architecture/unified-retrieval-plane.md
+    - docs/architecture/unified-retrieval-plane.type-dd.yaml
+    - docs/operations/graphrag-epub-batch-runbook.md
+    - catalog/data-bus.catalog.yaml
+  readyForReaudit: true
+designReaudit:
+  completedAt: "2026-05-25T16:32:36Z"
+  result: pass
+  reports:
+    design-agent-a: design-agent-a/reaudit-1.md
+    design-agent-b: design-agent-b/reaudit-1.md
+    design-agent-c: design-agent-c/reaudit-1.md
+  agentResults:
+    design-agent-a: pass
+    design-agent-b: pass
+    design-agent-c: pass
+implementation:
+  completedAt: "2026-05-25T16:32:36Z"
+  summary: implementation-summary.md
+  changedFiles:
+    - src/job-state/repository.ts
+    - src/job-state/graphrag-book.ts
+    - test/book-job-state.test.ts
+    - test/graphrag-book-state.test.ts
+  devAuditBaselines:
+    dev-agent-a: dev-agent-a/baseline.md
+    dev-agent-b: dev-agent-b/baseline.md
+    dev-agent-c: dev-agent-c/baseline.md
+  verification:
+    - npm run test:types
+    - node ./node_modules/vitest/vitest.mjs run test/graphrag-book-state.test.ts test/book-job-state.test.ts --testTimeout 120000 --reporter=dot
+    - node ./node_modules/vitest/vitest.mjs run test/unified-query.test.ts test/cli-graphrag-route.test.ts test/integrations/graphrag-cost.test.ts --testTimeout 120000 --reporter=dot
+    - node ./node_modules/vitest/vitest.mjs run test/cli.test.ts --testTimeout 120000 --reporter=dot
+    - .venv-graphrag/bin/python test/python/test_graphrag_bridge_scope.py
+  devAuditRound1:
+    result: fail
+    reports:
+      dev-agent-a: dev-agent-a/report.md
+      dev-agent-b: dev-agent-b/report.md
+      dev-agent-c: dev-agent-c/report.md
+    agentResults:
+      dev-agent-a: fail
+      dev-agent-b: pass
+      dev-agent-c: fail
+    fixes:
+      - protected_repository_projection_metadata_existing_wins
+      - documented_true_epub_resume_remaining_risk
+      - reran_combined_focused_state_tests
+      - deduped_legacy_document_identity_map_entries
+      - denied_raw_provider_payload_metadata_keys
+    postFixVerification:
+      - npm run test:types
+      - node ./node_modules/vitest/vitest.mjs run test/graphrag-book-state.test.ts test/book-job-state.test.ts --testTimeout 120000 --reporter=dot
+      - node ./node_modules/vitest/vitest.mjs run test/book-job-state.test.ts --testTimeout 120000 --reporter=dot
+      - node ./node_modules/vitest/vitest.mjs run test/graphrag-book-state.test.ts --testTimeout 120000 --reporter=dot
+    trueEpubResume:
+      status: not_rerun_after_patch
+      reason: dev_audit_must_pass_before_returning_to_real_epub_loop
+      requiredNext: resume_real_failed_book_or_new_real_run_after_dev_audit_pass
+  devAuditFinal:
+    completedAt: "2026-05-25T17:46:00Z"
+    result: pass
+    reports:
+      dev-agent-a: dev-agent-a/reaudit-2.md
+      dev-agent-b: dev-agent-b/report.md
+      dev-agent-c: dev-agent-c/reaudit-1.md
+    agentResults:
+      dev-agent-a: pass
+      dev-agent-b: pass
+      dev-agent-c: pass
+    finalVerification:
+      - npm run test:types
+      - node ./node_modules/vitest/vitest.mjs run test/book-job-state.test.ts --testTimeout 120000 --reporter=dot
+      - node ./node_modules/vitest/vitest.mjs run test/graphrag-book-state.test.ts --testTimeout 120000 --reporter=dot
+      - node ./node_modules/vitest/vitest.mjs run test/unified-query.test.ts test/cli-graphrag-route.test.ts test/integrations/graphrag-cost.test.ts --testTimeout 120000 --reporter=dot
+      - node ./node_modules/vitest/vitest.mjs run test/cli.test.ts --testTimeout 120000 --reporter=dot
+      - .venv-graphrag/bin/python test/python/test_graphrag_bridge_scope.py

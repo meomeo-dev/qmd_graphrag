@@ -346,6 +346,31 @@ artifact 证据。community report artifact 的 producer stage 必须是
 已写入 `graphDocumentId`、非空 `graphTextUnitIds` 且 qmd corpus registration
 存在时发布 graph capability。
 
+GraphRAG identity projection repair（身份投影修复）规则：
+
+- `documentId`、`sourceHash`、`contentHash` 和 `normalizedPath` 的事实源是
+  book job 与 qmd corpus registration。
+- `graphDocumentId` 和 `graphTextUnitIds` 的事实源是已验证的 book-scoped
+  GraphRAG output，具体来自 `documents.parquet` 和 `text_units.parquet`。
+- `qmd_graph_text_unit_identity.json` 是从 GraphRAG output 派生的 repair
+  evidence，不是绕过 `DocumentIdentityMap` 的发布事实源。
+- `DocumentIdentityMap` 是 `query_ready` capability 发布和查询路由读取的
+  catalog projection。重复注册同一
+  `canonicalBookId/documentId/contentHash/sourceHash` 时必须非破坏性合并，
+  保留已验证的 qmd metadata、`chunkIds`、`graphDocumentId` 和
+  `graphTextUnitIds`。
+- repair 必须先通过 `qmd_output_manifest.json`、producer checkpoints、
+  artifact manifests、stage fingerprints、provider fingerprint 和
+  `metadata.corpusContentHash` 校验。
+- sidecar repair 必须校验 `bookId/sourceId/sourceHash/documentId/contentHash`
+  与当前 job/catalog 一致，且 `graphTextUnitIds` 非空并能在 text units output 中
+  证明存在。
+- sidecar 缺失时，只允许从 parquet 做可证明映射：直接匹配 GraphRAG document
+  id，或在单 GraphRAG document output 中 fallback。多 document output 无法唯一
+  证明目标 document 时必须 fail-closed，不得按 title、路径、首行或第一行猜测。
+- source/content hash mismatch、混书 output、空 text units、无效 output locator
+  或 producer lineage 不一致时，repair 必须拒绝。
+
 成本去重 key 为：
 
 ```text
@@ -689,6 +714,14 @@ GraphRAG capability。
   下一次同一 `runId` 恢复运行到达 retry window 后继续该书闭环。
 - `failed` item 只有 `retryable=true` 时由同一 `runId` 自动重试；permanent
   failed item 保持 failed，不阻塞其他 pending item。
+- 当 book-scoped GraphRAG outputs、producer lineage、qmd corpus registration
+  和 identity sidecar 有效，但 `DocumentIdentityMap` 缺失或陈旧时，该失败归类为
+  `graph_identity_projection_missing` 本地状态。恢复必须先低成本重建 catalog
+  projection，再重试 `query_ready` capability 发布；不得重跑
+  `graph_extract`、`community_report` 或 `embed`。
+- identity projection repair 必须写入可观测事件或 recovery summary evidence，
+  至少包含 sidecar locator、graph text unit count、复用的 producer run ids、
+  reopened checkpoint 或 next stage。
 - 批次完成条件只接受 `completedItems == totalItems`。`skippedItems` 和
   `importedCompletedItems` 是调度事实，不抵扣闭环完成。
 - 每个 completed checkpoint 必须包含 27 个固定名称的 command checks，且全部
@@ -779,6 +812,26 @@ kind-specific validators 包括：
   structured output schema，纯文本调用不发送 `text.format`。
 - Jina embedding 与 rerank 都进入 typed provider bus。
 - 成本账本能定位每个高成本 artifact 的生产者、模型和 run。
+- 真实失败 `book-9f587b71073a-ad95ce2f` 的回归验收必须证明：
+  `qmd_graph_text_unit_identity.json` 已存在而 catalog 缺 graph fields 时，
+  resume 可补齐 `DocumentIdentityMap` 并完成 `query_ready`；同时
+  `graph_extract`、`community_report` 和 `embed` 的 producer run ids 不变。
+
+## 提交边界
+
+源码提交只包含设计、源代码、测试、固定审计基准和审计报告。以下 generated
+runtime outputs 不得进入源码提交：
+
+- `graph_vault/` 下的运行状态、GraphRAG output、batch manifests、
+  checkpoints、provider request fingerprints 和 cost ledger。
+- `.qmd/*.sqlite*` qmd index 与本地查询缓存。
+- `inbox/` 原始 EPUB 输入。
+- `tmp/`、`/tmp/qmd-*`、GraphRAG report logs 和 batch log roots。
+- 原始 provider 请求体、响应体、密钥、Bearer token、URL userinfo 或 URL query
+  credential。
+
+audit 目录中的固定审计基准、代理报告、状态文件和最终报告可提交；它们只能记录
+脱敏事实、设计结论、测试命令和运行摘要，不得复制 runtime 大产物或密钥。
 
 ## 使用规则
 

@@ -111,6 +111,12 @@ types:
       - providerStatusCode and retryAfterSeconds are projections from failed
         commandChecks; checkpoint top-level fields remain the recovery state
         source of truth
+      - graph_identity_projection_missing reports a local catalog projection
+        failure only after GraphRAG output, producer lineage, qmd corpus
+        registration, and identity sidecar or parquet evidence are valid
+      - identity repair evidence includes sidecar path, graph text unit count,
+        reused producer run ids, reopened checkpoint, and next stage when
+        available
       - status-json emits the same typed payload without running work
       - remote running items with fresh heartbeat are observed but not stolen;
         missing ownership, stale heartbeat beyond TTL, or a dead same-host
@@ -188,6 +194,11 @@ types:
       - qmdCorpusRegistered gates query_ready capability publication
       - persists graphDocumentId and graphTextUnitIds when GraphRAG output is
         available
+      - upserts for the same canonicalBookId, sourceHash, documentId, and
+        contentHash are non-destructive and preserve verified graph identity
+        fields unless content identity changes
+      - catalog is the query_ready publication source; sidecars can repair the
+        projection but cannot replace this gate
 
   - name: document_identity_catalog
     schema: src/contracts/corpus.ts#DocumentIdentityCatalogSchema
@@ -215,6 +226,14 @@ types:
         graphDocumentId and graphTextUnitIds
       - GraphRAG documents.parquet and text_units.parquet are source tables
         read by the producer; they are not Type DD bus producers
+      - qmd_graph_text_unit_identity.json under the book output directory is
+        repair evidence derived from validated GraphRAG documents and text
+        units, not an independent source of truth
+      - repair is fail-closed for mixed book output, source/content mismatch,
+        empty graphTextUnitIds, absent text unit ids, invalid outputDir, or
+        producer lineage mismatch
+      - multi-document GraphRAG output without a valid sidecar or direct
+        document identity match must not be repaired by title or first row
 
   - name: query_expansion_item
     schema: src/contracts/common.ts#QueryExpansionItemSchema
@@ -1060,6 +1079,11 @@ types:
     notes:
       - stage state reason may be `artifact_missing` when checkpoint metadata
         exists but required artifacts are missing from manifest or disk
+      - graph_identity_projection_missing is a local projection repair reason
+        when query-ready artifacts and qmd corpus registration are valid but
+        document_identity_map lacks graphDocumentId or graphTextUnitIds
+      - this reason reopens only catalog/query_ready projection work and must
+        not rerun graph_extract, community_report, or embed
 
   - name: book_run_catalog
     schema: src/contracts/book-job.ts#BookJobRunCatalogSchema

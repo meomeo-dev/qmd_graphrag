@@ -4,6 +4,8 @@ import { hasAbsolutePathSyntax } from "./path.js";
 const SensitiveKeyPattern =
   /(^|[_-])(api[-_]?key|key|token|authorization|secret|password|credential)([_-]|$)/iu;
 const SensitiveValuePattern = /\b(bearer\s+[A-Za-z0-9._~+/=-]+|sk-[A-Za-z0-9_-]+)\b/iu;
+const RawProviderPayloadKeyPattern =
+  /(^|[_-])(raw|payload|body|provider[-_]?request|provider[-_]?response|raw[-_]?request|raw[-_]?response|request[-_]?body|response[-_]?body|request[-_]?payload|response[-_]?payload)([_-]|$)/iu;
 const SensitiveUrlValuePattern =
   /\bhttps?:\/\/[^\s"'`),\]}]+/giu;
 const UnixAbsolutePathPattern = /(?<![\w./-])\/(?:[\w .@+-]+\/)+[\w .@+-]*/gu;
@@ -12,6 +14,12 @@ const WindowsAbsolutePathPattern =
 
 function isSensitiveKey(key: string): boolean {
   return SensitiveKeyPattern.test(key) || key.toUpperCase().endsWith("_KEY");
+}
+
+function isUnsafeMetadataKey(key: string): boolean {
+  const normalizedKey = key.replace(/([a-z0-9])([A-Z])/gu, "$1_$2");
+  return isSensitiveKey(normalizedKey) ||
+    RawProviderPayloadKeyPattern.test(normalizedKey);
 }
 
 function isUnsafeStringValue(value: string): boolean {
@@ -36,7 +44,7 @@ function sanitizeJsonValue(value: JsonValue): JsonValue | undefined {
   }
 
   const entries = Object.entries(value)
-    .filter(([key]) => !isSensitiveKey(key))
+    .filter(([key]) => !isUnsafeMetadataKey(key))
     .map(([key, item]) => [key, sanitizeJsonValue(item)] as const)
     .filter((entry): entry is readonly [string, JsonValue] =>
       entry[1] !== undefined

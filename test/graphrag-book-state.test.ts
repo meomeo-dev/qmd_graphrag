@@ -55,6 +55,32 @@ async function writeMinimalGraphOutput(outputDir: string): Promise<void> {
   await writeFile(join(outputDir, "stats.json"), '{"workflows":{}}', "utf8");
 }
 
+async function writeMultiDocumentGraphOutput(outputDir: string): Promise<void> {
+  await mkdir(outputDir, { recursive: true });
+  const parquetScript = [
+    "import pandas as pd, sys",
+    "output_dir = sys.argv[1]",
+    "pd.DataFrame([",
+    "  {'id':'graph-doc-1','title':'book-a.md','text_unit_ids':['tu-1','tu-2']},",
+    "  {'id':'graph-doc-2','title':'book-b.md','text_unit_ids':['tu-3']},",
+    "]).to_parquet(f'{output_dir}/documents.parquet')",
+    "pd.DataFrame([",
+    "  {'id':'tu-1','document_id':'graph-doc-1'},",
+    "  {'id':'tu-2','document_id':'graph-doc-1'},",
+    "  {'id':'tu-3','document_id':'graph-doc-2'},",
+    "]).to_parquet(f'{output_dir}/text_units.parquet')",
+    "pd.DataFrame([{'community':'0','title':'report','full_content':'report'}]).to_parquet(f'{output_dir}/community_reports.parquet')",
+    "for name in ['entities', 'relationships', 'communities']:",
+    "    pd.DataFrame([{'id': f'{name}-1'}]).to_parquet(f'{output_dir}/{name}.parquet')",
+  ].join("\n");
+  const result = spawnSync(TestPythonBin, ["-c", parquetScript, outputDir], {
+    encoding: "utf8",
+  });
+  expect(result.status, result.stderr).toBe(0);
+  await writeFile(join(outputDir, "context.json"), '{"records":[]}', "utf8");
+  await writeFile(join(outputDir, "stats.json"), '{"workflows":{}}', "utf8");
+}
+
 async function writeCompleteLanceDbSidecars(outputDir: string): Promise<void> {
   for (const tableName of [
     "entity_description.lance",
@@ -749,6 +775,200 @@ describe("syncGraphRagBookWorkspace", () => {
     }
   });
 
+  test("repairs missing catalog graph identity from a validated sidecar", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+      await writeManagedGraphRagSettings({ config: projectConfig, graphVault });
+      await writeFile(join(graphVault, "prompts", "extract_graph.txt"), "prompt", "utf8");
+
+      const initial = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig,
+        recordRecoveredStages: false,
+      });
+      const outputDir = graphRagBookOutputDir({
+        stateRootDir: graphVault,
+        bookId: initial.job.bookId,
+      });
+      await writeMultiDocumentGraphOutput(outputDir);
+      await writeCompleteLanceDbSidecars(outputDir);
+      for (const stage of [
+        "graph_extract",
+        "community_report",
+        "embed",
+      ] as const) {
+        await writeGraphRagOutputProducerManifest({
+          outputDir,
+          bookId: initial.job.bookId,
+          sourceHash: initial.job.sourceHash,
+          documentId: initial.job.documentId,
+          contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+          stageFingerprints: initial.stageFingerprints,
+          providerFingerprint: initial.job.providerFingerprint!,
+          producerRunId: `real-${stage}`,
+          stage,
+        });
+      }
+      await writeFile(
+        join(outputDir, "qmd_graph_text_unit_identity.json"),
+        JSON.stringify({
+          schemaVersion: SchemaVersion,
+          bookId: initial.job.bookId,
+          sourceId: `sha256:${initial.job.sourceHash}`,
+          sourceHash: initial.job.sourceHash,
+          documentId: initial.job.documentId,
+          contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+          normalizedPath: initial.job.normalizedPath,
+          graphDocumentId: "graph-doc-1",
+          graphTextUnitIds: ["tu-1", "tu-2"],
+        }, null, 2),
+        "utf8",
+      );
+
+      const synced = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig,
+        recordRecoveredStages: false,
+      });
+      const catalog = YAML.parse(await readFile(
+        join(graphVault, "catalog", "document-identity-map.yaml"),
+        "utf8",
+      )) as {
+        items: Array<{
+          documentId: string;
+          graphDocumentId?: string;
+          graphTextUnitIds?: string[];
+          metadata?: Record<string, unknown>;
+        }>;
+      };
+      const identity = catalog.items.find((item) =>
+        item.documentId === synced.job.documentId
+      );
+
+      expect(identity?.metadata?.qmdCorpusRegistered).toBe(true);
+      expect(identity?.graphDocumentId).toBe("graph-doc-1");
+      expect(identity?.graphTextUnitIds).toEqual(["tu-1", "tu-2"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects mismatched or stale GraphRAG identity sidecars", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+      await writeManagedGraphRagSettings({ config: projectConfig, graphVault });
+      await writeFile(join(graphVault, "prompts", "extract_graph.txt"), "prompt", "utf8");
+
+      const initial = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig,
+        recordRecoveredStages: false,
+      });
+      const outputDir = graphRagBookOutputDir({
+        stateRootDir: graphVault,
+        bookId: initial.job.bookId,
+      });
+      await writeMultiDocumentGraphOutput(outputDir);
+      await writeCompleteLanceDbSidecars(outputDir);
+      await writeGraphRagOutputProducerManifest({
+        outputDir,
+        bookId: initial.job.bookId,
+        sourceHash: initial.job.sourceHash,
+        documentId: initial.job.documentId,
+        contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+        stageFingerprints: initial.stageFingerprints,
+        providerFingerprint: initial.job.providerFingerprint!,
+        producerRunId: "real-graph-extract",
+        stage: "graph_extract",
+      });
+      await writeGraphRagOutputProducerManifest({
+        outputDir,
+        bookId: initial.job.bookId,
+        sourceHash: initial.job.sourceHash,
+        documentId: initial.job.documentId,
+        contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+        stageFingerprints: initial.stageFingerprints,
+        providerFingerprint: initial.job.providerFingerprint!,
+        producerRunId: "real-community-report",
+        stage: "community_report",
+      });
+      await writeGraphRagOutputProducerManifest({
+        outputDir,
+        bookId: initial.job.bookId,
+        sourceHash: initial.job.sourceHash,
+        documentId: initial.job.documentId,
+        contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+        stageFingerprints: initial.stageFingerprints,
+        providerFingerprint: initial.job.providerFingerprint!,
+        producerRunId: "real-embed",
+        stage: "embed",
+      });
+      await writeFile(
+        join(outputDir, "qmd_graph_text_unit_identity.json"),
+        JSON.stringify({
+          schemaVersion: SchemaVersion,
+          bookId: initial.job.bookId,
+          sourceId: `sha256:${initial.job.sourceHash}`,
+          sourceHash: initial.job.sourceHash,
+          documentId: initial.job.documentId,
+          contentHash: "stale-content-hash",
+          normalizedPath: initial.job.normalizedPath,
+          graphDocumentId: "graph-doc-1",
+          graphTextUnitIds: ["tu-1", "tu-2"],
+        }, null, 2),
+        "utf8",
+      );
+
+      await expect(syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig,
+        recordRecoveredStages: false,
+      })).rejects.toThrow("sidecar does not match");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("keeps producer manifest portable and stage-scoped", async () => {
     const root = await createWorkspace();
     try {
@@ -1364,6 +1584,102 @@ describe("syncGraphRagBookWorkspace", () => {
       expect(identities.items[0]?.metadata?.bookId).toBe(stableBookId);
       expect(await repo.getBookJob(legacyBookId)).toBeNull();
       expect(await repo.getBookJob(stableBookId)).not.toBeNull();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("deduplicates old and stable document identities during legacy remap", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+
+      const sourceName = "A Philosophy of Software Design (John K. Ousterhout).epub";
+      const sourcePath = join(root, sourceName);
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+      await writeFile(join(graphVault, "settings.yaml"), "vector_store: {}\n", "utf8");
+      await writeFile(join(graphVault, "prompts", "extract_graph.txt"), "prompt", "utf8");
+
+      const oldState = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        sourceIdentityPath: sourceName,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        recordRecoveredStages: false,
+      });
+      const stableBookId = oldState.job.bookId;
+      const legacyBookId = `a-philosophy-of-software-design-john-k-ousterhout-${
+        oldState.job.sourceHash.slice(0, 12)
+      }`;
+      const catalogPath = join(graphVault, "catalog", "document-identity-map.yaml");
+      const catalog = YAML.parse(await readFile(catalogPath, "utf8")) as {
+        items: Array<Record<string, unknown>>;
+      };
+      const stableIdentity = catalog.items[0]!;
+      catalog.items.push({
+        ...stableIdentity,
+        canonicalBookId: legacyBookId,
+        chunkIds: ["legacy-chunk"],
+        graphDocumentId: "legacy-graph-doc",
+        graphTextUnitIds: ["legacy-tu"],
+        metadata: {
+          bookId: legacyBookId,
+          graphDocumentId: "legacy-graph-doc",
+          graphTextUnitCount: 1,
+        },
+      });
+      await writeFile(
+        catalogPath,
+        YAML.stringify({ schemaVersion: SchemaVersion, items: catalog.items }),
+        "utf8",
+      );
+      await rename(
+        join(graphVault, "books", stableBookId),
+        join(graphVault, "books", legacyBookId),
+      );
+      await mkdir(join(graphVault, "sources"), { recursive: true });
+      await rename(
+        join(graphVault, "sources", stableBookId),
+        join(graphVault, "sources", legacyBookId),
+      );
+
+      await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        sourceIdentityPath: sourceName,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        recordRecoveredStages: false,
+      });
+      const remapped = YAML.parse(await readFile(catalogPath, "utf8")) as {
+        items: Array<{
+          canonicalBookId?: string;
+          documentId?: string;
+          chunkIds?: string[];
+          graphDocumentId?: string;
+          graphTextUnitIds?: string[];
+        }>;
+      };
+      const identities = remapped.items.filter((item) =>
+        item.canonicalBookId === stableBookId &&
+        item.documentId === oldState.job.documentId
+      );
+
+      expect(identities).toHaveLength(1);
+      expect(identities[0]?.chunkIds?.length).toBeGreaterThan(0);
+      expect(identities[0]?.graphDocumentId).toBe("legacy-graph-doc");
+      expect(identities[0]?.graphTextUnitIds).toEqual(["legacy-tu"]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

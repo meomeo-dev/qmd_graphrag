@@ -129,6 +129,13 @@ export type GraphRagTextUnitIdentity = {
   graphTextUnitIds: string[];
 };
 
+type GraphRagTextUnitIdentityInput = Omit<
+  GraphRagTextUnitIdentity,
+  "schemaVersion" | "graphDocumentId" | "graphTextUnitIds"
+> & {
+  outputDir: string;
+};
+
 export function graphRagBookInputDir(input: {
   stateRootDir: string;
   bookId: string;
@@ -611,6 +618,46 @@ function normalizeIdList(value: unknown): string[] {
   return [String(value)].filter((item) => item.length > 0);
 }
 
+function graphTextUnitIdentitySidecarPath(outputDir: string): string {
+  return join(resolve(outputDir), "qmd_graph_text_unit_identity.json");
+}
+
+function parseGraphTextUnitIdentitySidecar(
+  raw: string,
+  expected: GraphRagTextUnitIdentityInput,
+): GraphRagTextUnitIdentity | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed == null) return null;
+  const value = parsed as Record<string, unknown>;
+  const graphTextUnitIds = normalizeIdList(value.graphTextUnitIds);
+  const mapping: GraphRagTextUnitIdentity = {
+    schemaVersion: "1.0.0",
+    bookId: String(value.bookId ?? ""),
+    sourceId: String(value.sourceId ?? ""),
+    sourceHash: String(value.sourceHash ?? ""),
+    documentId: String(value.documentId ?? ""),
+    contentHash: String(value.contentHash ?? ""),
+    normalizedPath: String(value.normalizedPath ?? ""),
+    graphDocumentId: String(value.graphDocumentId ?? ""),
+    graphTextUnitIds,
+  };
+  const matchesIdentity =
+    mapping.bookId === expected.bookId &&
+    mapping.sourceId === expected.sourceId &&
+    mapping.sourceHash === expected.sourceHash &&
+    mapping.documentId === expected.documentId &&
+    mapping.contentHash === expected.contentHash &&
+    mapping.normalizedPath === expected.normalizedPath &&
+    mapping.graphDocumentId.length > 0 &&
+    mapping.graphTextUnitIds.length > 0;
+  return matchesIdentity ? mapping : null;
+}
+
 function selectPythonBin(): string {
   const bundledPython = resolve(process.cwd(), ".venv-graphrag", "bin", "python");
   if (process.env.QMD_GRAPHRAG_PYTHON) return process.env.QMD_GRAPHRAG_PYTHON;
@@ -701,6 +748,81 @@ export async function readGraphTextUnitIdentity(input: {
   };
 }
 
+async function graphTextUnitIdsExist(input: {
+  outputDir: string;
+  graphDocumentId: string;
+  graphTextUnitIds: string[];
+}): Promise<boolean> {
+  const textUnitsPath = join(input.outputDir, "text_units.parquet");
+  try {
+    await stat(textUnitsPath);
+  } catch {
+    return false;
+  }
+  const helper = [
+    "import json, sys",
+    "import pandas as pd",
+    "text_units_path, graph_document_id, ids_json = sys.argv[1:4]",
+    "expected = set(str(item) for item in json.loads(ids_json))",
+    "text_units = pd.read_parquet(text_units_path)",
+    "if 'id' not in text_units.columns:",
+    "    print('false')",
+    "    raise SystemExit(0)",
+    "actual = set(str(item) for item in text_units['id'].tolist() if item is not None)",
+    "if 'document_id' in text_units.columns:",
+    "    scoped = text_units.loc[text_units['document_id'].astype(str) == str(graph_document_id)]",
+    "    actual = set(str(item) for item in scoped['id'].tolist() if item is not None)",
+    "print('true' if expected and expected.issubset(actual) else 'false')",
+  ].join("\n");
+  const result = spawnSync(selectPythonBin(), [
+    "-c",
+    helper,
+    textUnitsPath,
+    input.graphDocumentId,
+    JSON.stringify(input.graphTextUnitIds),
+  ], {
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    throw new Error(
+      result.stderr.trim() || "failed to validate GraphRAG text unit identity",
+    );
+  }
+  return result.stdout.trim() === "true";
+}
+
+async function readGraphTextUnitIdentitySidecar(
+  input: GraphRagTextUnitIdentityInput,
+): Promise<GraphRagTextUnitIdentity | null> {
+  let raw: string;
+  try {
+    raw = await readFile(graphTextUnitIdentitySidecarPath(input.outputDir), "utf8");
+  } catch {
+    return null;
+  }
+  const mapping = parseGraphTextUnitIdentitySidecar(raw, input);
+  if (mapping == null) {
+    throw new Error(
+      `GraphRAG document identity sidecar does not match query_ready: ${
+        input.documentId
+      }`,
+    );
+  }
+  const textUnitsExist = await graphTextUnitIdsExist({
+    outputDir: input.outputDir,
+    graphDocumentId: mapping.graphDocumentId,
+    graphTextUnitIds: mapping.graphTextUnitIds,
+  });
+  if (!textUnitsExist) {
+    throw new Error(
+      `GraphRAG document identity sidecar references missing text units: ${
+        input.documentId
+      }`,
+    );
+  }
+  return mapping;
+}
+
 async function recordGraphTextUnitIdentityIfAvailable(input: {
   repo: FileBookJobStateRepository;
   job: BookJob;
@@ -708,17 +830,19 @@ async function recordGraphTextUnitIdentityIfAvailable(input: {
   outputDir: string;
   required: boolean;
 }): Promise<void> {
-  let mapping: Awaited<ReturnType<typeof readGraphTextUnitIdentity>>;
+  const identityInput: GraphRagTextUnitIdentityInput = {
+    bookId: input.job.bookId,
+    sourceId: `sha256:${input.job.sourceHash}`,
+    sourceHash: input.job.sourceHash,
+    documentId: input.job.documentId,
+    contentHash: input.job.normalizedContentHash ?? input.job.sourceHash,
+    normalizedPath: input.normalizedPath,
+    outputDir: input.outputDir,
+  };
+  let mapping: GraphRagTextUnitIdentity | null;
   try {
-    mapping = await readGraphTextUnitIdentity({
-      bookId: input.job.bookId,
-      sourceId: `sha256:${input.job.sourceHash}`,
-      sourceHash: input.job.sourceHash,
-      documentId: input.job.documentId,
-      contentHash: input.job.normalizedContentHash ?? input.job.sourceHash,
-      normalizedPath: input.normalizedPath,
-      outputDir: input.outputDir,
-    });
+    mapping = await readGraphTextUnitIdentitySidecar(identityInput) ??
+      await readGraphTextUnitIdentity(identityInput);
   } catch (error) {
     if (!input.required) return;
     throw error;
@@ -731,7 +855,7 @@ async function recordGraphTextUnitIdentityIfAvailable(input: {
   }
   await input.repo.recordGraphTextUnitIdentity(mapping);
   await writeFile(
-    join(input.outputDir, "qmd_graph_text_unit_identity.json"),
+    graphTextUnitIdentitySidecarPath(input.outputDir),
     JSON.stringify(mapping, null, 2),
     "utf8",
   );

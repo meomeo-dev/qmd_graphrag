@@ -115,6 +115,11 @@ runId 恢复；缺失/不完整证据或非 transient command check 降级为
   `providerFingerprint` 必须与 book job identity 一致。
 - 高成本 stage artifact 的 `producerRunId`、`stageFingerprint` 和
   `providerFingerprint` 必须与对应 stage checkpoint 和 book job identity 一致。
+- `DocumentIdentityMap.metadata.qmdCorpusRegistered=true`，并且同一
+  `bookId/documentId/contentHash` 已持久化 `graphDocumentId` 与非空
+  `graphTextUnitIds`。若 `qmd_graph_text_unit_identity.json` 已存在但 catalog
+  缺少这些 graph fields，恢复必须先校验 sidecar 与 output manifest，再低成本修复
+  catalog projection。
 
 ## Provider 限流与重试
 
@@ -187,6 +192,16 @@ GraphRAG 输出生产者 manifest 必须保存在每本书的 book-scoped output
 - `query_ready` 只接受 `books/<bookId>/output` 下的
   `community_reports.parquet` 和 `lancedb`。共享 `graph_vault/output` 产物不得
   发布 graph capability。
+- `qmd_graph_text_unit_identity.json` 是 GraphRAG documents/text units 的可验证
+  repair evidence，不是 capability 发布事实源。`query_ready` 发布仍以
+  `document-identity-map.yaml` 为读取源。
+- 有效 book-scoped output、producer lineage、qmd corpus registration 与 identity
+  sidecar 已存在，但 catalog 缺失或陈旧时，失败归类为
+  `graph_identity_projection_missing`。同一 runId resume 只补 catalog projection
+  并重试 `query_ready`，不得重跑 `graph_extract`、`community_report` 或 `embed`。
+- identity repair 必须拒绝混书 output、source/content mismatch、空 text unit、
+  text unit id 不存在、无效 `outputDir`、producer lineage 不一致，以及缺少有效
+  sidecar 的多 GraphRAG document 歧义。
 - `output/reports/indexing-engine.log` 只作为 stage health evidence 读取，不登记为
   query-ready graph artifact。
 - stage gate 只接受当前 stage 对应 producer run 的 artifact。
@@ -360,3 +375,18 @@ rerank 或 GraphRAG provider。
 credential 等值不得写入 `graph_vault`、stdout、stderr、manifest 或 event log。
 redaction 覆盖 `api_key`、`token`、`access_token`、`sig`、`signature`、
 `secret`、`password`、`credential` 和 `client_secret`。
+
+## 提交边界
+
+以下 generated runtime outputs 不得提交到源码仓库：
+
+- `graph_vault/` 运行状态、GraphRAG output、batch checkpoint、provider request
+  fingerprint、cost ledger 和 runtime catalog。
+- `.qmd/*.sqlite*` qmd index 与本地查询缓存。
+- `inbox/` 原始 EPUB。
+- `tmp/`、`/tmp/qmd-*`、GraphRAG report logs 和 batch log root。
+- 原始 provider 请求体、响应体、密钥、Bearer token、URL userinfo 或 query
+  credential。
+
+`audit/<case>-run_<n>/` 下的固定审计基准、代理报告、状态文件和最终报告可提交，
+但只能包含脱敏事实、判定、测试命令和摘要，不得复制 runtime 大产物。

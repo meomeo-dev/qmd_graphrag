@@ -614,6 +614,90 @@ function mergeJobMetadata(
   return Object.keys(metadata).length > 0 ? metadata : undefined;
 }
 
+function preserveMetadataKeys(
+  metadata: Record<string, JsonValue> | undefined,
+  preserved: Record<string, JsonValue> | undefined,
+  keys: readonly string[],
+): Record<string, JsonValue> | undefined {
+  if (metadata == null || preserved == null) return metadata;
+  const next = { ...metadata };
+  for (const key of keys) {
+    if (preserved[key] !== undefined) {
+      next[key] = preserved[key];
+    }
+  }
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
+function mergeStringLists(
+  left: readonly string[] | undefined,
+  right: readonly string[] | undefined,
+): string[] | undefined {
+  const values = [...(left ?? []), ...(right ?? [])];
+  return values.length > 0 ? [...new Set(values)] : undefined;
+}
+
+function mergeDocumentIdentityMaps(
+  left: DocumentIdentityCatalog["items"][number],
+  right: DocumentIdentityCatalog["items"][number],
+): DocumentIdentityCatalog["items"][number] {
+  const leftGraphCount = left.graphTextUnitIds?.length ?? 0;
+  const rightGraphCount = right.graphTextUnitIds?.length ?? 0;
+  const graphSource = leftGraphCount >= rightGraphCount ? left : right;
+  const mergedMetadata = mergeJobMetadata(left.metadata, right.metadata);
+  const preservedMetadata = preserveMetadataKeys(
+    mergedMetadata,
+    left.metadata,
+    [
+      "qmdCorpusRegistered",
+      "qmdCollection",
+      "qmdRelativePath",
+      "qmdChunkCount",
+      "graphDocumentId",
+      "graphTextUnitCount",
+    ],
+  );
+  return DocumentIdentityMapSchema.parse({
+    ...left,
+    normalizedPath: right.normalizedPath ?? left.normalizedPath,
+    chunkIds: mergeStringLists(left.chunkIds, right.chunkIds) ?? [],
+    ...(graphSource.graphDocumentId
+      ? { graphDocumentId: graphSource.graphDocumentId }
+      : {}),
+    ...(graphSource.graphTextUnitIds
+      ? { graphTextUnitIds: graphSource.graphTextUnitIds }
+      : {}),
+    aliases: mergeStringLists(left.aliases, [
+      ...(right.aliases ?? []),
+      right.normalizedPath ?? "",
+    ].filter((item) => item.length > 0)),
+    metadata: preservedMetadata,
+  });
+}
+
+function dedupeDocumentIdentityMaps(
+  items: DocumentIdentityCatalog["items"],
+): DocumentIdentityCatalog["items"] {
+  const byIdentity = new Map<string, DocumentIdentityCatalog["items"][number]>();
+  for (const item of items) {
+    const key = [
+      item.canonicalBookId ?? "",
+      item.sourceId,
+      item.sourceHash,
+      item.documentId,
+      item.contentHash,
+    ].join("\0");
+    const existing = byIdentity.get(key);
+    byIdentity.set(
+      key,
+      existing == null ? item : mergeDocumentIdentityMaps(existing, item),
+    );
+  }
+  return [...byIdentity.values()].sort((left, right) =>
+    left.documentId.localeCompare(right.documentId),
+  );
+}
+
 function metadataString(
   metadata: Record<string, JsonValue> | undefined,
   key: string,
@@ -1083,6 +1167,7 @@ export class FileBookJobStateRepository {
   private async upsertDocumentIdentityMap(job: BookJob): Promise<void> {
     const sourceId = `sha256:${job.sourceHash}`;
     const normalizedPath = job.normalizedPath;
+    const contentHash = job.normalizedContentHash ?? job.sourceHash;
     const catalog = await readYamlFile(
       this.documentIdentityCatalogPath(),
       DocumentIdentityCatalogSchema,
@@ -1092,6 +1177,10 @@ export class FileBookJobStateRepository {
       item.canonicalBookId === job.bookId &&
       item.documentId === job.documentId
     );
+    const preservesContentIdentity =
+      existingIdentity?.sourceId === sourceId &&
+      existingIdentity.sourceHash === job.sourceHash &&
+      existingIdentity.contentHash === contentHash;
     const aliases = [
       ...(existingIdentity?.aliases ?? []),
       existingIdentity?.normalizedPath ?? null,
@@ -1100,7 +1189,27 @@ export class FileBookJobStateRepository {
       metadataString(job.metadata, "sourceName") ?? null,
       normalizedPath,
     ].filter((value): value is string => !!value);
-    const contentHash = job.normalizedContentHash ?? job.sourceHash;
+    const metadata = mergeJobMetadata(
+      preservesContentIdentity ? existingIdentity.metadata : undefined,
+      {
+        ...job.metadata,
+        bookId: job.bookId,
+        sourceIdentityPath: job.sourceIdentityPath,
+        normalizedPath: normalizedPath ?? null,
+      },
+    );
+    const preservedProjectionMetadata = preserveMetadataKeys(
+      metadata,
+      preservesContentIdentity ? existingIdentity.metadata : undefined,
+      [
+        "qmdCorpusRegistered",
+        "qmdCollection",
+        "qmdRelativePath",
+        "qmdChunkCount",
+        "graphDocumentId",
+        "graphTextUnitCount",
+      ],
+    );
     const identity = DocumentIdentityMapSchema.parse({
       schemaVersion: SchemaVersion,
       sourceId,
@@ -1111,13 +1220,15 @@ export class FileBookJobStateRepository {
       normalizationPolicyVersion:
         job.normalizationPolicyVersion ?? NormalizationPolicyVersion,
       normalizedPath,
-      chunkIds: [],
+      chunkIds: preservesContentIdentity ? existingIdentity.chunkIds : [],
+      ...(preservesContentIdentity && existingIdentity.graphDocumentId
+        ? { graphDocumentId: existingIdentity.graphDocumentId }
+        : {}),
+      ...(preservesContentIdentity && existingIdentity.graphTextUnitIds
+        ? { graphTextUnitIds: existingIdentity.graphTextUnitIds }
+        : {}),
       aliases: [...new Set(aliases)],
-      metadata: mergeJobMetadata(job.metadata, {
-        bookId: job.bookId,
-        sourceIdentityPath: job.sourceIdentityPath,
-        normalizedPath: normalizedPath ?? null,
-      }),
+      metadata: preservedProjectionMetadata,
     });
 
     const items = catalog.items.filter((item) =>
@@ -2070,14 +2181,16 @@ export class FileBookJobStateRepository {
     if (identities.items.some((item) => item.canonicalBookId === oldBookId)) {
       await writeYamlFile(this.documentIdentityCatalogPath(), {
         schemaVersion: SchemaVersion,
-        items: identities.items.map((item) =>
-          item.canonicalBookId === oldBookId
-            ? DocumentIdentityMapSchema.parse({
-                ...item,
-                canonicalBookId: newBookId,
-                metadata: mergeJobMetadata(item.metadata, { bookId: newBookId }),
-              })
-            : item,
+        items: dedupeDocumentIdentityMaps(
+          identities.items.map((item) =>
+            item.canonicalBookId === oldBookId
+              ? DocumentIdentityMapSchema.parse({
+                  ...item,
+                  canonicalBookId: newBookId,
+                  metadata: mergeJobMetadata(item.metadata, { bookId: newBookId }),
+                })
+              : item,
+          ),
         ),
       });
     }

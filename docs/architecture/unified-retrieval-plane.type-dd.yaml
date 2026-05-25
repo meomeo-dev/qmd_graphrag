@@ -455,6 +455,12 @@ typed_buses:
           - src/query/qmd-candidates.ts#loadDocumentIdentitiesFromGraphVault
           - src/job-state/repository.ts#FileBookJobStateRepository.validateQueryReadyGraphIdentity
           - src/vault/restore.ts#restoreFromVault
+        merge_policy: >-
+          Upserts for the same canonicalBookId, sourceHash, documentId, and
+          contentHash are non-destructive. They preserve verified qmd metadata,
+          chunkIds, graphDocumentId, and graphTextUnitIds. Graph identity may
+          be cleared only when content identity changes or validated repair
+          evidence proves the old projection stale.
       - name: graph_text_unit_identity_map
         schema: src/contracts/corpus.ts#GraphTextUnitIdentityMapSchema
         envelope: src/contracts/corpus.ts#GraphTextUnitIdentityMapEnvelopeSchema
@@ -472,6 +478,17 @@ typed_buses:
           - sourceHash
           - documentId
           - contentHash
+        repair_evidence_sidecar: >-
+          graph_vault/books/<book_id>/output/qmd_graph_text_unit_identity.json
+          is derived repair evidence from validated GraphRAG output. It is not
+          the query capability source of truth; it reconstructs
+          DocumentIdentityMap when catalog projection is missing or stale.
+        repair_rejection_policy: >-
+          Repair is fail-closed on mixed book output, sourceHash mismatch,
+          documentId mismatch, contentHash mismatch, empty graphTextUnitIds,
+          text unit ids absent from GraphRAG text_units output, invalid
+          outputDir, or producer lineage mismatch. Multi-document GraphRAG
+          output may not choose by title, path, first row, or first text unit.
       - name: document_identity_catalog
         schema: src/contracts/corpus.ts#DocumentIdentityCatalogSchema
         envelope: src/contracts/corpus.ts#DocumentIdentityCatalogEnvelopeSchema
@@ -1631,6 +1648,15 @@ state_and_recovery:
       query_ready also requires completed and validated graph_extract,
       community_report, and embed producer checkpoints before publishing
       capability.
+    graph_identity_projection_repair_rule: >-
+      If GraphRAG output artifacts, qmd_output_manifest.json, producer
+      checkpoints, providerFingerprint, stageFingerprints, and qmd corpus
+      registration are valid but DocumentIdentityMap lacks graphDocumentId or
+      graphTextUnitIds, the runner treats the condition as local
+      graph_identity_projection_missing. Resume repairs the catalog projection
+      from qmd_graph_text_unit_identity.json or validated parquet extraction and
+      then retries query_ready. It must not rerun graph_extract,
+      community_report, or embed for this local projection failure.
     running_ownership_rule: >-
       A running checkpoint owned by another runner host is observed but not
       stolen while its heartbeat is within TTL. Missing ownership, heartbeat
@@ -1708,6 +1734,11 @@ state_and_recovery:
     qmd_corpus_registration_gate: >-
       DocumentIdentityMap.metadata.qmdCorpusRegistered must be true before
       query_ready checkpoint completion can publish graph capability records.
+    graph_identity_gate: >-
+      DocumentIdentityMap.graphDocumentId and non-empty graphTextUnitIds must
+      be present before query_ready completion can publish graph capability
+      records. A sidecar can repair this projection but cannot substitute for
+      the catalog gate.
     mirrors:
       - graph_capability
       - qmd_sqlite_capability_mirror
@@ -1894,3 +1925,12 @@ acceptance_requirements:
   - Jina embedding and rerank payloads are both on the provider bus.
   - Cost accounting resolves provider, model, run, and artifact lineage.
   - Python bridge tests run with declared python/requirements-test.txt dependencies.
+  - >-
+    Real regression for book-9f587b71073a-ad95ce2f repairs missing catalog graph
+    identity from existing qmd_graph_text_unit_identity.json and completes
+    query_ready without changing graph_extract, community_report, or embed
+    producer run ids.
+  - >-
+    Negative tests reject multi-document ambiguous GraphRAG output without a
+    valid sidecar, source/content mismatch, empty graph text unit ids, and text
+    unit ids absent from text_units.parquet.
