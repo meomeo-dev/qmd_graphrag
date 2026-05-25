@@ -170,7 +170,16 @@
 - `configs/graphrag/settings.lancedb-jina.template.yaml`
 
 `graph_vault/settings.yaml` 必须由 qmd 从 `.qmd/index.yml` 投影生成，不手工
-复制模板覆盖。模板只用于审阅当前受管配置形状。
+复制模板覆盖。模板只用于审阅当前受管配置形状。投影校验必须使用
+`src/graphrag/settings-projection.ts` writer 等价 loader，不得把受管投影与
+GraphRAG default-loaded config 比较。
+
+当 `settings.yaml` 带 qmd managed marker 且 `.qmd/index.yml` 有效时，
+source fingerprint mismatch 是可恢复 drift：执行器安全重写该受管投影并继续
+当前 book resume。缺少 managed marker、目标为 user-owned settings file 或 source
+config invalid 时必须 fail-closed，不覆盖用户文件。该修复只允许改写
+`graph_vault/settings.yaml`，不得删除或污染 `graph_vault/books/<bookId>/output`
+下的 GraphRAG 产物。
 
 - `JINA_API_KEY`
 - `OPENAI_API_KEY` 或其他 completion provider 对应 key
@@ -198,7 +207,9 @@ Jina、LanceDB、状态恢复和 Type DD 数据总线契约；上游 completion 
 `graph_vault` 是 GraphRAG 持久化仓库（persistent vault）。所有可迁移路径
 使用 vault-relative locator；`settings.yaml` 是 `.qmd/index.yml` 的受管投影
 （managed projection），由 `qmd_graphrag.managed_by` 与
-`source_fingerprint` 校验漂移。
+`source_fingerprint` 校验漂移。漂移修复的事件和 recovery summary 必须记录
+rewrite/reject decision、source fingerprint、project config locator、
+settings locator、evidence locator 和 redacted reason。
 
 查询入口保持统一：`qmd` 覆盖全集检索，GraphRAG 能力通过
 `GraphCapability` 暴露为增强子集。`qmd --graphrag` 只能消费已验证的

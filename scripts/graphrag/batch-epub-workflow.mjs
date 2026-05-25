@@ -148,6 +148,7 @@ const RepairMetadataSchema = z.object({
   reopenedFromStatus: z.string().min(1),
   reopenedToStatus: z.literal("pending"),
   reopenedFromRecoveryDecision: z.string().min(1),
+  activeCommand: z.string().min(1).optional(),
   repairReason: RepairReasonSchema,
   repairFailureText: z.string().min(1).max(1000),
   repairedProjection: RepairedProjectionSchema,
@@ -158,6 +159,18 @@ const RepairMetadataSchema = z.object({
     embed: z.string().min(1),
   }).passthrough(),
   normalCommandChecksRequired: z.literal(true),
+  settingsProjectionDecision: z.enum([
+    "already_valid",
+    "rewritten",
+    "rejected_user_owned",
+    "rejected_invalid_source",
+  ]).optional(),
+  settingsProjectionRewritten: z.boolean().optional(),
+  settingsProjectionSourceFingerprint: z.string().min(1).optional(),
+  settingsProjectionProjectConfigLocator: z.string().min(1).optional(),
+  settingsProjectionLocator: z.string().min(1).optional(),
+  settingsProjectionEvidenceLocator: z.string().min(1).optional(),
+  settingsProjectionReason: z.string().min(1).optional(),
 });
 
 const batchRoot = join(stateRoot, "catalog", "batch-runs", runId);
@@ -395,6 +408,7 @@ const BatchItemCheckpointBaseSchema = z.object({
   runnerHeartbeatAt: z.string().datetime().optional(),
   orphanedRunnerDetectedAt: z.string().datetime().optional(),
   currentCommand: z.string().min(1).optional(),
+  activeCommand: z.string().min(1).optional(),
   currentCommandStartedAt: z.string().datetime().optional(),
   nextRetryAt: z.string().datetime().optional(),
   retryDelaySeconds: z.number().int().nonnegative().optional(),
@@ -526,6 +540,7 @@ const BatchRecoverySummaryItemSchema = z.object({
   runnerHeartbeatAt: z.string().datetime().optional(),
   orphanedRunnerDetectedAt: z.string().datetime().optional(),
   currentCommand: z.string().min(1).optional(),
+  activeCommand: z.string().min(1).optional(),
   currentCommandStartedAt: z.string().datetime().optional(),
   waitingForProviderRecovery: z.boolean().optional(),
   reopenedFromStatus: BatchItemStatusSchema.optional(),
@@ -537,6 +552,18 @@ const BatchRecoverySummaryItemSchema = z.object({
   repairEvidenceLocator: z.string().min(1).optional(),
   reusedProducerRunIds: z.record(z.string(), z.string().min(1)).optional(),
   normalCommandChecksRequired: z.boolean().optional(),
+  settingsProjectionDecision: z.enum([
+    "already_valid",
+    "rewritten",
+    "rejected_user_owned",
+    "rejected_invalid_source",
+  ]).optional(),
+  settingsProjectionRewritten: z.boolean().optional(),
+  settingsProjectionSourceFingerprint: z.string().min(1).optional(),
+  settingsProjectionProjectConfigLocator: z.string().min(1).optional(),
+  settingsProjectionLocator: z.string().min(1).optional(),
+  settingsProjectionEvidenceLocator: z.string().min(1).optional(),
+  settingsProjectionReason: z.string().min(1).optional(),
   errorSummary: z.string().max(1000).optional(),
 });
 const BatchRecoverySummarySchema = z.object({
@@ -706,6 +733,198 @@ function checkpointHasDataCompatibilityFailure(checkpoint) {
 
 function parseRepairMetadata(metadata) {
   return RepairMetadataSchema.parse(withoutUndefined(metadata));
+}
+
+function deterministicHash(input) {
+  const normalize = (value) => {
+    if (
+      value === null ||
+      typeof value === "boolean" ||
+      typeof value === "number" ||
+      typeof value === "string"
+    ) {
+      return value;
+    }
+    if (Array.isArray(value)) return value.map((item) => normalize(item));
+    if (typeof value === "object" && value != null) {
+      return Object.fromEntries(Object.entries(value)
+        .filter(([, entryValue]) => entryValue !== undefined)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entryValue]) => [key, normalize(entryValue)]));
+    }
+    return String(value);
+  };
+  return createHash("sha256")
+    .update(JSON.stringify(normalize(input)))
+    .digest("hex");
+}
+
+function projectConfigFingerprintFromYamlText(text) {
+  const parsed = YAML.parse(text) ?? {};
+  const config = parsed && typeof parsed === "object" ? parsed : {};
+  return deterministicHash({
+    models: config.models ?? {},
+    providers: config.providers ?? {},
+    embedding: config.embedding ?? {},
+    graphrag: config.graphrag ?? {},
+    query: config.query ?? {},
+  });
+}
+
+function loadProjectConfigForSettingsProjection() {
+  if (!existsSync(configPath)) return { collections: {} };
+  const parsed = YAML.parse(readFileSync(configPath, "utf8")) ?? {};
+  if (typeof parsed !== "object" || parsed == null || Array.isArray(parsed)) {
+    throw new Error(`${configPath} must contain a YAML object`);
+  }
+  return parsed;
+}
+
+function settingsProjectionSourceFingerprintFromConfigText(configText) {
+  try {
+    return projectConfigFingerprintFromYamlText(configText);
+  } catch {
+    return deterministicHash({
+      invalidSourceBytesSha256: createHash("sha256")
+        .update(String(configText ?? ""))
+        .digest("hex"),
+    });
+  }
+}
+
+function settingsProjectionSourceFingerprintFromConfig() {
+  if (!existsSync(configPath)) {
+    return deterministicHash({
+      models: {},
+      providers: {},
+      embedding: {},
+      graphrag: {},
+      query: {},
+    });
+  }
+  return settingsProjectionSourceFingerprintFromConfigText(
+    readFileSync(configPath, "utf8"),
+  );
+}
+
+function validateSettingsProjectionSourceConfig(config) {
+  const responseApi = config?.providers?.openai?.response_api ?? {};
+  if (
+    responseApi.endpoint !== undefined &&
+    responseApi.endpoint !== "/responses"
+  ) {
+    throw new Error("OpenAI Responses API endpoint must be /responses");
+  }
+  if (responseApi.stream !== undefined && responseApi.stream !== true) {
+    throw new Error("OpenAI Responses API stream transport must be enabled");
+  }
+  if (
+    responseApi.strict_structured_output !== undefined &&
+    responseApi.strict_structured_output !== true
+  ) {
+    throw new Error("OpenAI Responses API structured output must be strict");
+  }
+  const profileName = config?.providers?.jina?.embedding_profile;
+  if (
+    profileName !== undefined &&
+    profileName !== "text" &&
+    profileName !== "multimodal"
+  ) {
+    throw new Error(
+      "providers.jina.embedding_profile must be one of: text, multimodal",
+    );
+  }
+  const concurrentRequests = config?.graphrag?.concurrent_requests;
+  if (
+    concurrentRequests !== undefined &&
+    (!Number.isInteger(concurrentRequests) || concurrentRequests < 1)
+  ) {
+    throw new Error("graphrag.concurrent_requests must be a positive integer");
+  }
+}
+
+function invalidSettingsProjectionSourceMetadata() {
+  return withoutUndefined({
+    settingsProjectionDecision: "rejected_invalid_source",
+    settingsProjectionRewritten: false,
+    settingsProjectionSourceFingerprint: settingsProjectionSourceFingerprintFromConfig(),
+    settingsProjectionProjectConfigLocator: configPath,
+    settingsProjectionLocator: resolve(stateRoot, "settings.yaml"),
+    settingsProjectionEvidenceLocator: configPath,
+    settingsProjectionReason: "settings_projection_rejected_invalid_source",
+  });
+}
+
+function userOwnedSettingsProjectionMetadata() {
+  return withoutUndefined({
+    settingsProjectionDecision: "rejected_user_owned",
+    settingsProjectionRewritten: false,
+    settingsProjectionSourceFingerprint: settingsProjectionSourceFingerprintFromConfig(),
+    settingsProjectionProjectConfigLocator: configPath,
+    settingsProjectionLocator: resolve(stateRoot, "settings.yaml"),
+    settingsProjectionEvidenceLocator: resolve(stateRoot, "settings.yaml"),
+    settingsProjectionReason:
+      "settings_projection_rejected_user_owned_or_invalid",
+  });
+}
+
+function settingsProjectionSourceConfigIsInvalid() {
+  try {
+    validateSettingsProjectionSourceConfig(loadProjectConfigForSettingsProjection());
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+function isSettingsProjectionCommand(name) {
+  return String(name ?? "").startsWith("resume-book-") ||
+    String(name ?? "").startsWith("repair-local-artifact-gate-");
+}
+
+function settingsProjectionMetadata(resume) {
+  const repair = resume?.settingsProjectionRepair;
+  if (repair == null || typeof repair !== "object") return {};
+  return withoutUndefined({
+    settingsProjectionDecision: repair.decision,
+    settingsProjectionRewritten: repair.rewritten,
+    settingsProjectionSourceFingerprint: repair.sourceFingerprint,
+    settingsProjectionProjectConfigLocator: configPath,
+    settingsProjectionLocator: repair.settingsPath,
+    settingsProjectionEvidenceLocator: repair.evidenceLocator,
+    settingsProjectionReason: repair.reason,
+  });
+}
+
+function settingsProjectionRejectionMetadataFromText(text, commandName) {
+  const message = String(text ?? "");
+  const normalized = message.toLowerCase();
+  if (
+    isSettingsProjectionCommand(commandName) &&
+    settingsProjectionSourceConfigIsInvalid()
+  ) {
+    return invalidSettingsProjectionSourceMetadata();
+  }
+  if (
+    normalized.includes("responses api") ||
+    normalized.includes("graphrag.concurrent_requests") ||
+    normalized.includes("failed to parse") ||
+    normalized.includes("providers.jina.embedding_profile")
+  ) {
+    return invalidSettingsProjectionSourceMetadata();
+  }
+  if (normalized.includes("managed projection")) {
+    return userOwnedSettingsProjectionMetadata();
+  }
+  return {};
+}
+
+function rejectedSettingsProjectionMetadata(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return settingsProjectionRejectionMetadataFromText(
+    message,
+    error?.commandCheck?.name,
+  );
 }
 
 function checkpointHasTransientFailure(checkpoint) {
@@ -1333,6 +1552,7 @@ function withCheckpointPersistenceInvariants(checkpoint) {
   return {
     ...checkpoint,
     currentCommand: undefined,
+    activeCommand: checkpoint.activeCommand ?? checkpoint.currentCommand,
     currentCommandStartedAt: undefined,
   };
 }
@@ -1454,6 +1674,7 @@ function writeHeartbeat() {
       ...checkpoint,
       runnerHeartbeatAt: new Date().toISOString(),
       currentCommand: command,
+      activeCommand: command,
       currentCommandStartedAt: commandStartedAt,
     };
     writeJsonAtomic(checkpointPath, JSON.stringify(updated, null, 2) + "\n");
@@ -1534,6 +1755,7 @@ function clearCommandHeartbeat(item, command) {
         ...withBuildStatusSnapshot(item, checkpoint),
         runnerHeartbeatAt: now(),
         currentCommand: undefined,
+        activeCommand: checkpoint.activeCommand ?? checkpoint.currentCommand,
         currentCommandStartedAt: undefined,
       }));
       writeJsonAtomic(itemPath(item), JSON.stringify(cleaned, null, 2) + "\n");
@@ -2849,6 +3071,7 @@ function buildRecoverySummary(manifest, checkpoints) {
       runnerHeartbeatAt: item.runnerHeartbeatAt,
       orphanedRunnerDetectedAt: item.orphanedRunnerDetectedAt,
       currentCommand: item.currentCommand,
+      activeCommand: item.activeCommand ?? item.currentCommand,
       currentCommandStartedAt: item.currentCommandStartedAt,
       waitingForProviderRecovery,
       reopenedFromStatus: item.metadata?.reopenedFromStatus,
@@ -2860,6 +3083,16 @@ function buildRecoverySummary(manifest, checkpoints) {
       repairEvidenceLocator: item.metadata?.repairEvidenceLocator,
       reusedProducerRunIds: item.metadata?.reusedProducerRunIds,
       normalCommandChecksRequired: item.metadata?.normalCommandChecksRequired,
+      settingsProjectionDecision: item.metadata?.settingsProjectionDecision,
+      settingsProjectionRewritten: item.metadata?.settingsProjectionRewritten,
+      settingsProjectionSourceFingerprint:
+        item.metadata?.settingsProjectionSourceFingerprint,
+      settingsProjectionProjectConfigLocator:
+        item.metadata?.settingsProjectionProjectConfigLocator,
+      settingsProjectionLocator: item.metadata?.settingsProjectionLocator,
+      settingsProjectionEvidenceLocator:
+        item.metadata?.settingsProjectionEvidenceLocator,
+      settingsProjectionReason: item.metadata?.settingsProjectionReason,
       errorSummary: item.errorSummary ? redacted(item.errorSummary) : undefined,
     });
   });
@@ -3186,6 +3419,8 @@ function runCommand(item, name, command, args, options = {}) {
         : "";
     const failureText = timeoutMessage || stderr || stdout || result.error?.message || "";
     const failure = result.status === 0 ? null : classifyFailure(failureText);
+    const projectionFailureMetadata =
+      settingsProjectionRejectionMetadataFromText(failureText, name);
     const retryDelaySeconds = failure?.retryAfterSeconds ??
       retryDelaySecondsForAttempt(attempt);
     const shouldRetry =
@@ -3232,24 +3467,25 @@ function runCommand(item, name, command, args, options = {}) {
       failureKind: check.failureKind,
       retryable: check.retryable,
       retryAfterSeconds: check.retryAfterSeconds,
-      attemptExhausted: check.attemptExhausted,
-      providerStatusCode: check.providerStatusCode,
-      recoveryDecision: check.recoveryDecision ??
-        (check.retryable ? "retry_same_run_id" : "stop_until_fixed"),
-      failedStage: name,
-      metadata: {
-        attempt,
-        exitCode: result.status,
-        maxAttempts: attempts,
-        retryBudgetSeconds,
-        commandTimeoutSeconds,
-        retryDelaySeconds: check.retryDelaySeconds,
-        elapsedRetrySeconds: options.checkpoint
-          ? elapsedRetrySeconds(options.checkpoint)
-          : undefined,
-        nextRetryAt,
-      },
-    });
+        attemptExhausted: check.attemptExhausted,
+        providerStatusCode: check.providerStatusCode,
+        recoveryDecision: check.recoveryDecision ??
+          (check.retryable ? "retry_same_run_id" : "stop_until_fixed"),
+        failedStage: name,
+        metadata: {
+          attempt,
+          exitCode: result.status,
+          maxAttempts: attempts,
+          retryBudgetSeconds,
+          commandTimeoutSeconds,
+          retryDelaySeconds: check.retryDelaySeconds,
+          elapsedRetrySeconds: options.checkpoint
+            ? elapsedRetrySeconds(options.checkpoint)
+            : undefined,
+          nextRetryAt,
+          ...projectionFailureMetadata,
+        },
+      });
     if (!shouldRetry) break;
     const delayMs = retryDelaySeconds * 1000;
     event({
@@ -3297,6 +3533,10 @@ function runCommand(item, name, command, args, options = {}) {
         maxAttempts: attempts,
         retryBudgetSeconds,
         commandTimeoutSeconds,
+        ...settingsProjectionRejectionMetadataFromText(
+          last.check.errorSummary,
+          name,
+        ),
       },
     };
     event(exhaustedEvent);
@@ -3499,7 +3739,10 @@ function runGraphResume(item, checkpoint, options = {}) {
       resume = parseResumeOutput(result.stdout);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      throw Object.assign(new Error(message), { commandCheck: result.check });
+      const failureText = [message, result.check?.errorSummary]
+        .filter(Boolean)
+        .join("\n");
+      throw Object.assign(new Error(failureText), { commandCheck: result.check });
     }
     event({
       itemId: item.itemId,
@@ -3512,6 +3755,7 @@ function runGraphResume(item, checkpoint, options = {}) {
         command: name,
         resumeStatus: resume.status,
         nextStage: resume.nextStage,
+        ...settingsProjectionMetadata(resume),
       },
     });
     if (
@@ -3520,7 +3764,7 @@ function runGraphResume(item, checkpoint, options = {}) {
     ) {
       return options.repairLocalArtifactGateOnly
         ? { status: "repaired", bookId: resume.bookId, resume }
-        : resume.bookId;
+        : { status: "ready", bookId: resume.bookId, resume };
     }
     if (options.repairLocalArtifactGateOnly && resume.status === "blocked") {
       return { status: "blocked", bookId: resume.bookId, resume };
@@ -3538,16 +3782,20 @@ function repairLocalArtifactGate(item, checkpoint) {
     repairLocalArtifactGateOnly: true,
   });
   const repairFailureText = redacted(checkpointFailureText(checkpoint));
+  const projectionMetadata = settingsProjectionMetadata(repairResult.resume);
   const repairMetadataCandidate = {
     reopenedFromStatus: checkpoint.status,
     reopenedToStatus: "pending",
     reopenedFromRecoveryDecision: checkpoint.recoveryDecision ?? "stop_until_fixed",
+    activeCommand: checkpoint.activeCommand ?? checkpoint.currentCommand ??
+      checkpoint.failedStage,
     repairReason: repairResult.resume?.repairReason,
     repairFailureText,
     repairedProjection: repairResult.resume?.repairedProjection,
     repairEvidenceLocator: repairResult.resume?.repairEvidenceLocator,
     reusedProducerRunIds: repairResult.resume?.reusedProducerRunIds,
     normalCommandChecksRequired: true,
+    ...projectionMetadata,
   };
   let repairMetadata = null;
   try {
@@ -3584,6 +3832,8 @@ function repairLocalArtifactGate(item, checkpoint) {
         retryExhausted: undefined,
         recoveryDecision: "continue_pending",
         failedStage: checkpoint.failedStage ?? "repair-local-artifact-gate",
+        activeCommand: checkpoint.activeCommand ?? checkpoint.currentCommand ??
+          checkpoint.failedStage,
         nextRetryAt: undefined,
         retryDelaySeconds: undefined,
         runnerHeartbeatAt: now(),
@@ -3628,6 +3878,8 @@ function repairLocalArtifactGate(item, checkpoint) {
       retryExhausted: undefined,
       recoveryDecision: "continue_pending",
       failedStage: checkpoint.failedStage ?? "repair-local-artifact-gate",
+      activeCommand: checkpoint.activeCommand ?? checkpoint.currentCommand ??
+        checkpoint.failedStage,
       nextRetryAt: undefined,
       retryDelaySeconds: undefined,
       runnerHeartbeatAt: now(),
@@ -3669,6 +3921,8 @@ function repairLocalArtifactGate(item, checkpoint) {
     retryExhausted: undefined,
     recoveryDecision: "continue_pending",
     failedStage: undefined,
+    activeCommand: checkpoint.activeCommand ?? checkpoint.currentCommand ??
+      checkpoint.failedStage,
     nextRetryAt: undefined,
     retryDelaySeconds: undefined,
     runnerHeartbeatAt: now(),
@@ -3760,7 +4014,9 @@ function runCliChecks(item) {
 
 function runItem(item, checkpoint) {
   normalizeEpubToMarkdown(item);
-  const resolvedBookId = runGraphResume(item, checkpoint) ?? checkpoint.bookId;
+  const resumeResult = runGraphResume(item, checkpoint);
+  const resolvedBookId = resumeResult?.bookId ?? checkpoint.bookId;
+  const projectionMetadata = settingsProjectionMetadata(resumeResult?.resume);
   const resolvedItem = { ...item, bookId: resolvedBookId };
   const commandChecks = runCliChecks(resolvedItem);
   const qmdBuildStatus = qmdBuildEvidence({ commandChecks });
@@ -3819,6 +4075,10 @@ function runItem(item, checkpoint) {
     graphQueryStatus,
     commandChecks,
     runnerHeartbeatAt: now(),
+    metadata: {
+      ...(checkpoint.metadata ?? {}),
+      ...projectionMetadata,
+    },
   };
   saveCheckpoint(item, completed);
   event({ itemId: item.itemId, event: "item_completed", status: "completed" });
@@ -4196,6 +4456,12 @@ function main() {
               processedInPass = true;
             }
           } catch (error) {
+            const projectionRejectionMetadata =
+              rejectedSettingsProjectionMetadata(error);
+            const activeCommand =
+              error?.commandCheck?.name ?? checkpoint.activeCommand ??
+                checkpoint.currentCommand ?? checkpoint.failedStage ??
+                "repair-local-artifact-gate";
             const failed = {
               ...checkpoint,
               status: "failed",
@@ -4208,8 +4474,28 @@ function main() {
               retryExhausted: true,
               recoveryDecision: "stop_until_fixed",
               failedStage: "repair-local-artifact-gate",
+              activeCommand,
               runnerHeartbeatAt: now(),
+              metadata: {
+                ...(checkpoint.metadata ?? {}),
+                ...projectionRejectionMetadata,
+                localArtifactGateRepairFailed: true,
+                waitingForProviderRecovery: false,
+              },
             };
+            const commandCheck = error?.commandCheck;
+            if (commandCheck) {
+              failed.commandChecks = [
+                ...(failed.commandChecks ?? []),
+                commandCheck.status === "failed"
+                  ? {
+                      ...commandCheck,
+                      recoveryDecision: commandCheck.recoveryDecision ??
+                        failed.recoveryDecision,
+                    }
+                  : commandCheck,
+              ];
+            }
             saveCheckpoint(item, failed);
             checkpoints.set(item.itemId, failed);
             manifest = updateManifest(manifest, Array.from(checkpoints.values()));
@@ -4222,8 +4508,13 @@ function main() {
               recoveryDecision: "stop_until_fixed",
               failedStage: "repair-local-artifact-gate",
               message: failed.errorSummary,
+              metadata: {
+                activeCommand,
+                command: commandCheck?.name,
+                ...projectionRejectionMetadata,
+              },
             });
-            throw error;
+            continue;
           }
           continue;
         } else {
@@ -4460,6 +4751,8 @@ function main() {
         const recoveryWaitCount = recoverableProviderFailure
           ? nextProviderRecoveryWaitCount(running)
           : undefined;
+        const projectionRejectionMetadata =
+          rejectedSettingsProjectionMetadata(error);
         const failed = recoverableProviderFailure ? {
           ...running,
           status: "pending",
@@ -4474,6 +4767,8 @@ function main() {
           nextRetryAt: isoAfterSeconds(providerRecoveryDelay),
           retryDelaySeconds: providerRecoveryDelay,
           runnerHeartbeatAt: now(),
+          activeCommand: commandCheck?.name ?? running.activeCommand ??
+            running.currentCommand ?? running.failedStage,
           metadata: {
             ...(running.metadata ?? {}),
             waitingForProviderRecovery: true,
@@ -4500,6 +4795,12 @@ function main() {
           nextRetryAt: undefined,
           retryDelaySeconds: undefined,
           runnerHeartbeatAt: now(),
+          activeCommand: commandCheck?.name ?? running.activeCommand ??
+            running.currentCommand ?? running.failedStage,
+          metadata: {
+            ...(running.metadata ?? {}),
+            ...projectionRejectionMetadata,
+          },
         };
         if (commandCheck) {
           failed.commandChecks = [
@@ -4538,7 +4839,11 @@ function main() {
                 maxProviderRecoveryWaits,
                 waitLimitReached: !providerRecoveryWaitStillAvailable,
               }
-            : undefined,
+            : {
+                activeCommand: failed.activeCommand,
+                command: commandCheck?.name,
+                ...projectionRejectionMetadata,
+              },
         });
         if (failFast) {
           manifest = persistFailFastInterruptedManifest(

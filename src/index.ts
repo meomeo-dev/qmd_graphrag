@@ -699,6 +699,8 @@ export {
 export {
   assertManagedGraphRagSettings,
   buildGraphRagRuntimeSettingsProjection,
+  ensureManagedGraphRagSettings,
+  ensureManagedGraphRagSettingsSync,
   graphRagProjectConfigFingerprint,
   writeManagedGraphRagSettings,
   writeManagedGraphRagSettingsSync,

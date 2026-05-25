@@ -19,6 +19,7 @@ import {
   syncGraphRagBookWorkspace,
   writeGraphRagOutputProducerManifest,
   writeManagedGraphRagSettings,
+  writeManagedGraphRagSettingsSync,
 } from "../src/index.js";
 import type { CollectionConfig } from "../src/collections.js";
 import { createStore } from "../src/store.js";
@@ -253,6 +254,21 @@ describe("syncGraphRagBookWorkspace", () => {
     expect(() =>
       buildGraphRagRuntimeSettingsProjection(invalidStrict),
     ).toThrow("strict");
+  });
+
+  test("rejects unknown Jina embedding profiles before projection", () => {
+    expect(() =>
+      buildGraphRagRuntimeSettingsProjection({
+        ...projectConfig,
+        providers: {
+          ...projectConfig.providers,
+          jina: {
+            ...projectConfig.providers?.jina,
+            embedding_profile: "audio" as any,
+          },
+        },
+      }),
+    ).toThrow("providers.jina.embedding_profile");
   });
 
   test("projects Jina API base without unsupported placeholder fallback", () => {
@@ -947,6 +963,86 @@ describe("syncGraphRagBookWorkspace", () => {
           documentId: initial.job.documentId,
           contentHash: "stale-content-hash",
           normalizedPath: initial.job.normalizedPath,
+          graphDocumentId: "graph-doc-1",
+          graphTextUnitIds: ["tu-1", "tu-2"],
+        }, null, 2),
+        "utf8",
+      );
+
+      await expect(syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig,
+        recordRecoveredStages: false,
+      })).rejects.toThrow("sidecar does not match");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects GraphRAG identity sidecar when normalizedPath mismatches", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+      await writeManagedGraphRagSettings({ config: projectConfig, graphVault });
+      await writeFile(join(graphVault, "prompts", "extract_graph.txt"), "prompt", "utf8");
+
+      const initial = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig,
+        recordRecoveredStages: false,
+      });
+      const outputDir = graphRagBookOutputDir({
+        stateRootDir: graphVault,
+        bookId: initial.job.bookId,
+      });
+      await writeMultiDocumentGraphOutput(outputDir);
+      await writeCompleteLanceDbSidecars(outputDir);
+      for (const stage of [
+        "graph_extract",
+        "community_report",
+        "embed",
+      ] as const) {
+        await writeGraphRagOutputProducerManifest({
+          outputDir,
+          bookId: initial.job.bookId,
+          sourceHash: initial.job.sourceHash,
+          documentId: initial.job.documentId,
+          contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+          stageFingerprints: initial.stageFingerprints,
+          providerFingerprint: initial.job.providerFingerprint!,
+          producerRunId: `real-${stage}`,
+          stage,
+        });
+      }
+      await writeFile(
+        join(outputDir, "qmd_graph_text_unit_identity.json"),
+        JSON.stringify({
+          schemaVersion: SchemaVersion,
+          bookId: initial.job.bookId,
+          sourceId: `sha256:${initial.job.sourceHash}`,
+          sourceHash: initial.job.sourceHash,
+          documentId: initial.job.documentId,
+          contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+          normalizedPath: "input/other-book.md",
           graphDocumentId: "graph-doc-1",
           graphTextUnitIds: ["tu-1", "tu-2"],
         }, null, 2),
@@ -1759,7 +1855,7 @@ describe("syncGraphRagBookWorkspace", () => {
     }
   });
 
-  test("rejects drifted GraphRAG settings when project config is supplied", async () => {
+  test("rewrites drifted managed GraphRAG settings when project config is supplied", async () => {
     const root = await createWorkspace();
     try {
       const graphVault = join(root, "graph_vault");
@@ -1773,6 +1869,12 @@ describe("syncGraphRagBookWorkspace", () => {
       await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
       await writeManagedGraphRagSettings({ config: projectConfig, graphVault });
       await writeFile(join(graphVault, "prompts", "extract_graph.txt"), "prompt", "utf8");
+      await mkdir(join(graphVault, "books", "unrelated", "output"), { recursive: true });
+      await writeFile(
+        join(graphVault, "books", "unrelated", "output", "keep.txt"),
+        "keep",
+        "utf8",
+      );
 
       const driftedConfig: CollectionConfig = {
         ...projectConfig,
@@ -1782,7 +1884,7 @@ describe("syncGraphRagBookWorkspace", () => {
         },
       };
 
-      await expect(syncGraphRagBookWorkspace({
+      const synced = await syncGraphRagBookWorkspace({
         stateRootDir: graphVault,
         sourcePath,
         normalizedPath,
@@ -1791,13 +1893,43 @@ describe("syncGraphRagBookWorkspace", () => {
         outputDir: join(graphVault, "output"),
         qmdIndexPath: join(root, ".qmd", "index.sqlite"),
         projectConfig: driftedConfig,
-      })).rejects.toThrow("managed projection");
+      });
+      const repairedRaw = await readFile(join(graphVault, "settings.yaml"), "utf8");
+      const repaired = YAML.parse(repairedRaw) as {
+        qmd_graphrag?: { source_fingerprint?: string };
+      };
+      expect(synced.settingsProjectionRepair).toMatchObject({
+        decision: "rewritten",
+        rewritten: true,
+        sourceFingerprint: repaired.qmd_graphrag?.source_fingerprint,
+        reason: "managed_projection_rewritten",
+      });
+      await expect(readFile(
+        join(graphVault, "books", "unrelated", "output", "keep.txt"),
+        "utf8",
+      )).resolves.toBe("keep");
+
+      const second = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig: driftedConfig,
+      });
+      expect(second.settingsProjectionRepair).toMatchObject({
+        decision: "already_valid",
+        rewritten: false,
+        sourceFingerprint: synced.settingsProjectionRepair?.sourceFingerprint,
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  test("rejects managed GraphRAG settings when projection body is mutated", async () => {
+  test("rewrites managed GraphRAG settings when projection body is mutated", async () => {
     const root = await createWorkspace();
     try {
       const graphVault = join(root, "graph_vault");
@@ -1817,6 +1949,45 @@ describe("syncGraphRagBookWorkspace", () => {
       parsed.concurrent_requests = 99;
       await writeFile(join(graphVault, "settings.yaml"), YAML.stringify(parsed), "utf8");
 
+      const synced = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig,
+      });
+      expect(synced.settingsProjectionRepair).toMatchObject({
+        decision: "rewritten",
+        rewritten: true,
+        reason: "managed_projection_rewritten",
+      });
+      const repaired = YAML.parse(
+        await readFile(join(graphVault, "settings.yaml"), "utf8"),
+      ) as { concurrent_requests?: number };
+      expect(repaired.concurrent_requests).toBe(5);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects user-owned GraphRAG settings when project config is supplied", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+      await mkdir(join(graphVault, "output"), { recursive: true });
+
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+      await writeFile(join(graphVault, "settings.yaml"), "vector_store: {}\n", "utf8");
+      await writeFile(join(graphVault, "prompts", "extract_graph.txt"), "prompt", "utf8");
+
       await expect(syncGraphRagBookWorkspace({
         stateRootDir: graphVault,
         sourcePath,
@@ -1827,6 +1998,44 @@ describe("syncGraphRagBookWorkspace", () => {
         qmdIndexPath: join(root, ".qmd", "index.sqlite"),
         projectConfig,
       })).rejects.toThrow("managed projection");
+      await expect(readFile(join(graphVault, "settings.yaml"), "utf8"))
+        .resolves.toBe("vector_store: {}\n");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("managed GraphRAG settings writer refuses user-owned settings", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(graphVault, { recursive: true });
+      await writeFile(join(graphVault, "settings.yaml"), "vector_store: {}\n", "utf8");
+
+      await expect(writeManagedGraphRagSettings({
+        config: projectConfig,
+        graphVault,
+      })).rejects.toThrow("managed projection");
+      await expect(readFile(join(graphVault, "settings.yaml"), "utf8"))
+        .resolves.toBe("vector_store: {}\n");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("sync managed GraphRAG settings writer refuses user-owned settings", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(graphVault, { recursive: true });
+      await writeFile(join(graphVault, "settings.yaml"), "vector_store: {}\n", "utf8");
+
+      expect(() => writeManagedGraphRagSettingsSync({
+        config: projectConfig,
+        graphVault,
+      })).toThrow("managed projection");
+      await expect(readFile(join(graphVault, "settings.yaml"), "utf8"))
+        .resolves.toBe("vector_store: {}\n");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

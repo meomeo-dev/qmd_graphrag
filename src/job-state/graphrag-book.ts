@@ -53,7 +53,10 @@ import {
   type StageArtifactRequirementMap,
   type StageFingerprintMap,
 } from "./repository.js";
-import { assertManagedGraphRagSettings } from "../graphrag/settings-projection.js";
+import {
+  ensureManagedGraphRagSettings,
+  type ManagedGraphRagSettingsRepairResult,
+} from "../graphrag/settings-projection.js";
 
 const GRAPHRAG_NORMALIZATION_POLICY_VERSION = "graphrag-normalized-markdown-v1";
 
@@ -104,6 +107,7 @@ export type GraphRagBookWorkspaceState = {
   stageFingerprints: Record<BookStage, string>;
   resumePlan: BookResumePlan;
   bootstrapRunId: string;
+  settingsProjectionRepair?: ManagedGraphRagSettingsRepairResult;
 };
 
 export type GraphRagStageReportHealth = {
@@ -1551,12 +1555,12 @@ export async function syncGraphRagBookWorkspace(
   const bootstrapRunId = createRunId("bootstrap");
   const settingsPath = resolve(input.settingsPath);
 
-  if (input.projectConfig != null) {
-    await assertManagedGraphRagSettings({
+  const settingsProjectionRepair = input.projectConfig == null
+    ? undefined
+    : await ensureManagedGraphRagSettings({
       config: input.projectConfig,
       settingsPath,
     });
-  }
 
   const [sourceHash, normalizedContentHash, promptFingerprint, settings] =
     await Promise.all([
@@ -1720,5 +1724,6 @@ export async function syncGraphRagBookWorkspace(
     stageFingerprints,
     resumePlan,
     bootstrapRunId,
+    settingsProjectionRepair,
   };
 }

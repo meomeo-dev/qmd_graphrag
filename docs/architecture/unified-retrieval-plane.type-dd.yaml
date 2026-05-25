@@ -255,6 +255,20 @@ identity_model:
       same bookId. Duplicate payloads at different source identities remain
       isolated so one book cannot reuse or overwrite another book's GraphRAG
       artifacts.
+  normalized_path:
+    description: Typed locator for the normalized input owned by the book job.
+    producer: scripts/graphrag/batch-epub-workflow.mjs#normalizeEpubForBatch
+    catalog_sources:
+      - BookJob.normalizedPath
+      - qmd corpus registration relativePath
+      - qmd_output_manifest.normalizedPath
+      - qmd_graph_text_unit_identity.normalizedPath
+    participates_in_canonical_identity: false
+    adoption_invariant: >-
+      Sidecar or parquet repair evidence may be adopted only when
+      normalizedPath matches the current book job and qmd corpus registration.
+      A mismatch is fail-closed because it indicates evidence from another
+      normalized input, legacy workspace, or stale book-scoped output.
   content_hash:
     description: Stable identity of normalized text content.
     producer: src/store.ts#hashContent
@@ -407,10 +421,19 @@ typed_buses:
           - retryAfterSeconds
           - recoveryDecision
           - failedStage
+          - activeCommand
         provider_recovery_observability_fields:
           - providerRecoveryWaitCount
           - maxProviderRecoveryWaits
           - providerRecoveryReason
+        settings_projection_repair_fields:
+          - settingsProjectionDecision
+          - settingsProjectionRewritten
+          - settingsProjectionSourceFingerprint
+          - settingsProjectionProjectConfigLocator
+          - settingsProjectionLocator
+          - settingsProjectionEvidenceLocator
+          - settingsProjectionReason
 
   corpus_bus:
     role: Whole-corpus ingestion and document identity.
@@ -495,6 +518,7 @@ typed_buses:
           - sourceHash
           - documentId
           - contentHash
+          - normalizedPath
         repair_evidence_sidecar: >-
           graph_vault/books/<book_id>/output/qmd_graph_text_unit_identity.json
           is derived repair evidence from validated GraphRAG output. It is not
@@ -502,10 +526,11 @@ typed_buses:
           DocumentIdentityMap when catalog projection is missing or stale.
         repair_rejection_policy: >-
           Repair is fail-closed on mixed book output, sourceHash mismatch,
-          documentId mismatch, contentHash mismatch, empty graphTextUnitIds,
-          text unit ids absent from GraphRAG text_units output, invalid
-          outputDir, or producer lineage mismatch. Multi-document GraphRAG
-          output may not choose by title, path, first row, or first text unit.
+          documentId mismatch, contentHash mismatch, normalizedPath mismatch,
+          empty graphTextUnitIds, text unit ids absent from GraphRAG text_units
+          output, invalid outputDir, or producer lineage mismatch.
+          Multi-document GraphRAG output may not choose by title, path, first
+          row, or first text unit.
       - name: document_identity_catalog
         schema: src/contracts/corpus.ts#DocumentIdentityCatalogSchema
         envelope: src/contracts/corpus.ts#DocumentIdentityCatalogEnvelopeSchema
@@ -1280,7 +1305,26 @@ config_projection:
     drift_control:
       - managed_header
       - source_fingerprint
-      - reject_on_fingerprint_mismatch
+      - loader_equivalent_comparison
+      - safe_rewrite_on_managed_fingerprint_mismatch
+      - reject_user_owned_or_invalid_source
+    loader_equivalence_rule: >-
+      Projection validation uses the same loader as
+      src/graphrag/settings-projection.ts writer: .qmd/index.yml parsing,
+      defaults, environment placeholder preservation, key ordering, and
+      canonical serialization. It must not compare graph_vault/settings.yaml
+      against a GraphRAG default-loaded config or any implicit fallback config.
+    safe_rewrite_rule: >-
+      A mismatched projection is rewritten only when .qmd/index.yml validates,
+      graph_vault/settings.yaml carries the qmd managed marker, and the target
+      is not a user-owned settings file. The rewrite is atomic and idempotent
+      for the same source fingerprint. Missing managed marker, invalid source
+      config, or user-owned target causes fail-closed refusal with a typed
+      recovery reason.
+    non_destructive_repair_rule: >-
+      Settings projection repair changes only graph_vault/settings.yaml and
+      its temporary atomic-write file. It must not delete, migrate, truncate,
+      or mark stale any graph_vault/books/<book_id>/output artifact.
     secret_policy: env_placeholder_only
   runtime_env:
     required_names:
@@ -1617,6 +1661,28 @@ state_and_recovery:
       must emit recovery evidence, run the normal resume and command checks,
       and must not rerun graph_extract, community_report, or embed when their
       producer checkpoints and artifacts remain valid.
+    settings_projection_repair_rule: >-
+      A failure with text
+      `graph_vault/settings.yaml is not the managed projection of .qmd/index.yml`
+      is classified as settings_projection_drift when the source project config
+      can be loaded by the projection writer-equivalent loader. If the existing
+      settings file has the qmd managed marker, resume rewrites the managed
+      projection atomically and continues the current BookResumePlan.nextStage.
+      If the file is user-owned, lacks the managed marker, or source config is
+      invalid, the runner records a fail-closed recovery decision and does not
+      overwrite the file.
+    settings_projection_idempotency_rule: >-
+      Repeated same-runId resume attempts for settings_projection_drift must
+      produce the same source fingerprint, projected content hash, and recovery
+      decision. A second resume after a successful rewrite observes matching
+      projection state and does not rewrite again.
+    settings_projection_observability_rule: >-
+      Batch events and recovery summary record settingsProjectionDecision,
+      settingsProjectionRewritten, settingsProjectionSourceFingerprint,
+      settingsProjectionProjectConfigLocator, settingsProjectionLocator,
+      settingsProjectionEvidenceLocator, failedStage, activeCommand, and a
+      redacted settingsProjectionReason. These are projections of checkpoint
+      metadata, not a second source of truth.
     local_projection_observability_rule: >-
       Event log and recovery summary are projections of the reopened item
       checkpoint. The checkpoint metadata records the original failure text,
@@ -1687,6 +1753,11 @@ state_and_recovery:
       from qmd_graph_text_unit_identity.json or validated parquet extraction and
       then retries query_ready. It must not rerun graph_extract,
       community_report, or embed for this local projection failure.
+    graph_identity_sidecar_adoption_rule: >-
+      qmd_graph_text_unit_identity.json may repair DocumentIdentityMap only
+      after bookId, sourceId, sourceHash, documentId, contentHash, and
+      normalizedPath all match the current BookJob, qmd corpus registration,
+      and qmd_output_manifest.json. normalizedPath mismatch is fail-closed.
     running_ownership_rule: >-
       A running checkpoint owned by another runner host is observed but not
       stolen while its heartbeat is within TTL. Missing ownership, heartbeat
@@ -1974,6 +2045,18 @@ acceptance_requirements:
     query_ready lineage, artifact lineage, and graph document identity are all
     present, rebuilds graph_query capability projection, and reruns the normal
     GraphRAG query command check without writing completed directly.
+  - >-
+    Focused regression for persisted failure text
+    `graph_vault/settings.yaml is not the managed projection of .qmd/index.yml`
+    classifies managed projection drift, rewrites graph_vault/settings.yaml
+    only when .qmd/index.yml validates and the settings file has the qmd
+    managed marker, then resumes the normal BookResumePlan path without
+    deleting or invalidating book-scoped GraphRAG outputs.
+  - >-
+    Settings projection tests cover writer-equivalent loader comparison,
+    GraphRAG default-loaded config mismatch rejection, user-owned settings
+    overwrite rejection, invalid source config rejection, repeated same-runId
+    idempotency, and recovery summary fields for rewrite or rejection.
   - >-
     Local projection reopen tests assert BatchItemCheckpoint metadata includes
     reopenedFromStatus, reopenedToStatus, reopenedFromRecoveryDecision,

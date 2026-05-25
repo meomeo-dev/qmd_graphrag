@@ -1,5 +1,5 @@
-import { mkdirSync, writeFileSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
 import YAML from "yaml";
@@ -21,6 +21,18 @@ export type GraphRagRuntimeSettingsProjection = {
   sourceFingerprint: string;
   settings: Record<string, unknown>;
 };
+
+export type ManagedGraphRagSettingsRepairResult = {
+  decision: "already_valid" | "rewritten";
+  rewritten: boolean;
+  sourceFingerprint: string;
+  settingsPath: string;
+  evidenceLocator: string;
+  reason: string;
+};
+
+const ManagedProjectionError =
+  "graph_vault/settings.yaml is not the managed projection of .qmd/index.yml";
 
 function envPlaceholder(envName: string | undefined, fallback: string): string {
   return `\${${envName || fallback}}`;
@@ -75,6 +87,12 @@ export function buildGraphRagRuntimeSettingsProjection(
   const jina = config.providers?.jina ?? {};
   const profileName = jina.embedding_profile ?? DEFAULT_JINA_EMBEDDING_PROFILE;
   const profile = JINA_EMBEDDING_PROFILES[profileName];
+  if (profile == null) {
+    throw new Error(
+      "providers.jina.embedding_profile must be one of: " +
+        Object.keys(JINA_EMBEDDING_PROFILES).join(", "),
+    );
+  }
   const concurrentRequests =
     config.graphrag?.concurrent_requests ?? DefaultConcurrentRequests;
   if (!Number.isInteger(concurrentRequests) || concurrentRequests < 1) {
@@ -219,10 +237,8 @@ export async function writeManagedGraphRagSettings(input: {
   config: CollectionConfig;
   graphVault: string;
 }): Promise<string> {
-  const projection = buildGraphRagRuntimeSettingsProjection(input.config);
   const settingsPath = join(resolve(input.graphVault), "settings.yaml");
-  await mkdir(dirname(settingsPath), { recursive: true });
-  await writeFile(settingsPath, YAML.stringify(projection.settings), "utf8");
+  await ensureManagedGraphRagSettings({ config: input.config, settingsPath });
   return settingsPath;
 }
 
@@ -230,11 +246,170 @@ export function writeManagedGraphRagSettingsSync(input: {
   config: CollectionConfig;
   graphVault: string;
 }): string {
-  const projection = buildGraphRagRuntimeSettingsProjection(input.config);
   const settingsPath = join(resolve(input.graphVault), "settings.yaml");
-  mkdirSync(dirname(settingsPath), { recursive: true });
-  writeFileSync(settingsPath, YAML.stringify(projection.settings), "utf8");
+  ensureManagedGraphRagSettingsSync({ config: input.config, settingsPath });
   return settingsPath;
+}
+
+function managedSettingsTempPath(settingsPath: string): string {
+  return `${settingsPath}.tmp-${process.pid}-${Date.now()}`;
+}
+
+async function writeManagedSettingsFile(
+  settingsPath: string,
+  settings: Record<string, unknown>,
+): Promise<void> {
+  const tmpPath = managedSettingsTempPath(settingsPath);
+  await writeFile(tmpPath, YAML.stringify(settings), "utf8");
+  await rename(tmpPath, settingsPath);
+}
+
+function writeManagedSettingsFileSync(
+  settingsPath: string,
+  settings: Record<string, unknown>,
+): void {
+  const tmpPath = managedSettingsTempPath(settingsPath);
+  writeFileSync(tmpPath, YAML.stringify(settings), "utf8");
+  renameSync(tmpPath, settingsPath);
+}
+
+function parseManagedSettings(raw: string): Record<string, unknown> & {
+  qmd_graphrag?: {
+    managed_by?: unknown;
+    source_fingerprint?: unknown;
+  };
+} {
+  const parsed = (YAML.parse(raw) ?? {}) as Record<string, unknown> & {
+    qmd_graphrag?: {
+      managed_by?: unknown;
+      source_fingerprint?: unknown;
+    };
+  };
+  if (typeof parsed !== "object" || parsed == null) {
+    throw new Error(ManagedProjectionError);
+  }
+  return parsed;
+}
+
+function isValidManagedProjection(
+  parsed: Record<string, unknown> & {
+    qmd_graphrag?: {
+      managed_by?: unknown;
+      source_fingerprint?: unknown;
+    };
+  },
+  projection: GraphRagRuntimeSettingsProjection,
+): boolean {
+  const header = parsed.qmd_graphrag;
+  return header?.managed_by === ManagedBy &&
+    header.source_fingerprint === projection.sourceFingerprint &&
+    createDeterministicHash(parsed) ===
+      createDeterministicHash(projection.settings);
+}
+
+function hasManagedMarker(
+  parsed: Record<string, unknown> & {
+    qmd_graphrag?: {
+      managed_by?: unknown;
+      source_fingerprint?: unknown;
+    };
+  },
+): boolean {
+  return parsed.qmd_graphrag?.managed_by === ManagedBy;
+}
+
+export async function ensureManagedGraphRagSettings(input: {
+  config: CollectionConfig;
+  settingsPath: string;
+}): Promise<ManagedGraphRagSettingsRepairResult> {
+  const projection = buildGraphRagRuntimeSettingsProjection(input.config);
+  const settingsPath = resolve(input.settingsPath);
+  let raw: string;
+  try {
+    raw = await readFile(settingsPath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    await mkdir(dirname(settingsPath), { recursive: true });
+    await writeManagedSettingsFile(settingsPath, projection.settings);
+    return {
+      decision: "rewritten",
+      rewritten: true,
+      sourceFingerprint: projection.sourceFingerprint,
+      settingsPath,
+      evidenceLocator: settingsPath,
+      reason: "managed_projection_created",
+    };
+  }
+  const parsed = parseManagedSettings(raw);
+  if (isValidManagedProjection(parsed, projection)) {
+    return {
+      decision: "already_valid",
+      rewritten: false,
+      sourceFingerprint: projection.sourceFingerprint,
+      settingsPath,
+      evidenceLocator: settingsPath,
+      reason: "managed_projection_valid",
+    };
+  }
+  if (!hasManagedMarker(parsed)) {
+    throw new Error(ManagedProjectionError);
+  }
+  await writeManagedSettingsFile(settingsPath, projection.settings);
+  return {
+    decision: "rewritten",
+    rewritten: true,
+    sourceFingerprint: projection.sourceFingerprint,
+    settingsPath,
+    evidenceLocator: settingsPath,
+    reason: "managed_projection_rewritten",
+  };
+}
+
+export function ensureManagedGraphRagSettingsSync(input: {
+  config: CollectionConfig;
+  settingsPath: string;
+}): ManagedGraphRagSettingsRepairResult {
+  const projection = buildGraphRagRuntimeSettingsProjection(input.config);
+  const settingsPath = resolve(input.settingsPath);
+  let raw: string;
+  try {
+    raw = readFileSync(settingsPath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    mkdirSync(dirname(settingsPath), { recursive: true });
+    writeManagedSettingsFileSync(settingsPath, projection.settings);
+    return {
+      decision: "rewritten",
+      rewritten: true,
+      sourceFingerprint: projection.sourceFingerprint,
+      settingsPath,
+      evidenceLocator: settingsPath,
+      reason: "managed_projection_created",
+    };
+  }
+  const parsed = parseManagedSettings(raw);
+  if (isValidManagedProjection(parsed, projection)) {
+    return {
+      decision: "already_valid",
+      rewritten: false,
+      sourceFingerprint: projection.sourceFingerprint,
+      settingsPath,
+      evidenceLocator: settingsPath,
+      reason: "managed_projection_valid",
+    };
+  }
+  if (!hasManagedMarker(parsed)) {
+    throw new Error(ManagedProjectionError);
+  }
+  writeManagedSettingsFileSync(settingsPath, projection.settings);
+  return {
+    decision: "rewritten",
+    rewritten: true,
+    sourceFingerprint: projection.sourceFingerprint,
+    settingsPath,
+    evidenceLocator: settingsPath,
+    reason: "managed_projection_rewritten",
+  };
 }
 
 export async function assertManagedGraphRagSettings(input: {
@@ -242,21 +417,7 @@ export async function assertManagedGraphRagSettings(input: {
   settingsPath: string;
 }): Promise<void> {
   const raw = await readFile(input.settingsPath, "utf8");
-  const parsed = (YAML.parse(raw) ?? {}) as Record<string, unknown> & {
-    qmd_graphrag?: {
-      managed_by?: unknown;
-      source_fingerprint?: unknown;
-    };
-  };
+  const parsed = parseManagedSettings(raw);
   const projection = buildGraphRagRuntimeSettingsProjection(input.config);
-  const header = parsed.qmd_graphrag;
-  if (
-    header?.managed_by !== ManagedBy ||
-    header.source_fingerprint !== projection.sourceFingerprint ||
-    createDeterministicHash(parsed) !== createDeterministicHash(projection.settings)
-  ) {
-    throw new Error(
-      "graph_vault/settings.yaml is not the managed projection of .qmd/index.yml",
-    );
-  }
+  if (!isValidManagedProjection(parsed, projection)) throw new Error(ManagedProjectionError);
 }

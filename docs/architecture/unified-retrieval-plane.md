@@ -305,6 +305,10 @@ GraphRAG 失败时不得写入 `graph_query` capability。qmd corpus registratio
 - `bookId`：书级处理身份，由 `sourceHash + sourceIdentityPath` 派生。
 - `sourceIdentityPath`：源文件的 canonical identity locator；参与 `bookId`
   隔离，不参与 `sourceId` 或 `documentId`。
+- `normalizedPath`：本次 book job 的规范化输入 locator，由 EPUB 规范化结果和
+  qmd corpus registration 投影产生；不参与 canonical identity，但参与
+  GraphRAG repair adoption 校验，防止同内容、同书名或 legacy workspace 产物被
+  错配到当前书。
 - `bookDisplaySlug`：书名展示和工作区可读性字段，不参与去重 identity。
 - `contentHash`：规范化文本内容 hash，包含 normalization policy version。
 - `chunkId`：qmd chunk 身份，基于 contentHash、chunk strategy、seq、pos。
@@ -362,14 +366,16 @@ GraphRAG identity projection repair（身份投影修复）规则：
 - repair 必须先通过 `qmd_output_manifest.json`、producer checkpoints、
   artifact manifests、stage fingerprints、provider fingerprint 和
   `metadata.corpusContentHash` 校验。
-- sidecar repair 必须校验 `bookId/sourceId/sourceHash/documentId/contentHash`
-  与当前 job/catalog 一致，且 `graphTextUnitIds` 非空并能在 text units output 中
-  证明存在。
+- sidecar repair 必须校验
+  `bookId/sourceId/sourceHash/documentId/contentHash/normalizedPath` 与当前
+  job/catalog 一致，且 `graphTextUnitIds` 非空并能在 text units output 中证明
+  存在。`normalizedPath` 是 typed locator contract；其 mismatch 表示 sidecar
+  不能被当前书 adoption。
 - sidecar 缺失时，只允许从 parquet 做可证明映射：直接匹配 GraphRAG document
   id，或在单 GraphRAG document output 中 fallback。多 document output 无法唯一
   证明目标 document 时必须 fail-closed，不得按 title、路径、首行或第一行猜测。
-- source/content hash mismatch、混书 output、空 text units、无效 output locator
-  或 producer lineage 不一致时，repair 必须拒绝。
+- source/content hash mismatch、`normalizedPath` mismatch、混书 output、空 text
+  units、无效 output locator 或 producer lineage 不一致时，repair 必须拒绝。
 
 成本去重 key 为：
 
@@ -651,10 +657,20 @@ query:
   `signature`、`secret`、`password`、`credential` 和 `client_secret`。
 - redaction 在持久化前执行，不能只依赖展示层遮盖。
 
-GraphRAG runtime config 是 qmd project config 的投影（projection）。投影文件
-必须带 managed header 和 source fingerprint。fingerprint 不匹配时拒绝运行。
-同一项 provider、model、endpoint 或 reasoning 配置不得在两个文件中手工维护
-为两个来源。
+GraphRAG runtime config 是 qmd project config 的投影（projection）。`.qmd/index.yml`
+是配置事实源，`graph_vault/settings.yaml` 是受管生成物，不是人工维护配置。
+投影文件必须带 managed header 和 source fingerprint。同一项 provider、model、
+endpoint 或 reasoning 配置不得在两个文件中手工维护为两个来源。
+
+settings projection drift 比较必须复用投影 writer 的等价 loader 语义：同一个
+`.qmd/index.yml` 解析入口、默认值填充、环境变量占位保留、排序规则和 canonical
+serialization。比较端不得把 `graph_vault/settings.yaml` 与 GraphRAG default-loaded
+config 或其他隐式默认配置比较。若 source config 有效、目标文件带 qmd managed
+marker 且未被判定为 user-owned settings file，fingerprint mismatch 必须安全重写
+受管投影；否则 fail-closed，返回 machine-readable recovery reason。该修复必须
+幂等：重复同一 `runId` resume 产生相同 projected content、source fingerprint 和
+recovery decision。重写 `settings.yaml` 不得删除、迁移、清空或标记 stale 任何
+`graph_vault/books/<bookId>/output` 下的 book-scoped GraphRAG 产物。
 
 DSPy offline optimization 使用同一个 OpenAI Responses provider projection。
 `qmd dspy optimize-query-prompt` 将 `.qmd/index.yml` 的 `providers.openai` 和
@@ -729,9 +745,20 @@ GraphRAG capability。
   `loadGraphQueryCapabilities` 仍无法返回当前书 `graph_query` capability 时，该失败
   归类为 `graph_query_capability_projection_missing`。恢复只能重建 capability
   projection 并重新运行 `qmd query --graphrag` 检查。
+- 当 `graph_vault/settings.yaml is not the managed projection of .qmd/index.yml`
+  发生时，执行器必须先判定它是否为 settings projection drift。若 `.qmd/index.yml`
+  valid、现有 `settings.yaml` 带 qmd managed marker 且不是 user-owned file，则
+  同一 `runId` 只安全重写 settings projection 并继续当前 `BookResumePlan.nextStage`；
+  不得重跑已完成的 `graph_extract`、`community_report` 或 `embed`，不得清理任何
+  book-scoped output。若缺少 managed marker、source config invalid 或 rewrite 会
+  覆盖 user-owned settings file，则 fail-closed 并记录拒绝原因。
 - identity projection repair 必须写入可观测事件或 recovery summary evidence，
   至少包含 sidecar locator、graph text unit count、复用的 producer run ids、
   reopened checkpoint 或 next stage。
+- settings projection repair 必须写入同一事件/summary 观测面，至少包含
+  `settingsProjectionDecision`、`settingsProjectionRewritten`、
+  `settingsProjectionSourceFingerprint`、project config locator、settings locator、
+  evidence locator、active GraphRAG stage、active command 和 redacted reason。
 - reopened item checkpoint 必须保留 machine-readable repair metadata：
   `reopenedFromStatus`、`reopenedToStatus`、`reopenedFromRecoveryDecision`、
   `repairReason`、`repairFailureText`、`repairedProjection`、
@@ -838,6 +865,12 @@ kind-specific validators 包括：
   book-356ff4920cdf-0bbd8bdb:graph_query`。两者都必须从 persisted
   `stop_until_fixed` checkpoint reopen 到 pending/continue_pending，走正常 resume
   与 command checks，且不得直接 completed。
+- 真实 failure text 回归还必须固定
+  `graph_vault/settings.yaml is not the managed projection of .qmd/index.yml`：
+  valid source config 与 managed settings mismatch 时安全重写投影并幂等 resume；
+  user-owned settings、loader-equivalence mismatch、invalid source config 和重复
+  same runId resume 必须分别有负例或幂等断言。该回归不得删除或污染任何
+  book-scoped GraphRAG output。
 
 ## 提交边界
 

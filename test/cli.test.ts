@@ -17,7 +17,7 @@ import {
   unlinkSync,
 } from "fs";
 import { hostname, tmpdir } from "os";
-import { join, dirname, relative } from "path";
+import { join, dirname, relative, sep } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
@@ -1968,6 +1968,28 @@ describe("GraphRAG EPUB batch runner", () => {
       failureKind: "permanent",
       retryable: false,
     });
+    expect(classifyFailure(
+      "GraphRAG document identity sidecar does not match query_ready",
+    )).toMatchObject({
+      failureKind: "permanent",
+      retryable: false,
+    });
+    expect(classifyFailure(
+      "graph_vault/settings.yaml is not the managed projection of .qmd/index.yml",
+    )).toMatchObject({
+      failureKind: "permanent",
+      retryable: false,
+    });
+    const repairScript = readFileSync(
+      join(projectRoot, "scripts", "graphrag", "resume-book-workspace.mjs"),
+      "utf8",
+    );
+    expect(repairScript).toContain(
+      "graphrag document identity sidecar does not match query_ready",
+    );
+    expect(repairScript).toContain(
+      "graph_vault/settings.yaml is not the managed projection of .qmd/index.yml",
+    );
   });
 
   test("repair-only validates query-ready projection without graph query calls", () => {
@@ -3959,6 +3981,22 @@ describe("GraphRAG EPUB batch runner", () => {
       repairedProjection: "graph_capability",
       evidenceSuffix: "checkpoints.yaml#query_ready",
     },
+    {
+      name: "document identity sidecar mismatch",
+      failureText:
+        "GraphRAG document identity sidecar does not match query_ready",
+      repairReason: "graph_identity_projection_missing",
+      repairedProjection: "document_identity_map",
+      evidenceSuffix: "output/qmd_graph_text_unit_identity.json",
+    },
+    {
+      name: "managed settings projection",
+      failureText:
+        "graph_vault/settings.yaml is not the managed projection of .qmd/index.yml",
+      repairReason: "graph_query_capability_projection_missing",
+      repairedProjection: "graph_capability",
+      evidenceSuffix: "checkpoints.yaml#query_ready",
+    },
   ])("reopens query-ready $name projection gate failures with fixed repair metadata", async ({
     failureText,
     repairReason,
@@ -4074,6 +4112,14 @@ describe("GraphRAG EPUB batch runner", () => {
         "    embed: 'run-embed',",
         "    query_ready: 'run-query-ready',",
         "  },",
+        "  settingsProjectionRepair: {",
+        "    decision: 'already_valid',",
+        "    rewritten: false,",
+        "    sourceFingerprint: 'settings-source-fp',",
+        `    settingsPath: '${join(stateRoot, "settings.yaml")}',`,
+        `    evidenceLocator: '${join(stateRoot, "settings.yaml")}',`,
+        "    reason: 'managed_projection_valid',",
+        "  },",
         "}));",
       ].join("\n"),
     );
@@ -4128,6 +4174,9 @@ describe("GraphRAG EPUB batch runner", () => {
       join(stateRoot, "catalog", "batch-runs", runId, "recovery-summary.json"),
       "utf8",
     ));
+    const redactionRoot = projectRoot.endsWith(sep) ? projectRoot : `${projectRoot}${sep}`;
+    const redactedPath = (path: string) =>
+      path.split(redactionRoot).join("[PROJECT_ROOT]");
     const expectedRepairMetadata = {
       reopenedFromStatus: "failed",
       reopenedToStatus: "pending",
@@ -4143,6 +4192,15 @@ describe("GraphRAG EPUB batch runner", () => {
         query_ready: "run-query-ready",
       },
       normalCommandChecksRequired: true,
+      settingsProjectionDecision: "already_valid",
+      settingsProjectionRewritten: false,
+      settingsProjectionSourceFingerprint: "settings-source-fp",
+      settingsProjectionProjectConfigLocator:
+        redactedPath(join(configDir, "index.yml")),
+      settingsProjectionLocator: redactedPath(join(stateRoot, "settings.yaml")),
+      settingsProjectionEvidenceLocator:
+        redactedPath(join(stateRoot, "settings.yaml")),
+      settingsProjectionReason: "managed_projection_valid",
     };
 
     expect(result.exitCode).not.toBe(0);
@@ -4472,6 +4530,279 @@ describe("GraphRAG EPUB batch runner", () => {
       event.event === "item_failed_not_retryable" &&
       event.itemId === itemId
     )).toBe(true);
+  });
+
+  test("settings projection rejection is observable in checkpoint events and summary", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-settings-reject-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "settings-projection-reject";
+    const sourceBytes = "settings projection rejection";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    const sourcePath = join(sourceDir, "Book.epub");
+    const normalizedPath = join(
+      stateRoot,
+      "input",
+      `book-${sourceHash.slice(0, 10)}.md`,
+    );
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(dirname(normalizedPath), { recursive: true });
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(normalizedPath, "# Book\n\nSettings rejection fixture.\n");
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const resumeScript = join(tmpRoot, "fake-settings-reject-resume.mjs");
+    await writeFile(
+      resumeScript,
+      [
+        "console.error(",
+        "  'Error: graph_vault/settings.yaml is not the managed projection of .qmd/index.yml',",
+        ");",
+        "process.exit(1);",
+      ].join("\n"),
+    );
+
+    const result = await new Promise<{ stderr: string; exitCode: number | null }>(
+      (resolveResult) => {
+        const proc = spawn(process.execPath, [
+          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+          "--source-dir",
+          sourceDir,
+          "--state-root",
+          stateRoot,
+          "--log-root",
+          logRoot,
+          "--config",
+          join(configDir, "index.yml"),
+          "--qmd-index-path",
+          join(tmpRoot, "index.sqlite"),
+          "--run-id",
+          runId,
+          "--skip-dotenv",
+          "--max-resume-passes",
+          "1",
+        ], {
+          env: {
+            ...process.env,
+            QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+            QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
+          },
+        });
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+        proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+      },
+    );
+
+    const checkpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      "utf8",
+    ));
+    const events = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
+      "utf8",
+    ).trim().split("\n").map((line) => JSON.parse(line));
+    const summary = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "recovery-summary.json"),
+      "utf8",
+    ));
+    const commandFailed = events.find((event) =>
+      event.event === "command_failed" && event.itemId === itemId
+    );
+    const commandExhausted = events.find((event) =>
+      event.event === "command_attempt_budget_exhausted" && event.itemId === itemId
+    );
+    const itemFailed = events.find((event) =>
+      event.event === "item_failed" && event.itemId === itemId
+    );
+    const settingsSourceFingerprint = createHash("sha256")
+      .update(JSON.stringify({
+        embedding: {},
+        graphrag: {},
+        models: {},
+        providers: {},
+        query: {},
+      }))
+      .digest("hex");
+    await rm(tmpRoot, { recursive: true, force: true });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toBe("");
+    expect(checkpoint).toMatchObject({
+      status: "failed",
+      recoveryDecision: "stop_until_fixed",
+      metadata: {
+        settingsProjectionDecision: "rejected_user_owned",
+        settingsProjectionRewritten: false,
+        settingsProjectionSourceFingerprint: settingsSourceFingerprint,
+        settingsProjectionReason:
+          "settings_projection_rejected_user_owned_or_invalid",
+      },
+    });
+    expect(commandFailed?.metadata).toMatchObject({
+      settingsProjectionDecision: "rejected_user_owned",
+      settingsProjectionRewritten: false,
+      settingsProjectionSourceFingerprint: settingsSourceFingerprint,
+      settingsProjectionReason:
+        "settings_projection_rejected_user_owned_or_invalid",
+    });
+    expect(commandExhausted?.metadata).toMatchObject({
+      settingsProjectionDecision: "rejected_user_owned",
+      settingsProjectionRewritten: false,
+      settingsProjectionSourceFingerprint: settingsSourceFingerprint,
+      settingsProjectionReason:
+        "settings_projection_rejected_user_owned_or_invalid",
+    });
+    expect(itemFailed?.metadata).toMatchObject({
+      activeCommand: "resume-book-1",
+      command: "resume-book-1",
+      settingsProjectionDecision: "rejected_user_owned",
+      settingsProjectionSourceFingerprint: settingsSourceFingerprint,
+    });
+    expect(summary.items[0]).toMatchObject({
+      status: "failed",
+      activeCommand: "repair-local-artifact-gate-1",
+      settingsProjectionDecision: "rejected_user_owned",
+      settingsProjectionRewritten: false,
+      settingsProjectionSourceFingerprint: settingsSourceFingerprint,
+      settingsProjectionProjectConfigLocator: join(configDir, "index.yml"),
+      settingsProjectionLocator: join(stateRoot, "settings.yaml"),
+      settingsProjectionEvidenceLocator: join(stateRoot, "settings.yaml"),
+      settingsProjectionReason:
+        "settings_projection_rejected_user_owned_or_invalid",
+    });
+  });
+
+  test("invalid source settings projection rejection is observable", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-settings-invalid-source-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "settings-projection-invalid-source";
+    const sourceBytes = "settings projection invalid source";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    const sourcePath = join(sourceDir, "Book.epub");
+    const normalizedPath = join(
+      stateRoot,
+      "input",
+      `book-${sourceHash.slice(0, 10)}.md`,
+    );
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(dirname(normalizedPath), { recursive: true });
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(normalizedPath, "# Book\n\nInvalid source fixture.\n");
+    await writeFile(
+      join(configDir, "index.yml"),
+      [
+        "collections: {}",
+        "providers:",
+        "  jina:",
+        "    embedding_profile: audio",
+      ].join("\n"),
+    );
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const resumeScript = join(tmpRoot, "fake-settings-invalid-source-resume.mjs");
+    await writeFile(
+      resumeScript,
+      [
+        "console.error(",
+        "  \"TypeError: Cannot read properties of undefined (reading 'queryTask')\",",
+        ");",
+        "process.exit(1);",
+      ].join("\n"),
+    );
+
+    const result = await new Promise<{ stderr: string; exitCode: number | null }>(
+      (resolveResult) => {
+        const proc = spawn(process.execPath, [
+          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+          "--source-dir",
+          sourceDir,
+          "--state-root",
+          stateRoot,
+          "--log-root",
+          logRoot,
+          "--config",
+          join(configDir, "index.yml"),
+          "--qmd-index-path",
+          join(tmpRoot, "index.sqlite"),
+          "--run-id",
+          runId,
+          "--skip-dotenv",
+          "--max-resume-passes",
+          "1",
+        ], {
+          env: {
+            ...process.env,
+            QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+            QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
+          },
+        });
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+        proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+      },
+    );
+
+    const checkpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      "utf8",
+    ));
+    const events = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
+      "utf8",
+    ).trim().split("\n").map((line) => JSON.parse(line));
+    const summary = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "recovery-summary.json"),
+      "utf8",
+    ));
+    const itemFailed = events.find((event) =>
+      event.event === "item_failed" && event.itemId === itemId
+    );
+    const settingsSourceFingerprint = createHash("sha256")
+      .update(JSON.stringify({
+        embedding: {},
+        graphrag: {},
+        models: {},
+        providers: { jina: { embedding_profile: "audio" } },
+        query: {},
+      }))
+      .digest("hex");
+    await rm(tmpRoot, { recursive: true, force: true });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toBe("");
+    expect(checkpoint.metadata).toMatchObject({
+      settingsProjectionDecision: "rejected_invalid_source",
+      settingsProjectionRewritten: false,
+      settingsProjectionSourceFingerprint: settingsSourceFingerprint,
+      settingsProjectionReason: "settings_projection_rejected_invalid_source",
+    });
+    expect(itemFailed?.metadata).toMatchObject({
+      activeCommand: "resume-book-1",
+      settingsProjectionDecision: "rejected_invalid_source",
+      settingsProjectionSourceFingerprint: settingsSourceFingerprint,
+    });
+    expect(summary.items[0]).toMatchObject({
+      status: "failed",
+      settingsProjectionDecision: "rejected_invalid_source",
+      settingsProjectionRewritten: false,
+      settingsProjectionSourceFingerprint: settingsSourceFingerprint,
+      settingsProjectionProjectConfigLocator: join(configDir, "index.yml"),
+      settingsProjectionEvidenceLocator: join(configDir, "index.yml"),
+      settingsProjectionReason: "settings_projection_rejected_invalid_source",
+    });
   });
 
   test("blocks repaired local projection output that lacks required metadata", async () => {

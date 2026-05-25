@@ -348,7 +348,16 @@ export function batchRecoverySummaryEnvelopeFixture() {
         nextRetryAt: "2026-05-23T00:05:00.000Z",
         retryDelaySeconds: 180,
         retryBudgetSeconds: 7200,
+        currentCommand: "resume-book-1",
+        activeCommand: "resume-book-1",
         waitingForProviderRecovery: true,
+        settingsProjectionDecision: "rewritten",
+        settingsProjectionRewritten: true,
+        settingsProjectionSourceFingerprint: "settings-fp",
+        settingsProjectionProjectConfigLocator: ".qmd/index.yml",
+        settingsProjectionLocator: "graph_vault/settings.yaml",
+        settingsProjectionEvidenceLocator: "graph_vault/settings.yaml",
+        settingsProjectionReason: "managed_projection_rewritten",
         errorSummary: "Error code: 503 - Service temporarily unavailable",
       }],
     },
@@ -1658,6 +1667,14 @@ describe("Data bus contracts", () => {
     );
     expect(parsedRecoverySummary.recoveryDecision).toBe("retry_same_run_id");
     expect(parsedRecoverySummary.items[0]?.retryAfterSeconds).toBe(180);
+    expect(parsedRecoverySummary.items[0]?.activeCommand)
+      .toBe("resume-book-1");
+    expect(parsedRecoverySummary.items[0]?.settingsProjectionDecision)
+      .toBe("rewritten");
+    expect(parsedRecoverySummary.items[0]?.settingsProjectionRewritten)
+      .toBe(true);
+    expect(parsedRecoverySummary.items[0]?.settingsProjectionSourceFingerprint)
+      .toBe("settings-fp");
     expect(parsedRecoverySummary.retryPolicy.heartbeatIntervalSeconds)
       .toBeUndefined();
   });

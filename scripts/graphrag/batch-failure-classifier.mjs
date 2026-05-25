@@ -163,6 +163,8 @@ export function isLocalArtifactGateFailureText(text) {
     message.includes("corpus_content_hash_mismatch") ||
     message.includes("artifact_not_book_scoped_graph_output") ||
     message.includes("graphrag document identity is missing for query_ready") ||
+    message.includes("graphrag document identity sidecar does not match query_ready") ||
+    message.includes("graph_vault/settings.yaml is not the managed projection of .qmd/index.yml") ||
     message.includes("capabilityscope references unknown or not-ready graphcapabilityid") ||
     message.includes("no graph_query capability is ready for book")
   );

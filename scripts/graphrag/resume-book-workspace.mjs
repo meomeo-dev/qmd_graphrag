@@ -43,7 +43,6 @@ async function importRuntime() {
     loadGraphQueryCapabilities: indexModule.loadGraphQueryCapabilities,
     syncGraphRagBookWorkspace: indexModule.syncGraphRagBookWorkspace,
     writeGraphRagOutputProducerManifest: indexModule.writeGraphRagOutputProducerManifest,
-    writeManagedGraphRagSettings: indexModule.writeManagedGraphRagSettings,
     loadConfig: collectionsModule.loadConfig,
     setConfigSource: collectionsModule.setConfigSource,
     sanitizeVaultText: metadataModule.sanitizeVaultText,
@@ -249,6 +248,8 @@ function isLocalArtifactGateError(value) {
     message.includes("corpus_content_hash_mismatch") ||
     message.includes("artifact_not_book_scoped_graph_output") ||
     message.includes("graphrag document identity is missing for query_ready") ||
+    message.includes("graphrag document identity sidecar does not match query_ready") ||
+    message.includes("graph_vault/settings.yaml is not the managed projection of .qmd/index.yml") ||
     message.includes("capabilityscope references unknown or not-ready graphcapabilityid") ||
     message.includes("no graph_query capability is ready for book")
   );
@@ -526,6 +527,19 @@ async function syncCurrentBook(
   return { sync, scopedInputDir, scopedOutputDir };
 }
 
+function settingsProjectionRepairForOutput(sync) {
+  const repair = sync.settingsProjectionRepair;
+  if (repair == null) return undefined;
+  return {
+    decision: repair.decision,
+    rewritten: repair.rewritten,
+    sourceFingerprint: repair.sourceFingerprint,
+    settingsPath: repair.settingsPath,
+    evidenceLocator: repair.evidenceLocator,
+    reason: repair.reason,
+  };
+}
+
 async function refreshOutputProducerManifestFromCheckpoints(
   runtimeApi,
   repo,
@@ -652,10 +666,6 @@ async function repairLocalArtifactGateFailureIfPossible({
 async function runRepairLocalArtifactGateOnly(runtimeApi, repo) {
   runtimeApi.setConfigSource({ configPath });
   const projectConfig = runtimeApi.loadConfig();
-  await runtimeApi.writeManagedGraphRagSettings({
-    config: projectConfig,
-    graphVault: stateRoot,
-  });
   const { sourcePath, sourceIdentityPath, normalizedPath } =
     await resolveWorkspaceInputs();
   const sourceHash = await runtimeApi.hashFile(sourcePath);
@@ -674,6 +684,7 @@ async function runRepairLocalArtifactGateOnly(runtimeApi, repo) {
       queryResult: null,
       repairOnly: true,
       repairedLocalArtifactGate: false,
+      settingsProjectionRepair: undefined,
       reason: "book state not found for local artifact gate repair",
     });
     return;
@@ -692,6 +703,7 @@ async function runRepairLocalArtifactGateOnly(runtimeApi, repo) {
       queryResult: null,
       repairOnly: true,
       repairedLocalArtifactGate: false,
+      settingsProjectionRepair: undefined,
       reason: "local artifact gate failure checkpoint not found",
     });
     return;
@@ -848,6 +860,7 @@ async function runRepairLocalArtifactGateOnly(runtimeApi, repo) {
     reusedProducerRunIds: producerRunIds,
     repairedCheckpointStages,
     repairedFailedStage: checkpoint?.stage,
+    settingsProjectionRepair: settingsProjectionRepairForOutput(sync),
   });
 }
 
@@ -863,10 +876,6 @@ async function run() {
 
   runtimeApi.setConfigSource({ configPath });
   const projectConfig = runtimeApi.loadConfig();
-  await runtimeApi.writeManagedGraphRagSettings({
-    config: projectConfig,
-    graphVault: stateRoot,
-  });
   const { sourcePath, sourceIdentityPath, normalizedPath } =
     await resolveWorkspaceInputs();
   let {
@@ -913,6 +922,7 @@ async function run() {
       queryResult: null,
       repairOnly: true,
       repairedLocalArtifactGate,
+      settingsProjectionRepair: settingsProjectionRepairForOutput(sync),
       reason: repairedLocalArtifactGate || nextStage == null
         ? undefined
         : "local artifact gate repair did not complete the next stage",
@@ -952,6 +962,7 @@ async function run() {
       nextStage: null,
       completedStages: sync.resumePlan.completedStages,
       queryResult,
+      settingsProjectionRepair: settingsProjectionRepairForOutput(sync),
     });
     return;
   }
@@ -1046,6 +1057,7 @@ async function run() {
       nextStage: refreshed.resumePlan.nextStage,
       completedStages: refreshed.resumePlan.completedStages,
       queryResult: null,
+      settingsProjectionRepair: settingsProjectionRepairForOutput(refreshed),
     });
     return;
   }
@@ -1058,6 +1070,7 @@ async function run() {
       nextStage,
       completedStages: sync.resumePlan.completedStages,
       queryResult: null,
+      settingsProjectionRepair: settingsProjectionRepairForOutput(sync),
       reason: `${nextStage} is a qmd_graphrag workspace materialization stage; rerun with valid --source-path and --normalized-path before GraphRAG workflows`,
     });
     return;
@@ -1195,6 +1208,7 @@ async function run() {
       completedStages: refreshed.resumePlan.completedStages,
       outputs: indexResult.outputs,
       queryResult,
+      settingsProjectionRepair: settingsProjectionRepairForOutput(refreshed),
     });
   } catch (error) {
     await repo.failStage({

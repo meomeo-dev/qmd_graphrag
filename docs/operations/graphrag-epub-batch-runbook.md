@@ -31,7 +31,10 @@ graph_vault/catalog/batch-runs/<runId>/
 - `events.jsonl`：`BatchEventLog`，逐行记录 batch/item/command 事件。
 - `recovery-summary.json`：批次观测摘要，记录每本书的 qmd/GraphRAG
   构建状态、GraphRAG query 检查状态、失败分类、下一次重试时间
-  （next retry time）和恢复决策。
+  （next retry time）和恢复决策。发生 settings projection repair 时，摘要还必须
+  记录 rewrite/reject decision、source fingerprint、project config locator、
+  settings locator、evidence locator、active stage、active command 和 redacted
+  reason。
 
 状态取值：
 
@@ -93,6 +96,18 @@ query-ready / graph-query readiness gate 已被当前代码分类为可低成本
 - `reusedProducerRunIds`：`graph_extract`、`community_report` 和 `embed` run ids。
 - `normalCommandChecksRequired`：固定为 `true`，表示 reopen 不等于 completed。
 
+settings projection drift 使用同一 metadata/summary 投影面。真实失败文本
+`graph_vault/settings.yaml is not the managed projection of .qmd/index.yml` 被分类为
+`settings_projection_drift` 时，执行器必须使用与
+`src/graphrag/settings-projection.ts` writer 等价的 loader 重新计算受管投影。若
+`.qmd/index.yml` 有效、`settings.yaml` 带 qmd managed marker 且不是 user-owned
+file，则 atomic rewrite `graph_vault/settings.yaml` 并继续当前
+`BookResumePlan.nextStage`。若 source config invalid、缺少 managed marker 或会覆盖
+user-owned file，则 fail-closed 并保留 redacted reason。重复同一 `runId` resume
+必须幂等；第二次运行应观察到同一 fingerprint 和 projected content，不重复写入。
+该修复不得删除、迁移、清空或标记 stale 任何
+`graph_vault/books/<bookId>/output` 产物。
+
 `events.jsonl` 和 `recovery-summary.json` 必须投影同一事实，操作者不应通过 raw
 logs 才能判断为何从 `stop_until_fixed` 重新进入 pending repair。
 
@@ -143,6 +158,10 @@ runId 恢复；缺失/不完整证据或非 transient command check 降级为
   `graphTextUnitIds`。若 `qmd_graph_text_unit_identity.json` 已存在但 catalog
   缺少这些 graph fields，恢复必须先校验 sidecar 与 output manifest，再低成本修复
   catalog projection。
+- identity sidecar adoption 还必须校验
+  `bookId/sourceId/sourceHash/documentId/contentHash/normalizedPath` 均与当前
+  book job、qmd corpus registration 和 `qmd_output_manifest.json` 一致。
+  `normalizedPath` mismatch 必须 fail-closed，不能按 title、路径片段或首行猜测。
 - 历史 checkpoint 若因
   `GraphRAG document identity is missing for query_ready` 或
   `capabilityScope references unknown or not-ready graphCapabilityId(s)` 停在
@@ -162,11 +181,17 @@ runId 恢复；缺失/不完整证据或非 transient command check 降级为
   book-356ff4920cdf-0bbd8bdb:graph_query`：仅在 validated `query_ready` lineage、
   artifact lineage 和 document identity 均有效时，重建 graph capability
   projection，并重新运行 `qmd query --graphrag` command check。
+- `graph_vault/settings.yaml is not the managed projection of .qmd/index.yml`：
+  valid source config 与 managed settings mismatch 时安全重写受管投影，并继续
+  当前 `BookResumePlan`；user-owned settings、invalid source config、default-loaded
+  config 比较错误和重复 same-runId resume 必须分别有负例或幂等断言。
 - 两个回归都必须断言 `graph_extract`、`community_report`、`embed` producer
-  run ids 不变，且 checkpoint 未被直接写成 `completed`。
+  run ids 不变，且 checkpoint 未被直接写成 `completed`。settings projection
+  回归还必须断言 book-scoped GraphRAG output 未被删除或标记 stale。
 - 负例必须证明 provider/network failure、mixed-book output、stale sidecar、
-  source/content mismatch、missing producer lineage 和 incomplete artifacts 不会
-  被本地 projection reopen。
+  source/content mismatch、normalizedPath mismatch、missing producer lineage、
+  incomplete artifacts、user-owned settings 和 invalid source config 不会被本地
+  projection reopen 或 unsafe rewrite。
 
 ## Provider 限流与重试
 
@@ -242,6 +267,8 @@ GraphRAG 输出生产者 manifest 必须保存在每本书的 book-scoped output
 - `qmd_graph_text_unit_identity.json` 是 GraphRAG documents/text units 的可验证
   repair evidence，不是 capability 发布事实源。`query_ready` 发布仍以
   `document-identity-map.yaml` 为读取源。
+- sidecar repair 必须校验 `normalizedPath`。该字段是 normalized input locator
+  contract，不参与 canonical identity，但决定当前 sidecar 能否被当前书 adoption。
 - 有效 book-scoped output、producer lineage、qmd corpus registration 与 identity
   sidecar 已存在，但 catalog 缺失或陈旧时，失败归类为
   `graph_identity_projection_missing`。同一 runId resume 只补 catalog projection
