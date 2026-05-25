@@ -244,6 +244,7 @@ export function batchItemCheckpointEnvelopeFixture() {
       nextRetryAt: "2026-05-23T00:05:00.000Z",
       retryDelaySeconds: 180,
       errorSummary: "Error code: 503 - Service temporarily unavailable",
+      maxProviderRecoveryWaits: 3,
       commandChecks: [{
         name: "resume-book-1",
         status: "failed",
@@ -257,6 +258,7 @@ export function batchItemCheckpointEnvelopeFixture() {
         retryable: true,
         attemptExhausted: true,
         providerStatusCode: 503,
+        retryAfterSeconds: 180,
         recoveryDecision: "retry_same_run_id",
         errorSummary: "Error code: 503 - Service temporarily unavailable",
       }],
@@ -280,6 +282,7 @@ export function batchEventLogEnvelopeFixture() {
       retryable: true,
       attemptExhausted: false,
       providerStatusCode: 503,
+      retryAfterSeconds: 180,
       recoveryDecision: "retry_same_run_id",
       failedStage: "resume-book-1",
       at: "2026-05-23T00:01:00.000Z",
@@ -337,6 +340,7 @@ export function batchRecoverySummaryEnvelopeFixture() {
         recoveryDecision: "retry_same_run_id",
         failedStage: "resume-book-1",
         providerStatusCode: 503,
+        retryAfterSeconds: 180,
         nextRetryAt: "2026-05-23T00:05:00.000Z",
         retryDelaySeconds: 180,
         retryBudgetSeconds: 7200,
@@ -1394,6 +1398,7 @@ describe("Data bus contracts", () => {
       checkpoint: legacy,
       expectedCommandCheckCount: 27,
       maxCommandAttempts: 3,
+      maxProviderRecoveryWaits: 3,
       defaultBookId: "book-legacy",
     });
     expect(hydrated).toMatchObject({
@@ -1403,12 +1408,13 @@ describe("Data bus contracts", () => {
       failedStage: "resume-book-1",
       expectedCommandCheckCount: 27,
       maxCommandAttempts: 3,
+      maxProviderRecoveryWaits: 3,
+      retryExhausted: false,
     });
-    expect(hydrated.retryExhausted).toBeUndefined();
     expect(hydrated.commandChecks[0]).toMatchObject({
       failureKind: "transient",
       retryable: true,
-      attemptExhausted: true,
+      attemptExhausted: false,
       providerStatusCode: 503,
     });
   });
@@ -1432,11 +1438,16 @@ describe("Data bus contracts", () => {
     expect(BatchItemCheckpointSchema.parse(checkpointEnvelope.payload).retryable)
       .toBe(true);
     expect(eventEnvelope.kind).toBe("qmd.batch_run.event_log");
-    expect(BatchEventLogSchema.parse(eventEnvelope.payload).failedStage)
+    const parsedEvent = BatchEventLogSchema.parse(eventEnvelope.payload);
+    expect(parsedEvent.failedStage)
       .toBe("resume-book-1");
+    expect(parsedEvent.retryAfterSeconds).toBe(180);
     expect(recoverySummaryEnvelope.kind).toBe("qmd.batch_run.recovery_summary");
-    expect(BatchRecoverySummarySchema.parse(recoverySummaryEnvelope.payload)
-      .recoveryDecision).toBe("retry_same_run_id");
+    const parsedRecoverySummary = BatchRecoverySummarySchema.parse(
+      recoverySummaryEnvelope.payload,
+    );
+    expect(parsedRecoverySummary.recoveryDecision).toBe("retry_same_run_id");
+    expect(parsedRecoverySummary.items[0]?.retryAfterSeconds).toBe(180);
   });
 
   test("rejects non-portable batch locators", () => {

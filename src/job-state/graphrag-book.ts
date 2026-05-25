@@ -1217,20 +1217,81 @@ function gateArtifactsForProducerRun(
     .filter((artifact) => requiredKindSet.has(artifact.kind));
 }
 
+function gateArtifactsForStageReadiness(input: {
+  artifacts: readonly BookArtifactManifest[];
+  stage: BookStage;
+  producerRunId: string;
+  requiredKinds: readonly BookArtifactKind[];
+  expectedProducerRunIds?: Partial<Record<BookStage, string>>;
+}): BookArtifactManifest[] {
+  if (input.stage !== "query_ready") {
+    return gateArtifactsForProducerRun(
+      input.artifacts,
+      input.stage,
+      input.producerRunId,
+      input.requiredKinds,
+    );
+  }
+  const requiredKindSet = new Set<BookArtifactKind>(input.requiredKinds);
+  const communityReportRunId = input.expectedProducerRunIds?.community_report;
+  const embedRunId = input.expectedProducerRunIds?.embed;
+  return input.artifacts.filter((artifact) =>
+    requiredKindSet.has(artifact.kind) &&
+    (
+      (
+        artifact.stage === "community_report" &&
+        artifact.producerRunId === communityReportRunId
+      ) ||
+      (
+        artifact.stage === "embed" &&
+        artifact.producerRunId === embedRunId
+      )
+    )
+  );
+}
+
 export async function assertGraphRagStageArtifactsReady(input: {
   stateRootDir: string;
   bookId: string;
   stage: BookStage;
   producerRunId: string;
   artifacts: readonly BookArtifactManifest[];
+  expectedProducerRunIds?: Partial<Record<BookStage, string>>;
+  expectedStageFingerprints?: Partial<Record<BookStage, string>>;
+  expectedProviderFingerprint?: string;
+  expectedCorpusContentHash?: string;
 }): Promise<string[]> {
   const requiredKinds = GRAPH_RAG_STAGE_ARTIFACT_REQUIREMENTS[input.stage] ?? [];
-  const stageArtifacts = gateArtifactsForProducerRun(
-    input.artifacts,
-    input.stage,
-    input.producerRunId,
+  const expectedProducerRunIds = input.stage === "query_ready"
+    ? input.expectedProducerRunIds
+    : { [input.stage]: input.producerRunId };
+  if (input.stage === "query_ready") {
+    if (
+      expectedProducerRunIds?.community_report == null ||
+      expectedProducerRunIds?.embed == null
+    ) {
+      throw new Error(
+        "query_ready artifact readiness requires completed GraphRAG producer run ids",
+      );
+    }
+    if (
+      input.expectedStageFingerprints?.community_report == null ||
+      input.expectedStageFingerprints?.embed == null ||
+      input.expectedProviderFingerprint == null ||
+      input.expectedCorpusContentHash == null
+    ) {
+      throw new Error(
+        "query_ready artifact readiness requires producer lineage fingerprints",
+      );
+    }
+  }
+  const stageArtifacts = gateArtifactsForStageReadiness({
+    artifacts: input.artifacts,
+    stage: input.stage,
+    producerRunId: input.producerRunId,
     requiredKinds,
-  );
+    expectedProducerRunIds,
+  });
   const validation = await validateBookArtifactSet({
     graphVault: input.stateRootDir,
     bookId: input.bookId,
@@ -1238,6 +1299,16 @@ export async function assertGraphRagStageArtifactsReady(input: {
     artifacts: input.artifacts,
     requiredKinds,
     allowedKinds: requiredKinds,
+    requireBookScopedGraphOutput: input.stage === "query_ready" ||
+      requiredKinds.some((kind) =>
+        kind === "graphrag_community_reports_parquet" ||
+        kind === "lancedb_index" ||
+        kind.startsWith("graphrag_")
+      ),
+    expectedProducerRunIds,
+    expectedStageFingerprints: input.expectedStageFingerprints,
+    expectedProviderFingerprint: input.expectedProviderFingerprint,
+    expectedCorpusContentHash: input.expectedCorpusContentHash,
   });
   if (!validation.isSatisfied) {
     throw new Error(

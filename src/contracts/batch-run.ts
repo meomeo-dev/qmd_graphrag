@@ -215,6 +215,7 @@ export const BatchRecoverySummaryItemSchema = z.object({
   recoveryDecision: BatchRecoveryDecisionSchema.optional(),
   failedStage: z.string().min(1).optional(),
   providerStatusCode: z.number().int().positive().optional(),
+  retryAfterSeconds: z.number().int().nonnegative().optional(),
   nextRetryAt: z.string().datetime().optional(),
   retryDelaySeconds: z.number().int().nonnegative().optional(),
   retryBudgetSeconds: z.number().int().positive().optional(),

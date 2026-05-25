@@ -338,6 +338,7 @@ typed_buses:
           - failureKind
           - retryable
           - providerStatusCode
+          - retryAfterSeconds
           - recoveryDecision
           - failedStage
       - name: batch_recovery_summary
@@ -355,6 +356,7 @@ typed_buses:
           - graphBuildStatus
           - graphQueryStatus
           - providerStatusCode
+          - retryAfterSeconds
           - recoveryDecision
           - failedStage
 
@@ -1610,10 +1612,17 @@ state_and_recovery:
       graphBuildStatus.status=succeeded, and graphQueryStatus.status=succeeded.
     command_check_failure_rule: >-
       Failed commandChecks carry failureKind, retryable, providerStatusCode
-      when available, attemptExhausted, the failed command name, and
+      and retryAfterSeconds when available, attemptExhausted, the failed
+      command name, and
       recoveryDecision. Command retry exhaustion records command-level
       exhaustion only; transient book-level recovery remains represented on
       the item checkpoint as retry_same_run_id.
+    recovery_summary_projection_rule: >-
+      batch_recovery_summary is an operator-facing projection. It reads
+      providerStatusCode and retryAfterSeconds from the latest failed
+      commandCheck, waitingForProviderRecovery from checkpoint metadata, and
+      qmd/GraphRAG build status from recomputed evidence. It must not become
+      a second source of truth for checkpoint state.
     transient_failure_policy: >-
       429, concurrency limit, timeout, and 5xx provider failures are retried
       with bounded backoff. When the short retry budget elapses, the current

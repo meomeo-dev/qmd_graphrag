@@ -5,6 +5,13 @@ export function classifyFailure(text) {
   const retryAfterSeconds = retryAfterMatch
     ? Number.parseInt(retryAfterMatch[1], 10)
     : undefined;
+  if (isLocalArtifactGateFailureText(message)) {
+    return {
+      failureKind: "permanent",
+      retryable: false,
+      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+    };
+  }
   if (
     providerStatusCode === 429 ||
     (providerStatusCode != null &&
@@ -27,26 +34,6 @@ export function classifyFailure(text) {
       failureKind: "permanent",
       retryable: false,
       providerStatusCode,
-      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
-    };
-  }
-  const localArtifactGateFailure =
-    message.includes("missingartifactkinds") ||
-    message.includes("missing artifact kinds") ||
-    message.includes("missingartifactids") ||
-    message.includes("missing artifact ids") ||
-    message.includes("invalidartifacts") ||
-    message.includes("invalid artifacts") ||
-    message.includes("did not produce valid book-scoped artifacts") ||
-    message.includes("producer_run_id_mismatch") ||
-    message.includes("stage_fingerprint_mismatch") ||
-    message.includes("provider_fingerprint_mismatch") ||
-    message.includes("corpus_content_hash_mismatch") ||
-    message.includes("artifact_not_book_scoped_graph_output");
-  if (localArtifactGateFailure) {
-    return {
-      failureKind: "permanent",
-      retryable: false,
       ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
     };
   }
@@ -91,6 +78,34 @@ export function classifyFailure(text) {
     retryable: false,
     ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
   };
+}
+
+export function isLocalArtifactGateFailureText(text) {
+  const message = String(text ?? "").toLowerCase();
+  return (
+    message.includes("missingartifactkinds") ||
+    message.includes("missing artifact kinds") ||
+    message.includes("missingartifactids") ||
+    message.includes("missing artifact ids") ||
+    message.includes("invalidartifacts") ||
+    message.includes("invalid artifacts") ||
+    message.includes("did not produce valid book-scoped artifacts") ||
+    message.includes("stage_artifact_") ||
+    message.includes("graph_output_producer_") ||
+    message.includes("bootstrap_stage_requires_real_rebuild") ||
+    message.includes("real_graphrag_stage_missing") ||
+    message.includes("artifact_identity_mismatch") ||
+    message.includes("artifact_stage_mismatch") ||
+    message.includes("artifact_kind_not_allowed") ||
+    message.includes("content_hash_mismatch") ||
+    message.includes("parquet_") ||
+    message.includes("lancedb_") ||
+    message.includes("producer_run_id_mismatch") ||
+    message.includes("stage_fingerprint_mismatch") ||
+    message.includes("provider_fingerprint_mismatch") ||
+    message.includes("corpus_content_hash_mismatch") ||
+    message.includes("artifact_not_book_scoped_graph_output")
+  );
 }
 
 function extractProviderStatusCode(message) {

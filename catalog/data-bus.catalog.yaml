@@ -61,8 +61,8 @@ types:
     notes:
       - stores redacted event summaries
       - redacts URL userinfo and URL query credentials before persistence
-      - records failureKind, retryable, failedStage, providerStatusCode, and
-        recoveryDecision
+      - records failureKind, retryable, failedStage, providerStatusCode,
+        retryAfterSeconds, and recoveryDecision
       - raw stdout, stderr, and GraphRAG report logs stay in temporary run logs
       - operators and audits consume this JSONL as a persisted record
 
@@ -89,6 +89,13 @@ types:
         than persisted status strings
       - exposes providerStatusCode when the failed command came from an
         upstream provider or gateway response
+      - exposes retryAfterSeconds from the latest failed command when the
+        upstream response supplies Retry-After
+      - exposes waitingForProviderRecovery as a projection from checkpoint
+        metadata, not as an independent item state
+      - providerStatusCode and retryAfterSeconds are projections from failed
+        commandChecks; checkpoint top-level fields remain the recovery state
+        source of truth
       - status-json emits the same typed payload without running work
 
   - name: source_document

@@ -2133,7 +2133,7 @@ describe("FileBookJobStateRepository", () => {
       await mkdir(join(graphVault, "books", jobA.bookId, "output"), {
         recursive: true,
       });
-      await writeFile(reportsA, "reports-a", "utf8");
+      await writeMinimalParquetFixture(reportsA);
       await writeCompleteLanceDbFixture(lancedbA);
       const artifactsA = await repo.recordArtifacts(jobA.bookId, [
         {

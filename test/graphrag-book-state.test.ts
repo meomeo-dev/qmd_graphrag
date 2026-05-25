@@ -1141,9 +1141,44 @@ describe("syncGraphRagBookWorkspace", () => {
       const capabilities = await new FileBookJobStateRepository(graphVault)
         .listStageCheckpoints(state.job.bookId);
       const queryReady = capabilities.find((item) => item.stage === "query_ready");
+      const queryReadyArtifactIds = await assertGraphRagStageArtifactsReady({
+        stateRootDir: graphVault,
+        bookId: syncedArtifacts.job.bookId,
+        stage: "query_ready",
+        producerRunId: "real-query-ready",
+        artifacts: syncedArtifacts.artifacts,
+        expectedProducerRunIds: {
+          community_report: "real-community-report",
+          embed: "real-embed",
+        },
+        expectedStageFingerprints: syncedArtifacts.stageFingerprints,
+        expectedProviderFingerprint: syncedArtifacts.job.providerFingerprint,
+        expectedCorpusContentHash:
+          syncedArtifacts.job.normalizedContentHash ?? syncedArtifacts.job.sourceHash,
+      });
 
       expect(state.resumePlan.canQuery).toBe(true);
       expect(queryReady?.artifactIds).toHaveLength(2);
+      expect(queryReadyArtifactIds).toEqual(expect.arrayContaining(
+        queryReady?.artifactIds ?? [],
+      ));
+      await expect(assertGraphRagStageArtifactsReady({
+        stateRootDir: graphVault,
+        bookId: syncedArtifacts.job.bookId,
+        stage: "query_ready",
+        producerRunId: "real-query-ready",
+        artifacts: syncedArtifacts.artifacts,
+        expectedProducerRunIds: {
+          community_report: "old-community-report",
+          embed: "real-embed",
+        },
+        expectedStageFingerprints: syncedArtifacts.stageFingerprints,
+        expectedProviderFingerprint: syncedArtifacts.job.providerFingerprint,
+        expectedCorpusContentHash:
+          syncedArtifacts.job.normalizedContentHash ?? syncedArtifacts.job.sourceHash,
+      })).rejects.toThrow(
+        "GraphRAG stage did not produce valid book-scoped artifacts",
+      );
       const qmdStore = createStore(join(root, ".qmd", "index.sqlite"));
       try {
         const row = qmdStore.db.prepare(`

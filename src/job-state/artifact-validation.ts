@@ -1,6 +1,5 @@
 import { open, readdir, readFile, realpath, stat } from "node:fs/promises";
-import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type {
@@ -244,52 +243,131 @@ async function validateParquetFile(
 }
 
 function readParquetRowCount(path: string): number | null {
-  const helper = [
-    "import json, sys",
-    "path = sys.argv[1]",
-    "try:",
-    "    import pyarrow.parquet as pq",
-    "    print(json.dumps({'rowCount': int(pq.ParquetFile(path).metadata.num_rows)}))",
-    "    raise SystemExit(0)",
-    "except SystemExit:",
-    "    raise",
-    "except Exception:",
-    "    pass",
-    "try:",
-    "    import pandas as pd",
-    "    print(json.dumps({'rowCount': int(len(pd.read_parquet(path).index))}))",
-    "    raise SystemExit(0)",
-    "except Exception as error:",
-    "    print(json.dumps({'error': str(error)[:200]}), file=sys.stderr)",
-    "    raise SystemExit(1)",
-  ].join("\n");
-  for (const pythonBin of candidatePythonBins()) {
-    const result = spawnSync(pythonBin, ["-c", helper, path], {
-      encoding: "utf8",
-    });
-    if (result.status !== 0) continue;
-    try {
-      const parsed = JSON.parse(result.stdout.trim()) as { rowCount?: unknown };
-      return typeof parsed.rowCount === "number" ? parsed.rowCount : null;
-    } catch {
-      return null;
+  try {
+    const file = existsSync(path) ? readFileSync(path) : null;
+    if (file == null) return null;
+    const footerLength = file.readUInt32LE(file.length - 8);
+    const footer = file.subarray(file.length - 8 - footerLength, file.length - 8);
+    return readParquetFooterNumRows(footer);
+  } catch {
+    return null;
+  }
+}
+
+function readParquetFooterNumRows(buffer: Buffer): number | null {
+  const reader = createCompactReader(buffer);
+  let previousFieldId = 0;
+  while (!reader.eof()) {
+    const header = reader.readByte();
+    const type = header & 0x0f;
+    if (type === 0) return null;
+    const delta = header >> 4;
+    const fieldId = delta === 0
+      ? reader.readZigZagVarint()
+      : previousFieldId + delta;
+    previousFieldId = fieldId;
+    if (fieldId === 3 && type === 6) {
+      return reader.readZigZagVarint();
     }
+    reader.skip(type);
   }
   return null;
 }
 
-function candidatePythonBins(): string[] {
-  const candidates = [
-    process.env.QMD_GRAPHRAG_PYTHON,
-    join(process.cwd(), ".venv-graphrag", "bin", "python"),
-    process.env.PYTHON,
-    "python3",
-  ];
-  return [...new Set(candidates.filter((item): item is string =>
-    typeof item === "string" &&
-    item.length > 0 &&
-    (!item.includes("/") || existsSync(item))
-  ))];
+function createCompactReader(buffer: Buffer) {
+  let offset = 0;
+  const readByte = () => {
+    if (offset >= buffer.length) {
+      throw new Error("parquet compact metadata ended unexpectedly");
+    }
+    const value = buffer[offset];
+    if (value == null) {
+      throw new Error("parquet compact metadata ended unexpectedly");
+    }
+    offset += 1;
+    return value;
+  };
+  const readVarint = () => {
+    let shift = 0;
+    let value = 0;
+    for (;;) {
+      const byte = readByte();
+      value += (byte & 0x7f) * (2 ** shift);
+      if ((byte & 0x80) === 0) return value;
+      shift += 7;
+      if (shift > 63) throw new Error("parquet compact varint too large");
+    }
+  };
+  const readZigZagVarint = () => {
+    const value = readVarint();
+    return Math.floor(value / 2) ^ -(value % 2);
+  };
+  const skip = (type: number): void => {
+    switch (type) {
+      case 0:
+      case 1:
+      case 2:
+        return;
+      case 3:
+        offset += 1;
+        return;
+      case 4:
+      case 5:
+      case 6:
+        readVarint();
+        return;
+      case 7:
+        offset += 8;
+        return;
+      case 8: {
+        const length = readVarint();
+        offset += length;
+        return;
+      }
+      case 9:
+      case 10: {
+        const header = readByte();
+        const elementType = header & 0x0f;
+        const inlineSize = header >> 4;
+        const size = inlineSize === 15 ? readVarint() : inlineSize;
+        for (let index = 0; index < size; index += 1) skip(elementType);
+        return;
+      }
+      case 11: {
+        const size = readVarint();
+        if (size === 0) return;
+        const types = readByte();
+        const keyType = types >> 4;
+        const valueType = types & 0x0f;
+        for (let index = 0; index < size; index += 1) {
+          skip(keyType);
+          skip(valueType);
+        }
+        return;
+      }
+      case 12: {
+        let previousFieldId = 0;
+        for (;;) {
+          const header = readByte();
+          const fieldType = header & 0x0f;
+          if (fieldType === 0) return;
+          const delta = header >> 4;
+          previousFieldId = delta === 0
+            ? readZigZagVarint()
+            : previousFieldId + delta;
+          skip(fieldType);
+        }
+      }
+      default:
+        throw new Error(`unsupported parquet compact type: ${type}`);
+    }
+  };
+  return {
+    eof: () => offset >= buffer.length,
+    readByte,
+    readZigZagVarint,
+    skip,
+  };
 }
 
 async function validateJsonObject(path: string): Promise<ArtifactValidationResult> {

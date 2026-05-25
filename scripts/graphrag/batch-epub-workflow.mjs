@@ -32,7 +32,10 @@ import { parseArgs } from "node:util";
 import YAML from "yaml";
 import { z } from "zod";
 
-import { classifyFailure } from "./batch-failure-classifier.mjs";
+import {
+  classifyFailure,
+  isLocalArtifactGateFailureText,
+} from "./batch-failure-classifier.mjs";
 import { hydrateBatchCheckpoint } from "./batch-checkpoint-hydration.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -462,6 +465,7 @@ const BatchRecoverySummaryItemSchema = z.object({
   recoveryDecision: BatchRecoveryDecisionSchema.optional(),
   failedStage: z.string().min(1).optional(),
   providerStatusCode: z.number().int().positive().optional(),
+  retryAfterSeconds: z.number().int().nonnegative().optional(),
   nextRetryAt: z.string().datetime().optional(),
   retryDelaySeconds: z.number().int().nonnegative().optional(),
   retryBudgetSeconds: z.number().int().positive().optional(),
@@ -583,9 +587,16 @@ function checkpointFailureText(checkpoint) {
   ].filter(Boolean).join("\n");
 }
 
+function checkpointHasLocalArtifactGateFailure(checkpoint) {
+  return isLocalArtifactGateFailureText(checkpointFailureText(checkpoint));
+}
+
 function checkpointHasTransientFailure(checkpoint) {
-  if (checkpoint?.failureKind === "transient") return true;
   const failure = classifyFailure(checkpointFailureText(checkpoint));
+  if (failure.failureKind !== "unknown") {
+    return failure.failureKind === "transient" && failure.retryable === true;
+  }
+  if (checkpoint?.failureKind === "transient") return true;
   return failure.failureKind === "transient" && failure.retryable === true;
 }
 
@@ -1017,6 +1028,7 @@ function hydrateCheckpoint(item, checkpoint) {
     retryBaseDelaySeconds,
     retryMaxDelaySeconds,
     retryBudgetSeconds,
+    maxProviderRecoveryWaits,
     commandTimeoutSeconds,
     defaultBookId: defaultBookIdFor(item.sourceHash),
   });
@@ -1047,7 +1059,11 @@ function loadCheckpoint(item, completedSeed) {
       return BatchItemCheckpointSchema.parse(defaultCheckpoint(item, completedSeed));
     }
     const checkpoint = defaultCheckpoint(item, completedSeed);
-    return writeTypedJson(path, BatchItemCheckpointSchema, checkpoint);
+    return writeTypedJson(
+      path,
+      BatchItemCheckpointSchema,
+      withBuildStatusSnapshot(item, checkpoint),
+    );
   }
   const hydrated = hydrateCheckpoint(item, readJson(path));
   const checkpoint = recoverProviderTransientCheckpoint(item,
@@ -1056,11 +1072,29 @@ function loadCheckpoint(item, completedSeed) {
       hydrated,
     )),
   );
-  return writeTypedJson(path, BatchItemCheckpointSchema, checkpoint);
+  if (statusJson) return BatchItemCheckpointSchema.parse(checkpoint);
+  return writeTypedJson(
+    path,
+    BatchItemCheckpointSchema,
+    withBuildStatusSnapshot(item, checkpoint),
+  );
+}
+
+function withBuildStatusSnapshot(item, checkpoint) {
+  return {
+    ...checkpoint,
+    qmdBuildStatus: redactJsonValue(qmdBuildEvidence(checkpoint)),
+    graphBuildStatus: redactJsonValue(graphBuildEvidence(item)),
+    graphQueryStatus: redactJsonValue(graphQueryEvidence(checkpoint)),
+  };
 }
 
 function saveCheckpoint(item, checkpoint) {
-  return writeTypedJson(itemPath(item), BatchItemCheckpointSchema, checkpoint);
+  return writeTypedJson(
+    itemPath(item),
+    BatchItemCheckpointSchema,
+    withBuildStatusSnapshot(item, checkpoint),
+  );
 }
 
 function readYamlFileIfExists(path) {
@@ -1250,10 +1284,141 @@ function validateParquetFile(path, size) {
     if (header.toString("ascii") !== "PAR1" || footer.toString("ascii") !== "PAR1") {
       return "parquet_magic_mismatch";
     }
+    const footerLengthBytes = Buffer.alloc(4);
+    readSync(fd, footerLengthBytes, 0, 4, size - 8);
+    const footerLength = footerLengthBytes.readUInt32LE(0);
+    if (footerLength <= 0 || footerLength > size - 12) {
+      return "parquet_footer_length_invalid";
+    }
+    const rowCount = readParquetRowCount(path);
+    if (rowCount == null) return "parquet_metadata_unreadable";
+    if (rowCount <= 0) return "parquet_row_count_empty";
     return null;
   } finally {
     closeSync(fd);
   }
+}
+
+function readParquetRowCount(path) {
+  try {
+    const file = readFileSync(path);
+    const footerLength = file.readUInt32LE(file.length - 8);
+    const footer = file.subarray(file.length - 8 - footerLength, file.length - 8);
+    return readParquetFooterNumRows(footer);
+  } catch {
+    return null;
+  }
+}
+
+function readParquetFooterNumRows(buffer) {
+  const reader = createCompactReader(buffer);
+  let previousFieldId = 0;
+  while (!reader.eof()) {
+    const header = reader.readByte();
+    const type = header & 0x0f;
+    if (type === 0) return null;
+    const delta = header >> 4;
+    const fieldId = delta === 0
+      ? reader.readZigZagVarint()
+      : previousFieldId + delta;
+    previousFieldId = fieldId;
+    if (fieldId === 3 && type === 6) {
+      return reader.readZigZagVarint();
+    }
+    reader.skip(type);
+  }
+  return null;
+}
+
+function createCompactReader(buffer) {
+  let offset = 0;
+  const readByte = () => {
+    if (offset >= buffer.length) {
+      throw new Error("parquet compact metadata ended unexpectedly");
+    }
+    return buffer[offset++];
+  };
+  const readVarint = () => {
+    let shift = 0;
+    let value = 0;
+    for (;;) {
+      const byte = readByte();
+      value += (byte & 0x7f) * (2 ** shift);
+      if ((byte & 0x80) === 0) return value;
+      shift += 7;
+      if (shift > 63) throw new Error("parquet compact varint too large");
+    }
+  };
+  const readZigZagVarint = () => {
+    const value = readVarint();
+    return Math.floor(value / 2) ^ -(value % 2);
+  };
+  const skip = (type) => {
+    switch (type) {
+      case 1:
+      case 2:
+      case 0:
+        return;
+      case 3:
+        offset += 1;
+        return;
+      case 4:
+      case 5:
+      case 6:
+        readVarint();
+        return;
+      case 7:
+        offset += 8;
+        return;
+      case 8: {
+        const length = readVarint();
+        offset += length;
+        return;
+      }
+      case 9:
+      case 10: {
+        const header = readByte();
+        const elementType = header & 0x0f;
+        const inlineSize = header >> 4;
+        const size = inlineSize === 15 ? readVarint() : inlineSize;
+        for (let index = 0; index < size; index += 1) skip(elementType);
+        return;
+      }
+      case 11: {
+        const size = readVarint();
+        if (size === 0) return;
+        const types = readByte();
+        const keyType = types >> 4;
+        const valueType = types & 0x0f;
+        for (let index = 0; index < size; index += 1) {
+          skip(keyType);
+          skip(valueType);
+        }
+        return;
+      }
+      case 12: {
+        let previousFieldId = 0;
+        for (;;) {
+          const header = readByte();
+          const fieldType = header & 0x0f;
+          if (fieldType === 0) return;
+          const delta = header >> 4;
+          previousFieldId = delta === 0
+            ? readZigZagVarint()
+            : previousFieldId + delta;
+          skip(fieldType);
+        }
+      }
+      default:
+        throw new Error(`unsupported parquet compact type: ${type}`);
+    }
+  };
+  return {
+    eof: () => offset >= buffer.length,
+    readByte,
+    readZigZagVarint,
+    skip,
+  };
 }
 
 function validateArtifactContent(artifact, bookId) {
@@ -2046,8 +2211,11 @@ function updateManifest(manifest, checkpoints) {
     delete manifest.completedAt;
     delete manifest.failedAt;
   }
-  const parsed = writeTypedJson(manifestPath, BatchRunManifestSchema, manifest);
-  writeRecoverySummary(parsed, checkpoints);
+  const parsed = BatchRunManifestSchema.parse(withoutUndefined(manifest));
+  if (!statusJson) {
+    writeTypedJson(manifestPath, BatchRunManifestSchema, parsed);
+    writeRecoverySummary(parsed, checkpoints);
+  }
   return parsed;
 }
 
@@ -2056,9 +2224,9 @@ function buildRecoverySummary(manifest, checkpoints) {
     const qmdStatus = qmdBuildEvidence(item);
     const graphStatus = graphBuildEvidence(item);
     const graphQueryStatus = graphQueryEvidence(item);
-    const failedCommand = (item.commandChecks ?? []).find((check) =>
-      check.status === "failed"
-    );
+    const failedCommands = (item.commandChecks ?? [])
+      .filter((check) => check.status === "failed");
+    const failedCommand = failedCommands.at(-1);
     return withoutUndefined({
       itemId: item.itemId,
       sourceName: item.sourceName,
@@ -2074,6 +2242,7 @@ function buildRecoverySummary(manifest, checkpoints) {
       recoveryDecision: item.recoveryDecision,
       failedStage: item.failedStage,
       providerStatusCode: failedCommand?.providerStatusCode,
+      retryAfterSeconds: failedCommand?.retryAfterSeconds,
       nextRetryAt: item.nextRetryAt,
       retryDelaySeconds: item.retryDelaySeconds,
       retryBudgetSeconds: item.retryBudgetSeconds,
@@ -2191,12 +2360,15 @@ function migrateEventLog(checkpoints) {
         .filter(Boolean)
         .join("\n"),
     );
-    const failureKind =
-      sanitized.failureKind ?? check?.failureKind ?? checkpoint.failureKind ??
-      inferredFailure.failureKind;
-    const retryable =
-      sanitized.retryable ?? check?.retryable ?? checkpoint.retryable ??
-      inferredFailure.retryable;
+    const knownFailure = inferredFailure.failureKind !== "unknown";
+    const failureKind = knownFailure
+      ? inferredFailure.failureKind
+      : sanitized.failureKind ?? check?.failureKind ?? checkpoint.failureKind ??
+        inferredFailure.failureKind;
+    const retryable = knownFailure
+      ? inferredFailure.retryable
+      : sanitized.retryable ?? check?.retryable ?? checkpoint.retryable ??
+        inferredFailure.retryable;
     const failedStage = sanitized.failedStage ?? check?.name ?? checkpoint.failedStage;
     const attemptExhausted = sanitized.attemptExhausted ??
       (sanitized.event === "command_failed" &&
@@ -2640,11 +2812,14 @@ with open(output_path, "w", encoding="utf-8") as handle:
   ]);
 }
 
-function runGraphResume(item, checkpoint) {
+function runGraphResume(item, checkpoint, options = {}) {
   requirePath(pythonBin, "GraphRAG Python");
   let lastResult = null;
   for (let pass = 1; pass <= maxResumePasses; pass += 1) {
-    const result = runCommand(item, `resume-book-${pass}`, process.execPath, [
+    const name = options.repairLocalArtifactGateOnly
+      ? `repair-local-artifact-gate-${pass}`
+      : `resume-book-${pass}`;
+    const result = runCommand(item, name, process.execPath, [
       ...resumeRunnerArgs(),
       "--state-root",
       stateRoot,
@@ -2666,6 +2841,9 @@ function runGraphResume(item, checkpoint) {
       query,
       "--query-method",
       "local",
+      ...(options.repairLocalArtifactGateOnly
+        ? ["--repair-local-artifact-gate-only"]
+        : []),
     ], {
       attempts: maxCommandAttempts,
       allowTransientBudget: true,
@@ -2682,21 +2860,56 @@ function runGraphResume(item, checkpoint) {
     }
     event({
       itemId: item.itemId,
-      event: "resume_pass_completed",
+      event: options.repairLocalArtifactGateOnly
+        ? "local_artifact_gate_repair_pass_completed"
+        : "resume_pass_completed",
       status: resume.status === "ready" ? "completed" : "running",
       metadata: {
         pass,
+        command: name,
         resumeStatus: resume.status,
         nextStage: resume.nextStage,
       },
     });
-    if (resume.status === "ready" && resume.nextStage == null) return resume.bookId;
+    if (
+      (resume.status === "ready" && resume.nextStage == null) ||
+      (options.repairLocalArtifactGateOnly && resume.status === "repaired")
+    ) {
+      return resume.bookId;
+    }
   }
 
   throw Object.assign(
     new Error(`resume-book did not reach ready after ${maxResumePasses} passes`),
     { commandCheck: lastResult?.check },
   );
+}
+
+function repairLocalArtifactGate(item, checkpoint) {
+  const repairedBookId = runGraphResume(item, checkpoint, {
+    repairLocalArtifactGateOnly: true,
+  });
+  return {
+    ...checkpoint,
+    status: "pending",
+    bookId: repairedBookId ?? checkpoint.bookId,
+    failedAt: undefined,
+    errorSummary: undefined,
+    failureKind: undefined,
+    retryable: undefined,
+    retryExhausted: undefined,
+    recoveryDecision: "continue_pending",
+    failedStage: undefined,
+    nextRetryAt: undefined,
+    retryDelaySeconds: undefined,
+    runnerHeartbeatAt: now(),
+    commandChecks: [],
+    metadata: {
+      ...(checkpoint.metadata ?? {}),
+      localArtifactGateRepairCompleted: true,
+      waitingForProviderRecovery: false,
+    },
+  };
 }
 
 function parseBookIdFromResume(item) {
@@ -3073,17 +3286,67 @@ function main() {
         continue;
       }
       if (checkpoint?.status === "failed" && checkpoint.retryable === false) {
-        event({
-          itemId: item.itemId,
-          event: "item_failed_not_retryable",
-          status: "failed",
-          failureKind: checkpoint.failureKind ?? "unknown",
-          retryable: false,
-          recoveryDecision: "stop_until_fixed",
-          failedStage: checkpoint.failedStage,
-          message: checkpoint.errorSummary,
-        });
-        continue;
+        if (checkpointHasLocalArtifactGateFailure(checkpoint)) {
+          event({
+            itemId: item.itemId,
+            event: "item_local_artifact_gate_repair",
+            status: "running",
+            failureKind: checkpoint.failureKind ?? "permanent",
+            retryable: false,
+            recoveryDecision: "continue_pending",
+            failedStage: checkpoint.failedStage,
+            message: checkpoint.errorSummary,
+          });
+          try {
+            const repaired = repairLocalArtifactGate(item, checkpoint);
+            saveCheckpoint(item, repaired);
+            checkpoints.set(item.itemId, repaired);
+            manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+            processedInPass = true;
+          } catch (error) {
+            const failed = {
+              ...checkpoint,
+              status: "failed",
+              failedAt: now(),
+              errorSummary: redacted(error instanceof Error
+                ? error.message
+                : String(error)),
+              failureKind: "permanent",
+              retryable: false,
+              retryExhausted: true,
+              recoveryDecision: "stop_until_fixed",
+              failedStage: "repair-local-artifact-gate",
+              runnerHeartbeatAt: now(),
+            };
+            saveCheckpoint(item, failed);
+            checkpoints.set(item.itemId, failed);
+            manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+            event({
+              itemId: item.itemId,
+              event: "item_local_artifact_gate_repair_failed",
+              status: "failed",
+              failureKind: "permanent",
+              retryable: false,
+              recoveryDecision: "stop_until_fixed",
+              failedStage: "repair-local-artifact-gate",
+              message: failed.errorSummary,
+            });
+            throw error;
+          }
+          continue;
+        } else {
+          event({
+            itemId: item.itemId,
+            event: "item_failed_not_retryable",
+            status: "failed",
+            failureKind: checkpoint.failureKind ?? "unknown",
+            retryable: false,
+            recoveryDecision: "stop_until_fixed",
+            failedStage: checkpoint.failedStage,
+            message: checkpoint.errorSummary,
+          });
+          continue;
+        }
       }
       if (checkpoint?.status === "failed" && checkpoint.retryable === true) {
         const recovered = recoverProviderTransientCheckpoint(item, checkpoint);

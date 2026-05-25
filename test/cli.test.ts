@@ -1190,6 +1190,7 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(contract).toContain("commandTimeoutSeconds");
     expect(contract).toContain("runnerSessionId");
     expect(contract).toContain("providerStatusCode");
+    expect(contract).toContain("retryAfterSeconds");
     expect(contract).toContain("recoveryDecision: BatchRecoveryDecisionSchema");
     expect(script).toContain("\"completed-manifest\"");
     expect(script).toContain("\"fail-fast\"");
@@ -1209,7 +1210,7 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(script).toContain("\"--report-root\"");
     expect(script).toContain("assertNoBookScopedRawReports");
     expect(script).toContain("BatchRunManifestSchema.parse");
-    expect(script).toContain("writeTypedJson(path, BatchItemCheckpointSchema");
+    expect(script).toContain("withBuildStatusSnapshot(item, checkpoint)");
     expect(script).toContain("BatchEventLogSchema.parse");
     expect(script).toContain("command_retry_exhausted");
     expect(script).toContain("batch_incomplete");
@@ -1217,6 +1218,10 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(script).toContain("--log-root must be outside graph_vault");
     expect(script).toContain("resume-book-workspace.mjs");
     expect(script).toContain("resume-book did not reach ready");
+    expect(script).toContain("repair-local-artifact-gate-");
+    expect(script).toContain("--repair-local-artifact-gate-only");
+    expect(script).toContain("item_local_artifact_gate_repair");
+    expect(script).toContain("localArtifactGateRepairCompleted");
     expect(script).toContain("qmd-query-graphrag-json");
     expect(script).toContain("redactLog(stdout)");
     expect(script).toContain("redactLog(stderr)");
@@ -1563,7 +1568,7 @@ describe("GraphRAG EPUB batch runner", () => {
         ),
         attempts: 1,
         failedAt: "2026-05-23T00:01:00.000Z",
-        errorSummary: "HTTP 503 Service temporarily unavailable",
+        errorSummary: "HTTP 503 Retry-After: 180 Service temporarily unavailable",
         commandChecks: [{
           name: "resume-book-1",
           status: "failed",
@@ -1573,7 +1578,7 @@ describe("GraphRAG EPUB batch runner", () => {
           stderrBytes: 12,
           startedAt: "2026-05-23T00:00:00.000Z",
           completedAt: "2026-05-23T00:01:00.000Z",
-          errorSummary: "HTTP 503 Service temporarily unavailable",
+          errorSummary: "HTTP 503 Retry-After: 180 Service temporarily unavailable",
         }],
       }),
     );
@@ -1586,7 +1591,7 @@ describe("GraphRAG EPUB batch runner", () => {
         event: "command_failed",
         command: "resume-book-1",
         at: "2026-05-23T00:01:00.000Z",
-        message: "HTTP 503 Service temporarily unavailable",
+        message: "HTTP 503 Retry-After: 180 Service temporarily unavailable",
         recoveryDecision: "retry_same_run_id",
         metadata: { attempt: 3, exitCode: 1 },
       }) + "\n",
@@ -1641,6 +1646,7 @@ describe("GraphRAG EPUB batch runner", () => {
       retryable: true,
       attemptExhausted: true,
       providerStatusCode: 503,
+      retryAfterSeconds: 180,
       recoveryDecision: "retry_same_run_id",
       failedStage: "resume-book-1",
     });
@@ -1666,6 +1672,7 @@ describe("GraphRAG EPUB batch runner", () => {
       waitingForProviderRecovery: true,
       failedStage: "resume-book-1",
       providerStatusCode: 503,
+      retryAfterSeconds: 180,
     });
     expect(rawLogEvent).toMatchObject({
       event: "raw_log_migrated",
@@ -1886,6 +1893,15 @@ describe("GraphRAG EPUB batch runner", () => {
         commandChecks: [],
       }),
     );
+    const checkpointPath = join(
+      stateRoot,
+      "catalog",
+      "batch-runs",
+      runId,
+      "items",
+      `${itemId}.json`,
+    );
+    const checkpointBeforeStatusJson = readFileSync(checkpointPath, "utf8");
 
     const result = await new Promise<{
       stdout: string;
@@ -1938,6 +1954,10 @@ describe("GraphRAG EPUB batch runner", () => {
       retryable: true,
       nextRetryAt: "2026-05-23T00:05:00.000Z",
     });
+    expect(readFileSync(checkpointPath, "utf8")).toBe(checkpointBeforeStatusJson);
+    expect(existsSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "recovery-summary.json"),
+    )).toBe(false);
   });
 
   test("keeps GraphRAG resume failures out of qmd build evidence", async () => {
@@ -2259,7 +2279,42 @@ describe("GraphRAG EPUB batch runner", () => {
         recoveryDecision: "retry_same_run_id",
         failedStage: "resume-book-2",
         errorSummary: "GraphRAG stage report partial-output failure",
-        commandChecks: [],
+        commandChecks: [
+          {
+            name: "resume-book-1",
+            status: "failed",
+            attempts: 3,
+            exitCode: 1,
+            stdoutBytes: 0,
+            stderrBytes: 48,
+            startedAt: "2026-05-23T00:00:00.000Z",
+            completedAt: "2026-05-23T00:01:00.000Z",
+            failureKind: "transient",
+            retryable: true,
+            attemptExhausted: true,
+            providerStatusCode: 500,
+            retryAfterSeconds: 60,
+            recoveryDecision: "retry_same_run_id",
+            errorSummary: "HTTP 500 Retry-After: 60",
+          },
+          {
+            name: "resume-book-2",
+            status: "failed",
+            attempts: 3,
+            exitCode: 1,
+            stdoutBytes: 0,
+            stderrBytes: 64,
+            startedAt: "2026-05-23T02:59:00.000Z",
+            completedAt: "2026-05-23T03:00:00.000Z",
+            failureKind: "transient",
+            retryable: true,
+            attemptExhausted: true,
+            providerStatusCode: 503,
+            retryAfterSeconds: 180,
+            recoveryDecision: "retry_same_run_id",
+            errorSummary: "HTTP 503 Retry-After: 180",
+          },
+        ],
       }),
     );
 
@@ -2317,6 +2372,8 @@ describe("GraphRAG EPUB batch runner", () => {
       retryExhausted: false,
       recoveryDecision: "retry_same_run_id",
       waitingForProviderRecovery: true,
+      providerStatusCode: 503,
+      retryAfterSeconds: 180,
     });
     expect(checkpoint).toMatchObject({
       retryable: true,
@@ -2630,10 +2687,10 @@ describe("GraphRAG EPUB batch runner", () => {
         bookId: `book-${sourceHash.slice(0, 12)}`,
         attempts: 4,
         failedAt: "2026-05-23T00:10:00.000Z",
-        failureKind: "unknown",
-        retryable: false,
-        retryExhausted: true,
-        recoveryDecision: "stop_until_fixed",
+        failureKind: "transient",
+        retryable: true,
+        retryExhausted: false,
+        recoveryDecision: "retry_same_run_id",
         failedStage: "resume-book-1",
         errorSummary,
         commandChecks: [{
@@ -2645,10 +2702,10 @@ describe("GraphRAG EPUB batch runner", () => {
           stderrBytes: 12,
           startedAt: "2026-05-23T00:00:00.000Z",
           completedAt: "2026-05-23T00:01:00.000Z",
-          failureKind: "unknown",
-          retryable: false,
+          failureKind: "transient",
+          retryable: true,
           attemptExhausted: true,
-          recoveryDecision: "stop_until_fixed",
+          recoveryDecision: "retry_same_run_id",
           errorSummary,
         }],
       }),
