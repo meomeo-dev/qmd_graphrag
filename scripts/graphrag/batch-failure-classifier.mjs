@@ -12,6 +12,13 @@ export function classifyFailure(text) {
       ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
     };
   }
+  if (isGraphRagDataCompatibilityFailureText(message)) {
+    return {
+      failureKind: "data_compatibility",
+      retryable: false,
+      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+    };
+  }
   if (
     providerStatusCode === 429 ||
     (providerStatusCode != null &&
@@ -78,6 +85,25 @@ export function classifyFailure(text) {
     retryable: false,
     ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
   };
+}
+
+export function isGraphRagDataCompatibilityFailureText(text) {
+  const message = String(text ?? "").toLowerCase();
+  return (
+    (
+      message.includes("create_community_reports_text") ||
+      message.includes("community_reports_text") ||
+      message.includes("graph rag text-unit context") ||
+      message.includes("graphrag text-unit context") ||
+      message.includes("community text-unit context")
+    ) &&
+    (
+      message.includes("'float' object is not subscriptable") ||
+      message.includes("references missing text units") ||
+      message.includes("no resolvable community rows") ||
+      message.includes("no resolvable text-unit rows")
+    )
+  );
 }
 
 export function isLocalArtifactGateFailureText(text) {

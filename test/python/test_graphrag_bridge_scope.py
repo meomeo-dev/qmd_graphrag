@@ -9,10 +9,23 @@ from pathlib import Path
 import sys
 import hashlib
 import json
+import base64
 
 import pandas as pd
 import yaml
 import numpy as np
+
+MINIMAL_PARQUET_FIXTURE = (
+    "UEFSMRUEFRIVFkwVAhUAEgAACSAFAAAAcm93LTEVABUSFRYsFQIVEBUGFQYcNgAo"
+    "BXJvdy0xGAVyb3ctMRERAAAACSACAAAAAgEBAgAVBBksNQAYBnNjaGVtYRUCABUM"
+    "JQIYAmlkJQBMHAAAABYCGRwZHCYAHBUMGTUABhAZGAJpZBUCFgIWigEWkgEmOiYI"
+    "HDYAKAVyb3ctMRgFcm93LTEREQAZLBUEFQAVAgAVABUQFQIAPBYKGQYZJgACAAAA"
+    "FooBFgImCBaSAQAZHBgMQVJST1c6c2NoZW1hGKABLy8vLy8zQUFBQUFRQUFBQUFB"
+    "QUtBQXdBQmdBRkFBZ0FDZ0FBQUFBQkJBQU1BQUFBQ0FBSUFBQUFCQUFJQUFBQUJB"
+    "QUFBQUVBQUFBVUFBQUFFQUFVQUFnQUJnQUhBQXdBQUFBUUFCQUFBQUFBQUFFRkVB"
+    "QUFBQmdBQUFBRUFBQUFBQUFBQUFJQUFBQnBaQUFBQkFBRUFBUUFBQUFBQUFBQQAY"
+    "IHBhcnF1ZXQtY3BwLWFycm93IHZlcnNpb24gMjIuMC4wGRwcAAAAWgEAAFBBUjE="
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "python"))
@@ -168,7 +181,7 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
     lancedb_dir = output_dir / "lancedb"
     _write_complete_lancedb_fixture(lancedb_dir)
     reports_path = output_dir / "community_reports.parquet"
-    reports_path.write_text("reports", encoding="utf-8")
+    reports_path.write_bytes(base64.b64decode(MINIMAL_PARQUET_FIXTURE))
     report_hash = _hash_file(reports_path)
     lancedb_hash = _bridge_hash_lancedb_directory_contents(lancedb_dir)
     artifact_ids = [artifact_prefix, f"{artifact_prefix}-lancedb"]
@@ -241,6 +254,9 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
                         "providerFingerprint": provider_fingerprint,
                         "producerRunId": "run-community-report",
                         "createdAt": "2026-05-21T00:00:00.000Z",
+                        "metadata": {
+                            "corpusContentHash": f"content-{book_id.rsplit('-', 1)[-1]}"
+                        },
                     },
                     {
                         "schemaVersion": "1.0.0",
@@ -254,6 +270,9 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
                         "providerFingerprint": provider_fingerprint,
                         "producerRunId": "run-embed",
                         "createdAt": "2026-05-21T00:00:00.000Z",
+                        "metadata": {
+                            "corpusContentHash": f"content-{book_id.rsplit('-', 1)[-1]}"
+                        },
                     },
                 ],
             }
@@ -358,6 +377,145 @@ def _frames() -> dict[str, pd.DataFrame]:
 
 
 class GraphRagBridgeScopeTest(unittest.TestCase):
+    def test_graphrag_text_context_patch_fills_orphan_text_unit_degree(self) -> None:
+        bridge_module._add_monorepo_package_paths(
+            REPO_ROOT / "vendor" / "graphrag",
+        )
+        try:
+            import graphrag.data_model.schemas as schemas
+            from graphrag.index.operations.summarize_communities.text_unit_context import (
+                context_builder,
+            )
+            import graphrag.index.workflows.create_community_reports_text as workflow
+        except Exception as error:  # noqa: BLE001
+            self.skipTest(f"GraphRAG package unavailable: {error}")
+
+        if getattr(context_builder.build_local_context, "_qmd_graphrag_compat_patch", False):
+            original = getattr(
+                context_builder.build_local_context,
+                "_qmd_graphrag_original",
+            )
+            context_builder.build_local_context = original
+            workflow.build_local_context = original
+            bridge_module._GRAPHRAG_TEXT_CONTEXT_COMPAT_PATCHED = False
+
+        class Tokenizer:
+            def num_tokens(self, value: str) -> int:
+                return len(value.split())
+
+        community_membership = pd.DataFrame(
+            [
+                {
+                    "community": 1,
+                    "level": 0,
+                    "text_unit_ids": np.array(["tu-valid", "tu-orphan"]),
+                },
+            ]
+        )
+        text_units = pd.DataFrame(
+            [
+                {
+                    "id": "tu-valid",
+                    "human_readable_id": 1,
+                    "text": "valid source",
+                },
+                {
+                    "id": "tu-orphan",
+                    "human_readable_id": 2,
+                    "text": "orphan source",
+                },
+            ]
+        )
+        nodes = pd.DataFrame(
+            [
+                {
+                    "id": "ent-1",
+                    "title": "Entity 1",
+                    "community": 1,
+                    "degree": 3,
+                    "text_unit_ids": np.array(["tu-valid"]),
+                },
+            ]
+        )
+
+        with self.assertRaises(TypeError):
+            context_builder.build_local_context(
+                community_membership,
+                text_units,
+                nodes.copy(),
+                Tokenizer(),
+            )
+
+        bridge_module._GRAPHRAG_TEXT_CONTEXT_COMPAT_PATCHED = False
+        bridge_module._install_graphrag_text_unit_context_compat_patch()
+        patched = context_builder.build_local_context(
+            community_membership,
+            text_units,
+            nodes.copy(),
+            Tokenizer(),
+        )
+
+        self.assertEqual(patched[schemas.COMMUNITY_ID].tolist(), [1])
+        contexts = patched[schemas.ALL_CONTEXT].iloc[0]
+        self.assertEqual(len(contexts), 2)
+        by_id = {item["id"]: item for item in contexts}
+        self.assertEqual(by_id[1]["text"], "valid source")
+        self.assertEqual(by_id[1]["entity_degree"], 3)
+        self.assertEqual(by_id[2]["text"], "orphan source")
+        self.assertEqual(by_id[2]["entity_degree"], 0)
+
+    def test_graphrag_text_context_patch_fails_missing_text_units(self) -> None:
+        bridge_module._add_monorepo_package_paths(
+            REPO_ROOT / "vendor" / "graphrag",
+        )
+        try:
+            from graphrag.index.operations.summarize_communities.text_unit_context import (
+                context_builder,
+            )
+        except Exception as error:  # noqa: BLE001
+            self.skipTest(f"GraphRAG package unavailable: {error}")
+
+        class Tokenizer:
+            def num_tokens(self, value: str) -> int:
+                return len(value.split())
+
+        community_membership = pd.DataFrame(
+            [
+                {
+                    "community": 1,
+                    "level": 0,
+                    "text_unit_ids": np.array(["tu-missing"]),
+                },
+            ]
+        )
+        text_units = pd.DataFrame(
+            [{"id": "tu-valid", "human_readable_id": 1, "text": "valid source"}]
+        )
+        nodes = pd.DataFrame(
+            [
+                {
+                    "id": "ent-1",
+                    "title": "Entity 1",
+                    "community": 1,
+                    "degree": 3,
+                    "text_unit_ids": np.array(["tu-valid"]),
+                },
+            ]
+        )
+
+        bridge_module._GRAPHRAG_TEXT_CONTEXT_COMPAT_PATCHED = False
+        bridge_module._install_graphrag_text_unit_context_compat_patch()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "references missing text units",
+        ):
+            context_builder.build_local_context(
+                community_membership,
+                text_units,
+                nodes.copy(),
+                Tokenizer(),
+            )
+
     def test_graphrag_index_applies_workflows_and_skip_validation(self) -> None:
         calls: dict[str, object] = {}
 
@@ -398,6 +556,11 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
             with (
                 patch.dict(sys.modules, modules),
                 patch.object(bridge_module, "_ensure_graphrag_prompt_assets"),
+                patch.object(
+                    bridge_module,
+                    "_register_qmd_completion_providers",
+                    wraps=bridge_module._register_qmd_completion_providers,
+                ) as register_providers,
             ):
                 response = asyncio.run(
                     _run_graphrag_index(
@@ -412,6 +575,7 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                     )
                 )
 
+        register_providers.assert_called_once()
         self.assertEqual(
             calls["cli_overrides"],
             {

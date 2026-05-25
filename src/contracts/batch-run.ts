@@ -24,6 +24,7 @@ export const BatchRunStatusSchema = z.enum([
 export const BatchFailureKindSchema = z.enum([
   "transient",
   "permanent",
+  "data_compatibility",
   "unknown",
 ]);
 

@@ -200,6 +200,7 @@ const BatchRunStatusSchema = z.enum([
 const BatchFailureKindSchema = z.enum([
   "transient",
   "permanent",
+  "data_compatibility",
   "unknown",
 ]);
 const BatchRecoveryDecisionSchema = z.enum([
@@ -589,6 +590,15 @@ function checkpointFailureText(checkpoint) {
 
 function checkpointHasLocalArtifactGateFailure(checkpoint) {
   return isLocalArtifactGateFailureText(checkpointFailureText(checkpoint));
+}
+
+function checkpointHasRecoverableDataCompatibilityFailure(checkpoint) {
+  if (checkpoint?.failureKind !== "data_compatibility") return false;
+  if (checkpoint.metadata?.recoveredFromGraphRagTextUnitContextCompat === true) {
+    return false;
+  }
+  const text = checkpointFailureText(checkpoint);
+  return text.includes("'float' object is not subscriptable");
 }
 
 function checkpointHasTransientFailure(checkpoint) {
@@ -2272,6 +2282,10 @@ function buildRecoverySummary(manifest, checkpoints) {
       runnerHeartbeatAt: item.runnerHeartbeatAt,
       orphanedRunnerDetectedAt: item.orphanedRunnerDetectedAt,
       waitingForProviderRecovery:
+        item.status === "pending" &&
+        item.failureKind === "transient" &&
+        item.retryable === true &&
+        item.recoveryDecision === "retry_same_run_id" &&
         item.metadata?.waitingForProviderRecovery === true,
       errorSummary: item.errorSummary ? redacted(item.errorSummary) : undefined,
     });
@@ -2333,6 +2347,9 @@ function printStatusAndExit(manifest, checkpoints) {
 }
 
 function recoveryDecisionForBatch(checkpoints) {
+  if (checkpoints.some((item) => shouldStopBatchAfterFailure(item))) {
+    return "stop_until_fixed";
+  }
   if (checkpoints.some((item) =>
     item.status !== "completed" &&
     (item.retryable === true || item.recoveryDecision === "retry_same_run_id")
@@ -3190,6 +3207,10 @@ function markItemRunning(item, checkpoint, checkpoints, manifest) {
     runnerHost,
     runnerPid,
     runnerHeartbeatAt: startedAt,
+    metadata: {
+      ...(checkpoint.metadata ?? {}),
+      waitingForProviderRecovery: false,
+    },
   };
   saveCheckpoint(item, running);
   checkpoints.set(item.itemId, running);
@@ -3262,6 +3283,35 @@ function eventProviderRecoveryWaitLimit(items, checkpoints) {
     },
   });
   return true;
+}
+
+function shouldStopBatchAfterFailure(checkpoint) {
+  return checkpoint?.status === "failed" &&
+    checkpoint.retryable === false &&
+    checkpoint.recoveryDecision === "stop_until_fixed" &&
+    checkpoint.failureKind === "data_compatibility";
+}
+
+function shouldStopBatchBeforeProcessing(checkpoint) {
+  return shouldStopBatchAfterFailure(checkpoint) &&
+    !checkpointHasLocalArtifactGateFailure(checkpoint) &&
+    !checkpointHasRecoverableDataCompatibilityFailure(checkpoint);
+}
+
+function emitBatchStoppedAfterNonTransientFailure(checkpoint) {
+  event({
+    itemId: checkpoint.itemId,
+    event: "batch_stopped_after_non_transient_failure",
+    status: "failed",
+    failureKind: checkpoint.failureKind ?? "unknown",
+    retryable: false,
+    recoveryDecision: "stop_until_fixed",
+    failedStage: checkpoint.failedStage,
+    message: checkpoint.errorSummary,
+    metadata: {
+      policy: "stop_current_runner_until_fixed",
+    },
+  });
 }
 
 function waitForNextRetryWindow(items, checkpoints) {
@@ -3343,9 +3393,22 @@ function main() {
 
   let processedInPass = true;
   const repairBlockedThisRun = new Set();
+  const stopLoggedThisRun = new Set();
+  let stopAfterNonTransientFailure = false;
   while (processedInPass) {
     processedInPass = false;
     let deferredForRetryWindow = false;
+    const stopCheckpoint = items
+      .map((item) => checkpoints.get(item.itemId))
+      .find((checkpoint) => shouldStopBatchBeforeProcessing(checkpoint));
+    if (stopCheckpoint) {
+      if (!stopLoggedThisRun.has(stopCheckpoint.itemId)) {
+        emitBatchStoppedAfterNonTransientFailure(stopCheckpoint);
+        stopLoggedThisRun.add(stopCheckpoint.itemId);
+      }
+      stopAfterNonTransientFailure = true;
+      break;
+    }
     for (const item of items) {
       if (repairBlockedThisRun.has(item.itemId)) {
         event({
@@ -3360,6 +3423,57 @@ function main() {
         continue;
       }
       const checkpoint = checkpoints.get(item.itemId);
+      if (
+        shouldStopBatchAfterFailure(checkpoint) &&
+        !checkpointHasLocalArtifactGateFailure(checkpoint)
+      ) {
+        if (checkpointHasRecoverableDataCompatibilityFailure(checkpoint)) {
+          const recovered = {
+            ...checkpoint,
+            status: "pending",
+            failedAt: undefined,
+            errorSummary: undefined,
+            failureKind: undefined,
+            retryable: undefined,
+            retryExhausted: undefined,
+            recoveryDecision: "continue_pending",
+            failedStage: undefined,
+            nextRetryAt: undefined,
+            retryDelaySeconds: undefined,
+            runnerHeartbeatAt: now(),
+            commandChecks: [],
+            metadata: {
+              ...(checkpoint.metadata ?? {}),
+              recoveredFromGraphRagTextUnitContextCompat: true,
+              waitingForProviderRecovery: false,
+            },
+          };
+          saveCheckpoint(item, recovered);
+          checkpoints.set(item.itemId, recovered);
+          manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+          event({
+            itemId: item.itemId,
+            event: "item_data_compatibility_recovered",
+            status: "pending",
+            failureKind: "data_compatibility",
+            retryable: false,
+            recoveryDecision: "continue_pending",
+            failedStage: checkpoint.failedStage,
+            message: "GraphRAG text-unit context compatibility patch available",
+            metadata: {
+              policy: "retry_after_local_compatibility_patch",
+            },
+          });
+          processedInPass = true;
+          continue;
+        }
+        if (!stopLoggedThisRun.has(checkpoint.itemId)) {
+          emitBatchStoppedAfterNonTransientFailure(checkpoint);
+          stopLoggedThisRun.add(checkpoint.itemId);
+        }
+        stopAfterNonTransientFailure = true;
+        break;
+      }
       if (checkpoint?.status === "completed") {
         event({ itemId: item.itemId, event: "item_skip_completed", status: "completed" });
         continue;
@@ -3437,6 +3551,14 @@ function main() {
             failedStage: checkpoint.failedStage,
             message: checkpoint.errorSummary,
           });
+          if (shouldStopBatchAfterFailure(checkpoint)) {
+            if (!stopLoggedThisRun.has(checkpoint.itemId)) {
+              emitBatchStoppedAfterNonTransientFailure(checkpoint);
+              stopLoggedThisRun.add(checkpoint.itemId);
+            }
+            stopAfterNonTransientFailure = true;
+            break;
+          }
           continue;
         }
       }
@@ -3634,9 +3756,18 @@ function main() {
             : undefined,
         });
         if (failFast) throw error;
+        if (shouldStopBatchAfterFailure(failed)) {
+          if (!stopLoggedThisRun.has(failed.itemId)) {
+            emitBatchStoppedAfterNonTransientFailure(failed);
+            stopLoggedThisRun.add(failed.itemId);
+          }
+          stopAfterNonTransientFailure = true;
+          break;
+        }
         processedInPass = true;
       }
     }
+    if (stopAfterNonTransientFailure) break;
     if (!processedInPass && deferredForRetryWindow) {
       if (providerRecoveryWaitLimitReached(items, checkpoints)) {
         eventProviderRecoveryWaitLimit(items, checkpoints);

@@ -1,0 +1,63 @@
+date: 2026-05-25
+title: GraphRAG orphan text-unit context compatibility
+status: accepted
+scope: qmd_graphrag
+
+problem:
+  summary: >-
+    A real `community_report` run can produce community rows whose
+    `text_unit_ids` include a text unit that has no entity membership in that
+    same community. GraphRAG's text-unit context builder left-joins those rows
+    and then dereferences the missing `ALL_DETAILS` value, which raises
+    `TypeError: 'float' object is not subscriptable`.
+  observed_case:
+    run_id: epub-batch-20260524-acceptance-full-real
+    book_id: book-bc1d37ebbc88
+    stage: community_report
+    workflow: create_community_reports_text
+    failed_stage: resume-book-2
+
+decision:
+  summary: >-
+    Install a qmd_graphrag Python bridge compatibility patch for GraphRAG's
+    text-unit context builder. The patch fills entity_degree=0 only when the
+    referenced text unit exists but has no community-local entity degree. It
+    logs count and affected communities and leaves all other GraphRAG
+    semantics and stage gates unchanged.
+  details:
+    - The vendored GraphRAG subtree remains unchanged.
+    - The patch runs inside `python/qmd_graphrag/bridge.py` before calling
+      `graphrag.api.build_index`.
+    - A row is filled only when `ALL_DETAILS` is not a dictionary after
+      merging community membership with prepared text-unit details and the
+      text-unit id exists in `text_units.parquet`.
+    - Missing text-unit identities fail closed with a data_compatibility
+      error; qmd_graphrag does not synthesize text or reports.
+    - `community_report` succeeds only after the normal GraphRAG output,
+      stage-report health check, producer manifest, and artifact gate pass.
+
+reasons:
+  - The unresolved row is a GraphRAG data compatibility edge, not a provider
+    transient error and not evidence of cross-book artifact leakage.
+  - Filling zero degree preserves the existing text evidence while avoiding a
+    whole-book failure caused by a missing community-local degree edge.
+  - Keeping the compatibility layer in the bridge preserves the vendor upgrade
+    exit path and the existing vendor-subtree integrity check.
+
+operational_rules:
+  - rule: Do not mark `community_report` succeeded from the compatibility
+      patch alone; artifact validation remains authoritative.
+  - rule: Classify this failure family as non-transient data compatibility,
+      not network SLA noise.
+  - rule: Stop the current batch runner after an unresolved non-transient
+      data_compatibility failure so high-cost pending books are not started
+      under a deterministic incompatible state.
+  - rule: After this bridge version is deployed, a failed book may be retried
+      from `community_report` with the same book-scoped output directory and
+      stage fingerprints.
+
+verification:
+  - Python bridge unit tests must cover orphan community/text-unit membership.
+  - Batch failure classification must recognize the prior error as
+      data_compatibility.
+  - Real recovery must resume the failed book and then pass query-ready gates.

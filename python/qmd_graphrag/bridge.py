@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -41,6 +42,8 @@ PRODUCER_STAGE_BY_ARTIFACT_KIND = {
 }
 WINDOWS_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 URI_LIKE_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+LOGGER = logging.getLogger(__name__)
+_GRAPHRAG_TEXT_CONTEXT_COMPAT_PATCHED = False
 
 if str(REPO_ROOT / "python") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "python"))
@@ -135,6 +138,184 @@ def _summarize_result(value: Any) -> str | None:
     if not text:
         return None
     return text[:400]
+
+
+def _install_graphrag_text_unit_context_compat_patch() -> None:
+    """Patch GraphRAG text context joins that lack community-local degree."""
+    global _GRAPHRAG_TEXT_CONTEXT_COMPAT_PATCHED
+    if _GRAPHRAG_TEXT_CONTEXT_COMPAT_PATCHED:
+        return
+
+    try:
+        import pandas as pd  # type: ignore
+        import graphrag.data_model.schemas as schemas  # type: ignore
+        import graphrag.index.workflows.create_community_reports_text as workflow  # type: ignore
+        from graphrag.index.operations.summarize_communities.text_unit_context import (  # type: ignore
+            context_builder,
+        )
+    except (ImportError, ModuleNotFoundError):
+        LOGGER.debug("GraphRAG text-unit context patch modules are unavailable")
+        return
+
+    original_build_local_context = context_builder.build_local_context
+    if getattr(original_build_local_context, "_qmd_graphrag_compat_patch", False):
+        _GRAPHRAG_TEXT_CONTEXT_COMPAT_PATCHED = True
+        return
+
+    def build_local_context_with_compat(
+        community_membership_df: pd.DataFrame,
+        text_units_df: pd.DataFrame,
+        node_df: pd.DataFrame,
+        tokenizer: Any,
+        max_context_tokens: int = 16000,
+    ) -> pd.DataFrame:
+        original_error: TypeError | None = None
+        try:
+            return original_build_local_context(
+                community_membership_df.copy(deep=True),
+                text_units_df.copy(deep=True),
+                node_df.copy(deep=True),
+                tokenizer,
+                max_context_tokens,
+            )
+        except TypeError as error:
+            if "'float' object is not subscriptable" not in str(error):
+                raise
+            original_error = error
+
+        prepped_text_units_df = context_builder.prep_text_units(
+            text_units_df.copy(deep=True),
+            node_df.copy(deep=True),
+        )
+        prepped_text_units_df = prepped_text_units_df.rename(
+            columns={
+                schemas.ID: schemas.TEXT_UNIT_IDS,
+                schemas.COMMUNITY_ID: schemas.COMMUNITY_ID,
+            },
+        )
+
+        context_df = community_membership_df.loc[
+            :,
+            [schemas.COMMUNITY_ID, schemas.COMMUNITY_LEVEL, schemas.TEXT_UNIT_IDS],
+        ]
+        context_df = context_df.explode(schemas.TEXT_UNIT_IDS)
+        context_df = context_df.merge(
+            prepped_text_units_df,
+            on=[schemas.TEXT_UNIT_IDS, schemas.COMMUNITY_ID],
+            how="left",
+        )
+
+        valid_details = context_df[schemas.ALL_DETAILS].apply(
+            lambda value: isinstance(value, dict),
+        )
+        unresolved_df = context_df.loc[~valid_details]
+        if unresolved_df.empty:
+            raise original_error
+
+        text_unit_lookup = text_units_df.copy()
+        text_unit_lookup["_qmd_text_unit_id"] = (
+            text_unit_lookup[schemas.ID].astype(str)
+        )
+        text_unit_lookup = text_unit_lookup.set_index("_qmd_text_unit_id", drop=False)
+        unresolved_text_ids = unresolved_df[schemas.TEXT_UNIT_IDS].astype(str)
+        missing_text_ids = sorted(
+            set(unresolved_text_ids) - set(text_unit_lookup.index.astype(str)),
+        )
+        if missing_text_ids:
+            raise RuntimeError(
+                "GraphRAG community text-unit context references missing text "
+                "units: " + ",".join(missing_text_ids[:20]),
+            ) from original_error
+
+        affected_communities = sorted(
+            {
+                str(item)
+                for item in unresolved_df[schemas.COMMUNITY_ID].dropna().tolist()
+            },
+        )
+        LOGGER.warning(
+            "qmd_graphrag filled %d GraphRAG community/text-unit context "
+            "rows with entity_degree=0 across %d communities",
+            len(unresolved_df.index),
+            len(affected_communities),
+        )
+        LOGGER.info(
+            "qmd_graphrag GraphRAG context compatibility communities: %s",
+            ",".join(affected_communities[:50]),
+        )
+
+        all_communities = context_df[
+            [schemas.COMMUNITY_ID, schemas.COMMUNITY_LEVEL]
+        ].drop_duplicates()
+        context_df = context_df.copy()
+
+        def fill_missing_details(row: Any) -> dict[str, Any]:
+            details = row[schemas.ALL_DETAILS]
+            if isinstance(details, dict):
+                return details
+            text_unit_id = str(row[schemas.TEXT_UNIT_IDS])
+            text_unit = text_unit_lookup.loc[text_unit_id]
+            return {
+                schemas.SHORT_ID: text_unit[schemas.SHORT_ID],
+                schemas.TEXT: text_unit[schemas.TEXT],
+                schemas.ENTITY_DEGREE: 0,
+            }
+
+        context_df[schemas.ALL_DETAILS] = context_df.apply(
+            fill_missing_details,
+            axis=1,
+        )
+
+        context_df[schemas.ALL_CONTEXT] = context_df.apply(
+            lambda row: {
+                "id": row[schemas.ALL_DETAILS][schemas.SHORT_ID],
+                "text": row[schemas.ALL_DETAILS][schemas.TEXT],
+                "entity_degree": row[schemas.ALL_DETAILS][schemas.ENTITY_DEGREE],
+            },
+            axis=1,
+        )
+
+        context_df = (
+            context_df
+            .groupby([schemas.COMMUNITY_ID, schemas.COMMUNITY_LEVEL])
+            .agg({schemas.ALL_CONTEXT: list})
+            .reset_index()
+        )
+        missing_communities = all_communities.merge(
+            context_df[[schemas.COMMUNITY_ID, schemas.COMMUNITY_LEVEL]],
+            on=[schemas.COMMUNITY_ID, schemas.COMMUNITY_LEVEL],
+            how="left",
+            indicator=True,
+        )
+        missing_communities = missing_communities[
+            missing_communities["_merge"] == "left_only"
+        ]
+        if not missing_communities.empty:
+            raise RuntimeError(
+                "GraphRAG text-unit context has communities with no resolvable "
+                "text-unit rows after compatibility fill: "
+                f"{len(missing_communities.index)}",
+            ) from original_error
+
+        context_df[schemas.CONTEXT_STRING] = context_df[schemas.ALL_CONTEXT].apply(
+            lambda value: context_builder.sort_context(value, tokenizer),
+        )
+        context_df[schemas.CONTEXT_SIZE] = context_df[schemas.CONTEXT_STRING].apply(
+            lambda value: tokenizer.num_tokens(value),
+        )
+        context_df[schemas.CONTEXT_EXCEED_FLAG] = context_df[
+            schemas.CONTEXT_SIZE
+        ].apply(lambda value: value > max_context_tokens)
+
+        return context_df
+
+    build_local_context_with_compat._qmd_graphrag_compat_patch = True  # type: ignore[attr-defined]
+    build_local_context_with_compat._qmd_graphrag_original = (  # type: ignore[attr-defined]
+        original_build_local_context
+    )
+    context_builder.build_local_context = build_local_context_with_compat
+    workflow.build_local_context = build_local_context_with_compat
+    _GRAPHRAG_TEXT_CONTEXT_COMPAT_PATCHED = True
 
 
 def _write_text_if_missing(path: Path, content: str) -> None:
@@ -241,11 +422,17 @@ def _scoped_storage_overrides(
 
 
 def _register_qmd_completion_providers() -> None:
-    from graphrag_llm.completion import register_completion
+    try:
+        from graphrag_llm.completion import register_completion
 
-    from qmd_graphrag.graphrag_responses_completion import (
-        OpenAIResponsesCompletion,
-    )
+        from qmd_graphrag.graphrag_responses_completion import (
+            OpenAIResponsesCompletion,
+        )
+    except ModuleNotFoundError as error:
+        if error.name != "graphrag_llm":
+            raise
+        LOGGER.debug("GraphRAG completion provider registration unavailable: %s", error)
+        return
 
     register_completion(
         completion_type="openai_responses",
@@ -1436,6 +1623,8 @@ async def _run_graphrag_index(request: dict[str, Any]) -> dict[str, Any]:
     import graphrag.api as api  # type: ignore
     from graphrag.config.load_config import load_config  # type: ignore
     from graphrag.index.validate_config import validate_config_names  # type: ignore
+
+    _install_graphrag_text_unit_context_compat_patch()
 
     root_dir = Path(request["rootDir"]).resolve()
     input_dir = request.get("inputDir")

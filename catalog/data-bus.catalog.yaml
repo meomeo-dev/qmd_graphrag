@@ -41,6 +41,8 @@ types:
       - one checkpoint per EPUB item
       - completed items are skipped on resume
       - retryable failed items resume through the same runId
+      - data_compatibility failures are non-retryable and stop the current
+        runner until a local compatibility fix explicitly reopens the item
       - unfinished items delegate recovery to BookResumePlan.nextStage
       - completed items require the fixed 27-command check set
       - completed items require qmdBuildStatus.status=succeeded
@@ -63,6 +65,8 @@ types:
       - redacts URL userinfo and URL query credentials before persistence
       - records failureKind, retryable, failedStage, providerStatusCode,
         retryAfterSeconds, and recoveryDecision
+      - records batch_stopped_after_non_transient_failure when an unresolved
+        data_compatibility failure would otherwise start high-cost pending books
       - raw stdout, stderr, and GraphRAG report logs stay in temporary run logs
       - operators and audits consume this JSONL as a persisted record
 
@@ -83,6 +87,8 @@ types:
         qmd/GraphRAG build status
       - transient provider failures enter provider recovery wait with
         recoveryDecision=retry_same_run_id instead of stop_until_fixed
+      - data_compatibility failures are exposed as operator action required
+        rather than provider recovery wait
       - exposes runner ownership and orphan recovery state for running items
       - reports qmd build status recomputed from 27 fixed command checks
       - reports GraphRAG build status from book-scoped producer lineage rather
@@ -462,6 +468,9 @@ types:
         GraphRAG workflow
       - indexScope carries current book/source/document/content lineage for
         provider cost accounting and prevents full-vault capability aggregation
+      - create_community_reports_text may fill entity_degree=0 only for an
+        existing text unit that lacks community-local entity degree; missing
+        text-unit identities remain fail-closed data_compatibility failures
 
   - name: graphrag_index_response
     schema: src/contracts/graphrag.ts#GraphRagIndexResponseSchema

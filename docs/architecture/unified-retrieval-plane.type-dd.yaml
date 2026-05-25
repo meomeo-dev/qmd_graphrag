@@ -341,6 +341,11 @@ typed_buses:
           - retryAfterSeconds
           - recoveryDecision
           - failedStage
+        failure_kind_contract:
+          data_compatibility: >-
+            Deterministic GraphRAG data-shape incompatibility after a real
+            stage execution. It is non-retryable until local code or upstream
+            data compatibility handling changes.
       - name: batch_recovery_summary
         schema: src/contracts/batch-run.ts#BatchRecoverySummarySchema
         envelope: src/contracts/batch-run.ts#BatchRecoverySummaryEnvelopeSchema
@@ -609,6 +614,13 @@ typed_buses:
           indexScope carries the current book/source/document/content identity
           for provider cost lineage. Index accounting must not aggregate
           artifactIds from unrelated graph_vault capabilities.
+        compatibility_contract:
+          community_text_unit_context: >-
+            During create_community_reports_text, a community/text-unit row may
+            reference an existing text unit that has no community-local entity
+            degree. The bridge may fill entity_degree=0 for that existing text
+            unit and continue. Missing text-unit identities remain fail-closed
+            data_compatibility failures.
       - name: graphrag_index_response
         schema: src/contracts/graphrag.ts#GraphRagIndexResponseSchema
         envelope: src/contracts/graphrag.ts#GraphRagIndexResponseEnvelopeSchema
@@ -1633,6 +1645,15 @@ state_and_recovery:
     permanent_failure_policy: >-
       Permanent failed items remain failed with retryable=false and
       recoveryDecision=stop_until_fixed. They do not block other pending items.
+    data_compatibility_failure_policy: >-
+      Data compatibility failed items use failureKind=data_compatibility,
+      retryable=false, and recoveryDecision=stop_until_fixed. The current
+      runner stops after persisting checkpoint, event log, manifest, and
+      recovery summary so high-cost pending books are not started under a
+      deterministic incompatible state. Only a code-level compatibility patch
+      may reopen a known recoverable data_compatibility checkpoint to pending;
+      the reopen event must be observable and must not skip the original
+      GraphRAG stage.
   commit_rule: >-
     A processing stage is committed only after required artifact manifests
     pass schema validation and vault-relative paths resolve from graph_vault.
