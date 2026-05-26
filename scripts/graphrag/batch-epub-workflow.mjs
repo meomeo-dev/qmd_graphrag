@@ -564,6 +564,8 @@ const BatchRecoverySummaryItemSchema = z.object({
   settingsProjectionLocator: z.string().min(1).optional(),
   settingsProjectionEvidenceLocator: z.string().min(1).optional(),
   settingsProjectionReason: z.string().min(1).optional(),
+  localArtifactGateRepairRequiresRealRebuild: z.boolean().optional(),
+  localArtifactGateRepairRebuildStage: z.string().min(1).optional(),
   errorSummary: z.string().max(1000).optional(),
 });
 const BatchRecoverySummarySchema = z.object({
@@ -3093,6 +3095,10 @@ function buildRecoverySummary(manifest, checkpoints) {
       settingsProjectionEvidenceLocator:
         item.metadata?.settingsProjectionEvidenceLocator,
       settingsProjectionReason: item.metadata?.settingsProjectionReason,
+      localArtifactGateRepairRequiresRealRebuild:
+        item.metadata?.localArtifactGateRepairRequiresRealRebuild,
+      localArtifactGateRepairRebuildStage:
+        item.metadata?.localArtifactGateRepairRebuildStage,
       errorSummary: item.errorSummary ? redacted(item.errorSummary) : undefined,
     });
   });
@@ -3850,18 +3856,37 @@ function repairLocalArtifactGate(item, checkpoint) {
   }
   if (repairResult?.status === "blocked") {
     const reason = redacted(repairResult.resume?.reason ?? "repair blocked");
+    const requiresRealRebuild =
+      repairResult.resume?.requiresRealRebuild === true;
+    const rebuildStage = typeof repairResult.resume?.rebuildStage === "string"
+      ? repairResult.resume.rebuildStage
+      : typeof repairResult.resume?.nextStage === "string"
+        ? repairResult.resume.nextStage
+        : undefined;
+    const recoveryFailureKind = requiresRealRebuild
+      ? "transient"
+      : checkpoint.failureKind ?? "permanent";
+    const recoveryRetryExhausted = requiresRealRebuild ? false : undefined;
+    const recoveryDecision = requiresRealRebuild
+      ? "retry_same_run_id"
+      : "continue_pending";
+    const recoveryFailedStage = rebuildStage ?? checkpoint.failedStage ??
+      "repair-local-artifact-gate";
     event({
       itemId: item.itemId,
       event: "item_local_artifact_gate_repair_blocked",
       status: "pending",
-      failureKind: checkpoint.failureKind ?? "permanent",
-      retryable: false,
-      recoveryDecision: "continue_pending",
-      failedStage: checkpoint.failedStage,
+      failureKind: recoveryFailureKind,
+      retryable: requiresRealRebuild,
+      attemptExhausted: recoveryRetryExhausted,
+      recoveryDecision,
+      failedStage: recoveryFailedStage,
       message: reason,
       metadata: {
         repairOnly: true,
         repairedLocalArtifactGate: false,
+        requiresRealRebuild,
+        rebuildStage,
         resumeStatus: repairResult.resume?.status,
         reason,
         ...(repairMetadata ?? {}),
@@ -3873,11 +3898,11 @@ function repairLocalArtifactGate(item, checkpoint) {
       bookId: repairResult.bookId ?? checkpoint.bookId,
       failedAt: undefined,
       errorSummary: reason,
-      failureKind: checkpoint.failureKind ?? "permanent",
-      retryable: false,
-      retryExhausted: undefined,
-      recoveryDecision: "continue_pending",
-      failedStage: checkpoint.failedStage ?? "repair-local-artifact-gate",
+      failureKind: recoveryFailureKind,
+      retryable: requiresRealRebuild,
+      retryExhausted: recoveryRetryExhausted,
+      recoveryDecision,
+      failedStage: recoveryFailedStage,
       activeCommand: checkpoint.activeCommand ?? checkpoint.currentCommand ??
         checkpoint.failedStage,
       nextRetryAt: undefined,
@@ -3888,8 +3913,10 @@ function repairLocalArtifactGate(item, checkpoint) {
         ...(checkpoint.metadata ?? {}),
         ...(repairMetadata ?? {}),
         localArtifactGateRepairCompleted: undefined,
-        localArtifactGateRepairBlocked: true,
-        localArtifactGateRepairBlockedReason: reason,
+        localArtifactGateRepairBlocked: requiresRealRebuild ? undefined : true,
+        localArtifactGateRepairBlockedReason: requiresRealRebuild ? undefined : reason,
+        localArtifactGateRepairRequiresRealRebuild: requiresRealRebuild,
+        localArtifactGateRepairRebuildStage: rebuildStage,
         waitingForProviderRecovery: false,
       },
     };

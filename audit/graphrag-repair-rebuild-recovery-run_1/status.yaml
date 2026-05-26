@@ -1,0 +1,42 @@
+schemaVersion: "1.0.0"
+case: graphrag-repair-rebuild-recovery
+run: 1
+status: passed
+startedAt: "2026-05-25T17:01:00-07:00"
+completedAt: "2026-05-25T17:42:00-07:00"
+scope:
+  - GraphRAG local artifact gate repair-only recovery.
+  - Same-run real GraphRAG rebuild reopening.
+  - Derived GraphRAG text-unit identity sidecar recovery.
+  - Batch checkpoint, event, and recovery-summary observability.
+fixedBaselines:
+  dev-agent-a: dev-agent-a/baseline.md
+  dev-agent-b: dev-agent-b/baseline.md
+  dev-agent-c: dev-agent-c/baseline.md
+auditState:
+  designAudit: not_required_bug_fix_scope
+  developmentAudit: passed
+  finalDecision: proceed_to_real_epub_batch_resume
+audits:
+  dev-agent-a:
+    initialReport: dev-agent-a/report.md
+    firstReaudit: dev-agent-a/reaudit-1.md
+    finalReaudit: dev-agent-a/reaudit-2.md
+    finalStatus: pass
+  dev-agent-b:
+    initialReport: dev-agent-b/report.md
+    finalReaudit: dev-agent-b/reaudit-1.md
+    finalStatus: pass
+  dev-agent-c:
+    initialReport: dev-agent-c/report.md
+    finalReaudit: dev-agent-c/reaudit-1.md
+    finalStatus: pass
+verification:
+  - command: npm run test:node -- test/graphrag-book-state.test.ts -t "syncGraphRagBookWorkspace"
+    status: pass
+  - command: npm run test:node -- test/cli.test.ts -t "GraphRAG EPUB batch runner"
+    status: pass
+  - command: npm run test:types
+    status: pass
+  - command: npm run build
+    status: pass

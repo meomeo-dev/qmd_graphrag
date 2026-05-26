@@ -639,15 +639,16 @@ function parseGraphTextUnitIdentitySidecar(
   if (typeof parsed !== "object" || parsed == null) return null;
   const value = parsed as Record<string, unknown>;
   const graphTextUnitIds = normalizeIdList(value.graphTextUnitIds);
+  const graphDocumentId = String(value.graphDocumentId ?? "");
   const mapping: GraphRagTextUnitIdentity = {
     schemaVersion: "1.0.0",
     bookId: String(value.bookId ?? ""),
     sourceId: String(value.sourceId ?? ""),
     sourceHash: String(value.sourceHash ?? ""),
     documentId: String(value.documentId ?? ""),
-    contentHash: String(value.contentHash ?? ""),
-    normalizedPath: String(value.normalizedPath ?? ""),
-    graphDocumentId: String(value.graphDocumentId ?? ""),
+    contentHash: expected.contentHash,
+    normalizedPath: expected.normalizedPath,
+    graphDocumentId,
     graphTextUnitIds,
   };
   const matchesIdentity =
@@ -655,8 +656,6 @@ function parseGraphTextUnitIdentitySidecar(
     mapping.sourceId === expected.sourceId &&
     mapping.sourceHash === expected.sourceHash &&
     mapping.documentId === expected.documentId &&
-    mapping.contentHash === expected.contentHash &&
-    mapping.normalizedPath === expected.normalizedPath &&
     mapping.graphDocumentId.length > 0 &&
     mapping.graphTextUnitIds.length > 0;
   return matchesIdentity ? mapping : null;
@@ -686,34 +685,75 @@ export async function readGraphTextUnitIdentity(input: {
     return null;
   }
 
+  return readValidatedGraphTextUnitIdentity(input);
+}
+
+async function readValidatedGraphTextUnitIdentity(
+  input: GraphRagTextUnitIdentityInput & {
+    graphDocumentId?: string;
+    graphTextUnitIds?: string[];
+  },
+): Promise<GraphRagTextUnitIdentity | null> {
+  const documentsPath = join(input.outputDir, "documents.parquet");
+  const textUnitsPath = join(input.outputDir, "text_units.parquet");
+  try {
+    await Promise.all([stat(documentsPath), stat(textUnitsPath)]);
+  } catch {
+    return null;
+  }
+
   const helper = [
     "import json, sys",
     "import pandas as pd",
-    "documents_path, text_units_path, document_id = sys.argv[1:4]",
+    "documents_path, text_units_path, document_id, graph_document_id, expected_json, normalized_path = sys.argv[1:7]",
     "documents = pd.read_parquet(documents_path)",
     "text_units = pd.read_parquet(text_units_path)",
-    "matched = documents.loc[documents['id'].astype(str) == str(document_id)]",
-    "if matched.empty and len(documents.index) == 1:",
-    "    matched = documents.iloc[[0]]",
+    "required_doc_cols = {'id', 'text_unit_ids'}",
+    "required_text_unit_cols = {'id', 'document_id'}",
+    "if not required_doc_cols.issubset(set(documents.columns)) or not required_text_unit_cols.issubset(set(text_units.columns)):",
+    "    print('null')",
+    "    raise SystemExit(0)",
+    "normalized_title = str(normalized_path).replace('\\\\', '/').split('/')[-1]",
+    "def title_basename(value):",
+    "    return str(value).replace('\\\\', '/').split('/')[-1]",
+    "if graph_document_id:",
+    "    matched = documents.loc[documents['id'].astype(str) == str(graph_document_id)]",
+    "else:",
+    "    matched = documents.loc[documents['id'].astype(str) == str(document_id)]",
+    "    if matched.empty and 'title' in documents.columns and normalized_title:",
+    "        matched = documents.loc[documents['title'].map(title_basename) == normalized_title]",
+    "    if matched.empty and len(documents.index) == 1:",
+    "        matched = documents.iloc[[0]]",
     "if matched.empty:",
     "    print('null')",
     "    raise SystemExit(0)",
     "document = matched.iloc[0]",
     "graph_document_id = str(document['id'])",
-    "ids = []",
-    "if 'text_unit_ids' in documents.columns:",
-    "    value = document.get('text_unit_ids')",
+    "if len(documents.index) > 1:",
+    "    if 'title' not in documents.columns or title_basename(document.get('title')) != normalized_title:",
+    "        print('null')",
+    "        raise SystemExit(0)",
+    "def normalize_ids(value):",
+    "    if value is None:",
+    "        return []",
     "    if hasattr(value, 'tolist'):",
     "        value = value.tolist()",
     "    if isinstance(value, (list, tuple, set)):",
-    "        ids.extend(str(item) for item in value if item is not None)",
-    "    elif value is not None:",
-    "        ids.append(str(value))",
-    "if 'document_id' in text_units.columns:",
-    "    filtered = text_units.loc[text_units['document_id'].astype(str) == graph_document_id]",
-    "    if 'id' in filtered.columns:",
-    "        ids.extend(str(item) for item in filtered['id'].tolist() if item is not None)",
-    "ids = sorted(set(item for item in ids if item))",
+    "        return [str(item) for item in value if item is not None and str(item)]",
+    "    if pd.isna(value):",
+    "        return []",
+    "    return [str(value)] if str(value) else []",
+    "document_ids = set(normalize_ids(document['text_unit_ids']))",
+    "filtered = text_units.loc[text_units['document_id'].astype(str) == graph_document_id]",
+    "scoped_ids = set(str(item) for item in filtered['id'].tolist() if item is not None and str(item))",
+    "expected_ids = set(str(item) for item in json.loads(expected_json)) if expected_json else set()",
+    "if not document_ids or document_ids != scoped_ids:",
+    "    print('null')",
+    "    raise SystemExit(0)",
+    "if expected_ids and expected_ids != document_ids:",
+    "    print('null')",
+    "    raise SystemExit(0)",
+    "ids = sorted(document_ids)",
     "print(json.dumps({'graphDocumentId': graph_document_id, 'graphTextUnitIds': ids}))",
   ].join("\n");
   const result = spawnSync(selectPythonBin(), [
@@ -722,6 +762,11 @@ export async function readGraphTextUnitIdentity(input: {
     documentsPath,
     textUnitsPath,
     input.documentId,
+    input.graphDocumentId ?? "",
+    input.graphTextUnitIds == null
+      ? ""
+      : JSON.stringify(input.graphTextUnitIds),
+    input.normalizedPath,
   ], {
     encoding: "utf8",
   });
@@ -752,49 +797,6 @@ export async function readGraphTextUnitIdentity(input: {
   };
 }
 
-async function graphTextUnitIdsExist(input: {
-  outputDir: string;
-  graphDocumentId: string;
-  graphTextUnitIds: string[];
-}): Promise<boolean> {
-  const textUnitsPath = join(input.outputDir, "text_units.parquet");
-  try {
-    await stat(textUnitsPath);
-  } catch {
-    return false;
-  }
-  const helper = [
-    "import json, sys",
-    "import pandas as pd",
-    "text_units_path, graph_document_id, ids_json = sys.argv[1:4]",
-    "expected = set(str(item) for item in json.loads(ids_json))",
-    "text_units = pd.read_parquet(text_units_path)",
-    "if 'id' not in text_units.columns:",
-    "    print('false')",
-    "    raise SystemExit(0)",
-    "actual = set(str(item) for item in text_units['id'].tolist() if item is not None)",
-    "if 'document_id' in text_units.columns:",
-    "    scoped = text_units.loc[text_units['document_id'].astype(str) == str(graph_document_id)]",
-    "    actual = set(str(item) for item in scoped['id'].tolist() if item is not None)",
-    "print('true' if expected and expected.issubset(actual) else 'false')",
-  ].join("\n");
-  const result = spawnSync(selectPythonBin(), [
-    "-c",
-    helper,
-    textUnitsPath,
-    input.graphDocumentId,
-    JSON.stringify(input.graphTextUnitIds),
-  ], {
-    encoding: "utf8",
-  });
-  if (result.status !== 0) {
-    throw new Error(
-      result.stderr.trim() || "failed to validate GraphRAG text unit identity",
-    );
-  }
-  return result.stdout.trim() === "true";
-}
-
 async function readGraphTextUnitIdentitySidecar(
   input: GraphRagTextUnitIdentityInput,
 ): Promise<GraphRagTextUnitIdentity | null> {
@@ -806,25 +808,21 @@ async function readGraphTextUnitIdentitySidecar(
   }
   const mapping = parseGraphTextUnitIdentitySidecar(raw, input);
   if (mapping == null) {
-    throw new Error(
-      `GraphRAG document identity sidecar does not match query_ready: ${
-        input.documentId
-      }`,
-    );
+    return null;
   }
-  const textUnitsExist = await graphTextUnitIdsExist({
-    outputDir: input.outputDir,
+  const validated = await readValidatedGraphTextUnitIdentity({
+    ...input,
     graphDocumentId: mapping.graphDocumentId,
     graphTextUnitIds: mapping.graphTextUnitIds,
   });
-  if (!textUnitsExist) {
+  if (validated == null) {
     throw new Error(
-      `GraphRAG document identity sidecar references missing text units: ${
+      `GraphRAG document identity sidecar evidence is invalid for query_ready: ${
         input.documentId
       }`,
     );
   }
-  return mapping;
+  return validated;
 }
 
 async function recordGraphTextUnitIdentityIfAvailable(input: {

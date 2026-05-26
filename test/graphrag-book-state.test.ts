@@ -2,12 +2,13 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { describe, expect, test } from "vitest";
 import YAML from "yaml";
 
 import {
+  BookStageOrder,
   buildGraphRagRuntimeSettingsProjection,
   assertGraphRagStageArtifactsReady,
   assertGraphRagStageReportHealthy,
@@ -22,6 +23,8 @@ import {
   writeManagedGraphRagSettingsSync,
 } from "../src/index.js";
 import type { CollectionConfig } from "../src/collections.js";
+import type { BookStage, BookJob } from "../src/contracts/book-job.js";
+import type { StageFingerprintMap } from "../src/job-state/repository.js";
 import { createStore } from "../src/store.js";
 
 const TestPythonBin = existsSync(join(process.cwd(), ".venv-graphrag", "bin", "python"))
@@ -62,7 +65,7 @@ async function writeMultiDocumentGraphOutput(outputDir: string): Promise<void> {
     "import pandas as pd, sys",
     "output_dir = sys.argv[1]",
     "pd.DataFrame([",
-    "  {'id':'graph-doc-1','title':'book-a.md','text_unit_ids':['tu-1','tu-2']},",
+    "  {'id':'graph-doc-1','title':'book.md','text_unit_ids':['tu-1','tu-2']},",
     "  {'id':'graph-doc-2','title':'book-b.md','text_unit_ids':['tu-3']},",
     "]).to_parquet(f'{output_dir}/documents.parquet')",
     "pd.DataFrame([",
@@ -99,6 +102,94 @@ async function writeCompleteLanceDbSidecars(outputDir: string): Promise<void> {
       "utf8",
     );
   }
+}
+
+async function prepareQueryReadyGraphFixture(input: {
+  graphVault: string;
+  sourcePath: string;
+  normalizedPath: string;
+  projectConfig: CollectionConfig;
+  writeGraphOutput?: (outputDir: string) => Promise<void>;
+}): Promise<{
+  initial: {
+    job: BookJob;
+    stageFingerprints: StageFingerprintMap;
+  };
+  outputDir: string;
+}> {
+  await writeManagedGraphRagSettings({
+    config: input.projectConfig,
+    graphVault: input.graphVault,
+  });
+  await writeFile(
+    join(input.graphVault, "prompts", "extract_graph.txt"),
+    "prompt",
+    "utf8",
+  );
+  const initial = await syncGraphRagBookWorkspace({
+    stateRootDir: input.graphVault,
+    sourcePath: input.sourcePath,
+    normalizedPath: input.normalizedPath,
+    settingsPath: join(input.graphVault, "settings.yaml"),
+    promptsDir: join(input.graphVault, "prompts"),
+    outputDir: join(input.graphVault, "output"),
+    qmdIndexPath: join(dirname(input.graphVault), ".qmd", "index.sqlite"),
+    projectConfig: input.projectConfig,
+    recordRecoveredStages: false,
+  });
+  const outputDir = graphRagBookOutputDir({
+    stateRootDir: input.graphVault,
+    bookId: initial.job.bookId,
+  });
+  await (input.writeGraphOutput ?? writeMultiDocumentGraphOutput)(outputDir);
+  await writeCompleteLanceDbSidecars(outputDir);
+  for (const stage of [
+    "graph_extract",
+    "community_report",
+    "embed",
+  ] as const) {
+    await writeGraphRagOutputProducerManifest({
+      outputDir,
+      bookId: initial.job.bookId,
+      sourceHash: initial.job.sourceHash,
+      documentId: initial.job.documentId,
+      contentHash: initial.job.normalizedContentHash ?? initial.job.sourceHash,
+      stageFingerprints: Object.fromEntries(BookStageOrder.map((item) => [
+        item,
+        initial.stageFingerprints[item] ?? item,
+      ])) as Record<BookStage, string>,
+      providerFingerprint: initial.job.providerFingerprint!,
+      producerRunId: `real-${stage}`,
+      stage,
+    });
+  }
+  return { initial, outputDir };
+}
+
+async function writeGraphTextUnitIdentitySidecar(input: {
+  outputDir: string;
+  job: BookJob;
+  normalizedPath: string;
+  graphDocumentId: string;
+  graphTextUnitIds: string[];
+  overrides?: Record<string, unknown>;
+}): Promise<void> {
+  await writeFile(
+    join(input.outputDir, "qmd_graph_text_unit_identity.json"),
+    JSON.stringify({
+      schemaVersion: SchemaVersion,
+      bookId: input.job.bookId,
+      sourceId: `sha256:${input.job.sourceHash}`,
+      sourceHash: input.job.sourceHash,
+      documentId: input.job.documentId,
+      contentHash: input.job.normalizedContentHash ?? input.job.sourceHash,
+      normalizedPath: input.normalizedPath,
+      graphDocumentId: input.graphDocumentId,
+      graphTextUnitIds: input.graphTextUnitIds,
+      ...(input.overrides ?? {}),
+    }, null, 2),
+    "utf8",
+  );
 }
 
 describe("syncGraphRagBookWorkspace", () => {
@@ -889,7 +980,7 @@ describe("syncGraphRagBookWorkspace", () => {
     }
   });
 
-  test("rejects mismatched or stale GraphRAG identity sidecars", async () => {
+  test("repairs stale GraphRAG identity sidecar content metadata", async () => {
     const root = await createWorkspace();
     try {
       const graphVault = join(root, "graph_vault");
@@ -969,7 +1060,7 @@ describe("syncGraphRagBookWorkspace", () => {
         "utf8",
       );
 
-      await expect(syncGraphRagBookWorkspace({
+      const synced = await syncGraphRagBookWorkspace({
         stateRootDir: graphVault,
         sourcePath,
         normalizedPath,
@@ -979,13 +1070,29 @@ describe("syncGraphRagBookWorkspace", () => {
         qmdIndexPath: join(root, ".qmd", "index.sqlite"),
         projectConfig,
         recordRecoveredStages: false,
-      })).rejects.toThrow("sidecar does not match");
+      });
+      const sidecar = JSON.parse(await readFile(
+        join(outputDir, "qmd_graph_text_unit_identity.json"),
+        "utf8",
+      )) as {
+        contentHash?: string;
+        normalizedPath?: string;
+        graphDocumentId?: string;
+        graphTextUnitIds?: string[];
+      };
+
+      expect(sidecar.contentHash).toBe(
+        synced.job.normalizedContentHash ?? synced.job.sourceHash,
+      );
+      expect(sidecar.normalizedPath).toBe(synced.job.normalizedPath);
+      expect(sidecar.graphDocumentId).toBe("graph-doc-1");
+      expect(sidecar.graphTextUnitIds).toEqual(["tu-1", "tu-2"]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  test("rejects GraphRAG identity sidecar when normalizedPath mismatches", async () => {
+  test("repairs stale GraphRAG identity sidecar path metadata", async () => {
     const root = await createWorkspace();
     try {
       const graphVault = join(root, "graph_vault");
@@ -1049,6 +1156,63 @@ describe("syncGraphRagBookWorkspace", () => {
         "utf8",
       );
 
+      const synced = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig,
+        recordRecoveredStages: false,
+      });
+      const sidecar = JSON.parse(await readFile(
+        join(outputDir, "qmd_graph_text_unit_identity.json"),
+        "utf8",
+      )) as {
+        contentHash?: string;
+        normalizedPath?: string;
+        graphDocumentId?: string;
+        graphTextUnitIds?: string[];
+      };
+
+      expect(sidecar.contentHash).toBe(
+        synced.job.normalizedContentHash ?? synced.job.sourceHash,
+      );
+      expect(sidecar.normalizedPath).toBe(synced.job.normalizedPath);
+      expect(sidecar.graphDocumentId).toBe("graph-doc-1");
+      expect(sidecar.graphTextUnitIds).toEqual(["tu-1", "tu-2"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects GraphRAG identity sidecar with missing graph document", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+      const { initial, outputDir } = await prepareQueryReadyGraphFixture({
+        graphVault,
+        sourcePath,
+        normalizedPath,
+        projectConfig,
+      });
+      await writeGraphTextUnitIdentitySidecar({
+        outputDir,
+        job: initial.job,
+        normalizedPath: initial.job.normalizedPath,
+        graphDocumentId: "graph-doc-missing",
+        graphTextUnitIds: ["tu-1", "tu-2"],
+      });
+
       await expect(syncGraphRagBookWorkspace({
         stateRootDir: graphVault,
         sourcePath,
@@ -1059,7 +1223,207 @@ describe("syncGraphRagBookWorkspace", () => {
         qmdIndexPath: join(root, ".qmd", "index.sqlite"),
         projectConfig,
         recordRecoveredStages: false,
-      })).rejects.toThrow("sidecar does not match");
+      })).rejects.toThrow(
+        "GraphRAG document identity sidecar evidence is invalid",
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects GraphRAG identity sidecar that binds another document", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+      const { initial, outputDir } = await prepareQueryReadyGraphFixture({
+        graphVault,
+        sourcePath,
+        normalizedPath,
+        projectConfig,
+      });
+      await writeGraphTextUnitIdentitySidecar({
+        outputDir,
+        job: initial.job,
+        normalizedPath: initial.job.normalizedPath,
+        graphDocumentId: "graph-doc-2",
+        graphTextUnitIds: ["tu-3"],
+      });
+
+      await expect(syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig,
+        recordRecoveredStages: false,
+      })).rejects.toThrow(
+        "GraphRAG document identity sidecar evidence is invalid",
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects GraphRAG identity sidecar with missing text units", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+      const { initial, outputDir } = await prepareQueryReadyGraphFixture({
+        graphVault,
+        sourcePath,
+        normalizedPath,
+        projectConfig,
+      });
+      await writeGraphTextUnitIdentitySidecar({
+        outputDir,
+        job: initial.job,
+        normalizedPath: initial.job.normalizedPath,
+        graphDocumentId: "graph-doc-1",
+        graphTextUnitIds: ["tu-1", "tu-missing"],
+      });
+
+      await expect(syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig,
+        recordRecoveredStages: false,
+      })).rejects.toThrow(
+        "GraphRAG document identity sidecar evidence is invalid",
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("falls back from mismatched sidecar to valid parquet identity", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+      const { initial, outputDir } = await prepareQueryReadyGraphFixture({
+        graphVault,
+        sourcePath,
+        normalizedPath,
+        projectConfig,
+      });
+      await writeGraphTextUnitIdentitySidecar({
+        outputDir,
+        job: initial.job,
+        normalizedPath: initial.job.normalizedPath,
+        graphDocumentId: "graph-doc-2",
+        graphTextUnitIds: ["tu-3"],
+        overrides: { documentId: "doc-other" },
+      });
+
+      const synced = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig,
+        recordRecoveredStages: false,
+      });
+      const sidecar = JSON.parse(await readFile(
+        join(outputDir, "qmd_graph_text_unit_identity.json"),
+        "utf8",
+      )) as {
+        documentId?: string;
+        graphDocumentId?: string;
+        graphTextUnitIds?: string[];
+      };
+
+      expect(sidecar.documentId).toBe(synced.job.documentId);
+      expect(sidecar.graphDocumentId).toBe("graph-doc-1");
+      expect(sidecar.graphTextUnitIds).toEqual(["tu-1", "tu-2"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects query-ready fallback when parquet text-unit evidence is corrupt", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+      await prepareQueryReadyGraphFixture({
+        graphVault,
+        sourcePath,
+        normalizedPath,
+        projectConfig,
+        writeGraphOutput: async (outputDir) => {
+          await mkdir(outputDir, { recursive: true });
+          const parquetScript = [
+            "import pandas as pd, sys",
+            "output_dir = sys.argv[1]",
+            "pd.DataFrame([",
+            "  {'id':'graph-doc-1','title':'book.md','text_unit_ids':['tu-1','tu-missing']},",
+            "]).to_parquet(f'{output_dir}/documents.parquet')",
+            "pd.DataFrame([",
+            "  {'id':'tu-1','document_id':'graph-doc-1'},",
+            "]).to_parquet(f'{output_dir}/text_units.parquet')",
+            "pd.DataFrame([{'community':'0','title':'report','full_content':'report'}]).to_parquet(f'{output_dir}/community_reports.parquet')",
+            "for name in ['entities', 'relationships', 'communities']:",
+            "    pd.DataFrame([{'id': f'{name}-1'}]).to_parquet(f'{output_dir}/{name}.parquet')",
+          ].join("\n");
+          const result = spawnSync(TestPythonBin, ["-c", parquetScript, outputDir], {
+            encoding: "utf8",
+          });
+          expect(result.status, result.stderr).toBe(0);
+          await writeFile(join(outputDir, "context.json"), '{"records":[]}', "utf8");
+          await writeFile(join(outputDir, "stats.json"), '{"workflows":{}}', "utf8");
+        },
+      });
+
+      await expect(syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig,
+        recordRecoveredStages: false,
+      })).rejects.toThrow(
+        "GraphRAG document identity is missing for query_ready",
+      );
     } finally {
       await rm(root, { recursive: true, force: true });
     }

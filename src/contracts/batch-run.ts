@@ -265,6 +265,8 @@ export const BatchRecoverySummaryItemSchema = z.object({
   settingsProjectionLocator: z.string().min(1).optional(),
   settingsProjectionEvidenceLocator: z.string().min(1).optional(),
   settingsProjectionReason: z.string().min(1).optional(),
+  localArtifactGateRepairRequiresRealRebuild: z.boolean().optional(),
+  localArtifactGateRepairRebuildStage: z.string().min(1).optional(),
   errorSummary: z.string().max(1000).optional(),
 });
 

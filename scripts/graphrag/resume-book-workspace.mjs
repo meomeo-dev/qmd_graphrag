@@ -248,6 +248,7 @@ function isLocalArtifactGateError(value) {
     message.includes("corpus_content_hash_mismatch") ||
     message.includes("artifact_not_book_scoped_graph_output") ||
     message.includes("graphrag document identity is missing for query_ready") ||
+    message.includes("graphrag document identity sidecar evidence is invalid for query_ready") ||
     message.includes("graphrag document identity sidecar does not match query_ready") ||
     message.includes("graph_vault/settings.yaml is not the managed projection of .qmd/index.yml") ||
     message.includes("capabilityscope references unknown or not-ready graphcapabilityid") ||
@@ -684,6 +685,7 @@ async function runRepairLocalArtifactGateOnly(runtimeApi, repo) {
       queryResult: null,
       repairOnly: true,
       repairedLocalArtifactGate: false,
+      requiresRealRebuild: false,
       settingsProjectionRepair: undefined,
       reason: "book state not found for local artifact gate repair",
     });
@@ -703,6 +705,9 @@ async function runRepairLocalArtifactGateOnly(runtimeApi, repo) {
       queryResult: null,
       repairOnly: true,
       repairedLocalArtifactGate: false,
+      requiresRealRebuild: true,
+      rebuildStage:
+        checkpoints.find((item) => item.status === "failed")?.stage ?? null,
       settingsProjectionRepair: undefined,
       reason: "local artifact gate failure checkpoint not found",
     });
@@ -835,10 +840,26 @@ async function runRepairLocalArtifactGateOnly(runtimeApi, repo) {
         `graph_vault/books/${bookId}/checkpoints.yaml#query_ready`;
       await graphQueryScopeFromSync(sync, runtimeApi.loadGraphQueryCapabilities);
     } else {
-      throw new Error(
-        `local artifact gate repair did not restore graph query capability: ` +
-        `nextStage=${sync.resumePlan.nextStage ?? "none"}`,
-      );
+      printJson({
+        status: "blocked",
+        bookId,
+        startedStage: null,
+        nextStage: sync.resumePlan.nextStage,
+        completedStages: sync.resumePlan.completedStages,
+        queryResult: null,
+        repairOnly: true,
+        repairedLocalArtifactGate: false,
+        requiresRealRebuild: true,
+        rebuildStage: sync.resumePlan.nextStage ?? null,
+        repairedCheckpointStages,
+        repairedFailedStage: checkpoint?.stage,
+        reusedProducerRunIds: producerRunIds,
+        settingsProjectionRepair: settingsProjectionRepairForOutput(sync),
+        reason: `real GraphRAG rebuild required for ${
+          sync.resumePlan.nextStage ?? "unknown"
+        }`,
+      });
+      return;
     }
   }
   checkpoints = await repo.listStageCheckpoints(bookId);
@@ -854,6 +875,7 @@ async function runRepairLocalArtifactGateOnly(runtimeApi, repo) {
     queryResult: null,
     repairOnly: true,
     repairedLocalArtifactGate: true,
+    requiresRealRebuild: false,
     repairReason,
     repairedProjection,
     repairEvidenceLocator,
