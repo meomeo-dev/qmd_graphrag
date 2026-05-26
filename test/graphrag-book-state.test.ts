@@ -232,7 +232,7 @@ describe("syncGraphRagBookWorkspace", () => {
     graphrag: {
       enabled: true,
       vault: "graph_vault",
-      concurrent_requests: 5,
+      concurrent_requests: 10,
       default_method: "local",
       default_response_type: "multiple paragraphs",
     },
@@ -284,12 +284,13 @@ describe("syncGraphRagBookWorkspace", () => {
         concurrent_requests: undefined,
       },
     });
-    expect(projection.settings.concurrent_requests).toBe(5);
+    expect(projection.settings.concurrent_requests).toBe(10);
     expect(projection.settings).toMatchObject({
       completion_models: {
         default_chat_model: {
           call_args: {
-            qmd_responses_max_concurrency: 5,
+            max_completion_tokens: 23000,
+            qmd_responses_max_concurrency: 10,
           },
         },
       },
@@ -2394,7 +2395,7 @@ describe("syncGraphRagBookWorkspace", () => {
       const repaired = YAML.parse(
         await readFile(join(graphVault, "settings.yaml"), "utf8"),
       ) as { concurrent_requests?: number };
-      expect(repaired.concurrent_requests).toBe(5);
+      expect(repaired.concurrent_requests).toBe(10);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

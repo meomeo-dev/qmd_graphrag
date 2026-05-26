@@ -15,7 +15,8 @@ const ManagedBy = "qmd_graphrag";
 const ResponsesEndpoint = "/responses";
 const DocumentEmbeddingModelId = "default_embedding_model";
 const QueryEmbeddingModelId = "query_embedding_model";
-const DefaultConcurrentRequests = 5;
+const DefaultConcurrentRequests = 10;
+const DefaultMaxCompletionTokens = 23000;
 
 export type GraphRagRuntimeSettingsProjection = {
   sourceFingerprint: string;
@@ -135,7 +136,7 @@ export function buildGraphRagRuntimeSettingsProjection(
           responses_stream: responseApi.stream ?? true,
           strict_structured_output: responseApi.strict_structured_output ?? true,
           reasoning_effort: responseApi.reasoning_effort ?? "medium",
-          max_completion_tokens: 4096,
+          max_completion_tokens: DefaultMaxCompletionTokens,
           qmd_responses_max_concurrency: concurrentRequests,
           qmd_responses_retry_max_retries: 12,
           qmd_responses_retry_base_delay: 2,

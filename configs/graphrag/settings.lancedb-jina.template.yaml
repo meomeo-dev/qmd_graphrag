@@ -24,9 +24,10 @@ completion_models:
       responses_stream: true
       strict_structured_output: true
       reasoning_effort: medium
-      max_completion_tokens: 4096
+      max_completion_tokens: 23000
+      qmd_responses_max_concurrency: 10
 
-concurrent_requests: 5
+concurrent_requests: 10
 
 embedding_models:
   default_embedding_model:
