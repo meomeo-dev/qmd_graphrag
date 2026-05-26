@@ -1915,6 +1915,15 @@ describe("GraphRAG EPUB batch runner", () => {
       failureKind: "transient",
       retryable: true,
     });
+    expect(classifyFailure(
+      "GraphRAG index workflow failed: " +
+      "[{\"workflow\":\"extract_graph\",\"errorMessage\":\"An error occurred " +
+      "while processing your request. You can retry your request, or contact " +
+      "support if the error persists. Please include the request ID req-1.\"}]",
+    )).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+    });
     expect(classifyFailure("GraphRAG stage report partial-output failure")).toMatchObject({
       failureKind: "transient",
       retryable: true,

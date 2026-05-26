@@ -37,6 +37,7 @@
   "scripts": {
     "prepare": "[ -d .git ] && ./scripts/install-hooks.sh || true",
     "build": "node scripts/build.mjs",
+    "typecheck": "npm run test:types",
     "test": "node scripts/test-all.mjs",
     "test:types": "node ./node_modules/typescript/bin/tsc -p tsconfig.build.json --noEmit",
     "test:node": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000",

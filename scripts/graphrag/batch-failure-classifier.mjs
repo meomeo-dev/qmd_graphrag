@@ -70,6 +70,7 @@ export function isProviderTransientFailureText(text) {
     "graphrag stage report",
     "rate limit",
     "temporarily unavailable",
+    "an error occurred while processing your request. you can retry your request",
     "kind=server_error",
     "kind=rate_limit_exceeded",
     "kind=timeout",

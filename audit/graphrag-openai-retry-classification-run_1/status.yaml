@@ -1,0 +1,53 @@
+schemaVersion: "1.0.0"
+case: graphrag-openai-retry-classification
+run: 1
+status: development_audit_passed
+startedAt: "2026-05-25T23:44:00-07:00"
+completedAt: "2026-05-26T00:35:00-07:00"
+scope:
+  - Batch failure classification for OpenAI provider retry guidance.
+  - Recovery path preservation for GraphRAG index stage provider failures.
+  - No changes to GraphRAG artifact gates, query projection, or output formats.
+fixedBaselines:
+  dev-agent-a: dev-agent-a/baseline.md
+  dev-agent-b: dev-agent-b/baseline.md
+  dev-agent-c: dev-agent-c/baseline.md
+auditState:
+  developmentAudit: passed
+  finalDecision: passed
+implementation:
+  changedFiles:
+    - package.json
+    - scripts/graphrag/batch-failure-classifier.mjs
+    - test/cli.test.ts
+    - docs/architecture/graphrag-provider-retry-classification.md
+verification:
+  commands:
+    - npm run typecheck
+    - npm run test:node -- test/cli.test.ts -t "keeps transient and permanent provider recovery decisions typed"
+    - npm run test:types
+    - git diff --check
+  result: passed
+developmentAuditReports:
+  - agent: dev-agent-a
+    baseline: dev-agent-a/baseline.md
+    report: dev-agent-a/report-r2.md
+    result: passed
+  - agent: dev-agent-b
+    baseline: dev-agent-b/baseline.md
+    report: dev-agent-b/report-r2.md
+    result: passed
+  - agent: dev-agent-c
+    baseline: dev-agent-c/baseline.md
+    report: dev-agent-c/report-r2.md
+    result: passed
+finalReport: final-report.md
+observedRun:
+  runId: epub-batch-20260525-full-real
+  itemId: item-b75032ab9516-bd1ba4a2
+  bookId: book-b75032ab9516-ec793703
+  failedStage: graph_extract
+  priorClassification:
+    failureKind: unknown
+    retryable: false
+    recoveryDecision: stop_until_fixed
