@@ -1,0 +1,109 @@
+schemaVersion: '1.0.0'
+case: graphrag-identity-sidecar-recovery
+run: 1
+status: development_audit_passed
+startedAt: '2026-05-26T23:10:00Z'
+updatedAt: '2026-05-26T23:38:00Z'
+criteriaFrozen: true
+criteriaPaths:
+  - agent-a/audit-criteria.md
+  - agent-b/audit-criteria.md
+  - agent-c/audit-criteria.md
+design: design.md
+designAuditReports:
+  - agent-a/design-audit-report.md
+  - agent-b/design-audit-report.md
+  - agent-c/design-audit-report.md
+revisedDesign: revised-design.md
+designReauditReports:
+  - agent-a/design-reaudit-report.md
+  - agent-b/design-reaudit-report.md
+  - agent-c/design-reaudit-report.md
+developmentCriteriaFrozen: true
+developmentCriteriaPaths:
+  - agent-a/development-audit-criteria.md
+  - agent-b/development-audit-criteria.md
+  - agent-c/development-audit-criteria.md
+implementation:
+  files:
+    - src/job-state/graphrag-book.ts
+    - test/graphrag-book-state.test.ts
+  summary:
+    - Prefer current documents/text_units parquet identity before sidecar fallback.
+    - Rewrite stale same-document sidecars from current parquet identity.
+    - Preserve fail-closed behavior when current parquet cannot prove identity.
+    - Verify graph_extract-only identity repair does not publish graph capability.
+verification:
+  passed:
+    - >-
+      npm run test:node -- test/graphrag-book-state.test.ts -t "sidecar"
+    - >-
+      npm run test:node -- test/graphrag-book-state.test.ts -t
+      "graph_extract identity"
+    - npm run test:node -- test/graphrag-book-state.test.ts
+    - npm run test:node -- test/book-job-state.test.ts
+    - npm run typecheck
+    - node -c scripts/graphrag/batch-epub-workflow.mjs
+    - git diff --check
+  workspaceHygiene:
+    checkedAt: '2026-05-26T23:35:00Z'
+    command: git status --short --untracked-files=all
+    result: no runtime artifact directories were present after removing .tmp-tests
+  realFailureProbe:
+    ranAt: '2026-05-26T23:34:00Z'
+    target:
+      runId: epub-batch-20260526-resume-after-auth
+      itemId: item-9f587b71073a-cff9f38d
+      bookId: book-9f587b71073a-ad95ce2f
+      documentId: doc-fd8875181a17
+    command: >-
+      npx tsx scripts/graphrag/resume-book-workspace.mjs --state-root
+      graph_vault --source-path "inbox/软件工程与系统设计经典著作指南/A
+      Philosophy of Software Design (John K. Ousterhout).epub"
+      --source-identity-path "inbox/软件工程与系统设计经典著作指南/A Philosophy
+      of Software Design (John K. Ousterhout).epub" --normalized-path
+      graph_vault/input/a-philosophy-of-software-design-john-k-ousterhout-9f587b7107.md
+      --qmd-index-path .qmd/index.sqlite --config .qmd/index.yml
+      --report-root /tmp/qmd-graphrag-sidecar-recovery-probe
+      --repair-local-artifact-gate-only
+    exitStatus: 0
+    stdoutPath: /tmp/qmd-graphrag-sidecar-recovery-probe/result-tsx.json
+    stderrPath: /tmp/qmd-graphrag-sidecar-recovery-probe/result-tsx.err
+    stderrBytes: 0
+    result:
+      status: blocked
+      nextStage: community_report
+      completedStages:
+        - ingest
+        - normalize
+        - graph_extract
+      repairedCheckpointStages:
+        - graph_extract
+      repairedFailedStage: graph_extract
+      requiresRealRebuild: true
+      rebuildStage: community_report
+      reason: real GraphRAG rebuild required for community_report
+    classification: >-
+      local sidecar recovery fixed; original sidecar invalid error did not
+      recur. Stage gate correctly requires real community_report rebuild and
+      did not publish query_ready.
+developmentAuditReports:
+  - agent-a/development-audit-report.md
+  - agent-b/development-audit-report.md
+  - agent-c/development-audit-report.md
+developmentReauditReports:
+  - agent-b/development-reaudit-report.md
+  - agent-c/development-reaudit-report.md
+finalReport: final-report.md
+trigger:
+  runId: epub-batch-20260526-resume-after-auth
+  itemId: item-9f587b71073a-cff9f38d
+  bookId: book-9f587b71073a-ad95ce2f
+  stage: resume-book-1
+  error: >-
+    GraphRAG document identity sidecar evidence is invalid for query_ready:
+    doc-fd8875181a17
+realRunEvidence:
+  statusJson: /tmp/qmd-epub-batch-20260526-resume-after-auth/status-after-stop.json
+  runnerLog: /tmp/qmd-epub-batch-20260526-resume-after-auth/logs/runner-20260526T230133Z.log
+  itemError: /tmp/qmd-epub-batch-20260526-resume-after-auth/logs/item-9f587b71073a-cff9f38d-resume-book-1.err

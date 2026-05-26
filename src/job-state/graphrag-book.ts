@@ -934,8 +934,9 @@ async function recordGraphTextUnitIdentityIfAvailable(input: {
   };
   let mapping: GraphRagTextUnitIdentity | null;
   try {
-    mapping = await readGraphTextUnitIdentitySidecar(identityInput) ??
-      await readGraphTextUnitIdentity(identityInput);
+    // The sidecar is a cache; recovered current Parquet output must win.
+    mapping = await readGraphTextUnitIdentity(identityInput) ??
+      await readGraphTextUnitIdentitySidecar(identityInput);
   } catch (error) {
     if (!input.required) return;
     throw error;
