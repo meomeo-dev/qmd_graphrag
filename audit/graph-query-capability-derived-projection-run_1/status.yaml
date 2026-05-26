@@ -1,0 +1,60 @@
+schemaVersion: "1.0.0"
+case: graph-query-capability-derived-projection
+run: 1
+status: passed
+startedAt: "2026-05-25T18:55:00-07:00"
+completedAt: "2026-05-25T19:35:00-07:00"
+scope:
+  - Python GraphRAG bridge capability resolution.
+  - Repair-only query-ready projection recovery.
+  - Batch recovery path for graph_query capability projection failures.
+fixedBaselines:
+  dev-agent-a: dev-agent-a/baseline.md
+  dev-agent-b: dev-agent-b/baseline.md
+  dev-agent-c: dev-agent-c/baseline.md
+auditState:
+  designAudit: not_required_bug_fix_scope
+  developmentAudit: passed
+  finalDecision: pass
+reports:
+  initial:
+    dev-agent-a: dev-agent-a/report.md
+    dev-agent-b: dev-agent-b/report.md
+    dev-agent-c: dev-agent-c/report.md
+  reaudit1:
+    dev-agent-a: dev-agent-a/reaudit-1.md
+    dev-agent-b: dev-agent-b/reaudit-1.md
+    dev-agent-c: dev-agent-c/reaudit-1.md
+  reaudit2:
+    dev-agent-a: dev-agent-a/reaudit-2.md
+    dev-agent-b: dev-agent-b/reaudit-2.md
+    dev-agent-c: dev-agent-c/reaudit-2.md
+  final: final-report.md
+verification:
+  - command: python -m pytest test/python/test_graphrag_bridge_scope.py -k 'capability_scope'
+    status: pass
+    result: "12 passed, 17 deselected"
+  - command: python -m pytest test/python/test_graphrag_bridge_scope.py -k 'capability_scope or index_scope or filter_graphrag_frames_for_scope or build_graphrag_evidence'
+    status: pass
+    result: "20 passed, 9 deselected"
+  - command: node --check scripts/graphrag/resume-book-workspace.mjs
+    status: pass
+  - command: node --check scripts/graphrag/batch-epub-workflow.mjs
+    status: pass
+  - command: npm run test:node -- test/cli.test.ts -t "GraphRAG EPUB batch runner"
+    status: pass
+    result: "55 passed, 132 skipped"
+  - command: npm run test:types
+    status: pass
+  - command: npm run build
+    status: pass
+  - command: python -m pytest test/python/test_graphrag_bridge_scope.py
+    status: blocked_environment
+    note: "Fails on missing nest_asyncio2 in an unrelated test path."
+finalAudit:
+  dev-agent-a: pass
+  dev-agent-b: pass
+  dev-agent-c: pass
+residualRisks:
+  - "Full Python bridge test still needs an environment with nest_asyncio2."
+  - "Long real EPUB batch is still running and must continue after this commit."

@@ -1029,6 +1029,76 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                 capabilities,
             )
 
+    def test_capability_scope_derives_missing_capability_with_explicit_catalog(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmd-bridge-scope-") as tmp:
+            root = Path(tmp)
+            _write_books(root)
+            capability_path = root / "catalog" / "graph-capabilities.yaml"
+            catalog = yaml.safe_load(capability_path.read_text(encoding="utf-8"))
+            catalog["items"] = [
+                item
+                for item in catalog["items"]
+                if item["capabilityId"] != "book-2:graph_query"
+            ]
+            capability_path.write_text(
+                yaml.safe_dump(catalog),
+                encoding="utf-8",
+            )
+
+            book_ids, capabilities = _resolve_capability_scoped_book_ids(
+                root,
+                ["book-2"],
+                ["book-2:graph_query"],
+            )
+
+            self.assertEqual(book_ids, ["book-2"])
+            self.assertEqual(capabilities[0]["capabilityId"], "book-2:graph_query")
+            self.assertEqual(
+                capabilities[0]["artifactIds"],
+                _lineage_artifact_ids("artifact-2"),
+            )
+            self.assertEqual(capabilities[0]["metadata"]["projectionSource"], "book_state")
+
+    def test_capability_scope_rejects_explicit_catalog_without_book_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmd-bridge-scope-") as tmp:
+            root = Path(tmp)
+            _write_books(root)
+            books_path = root / "catalog" / "books.yaml"
+            catalog = yaml.safe_load(books_path.read_text(encoding="utf-8"))
+            catalog["items"] = [
+                item for item in catalog["items"] if item["bookId"] != "book-1"
+            ]
+            books_path.write_text(yaml.safe_dump(catalog), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "unknown or not-ready"):
+                _resolve_capability_scoped_book_ids(
+                    root,
+                    ["book-1"],
+                    ["book-1:graph_query"],
+                )
+
+    def test_capability_scope_rejects_explicit_catalog_when_derivation_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmd-bridge-scope-") as tmp:
+            root = Path(tmp)
+            _write_books(root)
+            identity_path = root / "catalog" / "document-identity-map.yaml"
+            catalog = yaml.safe_load(identity_path.read_text(encoding="utf-8"))
+            catalog["items"][0]["graphTextUnitIds"] = "tu-1"
+            identity_path.write_text(yaml.safe_dump(catalog), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "missing graphTextUnitIds"):
+                _resolve_capability_scoped_book_ids(
+                    root,
+                    ["book-1"],
+                    ["book-1:graph_query"],
+                )
+
     def test_capability_scope_rejects_derived_capability_without_identity(
         self,
     ) -> None:
@@ -1109,6 +1179,34 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                     root,
                     ["book-1"],
                     ["book-1:graph_query"],
+                )
+
+    def test_capability_request_scope_requires_graph_text_unit_list(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmd-bridge-scope-") as tmp:
+            root = Path(tmp)
+            _write_books(root)
+            _, capabilities = _resolve_capability_scoped_book_ids(
+                root,
+                ["book-1"],
+                ["book-1:graph_query"],
+            )
+            identity_path = root / "catalog" / "document-identity-map.yaml"
+            catalog = yaml.safe_load(identity_path.read_text(encoding="utf-8"))
+            catalog["items"][0]["graphTextUnitIds"] = "tu-1"
+            identity_path.write_text(yaml.safe_dump(catalog), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "missing graphTextUnitIds"):
+                _validate_capabilities_against_request_scope(
+                    root,
+                    {
+                        "selectedBookIds": ["book-1"],
+                        "graphCapabilityIds": ["book-1:graph_query"],
+                        "sourceIds": ["sha256:source-1"],
+                        "documentIds": ["doc-1"],
+                        "contentHashes": ["content-1"],
+                        "artifactIds": _lineage_artifact_ids("artifact-1"),
+                    },
+                    capabilities,
                 )
 
     def test_capability_scope_requires_qmd_corpus_registration(self) -> None:

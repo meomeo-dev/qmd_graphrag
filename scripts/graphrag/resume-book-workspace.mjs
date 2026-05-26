@@ -664,6 +664,81 @@ async function repairLocalArtifactGateFailureIfPossible({
   return true;
 }
 
+async function repairQueryReadyProjectionIfPossible({
+  runtimeApi,
+  repo,
+  projectConfig,
+  sourcePath,
+  sourceIdentityPath,
+  normalizedPath,
+  sync,
+  scopedOutputDir,
+  producerRunIds,
+}) {
+  if (
+    sync.resumePlan.nextStage != null &&
+    sync.resumePlan.nextStage !== "query_ready"
+  ) {
+    return null;
+  }
+
+  const queryReadyArtifacts = await queryReadyProducerArtifacts(runtimeApi, repo, sync);
+  const queryReadyCheckpoint = (await repo.listStageCheckpoints(sync.job.bookId))
+    .find((item) => item.stage === "query_ready");
+  const runId = queryReadyCheckpoint?.runId ??
+    producerRunIds.query_ready ??
+    runtimeApi.createRunId("query_ready");
+
+  await repo.completeStage({
+    bookId: sync.job.bookId,
+    stage: "query_ready",
+    runId,
+    inputFingerprint: sync.stageFingerprints.query_ready,
+    contentHash: sync.job.normalizedContentHash ?? sync.job.sourceHash,
+    stageFingerprint: sync.stageFingerprints.query_ready,
+    providerFingerprint: sync.job.providerFingerprint,
+    artifactIds: queryReadyArtifacts.artifactIds,
+    metadata: {
+      ...(queryReadyCheckpoint?.metadata ?? {}),
+      graphWorkspace: "book_scoped",
+      readinessSource: "local_artifact_gate_repair",
+      producerRunIds: queryReadyArtifacts.producerRunIds,
+      recoveredFromLocalArtifactGateFailure: true,
+      repairMode: "query_ready_projection_only",
+    },
+  });
+
+  const refreshed = await syncCurrentBook(
+    runtimeApi,
+    projectConfig,
+    sourcePath,
+    sourceIdentityPath,
+    normalizedPath,
+  );
+  const restoredProducerRunIds = await restoreProducerManifestFromEvidence({
+    runtimeApi,
+    repo,
+    sync: refreshed.sync,
+    scopedOutputDir: refreshed.scopedOutputDir,
+  });
+  const mergedProducerRunIds = mergeProducerRunIds(
+    producerRunIds,
+    restoredProducerRunIds,
+    { query_ready: runId },
+  );
+  await graphQueryScopeFromSync(
+    refreshed.sync,
+    runtimeApi.loadGraphQueryCapabilities,
+  );
+
+  return {
+    sync: refreshed.sync,
+    scopedOutputDir: refreshed.scopedOutputDir,
+    producerRunIds: mergedProducerRunIds,
+    repairedCheckpointStages: ["query_ready"],
+  };
+}
+
 async function runRepairLocalArtifactGateOnly(runtimeApi, repo) {
   runtimeApi.setConfigSource({ configPath });
   const projectConfig = runtimeApi.loadConfig();
@@ -693,27 +768,6 @@ async function runRepairLocalArtifactGateOnly(runtimeApi, repo) {
   }
   let checkpoints = await repo.listStageCheckpoints(bookId);
   let checkpoint = localArtifactGateFailureCheckpoint(checkpoints);
-  if (checkpoint == null) {
-    printJson({
-      status: "blocked",
-      bookId,
-      startedStage: null,
-      nextStage: null,
-      completedStages: checkpoints
-        .filter((item) => item.status === "succeeded")
-        .map((item) => item.stage),
-      queryResult: null,
-      repairOnly: true,
-      repairedLocalArtifactGate: false,
-      requiresRealRebuild: true,
-      rebuildStage:
-        checkpoints.find((item) => item.status === "failed")?.stage ?? null,
-      settingsProjectionRepair: undefined,
-      reason: "local artifact gate failure checkpoint not found",
-    });
-    return;
-  }
-
   let { sync, scopedOutputDir } = await syncCurrentBook(
     runtimeApi,
     projectConfig,
@@ -727,6 +781,91 @@ async function runRepairLocalArtifactGateOnly(runtimeApi, repo) {
     sync,
     scopedOutputDir,
   });
+  if (checkpoint == null) {
+    try {
+      const repairedProjection = await repairQueryReadyProjectionIfPossible({
+        runtimeApi,
+        repo,
+        projectConfig,
+        sourcePath,
+        sourceIdentityPath,
+        normalizedPath,
+        sync,
+        scopedOutputDir,
+        producerRunIds,
+      });
+      if (repairedProjection != null) {
+        sync = repairedProjection.sync;
+        scopedOutputDir = repairedProjection.scopedOutputDir ?? scopedOutputDir;
+        producerRunIds = repairedProjection.producerRunIds;
+        checkpoints = await repo.listStageCheckpoints(bookId);
+        printJson({
+          status: "repaired",
+          bookId,
+          startedStage: null,
+          nextStage: sync.resumePlan.nextStage,
+          completedStages: checkpoints
+            .filter((item) => item.status === "succeeded")
+            .map((item) => item.stage),
+          queryResult: null,
+          repairOnly: true,
+          repairedLocalArtifactGate: true,
+          requiresRealRebuild: false,
+          repairReason: "graph_query_capability_projection_missing",
+          repairedProjection: "graph_capability",
+          repairEvidenceLocator: `graph_vault/books/${bookId}/checkpoints.yaml#query_ready`,
+          reusedProducerRunIds: producerRunIds,
+          repairedCheckpointStages:
+            repairedProjection.repairedCheckpointStages,
+          repairedFailedStage: null,
+          settingsProjectionRepair: settingsProjectionRepairForOutput(sync),
+        });
+        return;
+      }
+    } catch (error) {
+      const reason = safeText(runtimeApi, error instanceof Error
+        ? error.message
+        : String(error));
+      printJson({
+        status: "blocked",
+        bookId,
+        startedStage: null,
+        nextStage: sync.resumePlan.nextStage,
+        completedStages: checkpoints
+          .filter((item) => item.status === "succeeded")
+          .map((item) => item.stage),
+        queryResult: null,
+        repairOnly: true,
+        repairedLocalArtifactGate: false,
+        requiresRealRebuild: false,
+        rebuildStage: null,
+        settingsProjectionRepair: settingsProjectionRepairForOutput(sync),
+        reason,
+      });
+      return;
+    }
+    printJson({
+      status: "blocked",
+      bookId,
+      startedStage: null,
+      nextStage: sync.resumePlan.nextStage,
+      completedStages: checkpoints
+        .filter((item) => item.status === "succeeded")
+        .map((item) => item.stage),
+      queryResult: null,
+      repairOnly: true,
+      repairedLocalArtifactGate: false,
+      requiresRealRebuild: sync.resumePlan.nextStage != null,
+      rebuildStage:
+        checkpoints.find((item) => item.status === "failed")?.stage ??
+        sync.resumePlan.nextStage ??
+        null,
+      settingsProjectionRepair: settingsProjectionRepairForOutput(sync),
+      reason: "local artifact gate failure checkpoint not found",
+    });
+    return;
+  }
+
   let repairedCheckpointStages = [];
   for (const stage of ["graph_extract", "community_report", "embed"]) {
     const repaired = await completeProducerStageFromEvidence({

@@ -595,24 +595,45 @@ def _derive_graph_query_capability(
     book_id = str(book.get("bookId") or "")
     if not book_id:
         raise ValueError("book state is missing bookId")
+    expected_source_hash = str(book.get("sourceHash") or "")
+    expected_source_id = f"sha256:{expected_source_hash}" if expected_source_hash else ""
+    expected_document_id = str(book.get("documentId") or "")
+    expected_content_hash = str(
+        book.get("normalizedContentHash") or book.get("sourceHash") or ""
+    )
     identity = (identity_by_book or _load_document_identity_map_by_book(root_dir)).get(
         book_id,
     )
     if identity is None:
+        document_identity = _load_document_identity_map(root_dir).get(expected_document_id)
+        if document_identity is not None:
+            identity = document_identity
+        else:
+            raise ValueError(f"book {book_id} is missing document identity")
+    if identity is None:
         raise ValueError(f"book {book_id} is missing document identity")
     if identity.get("canonicalBookId") != book_id:
-        raise ValueError(f"book {book_id} identity canonicalBookId mismatch")
+        raise ValueError(f"book {book_id} bookId mismatches identity")
     identity_metadata = identity.get("metadata") or {}
     if identity_metadata.get("qmdCorpusRegistered") is not True:
         raise ValueError(f"book {book_id} identity is not registered in qmd corpus")
     artifact_ids = _load_query_ready_lineage_artifact_ids(root_dir, book_id) or []
     source_id = identity.get("sourceId")
+    source_hash = identity.get("sourceHash")
     document_id = identity.get("documentId")
     content_hash = identity.get("contentHash")
     graph_document_id = identity.get("graphDocumentId")
     graph_text_unit_ids = identity.get("graphTextUnitIds")
     if not source_id or not document_id or not content_hash:
         raise ValueError(f"book {book_id} is missing graph capability identity")
+    if not expected_source_hash or source_hash != expected_source_hash:
+        raise ValueError(f"book {book_id} identity sourceHash mismatch")
+    if source_id != expected_source_id:
+        raise ValueError(f"book {book_id} identity sourceId mismatch")
+    if not expected_document_id or document_id != expected_document_id:
+        raise ValueError(f"book {book_id} identity documentId mismatch")
+    if not expected_content_hash or content_hash != expected_content_hash:
+        raise ValueError(f"book {book_id} identity contentHash mismatch")
     if not isinstance(graph_document_id, str) or not graph_document_id:
         raise ValueError(f"book {book_id} is missing graphDocumentId")
     if not isinstance(graph_text_unit_ids, list) or not graph_text_unit_ids:
@@ -774,11 +795,13 @@ def _validate_capabilities_against_request_scope(
             raise ValueError(
                 f"graph capability contentHash mismatches identity: {content_hash}"
             )
-        if not identity.get("graphDocumentId"):
+        graph_document_id = identity.get("graphDocumentId")
+        graph_text_unit_ids = identity.get("graphTextUnitIds")
+        if not isinstance(graph_document_id, str) or not graph_document_id:
             raise ValueError(
                 f"document identity missing graphDocumentId: {document_id}"
             )
-        if not identity.get("graphTextUnitIds"):
+        if not isinstance(graph_text_unit_ids, list) or not graph_text_unit_ids:
             raise ValueError(
                 f"document identity missing graphTextUnitIds: {document_id}"
             )
@@ -804,9 +827,11 @@ def _capability_identity_failure(
         return f"graph capability sourceId mismatches identity: {source_id}"
     if str(identity.get("contentHash") or "") != content_hash:
         return f"graph capability contentHash mismatches identity: {content_hash}"
-    if not identity.get("graphDocumentId"):
+    graph_document_id = identity.get("graphDocumentId")
+    graph_text_unit_ids = identity.get("graphTextUnitIds")
+    if not isinstance(graph_document_id, str) or not graph_document_id:
         return f"document identity missing graphDocumentId: {document_id}"
-    if not identity.get("graphTextUnitIds"):
+    if not isinstance(graph_text_unit_ids, list) or not graph_text_unit_ids:
         return f"document identity missing graphTextUnitIds: {document_id}"
     return None
 
@@ -859,26 +884,59 @@ def _load_graph_capabilities(
 
     requested_ids = {str(item) for item in graph_capability_ids if str(item)}
     capability_path = root_dir / "catalog" / "graph-capabilities.yaml"
-    items: list[dict[str, Any]] = []
+    explicit_items: list[dict[str, Any]] = []
+    derived_items: list[dict[str, Any]] = []
+    derivation_errors: dict[str, Exception] = {}
+    graph_query_requested_ids = {
+        capability_id
+        for capability_id in requested_ids
+        if capability_id.endswith(":graph_query")
+    }
 
     if capability_path.exists():
         catalog = yaml.safe_load(capability_path.read_text(encoding="utf-8")) or {}
-        items = [
+        explicit_items = [
             item
             for item in catalog.get("items", [])
             if isinstance(item, dict)
         ]
-    else:
-        books = _load_books_by_id(root_dir)
-        if not books:
-            raise FileNotFoundError(
-                f"missing graph capability catalog for scoped query: {capability_path}"
+
+    books = _load_books_by_id(root_dir)
+    if not capability_path.exists() and not books:
+        raise FileNotFoundError(
+            f"missing graph capability catalog for scoped query: {capability_path}"
+        )
+
+    identity_by_book = _load_document_identity_map_by_book(root_dir)
+    for capability_id in graph_query_requested_ids:
+        book_id = capability_id.removesuffix(":graph_query")
+        book = books.get(book_id)
+        if book is None:
+            derivation_errors[capability_id] = ValueError(
+                "capabilityScope references unknown or not-ready graphCapabilityId(s): "
+                + capability_id
             )
-        identity_by_book = _load_document_identity_map_by_book(root_dir)
-        for book in books.values():
-            items.append(
+            continue
+        try:
+            derived_items.append(
                 _derive_graph_query_capability(root_dir, book, identity_by_book)
             )
+        except Exception as error:  # noqa: BLE001
+            derivation_errors[capability_id] = error
+
+    items_by_id = {
+        str(item.get("capabilityId") or ""): item
+        for item in explicit_items
+        if str(item.get("capabilityId") or "") and
+        str(item.get("capabilityId") or "") not in graph_query_requested_ids
+    }
+    if derivation_errors:
+        raise next(iter(derivation_errors.values()))
+    for item in derived_items:
+        capability_id = str(item.get("capabilityId") or "")
+        if capability_id:
+            items_by_id[capability_id] = item
+    items = list(items_by_id.values())
 
     capabilities = []
     for item in items:
@@ -920,6 +978,9 @@ def _load_graph_capabilities(
     resolved_ids = {str(item.get("capabilityId")) for item in capabilities}
     missing = sorted(requested_ids - resolved_ids)
     if missing:
+        for capability_id in missing:
+            if capability_id in derivation_errors:
+                raise derivation_errors[capability_id]
         raise ValueError(
             "capabilityScope references unknown or not-ready graphCapabilityId(s): "
             + ", ".join(missing)
