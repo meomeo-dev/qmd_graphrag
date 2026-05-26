@@ -67,6 +67,7 @@ type CheckpointCandidate = Pick<
   | "stageFingerprint"
   | "providerFingerprint"
   | "artifactIds"
+  | "metadata"
 >;
 
 export type QueryReadyLineageProjection = {
@@ -173,6 +174,7 @@ function runRecordToCheckpointCandidate(
     providerFingerprint: metadataString(record.metadata, "providerFingerprint") ??
       book.providerFingerprint,
     artifactIds: record.artifactIds,
+    metadata: record.metadata,
   };
 }
 
@@ -226,6 +228,7 @@ function checkpointMatchesBook(
   if (stageFingerprint == null || book.providerFingerprint == null) return false;
   return checkpoint.bookId === book.bookId &&
     checkpoint.status === "succeeded" &&
+    checkpoint.metadata?.bootstrap !== true &&
     (options.requireRunId === false || checkpoint.runId != null) &&
     checkpoint.contentHash === expectedContentHash(book) &&
     checkpoint.stageFingerprint === stageFingerprint &&

@@ -1,0 +1,48 @@
+schemaVersion: '1.0.0'
+case: graphrag-artifact-id-rebinding
+run: 1
+status: development_audit_passed
+startedAt: '2026-05-26T20:35:00Z'
+updatedAt: '2026-05-26T22:35:00Z'
+criteriaFrozen: true
+criteriaPaths:
+  - agent-a/audit-criteria.md
+  - agent-b/audit-criteria.md
+  - agent-c/audit-criteria.md
+design: design.md
+designAuditReports:
+  - agent-a/design-audit-report.md
+  - agent-b/design-audit-report.md
+  - agent-c/design-audit-report.md
+revisedDesign: revised-design.md
+designReauditReports:
+  - agent-a/design-reaudit-report.md
+  - agent-b/design-reaudit-report.md
+  - agent-c/design-reaudit-report.md
+developmentCriteriaPaths:
+  - agent-a/development-audit-criteria.md
+  - agent-b/development-audit-criteria.md
+  - agent-c/development-audit-criteria.md
+developmentAuditReports:
+  - agent-a/development-audit-report.md
+  - agent-b/development-audit-report.md
+  - agent-c/development-audit-report.md
+developmentReauditReports:
+  - agent-a/development-reaudit-report.md
+  - agent-b/development-reaudit-report.md
+  - agent-c/development-reaudit-report.md
+finalReport: final-report.md
+verification:
+  - npm run test:node -- test/book-job-state.test.ts -t "bootstrap producers"
+  - npm run test:node -- test/book-job-state.test.ts
+  - npm run test:node -- test/graphrag-book-state.test.ts
+  - npm run test:node -- test/unified-query.test.ts
+  - npm run typecheck
+  - node -c scripts/graphrag/batch-epub-workflow.mjs
+  - git diff --check
+  - node scripts/graphrag/batch-epub-workflow.mjs --run-id epub-batch-20260525-full-real --source-dir "inbox/软件工程与系统设计经典著作指南" --state-root graph_vault --log-root /tmp/qmd-epub-batch-20260525-full-real/logs --status-json
+realRunBlocker:
+  kind: external_credential
+  command: qmd-query-json
+  error: 'OpenAI Responses request failed (401): INVALID_API_KEY'
+  decision: stop_until_fixed

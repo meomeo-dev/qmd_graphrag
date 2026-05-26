@@ -82,6 +82,7 @@ import {
   GRAPH_EXTRACT_CORE_ARTIFACT_KINDS,
   GRAPH_EXTRACT_ARTIFACT_KINDS,
   QUERY_READY_ARTIFACT_KINDS,
+  selectValidBookArtifactsByKind,
   validateArtifact,
   validateBookArtifactSet,
 } from "./artifact-validation.js";
@@ -889,6 +890,15 @@ function buildResumePlan(
   });
 }
 
+function isRealGraphQueryProducerCheckpoint(
+  checkpoint: BookJobStageCheckpoint | undefined,
+): checkpoint is BookJobStageCheckpoint & { runId: string } {
+  return checkpoint?.status === "succeeded" &&
+    checkpoint.metadata?.bootstrap !== true &&
+    typeof checkpoint.runId === "string" &&
+    checkpoint.runId.length > 0;
+}
+
 function producerRunIdsForQueryReady(
   checkpointByStage: ReadonlyMap<BookStage, BookJobStageCheckpoint>,
 ): Partial<Record<BookStage, string>> | undefined {
@@ -896,15 +906,9 @@ function producerRunIdsForQueryReady(
   const communityReport = checkpointByStage.get("community_report");
   const embed = checkpointByStage.get("embed");
   if (
-    graphExtract?.status !== "succeeded" ||
-    typeof graphExtract.runId !== "string" ||
-    graphExtract.runId.length === 0 ||
-    communityReport?.status !== "succeeded" ||
-    typeof communityReport.runId !== "string" ||
-    communityReport.runId.length === 0 ||
-    embed?.status !== "succeeded" ||
-    typeof embed.runId !== "string" ||
-    embed.runId.length === 0
+    !isRealGraphQueryProducerCheckpoint(graphExtract) ||
+    !isRealGraphQueryProducerCheckpoint(communityReport) ||
+    !isRealGraphQueryProducerCheckpoint(embed)
   ) {
     return undefined;
   }
@@ -1828,10 +1832,8 @@ export class FileBookJobStateRepository {
     }));
     const validityByStage = effective.artifactValidity;
     const missingStages = checkpoints
-      .filter(({ stage, checkpoint }) =>
-        checkpoint == null ||
-        checkpoint.status !== "succeeded" ||
-        checkpoint.runId == null
+      .filter(({ checkpoint }) =>
+        !isRealGraphQueryProducerCheckpoint(checkpoint)
       )
       .map(({ stage }) => stage);
     if (missingStages.length > 0) {
@@ -2403,22 +2405,22 @@ export class FileBookJobStateRepository {
       }
 
       const requiredKinds = requirements[checkpoint.stage] ?? [];
-      const requiredKindSet = new Set<BookArtifactKind>(requiredKinds);
-      const artifactIds = checkpoint.artifactIds.filter((artifactId) => {
-        if (requiredKindSet.size === 0) return true;
-        const artifact = artifacts.find((candidate) =>
-          candidate.artifactId === artifactId
-        );
-        return artifact != null && requiredKindSet.has(artifact.kind);
-      });
       const queryReadyProducerRunIds = checkpoint.stage === "query_ready"
         ? producerRunIdsForQueryReady(checkpointByStage)
         : undefined;
-      const artifactValidation = await validateBookArtifactSet({
+      const candidateArtifactIds = this.artifactIdsForCheckpointCandidate({
+        checkpoint,
+        artifacts,
+        requiredKinds,
+        queryReadyProducerRunIds,
+      });
+      const candidateArtifacts = artifacts.filter((artifact) =>
+        candidateArtifactIds.includes(artifact.artifactId)
+      );
+      const validationInput = {
         graphVault: this.rootDir,
         bookId,
-        artifactIds,
-        artifacts,
+        artifacts: candidateArtifacts,
         requiredKinds,
         allowedKinds: checkpoint.stage === "query_ready"
           ? QUERY_READY_ARTIFACT_KINDS
@@ -2445,11 +2447,25 @@ export class FileBookJobStateRepository {
         expectedCorpusContentHash: job == null
           ? undefined
           : job.normalizedContentHash ?? job.sourceHash,
-      });
+      };
+      let artifactValidation;
+      let selectedArtifactIds: string[];
+      if (requiredKinds.length === 0) {
+        artifactValidation = await validateBookArtifactSet({
+            ...validationInput,
+            artifactIds: candidateArtifactIds,
+          });
+        selectedArtifactIds = artifactValidation.validArtifacts.map(
+          (artifact) => artifact.artifactId,
+        );
+      } else {
+        artifactValidation = await selectValidBookArtifactsByKind(validationInput);
+        selectedArtifactIds = artifactValidation.artifactIds;
+      }
 
       result.set(checkpoint.stage, {
         isSatisfied: artifactValidation.isSatisfied,
-        artifactIds,
+        artifactIds: selectedArtifactIds,
         missingArtifactIds: artifactValidation.missingArtifactIds,
         missingArtifactKinds: artifactValidation.missingArtifactKinds,
         invalidArtifacts: artifactValidation.invalidArtifacts,
@@ -2492,12 +2508,32 @@ export class FileBookJobStateRepository {
     checkpoint: BookJobStageCheckpoint;
     artifacts: readonly BookArtifactManifest[];
     requiredKinds: readonly BookArtifactKind[];
+    queryReadyProducerRunIds?: Partial<Record<BookStage, string>>;
   }): string[] {
     const requiredKindSet = new Set<BookArtifactKind>(input.requiredKinds);
+    if (input.checkpoint.stage === "query_ready") {
+      const communityReportRunId = input.queryReadyProducerRunIds?.community_report;
+      const embedRunId = input.queryReadyProducerRunIds?.embed;
+      return input.artifacts
+        .filter((artifact) =>
+          artifact.bookId === input.checkpoint.bookId &&
+          requiredKindSet.has(artifact.kind) &&
+          (
+            (
+              artifact.stage === "community_report" &&
+              artifact.producerRunId === communityReportRunId
+            ) ||
+            (
+              artifact.stage === "embed" &&
+              artifact.producerRunId === embedRunId
+            )
+          )
+        )
+        .map((artifact) => artifact.artifactId);
+    }
     if (
       input.checkpoint.runId == null ||
-      !HIGH_COST_STAGES.has(input.checkpoint.stage) ||
-      input.checkpoint.stage === "query_ready"
+      !HIGH_COST_STAGES.has(input.checkpoint.stage)
     ) {
       return input.checkpoint.artifactIds.filter((artifactId) => {
         if (requiredKindSet.size === 0) return true;
@@ -2531,15 +2567,20 @@ export class FileBookJobStateRepository {
       checkpoint: input.checkpoint,
       artifacts: input.artifacts,
       requiredKinds,
+      queryReadyProducerRunIds: input.checkpoint.stage === "query_ready"
+        ? producerRunIdsForQueryReady(input.checkpointByStage ?? new Map())
+        : undefined,
     });
     const queryReadyProducerRunIds = input.checkpoint.stage === "query_ready"
       ? producerRunIdsForQueryReady(input.checkpointByStage ?? new Map())
       : undefined;
-    const artifactValidation = await validateBookArtifactSet({
+    const candidateArtifacts = input.artifacts.filter((artifact) =>
+      artifactIds.includes(artifact.artifactId)
+    );
+    const validationInput = {
       graphVault: this.rootDir,
       bookId: input.bookId,
-      artifactIds,
-      artifacts: input.artifacts,
+      artifacts: candidateArtifacts,
       requiredKinds,
       allowedKinds: input.checkpoint.stage === "query_ready"
         ? QUERY_READY_ARTIFACT_KINDS
@@ -2566,11 +2607,25 @@ export class FileBookJobStateRepository {
       expectedCorpusContentHash: input.job == null
         ? undefined
         : input.job.normalizedContentHash ?? input.job.sourceHash,
-    });
+    };
+    let artifactValidation;
+    let selectedArtifactIds: string[];
+    if (requiredKinds.length === 0) {
+      artifactValidation = await validateBookArtifactSet({
+          ...validationInput,
+          artifactIds,
+        });
+      selectedArtifactIds = artifactValidation.validArtifacts.map(
+        (artifact) => artifact.artifactId,
+      );
+    } else {
+      artifactValidation = await selectValidBookArtifactsByKind(validationInput);
+      selectedArtifactIds = artifactValidation.artifactIds;
+    }
 
     return {
       isSatisfied: artifactValidation.isSatisfied,
-      artifactIds,
+      artifactIds: selectedArtifactIds,
       missingArtifactIds: artifactValidation.missingArtifactIds,
       missingArtifactKinds: artifactValidation.missingArtifactKinds,
       invalidArtifacts: artifactValidation.invalidArtifacts,

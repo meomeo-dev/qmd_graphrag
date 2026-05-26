@@ -71,6 +71,10 @@ export type BookArtifactSetValidationResult = {
   validArtifacts: BookArtifactManifest[];
 };
 
+export type BookArtifactKindSelectionResult = BookArtifactSetValidationResult & {
+  artifactIds: string[];
+};
+
 async function listFilesRecursive(rootDir: string): Promise<string[]> {
   const entries = await readdir(rootDir, { withFileTypes: true });
   const files: string[] = [];
@@ -577,6 +581,87 @@ export async function validateBookArtifactSet(input: {
     missingArtifactKinds,
     invalidArtifacts,
     validArtifacts,
+  };
+}
+
+function sortCurrentArtifacts(
+  artifacts: readonly BookArtifactManifest[],
+): BookArtifactManifest[] {
+  return [...artifacts].sort((left, right) => {
+    const created = right.createdAt.localeCompare(left.createdAt);
+    return created === 0 ? left.artifactId.localeCompare(right.artifactId) : created;
+  });
+}
+
+export async function selectValidBookArtifactsByKind(input: {
+  graphVault: string;
+  bookId: string;
+  artifacts: readonly BookArtifactManifest[];
+  requiredKinds: readonly BookArtifactKind[];
+  allowedKinds?: readonly BookArtifactKind[];
+  requireBookScopedGraphOutput?: boolean;
+  expectedProducerRunIds?: Partial<Record<BookStage, string>>;
+  expectedStageFingerprints?: Partial<Record<BookStage, string>>;
+  expectedProviderFingerprint?: string;
+  expectedCorpusContentHash?: string;
+}): Promise<BookArtifactKindSelectionResult> {
+  const requiredKinds = input.requiredKinds ?? [];
+  const requiredKindSet = new Set<BookArtifactKind>(requiredKinds);
+  const validByKind = new Map<BookArtifactKind, BookArtifactManifest[]>();
+  const invalidByKind = new Map<
+    BookArtifactKind,
+    BookArtifactKindSelectionResult["invalidArtifacts"]
+  >();
+
+  for (const artifact of input.artifacts) {
+    if (!requiredKindSet.has(artifact.kind)) continue;
+    const validation = await validateBookArtifactSet({
+      graphVault: input.graphVault,
+      bookId: input.bookId,
+      artifactIds: [artifact.artifactId],
+      artifacts: input.artifacts,
+      requiredKinds: [artifact.kind],
+      allowedKinds: input.allowedKinds ?? [artifact.kind],
+      requireBookScopedGraphOutput: input.requireBookScopedGraphOutput,
+      expectedProducerRunIds: input.expectedProducerRunIds,
+      expectedStageFingerprints: input.expectedStageFingerprints,
+      expectedProviderFingerprint: input.expectedProviderFingerprint,
+      expectedCorpusContentHash: input.expectedCorpusContentHash,
+    });
+    if (validation.isSatisfied) {
+      const items = validByKind.get(artifact.kind) ?? [];
+      items.push(artifact);
+      validByKind.set(artifact.kind, items);
+      continue;
+    }
+    const items = invalidByKind.get(artifact.kind) ?? [];
+    items.push(...validation.invalidArtifacts);
+    invalidByKind.set(artifact.kind, items);
+  }
+
+  const selected: BookArtifactManifest[] = [];
+  const missingArtifactIds: string[] = [];
+  const missingArtifactKinds: BookArtifactKind[] = [];
+  const invalidArtifacts: BookArtifactKindSelectionResult["invalidArtifacts"] = [];
+  for (const kind of requiredKinds) {
+    const candidates = validByKind.get(kind) ?? [];
+    if (candidates.length === 0) {
+      missingArtifactKinds.push(kind);
+      const invalid = invalidByKind.get(kind) ?? [];
+      invalidArtifacts.push(...invalid);
+      missingArtifactIds.push(...invalid.map((artifact) => artifact.artifactId));
+      continue;
+    }
+    selected.push(sortCurrentArtifacts(candidates)[0]!);
+  }
+
+  return {
+    isSatisfied: missingArtifactKinds.length === 0,
+    artifactIds: selected.map((artifact) => artifact.artifactId),
+    missingArtifactIds: [...new Set(missingArtifactIds)],
+    missingArtifactKinds,
+    invalidArtifacts,
+    validArtifacts: selected,
   };
 }
 

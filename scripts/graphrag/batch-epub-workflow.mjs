@@ -2171,6 +2171,152 @@ function expectedArtifactStage(stage, artifact) {
     : undefined;
 }
 
+function sortedCurrentArtifacts(artifacts) {
+  return [...artifacts].sort((left, right) => {
+    const created = String(right?.createdAt ?? "")
+      .localeCompare(String(left?.createdAt ?? ""));
+    return created === 0
+      ? String(left?.artifactId ?? "").localeCompare(String(right?.artifactId ?? ""))
+      : created;
+  });
+}
+
+function stageCandidateArtifacts({
+  item,
+  stage,
+  checkpoint,
+  artifacts,
+  requiredKinds,
+  expectedProducerRunId,
+  producer,
+}) {
+  const requiredKindSet = new Set(requiredKinds);
+  if (stage === "query_ready") {
+    const communityReportRunId = producer?.stageProducerRunIds?.community_report;
+    const embedRunId = producer?.stageProducerRunIds?.embed;
+    return artifacts.filter((artifact) =>
+      artifact?.bookId === item.bookId &&
+      requiredKindSet.has(artifact.kind) &&
+      (
+        (
+          artifact.stage === "community_report" &&
+          artifact.producerRunId === communityReportRunId
+        ) ||
+        (
+          artifact.stage === "embed" &&
+          artifact.producerRunId === embedRunId
+        )
+      )
+    );
+  }
+  const producerRunId = expectedProducerRunId ?? checkpoint?.runId;
+  if (graphProducerStages.includes(stage) && typeof producerRunId === "string") {
+    return artifacts.filter((artifact) =>
+      artifact?.bookId === item.bookId &&
+      artifact.stage === stage &&
+      artifact.producerRunId === producerRunId &&
+      requiredKindSet.has(artifact.kind)
+    );
+  }
+  const artifactIds = new Set(checkpointArtifactIds(checkpoint));
+  return artifacts.filter((artifact) =>
+    artifact?.bookId === item.bookId &&
+    artifactIds.has(artifact.artifactId) &&
+    (requiredKindSet.size === 0 || requiredKindSet.has(artifact.kind))
+  );
+}
+
+function selectValidStageArtifacts({
+  item,
+  stage,
+  artifacts,
+  requiredKinds,
+  expectedStageFingerprints,
+  expectedProviderFingerprint,
+  expectedCorpusContentHash,
+  expectedProducerRunId,
+  producer,
+}) {
+  const validByKind = new Map();
+  const invalidReasons = [];
+  for (const artifact of artifacts) {
+    const artifactStage = expectedArtifactStage(stage, artifact);
+    const invalidReason = validateArtifactContent(artifact, item.bookId);
+    if (invalidReason != null) {
+      invalidReasons.push(`stage_artifact_invalid:${invalidReason}`);
+      continue;
+    }
+    if (artifactStage == null) {
+      invalidReasons.push(`stage_artifact_stage_mismatch:${stage}`);
+      continue;
+    }
+    if (stage !== "query_ready") {
+      if (
+        expectedProducerRunId != null &&
+        artifact.producerRunId !== expectedProducerRunId
+      ) {
+        invalidReasons.push(`stage_artifact_producer_run_mismatch:${stage}`);
+        continue;
+      }
+    } else {
+      const expectedRunId = producer?.stageProducerRunIds?.[artifactStage];
+      if (expectedRunId == null || artifact.producerRunId !== expectedRunId) {
+        invalidReasons.push(`stage_artifact_producer_run_mismatch:${stage}`);
+        continue;
+      }
+    }
+    if (
+      expectedStageFingerprints != null &&
+      artifact.stageFingerprint !== expectedStageFingerprints[artifactStage]
+    ) {
+      invalidReasons.push(`stage_artifact_fingerprint_mismatch:${stage}`);
+      continue;
+    }
+    if (
+      expectedProviderFingerprint != null &&
+      artifact.providerFingerprint !== expectedProviderFingerprint
+    ) {
+      invalidReasons.push(`stage_artifact_provider_mismatch:${stage}`);
+      continue;
+    }
+    if (
+      expectedCorpusContentHash != null &&
+      (artifact.kind.startsWith("graphrag_") || artifact.kind === "lancedb_index") &&
+      artifact.metadata?.corpusContentHash !== expectedCorpusContentHash
+    ) {
+      invalidReasons.push(`stage_artifact_corpus_mismatch:${stage}`);
+      continue;
+    }
+    const isBookScoped = stage === "embed"
+      ? artifact.path === `books/${item.bookId}/output/lancedb`
+      : artifact.path.startsWith(`books/${item.bookId}/output/`);
+    if (!isBookScoped) {
+      invalidReasons.push("stage_artifact_not_book_scoped");
+      continue;
+    }
+    const items = validByKind.get(artifact.kind) ?? [];
+    items.push(artifact);
+    validByKind.set(artifact.kind, items);
+  }
+
+  const selected = [];
+  for (const kind of requiredKinds) {
+    const candidates = validByKind.get(kind) ?? [];
+    if (candidates.length === 0) {
+      return {
+        ok: false,
+        reason: invalidReasons[0] ?? `stage_artifact_kind_missing:${kind}`,
+        artifactIds: artifacts.map((artifact) => artifact.artifactId),
+      };
+    }
+    selected.push(sortedCurrentArtifacts(candidates)[0]);
+  }
+  return {
+    ok: true,
+    artifactIds: selected.map((artifact) => artifact.artifactId),
+  };
+}
+
 function validateGraphStageEvidence({
   item,
   stage,
@@ -2252,151 +2398,35 @@ function validateGraphStageEvidence({
     };
   }
 
-  const artifactIds = checkpointArtifactIds(checkpoint);
-  if (artifactIds.length === 0) {
-    return {
-      ok: false,
-      reason: "stage_artifact_missing",
-      artifactIds,
-    };
-  }
-
-  const requiredKinds = new Set(graphStageArtifactKinds[stage]);
-  const gateArtifactIds = artifactIds.filter((artifactId) => {
-    const artifact = artifacts.find((candidate) =>
-      String(candidate?.artifactId) === artifactId
-    );
-    return artifact != null && requiredKinds.has(artifact.kind);
+  const requiredKinds = graphStageArtifactKinds[stage];
+  const stageArtifacts = stageCandidateArtifacts({
+    item,
+    stage,
+    checkpoint,
+    artifacts,
+    requiredKinds,
+    expectedProducerRunId,
+    producer,
   });
-  if (gateArtifactIds.length === 0) {
+  if (stageArtifacts.length === 0) {
     return {
       ok: false,
       reason: "stage_artifact_missing",
-      artifactIds,
+      artifactIds: checkpointArtifactIds(checkpoint),
     };
   }
 
-  const stageArtifacts = [];
-  for (const artifactId of gateArtifactIds) {
-    const artifact = artifacts.find((candidate) =>
-      String(candidate?.artifactId) === artifactId
-    );
-    const invalidReason = validateArtifactContent(artifact, item.bookId);
-    if (invalidReason != null) {
-      return {
-        ok: false,
-        reason: `stage_artifact_invalid:${invalidReason}`,
-        artifactIds,
-      };
-    }
-    stageArtifacts.push(artifact);
-  }
-  if (stageArtifacts.length !== gateArtifactIds.length) {
-    return {
-      ok: false,
-      reason: "stage_artifact_missing",
-      artifactIds,
-    };
-  }
-  const artifactKinds = new Set(stageArtifacts.map((artifact) => artifact.kind));
-  const missingKind = graphStageArtifactKinds[stage].find((kind) =>
-    !artifactKinds.has(kind)
-  );
-  if (missingKind) {
-    return {
-      ok: false,
-      reason: `stage_artifact_kind_missing:${missingKind}`,
-      artifactIds,
-    };
-  }
-
-  const invalidArtifactStage = stageArtifacts.find((artifact) =>
-    expectedArtifactStage(stage, artifact) == null
-  );
-  if (invalidArtifactStage) {
-    return {
-      ok: false,
-      reason: `stage_artifact_stage_mismatch:${stage}`,
-      artifactIds,
-    };
-  }
-
-  const invalidArtifactProducer = stageArtifacts.find((artifact) => {
-    const artifactStage = expectedArtifactStage(stage, artifact);
-    if (artifactStage == null) return true;
-    if (stage !== "query_ready") {
-      if (expectedProducerRunId != null) {
-        return artifact.producerRunId !== expectedProducerRunId;
-      }
-      return artifact.producerRunId !== checkpoint.runId;
-    }
-    const expectedRunId = producer?.stageProducerRunIds?.[artifactStage];
-    return expectedRunId == null || artifact.producerRunId !== expectedRunId;
+  return selectValidStageArtifacts({
+    item,
+    stage,
+    artifacts: stageArtifacts,
+    requiredKinds,
+    expectedStageFingerprints,
+    expectedProviderFingerprint,
+    expectedCorpusContentHash,
+    expectedProducerRunId,
+    producer,
   });
-  if (invalidArtifactProducer) {
-    return {
-      ok: false,
-      reason: `stage_artifact_producer_run_mismatch:${stage}`,
-      artifactIds,
-    };
-  }
-
-  if (expectedStageFingerprints != null) {
-    const invalidArtifactFingerprint = stageArtifacts.find((artifact) => {
-      const artifactStage = expectedArtifactStage(stage, artifact);
-      return artifactStage == null ||
-        artifact.stageFingerprint !== expectedStageFingerprints[artifactStage];
-    });
-    if (invalidArtifactFingerprint) {
-      return {
-        ok: false,
-        reason: `stage_artifact_fingerprint_mismatch:${stage}`,
-        artifactIds,
-      };
-    }
-  }
-
-  if (expectedProviderFingerprint != null) {
-    const invalidArtifactProvider = stageArtifacts.find((artifact) =>
-      artifact.providerFingerprint !== expectedProviderFingerprint
-    );
-    if (invalidArtifactProvider) {
-      return {
-        ok: false,
-        reason: `stage_artifact_provider_mismatch:${stage}`,
-        artifactIds,
-      };
-    }
-  }
-
-  if (expectedCorpusContentHash != null) {
-    const invalidArtifactCorpus = stageArtifacts.find((artifact) =>
-      (artifact.kind.startsWith("graphrag_") || artifact.kind === "lancedb_index") &&
-      artifact.metadata?.corpusContentHash !== expectedCorpusContentHash
-    );
-    if (invalidArtifactCorpus) {
-      return {
-        ok: false,
-        reason: `stage_artifact_corpus_mismatch:${stage}`,
-        artifactIds,
-      };
-    }
-  }
-
-  const invalidPath = stageArtifacts.find((artifact) =>
-    stage === "embed"
-      ? artifact.path !== `books/${item.bookId}/output/lancedb`
-      : !artifact.path.startsWith(`books/${item.bookId}/output/`)
-  );
-  if (invalidPath) {
-    return {
-      ok: false,
-      reason: "stage_artifact_not_book_scoped",
-      artifactIds,
-    };
-  }
-
-  return { ok: true, artifactIds };
 }
 
 function graphBuildEvidence(item) {

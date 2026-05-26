@@ -47,6 +47,7 @@ import {
   hashDirectoryContents,
   hashLanceDbDirectoryContents,
   isCompleteLanceDbDirectory,
+  selectValidBookArtifactsByKind,
   validateBookArtifactSet,
 } from "./artifact-validation.js";
 import {
@@ -1599,11 +1600,10 @@ export async function assertGraphRagStageArtifactsReady(input: {
     requiredKinds,
     expectedProducerRunIds,
   });
-  const validation = await validateBookArtifactSet({
+  const validation = await selectValidBookArtifactsByKind({
     graphVault: input.stateRootDir,
     bookId: input.bookId,
-    artifactIds: stageArtifacts.map((artifact) => artifact.artifactId),
-    artifacts: input.artifacts,
+    artifacts: stageArtifacts,
     requiredKinds,
     allowedKinds: requiredKinds,
     requireBookScopedGraphOutput: input.stage === "query_ready" ||
@@ -1630,7 +1630,7 @@ export async function assertGraphRagStageArtifactsReady(input: {
         }),
     );
   }
-  return validation.validArtifacts.map((artifact) => artifact.artifactId);
+  return validation.artifactIds;
 }
 
 export async function syncGraphRagBookWorkspace(
