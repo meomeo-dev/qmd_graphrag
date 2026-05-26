@@ -28,9 +28,19 @@ import {
   toIsoTimestamp,
 } from "../job-state/fingerprint.js";
 import { callPythonBridge } from "./python-bridge.js";
+import type { BookStage } from "../contracts/book-job.js";
+import type { PythonBridgeEarlyStop } from "./python-bridge.js";
 
 const GRAPHRAG_QUERY_MAX_RETRIES = 3;
 const GRAPHRAG_QUERY_RETRY_BASE_MS = 1000;
+
+export type GraphRagIndexRuntimeOptions = {
+  earlyStop?: {
+    stage: BookStage;
+    logStartOffset: number;
+    logLocator: string;
+  };
+};
 
 function delayMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -285,6 +295,7 @@ export async function runGraphRagQuery(
 
 export async function runGraphRagIndex(
   request: GraphRagIndexRequest,
+  runtimeOptions?: GraphRagIndexRuntimeOptions,
 ): Promise<GraphRagIndexResponse> {
   const parsed = GraphRagIndexRequestSchema.parse(request);
   const requestArtifact = await writeGraphRagProviderRequestArtifact({
@@ -300,6 +311,17 @@ export async function runGraphRagIndex(
       indexScope: parsed.indexScope ?? null,
     },
   });
+  const earlyStop: PythonBridgeEarlyStop | undefined =
+    runtimeOptions?.earlyStop == null || parsed.reportDir == null || parsed.dataDir == null
+      ? undefined
+      : {
+          kind: "graphrag_stage_report",
+          stage: runtimeOptions.earlyStop.stage,
+          reportDir: parsed.reportDir,
+          outputDir: parsed.dataDir,
+          logStartOffset: runtimeOptions.earlyStop.logStartOffset,
+          logLocator: runtimeOptions.earlyStop.logLocator,
+        };
 
   const response = await callPythonBridge({
     command: "graphrag_index",
@@ -307,6 +329,7 @@ export async function runGraphRagIndex(
     workingDirectory: parsed.environment?.workingDirectory,
     request: parsed,
     responseSchema: GraphRagIndexResponseSchema,
+    earlyStop,
   });
   assertGraphRagIndexSucceeded(response);
   const lineage = indexCostLineage(parsed.indexScope);

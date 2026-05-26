@@ -36,6 +36,7 @@ async function importRuntime() {
     hashFile: indexModule.hashFile,
     GraphRagWorkflowNameSchema: indexModule.GraphRagWorkflowNameSchema,
     assertGraphRagStageReportHealthy: indexModule.assertGraphRagStageReportHealthy,
+    cleanFailedGraphRagStageOutputs: indexModule.cleanFailedGraphRagStageOutputs,
     graphRagBookInputDir: indexModule.graphRagBookInputDir,
     graphRagBookOutputDir: indexModule.graphRagBookOutputDir,
     assertGraphRagStageArtifactsReady: indexModule.assertGraphRagStageArtifactsReady,
@@ -106,6 +107,39 @@ function errorText(error) {
 
 function safeText(runtimeApi, value) {
   return runtimeApi.sanitizeVaultText(String(value)) ?? "[redacted]";
+}
+
+function stageFailureKind(error) {
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  if (
+    message.includes("partial-output") ||
+    message.includes("partial output") ||
+    message.includes("no report found for community") ||
+    message.includes("community report extraction error") ||
+    message.includes("error generating community report")
+  ) {
+    return "partial_output";
+  }
+  if (
+    message.includes("concurrency limit") ||
+    message.includes("rate limit") ||
+    message.includes("temporarily unavailable") ||
+    message.includes("timeout") ||
+    message.includes("timed out") ||
+    message.includes("service unavailable") ||
+    message.includes("gateway timeout") ||
+    message.includes("bad gateway") ||
+    message.includes("connection reset") ||
+    message.includes("socket hang up")
+  ) {
+    return "transient";
+  }
+  return undefined;
+}
+
+function stageFailureMetadata(error) {
+  const failureKind = stageFailureKind(error);
+  return failureKind == null ? {} : { failureKind };
 }
 
 function stageWorkflows(stage) {
@@ -1247,6 +1281,15 @@ async function run() {
   const runId = reusableRunIdForStage(sync, nextStage) ??
     runtimeApi.createRunId(nextStage);
   const inputFingerprint = sync.stageFingerprints[nextStage];
+  const previousStageCheckpoint = await repo.getStageCheckpoint(
+    sync.job.bookId,
+    nextStage,
+  );
+  const residualCleanup = await runtimeApi.cleanFailedGraphRagStageOutputs({
+    outputDir: scopedOutputDir,
+    stage: nextStage,
+    previousCheckpoint: previousStageCheckpoint,
+  });
 
   await repo.startStage({
     bookId: sync.job.bookId,
@@ -1256,6 +1299,7 @@ async function run() {
     metadata: {
       workflows,
       resumedFrom: nextStage,
+      residualCleanup,
     },
   });
 
@@ -1277,6 +1321,12 @@ async function run() {
       environment: {
         pythonBin,
         workingDirectory,
+      },
+    }, {
+      earlyStop: {
+        stage: nextStage,
+        logStartOffset: stageLogStartOffset,
+        logLocator: join("graphrag-reports", sync.job.bookId, nextStage, "indexing-engine.log"),
       },
     });
     const stageReportHealth = await runtimeApi.assertGraphRagStageReportHealthy({
@@ -1328,6 +1378,7 @@ async function run() {
         workflows,
         resumedFrom: nextStage,
         graphWorkspace: "book_scoped",
+        residualCleanup,
         stageReportHealth,
       },
     });
@@ -1386,6 +1437,8 @@ async function run() {
       metadata: {
         resumedFrom: nextStage,
         graphWorkspace: "book_scoped",
+        residualCleanup,
+        ...stageFailureMetadata(error),
       },
     });
     throw error;

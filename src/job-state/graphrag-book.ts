@@ -5,10 +5,11 @@ import {
   mkdir,
   readFile,
   rename,
+  rm,
   stat,
   writeFile,
 } from "node:fs/promises";
-import { basename, dirname, extname, join, resolve } from "node:path";
+import { basename, dirname, extname, join, relative, resolve } from "node:path";
 
 import YAML from "yaml";
 
@@ -307,6 +308,95 @@ export async function assertGraphRagStageReportHealthy(input: {
     );
   }
   return health;
+}
+
+function stageOwnedGraphRagOutputPaths(input: {
+  outputDir: string;
+  stage: BookStage;
+}): string[] {
+  const outputDir = resolve(input.outputDir);
+  if (input.stage === "community_report") {
+    return [join(outputDir, "community_reports.parquet")];
+  }
+  if (input.stage === "embed") {
+    return [join(outputDir, "lancedb")];
+  }
+  if (input.stage === "graph_extract") {
+    return [
+      join(outputDir, "documents.parquet"),
+      join(outputDir, "text_units.parquet"),
+      join(outputDir, "entities.parquet"),
+      join(outputDir, "relationships.parquet"),
+      join(outputDir, "communities.parquet"),
+      join(outputDir, "context.json"),
+      join(outputDir, "stats.json"),
+      join(outputDir, "qmd_graph_text_unit_identity.json"),
+    ];
+  }
+  return [];
+}
+
+function outputRelativeLocator(outputDir: string, path: string): string {
+  return relative(resolve(outputDir), path).replaceAll("\\", "/");
+}
+
+function failedCheckpointNeedsGraphRagOutputCleanup(input: {
+  status: string;
+  errorSummary?: string;
+  metadata?: Record<string, JsonValue>;
+}): boolean {
+  if (input.status !== "failed") return false;
+  const errorSummary = input.errorSummary?.toLowerCase() ?? "";
+  const failureKind = String(input.metadata?.failureKind ?? "").toLowerCase();
+  return (
+    failureKind === "transient" ||
+    failureKind === "partial_output" ||
+    errorSummary.includes("partial-output") ||
+    errorSummary.includes("partial output") ||
+    errorSummary.includes("graphrag stage report") ||
+    errorSummary.includes("community report extraction error") ||
+    errorSummary.includes("no report found for community") ||
+    errorSummary.includes("error generating community report") ||
+    GRAPH_RAG_STAGE_TRANSIENT_LOG_PATTERN.test(errorSummary)
+  );
+}
+
+export async function cleanFailedGraphRagStageOutputs(input: {
+  outputDir: string;
+  stage: BookStage;
+  previousCheckpoint?: {
+    status: string;
+    errorSummary?: string;
+    metadata?: Record<string, JsonValue>;
+  } | null;
+}): Promise<{
+  cleaned: boolean;
+  deletedLocators: string[];
+  reason?: string;
+}> {
+  if (!failedCheckpointNeedsGraphRagOutputCleanup({
+    status: input.previousCheckpoint?.status ?? "",
+    errorSummary: input.previousCheckpoint?.errorSummary,
+    metadata: input.previousCheckpoint?.metadata,
+  })) {
+    return { cleaned: false, deletedLocators: [] };
+  }
+
+  const deletedLocators: string[] = [];
+  for (const path of stageOwnedGraphRagOutputPaths(input)) {
+    try {
+      await stat(path);
+      await rm(path, { recursive: true, force: true });
+      deletedLocators.push(outputRelativeLocator(input.outputDir, path));
+    } catch {
+      // Missing or concurrently removed residual outputs do not block retry.
+    }
+  }
+  return {
+    cleaned: true,
+    deletedLocators,
+    reason: "previous failed GraphRAG producer attempt was retryable",
+  };
 }
 
 async function parseSettingsFingerprint(

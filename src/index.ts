@@ -682,6 +682,7 @@ export {
 export {
   assertGraphRagStageReportHealthy,
   checkGraphRagStageReportHealth,
+  cleanFailedGraphRagStageOutputs,
   graphRagIndexLogOffset,
   graphRagBookInputDir,
   graphRagBookOutputDir,

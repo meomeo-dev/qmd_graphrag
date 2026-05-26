@@ -10,10 +10,12 @@ import type {
 } from "./contracts/graphrag.js";
 import { optimizeQueryPrompt } from "./integrations/dspy.js";
 import { runGraphRagIndex, runGraphRagQuery } from "./integrations/graphrag.js";
+import type { GraphRagIndexRuntimeOptions } from "./integrations/graphrag.js";
 
 export type QmdGraphRagRuntime = {
   graphIndex(
     request: GraphRagIndexRequest,
+    runtimeOptions?: GraphRagIndexRuntimeOptions,
   ): Promise<GraphRagIndexResponse>;
   graphQuery(
     request: GraphRagQueryRequest,

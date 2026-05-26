@@ -1,0 +1,53 @@
+schemaVersion: "1.0.0"
+case: graphrag-partial-output-early-stop
+run: 1
+status: development_audit_passed
+startedAt: "2026-05-25T19:56:00-07:00"
+scope:
+  - GraphRAG index partial-output detection during active stage execution.
+  - Early termination of unrecoverable current stage attempts.
+  - Batch recovery and observability for retryable provider/partial-output failures.
+fixedBaselines:
+  dev-agent-a: dev-agent-a/baseline.md
+  dev-agent-b: dev-agent-b/baseline.md
+  dev-agent-c: dev-agent-c/baseline.md
+auditState:
+  designAudit: passed_round_2
+  developmentAudit: passed_round_2
+  finalDecision: implementation_passed_audit
+reports:
+  designRound1:
+    dev-agent-a: dev-agent-a/design-report.md
+    dev-agent-b: dev-agent-b/design-report.md
+    dev-agent-c: dev-agent-c/design-report.md
+  designRound2:
+    dev-agent-a: dev-agent-a/design-reaudit-1.md
+    dev-agent-b: dev-agent-b/design-reaudit-1.md
+    dev-agent-c: dev-agent-c/design-reaudit-1.md
+  developmentRound1:
+    dev-agent-a: dev-agent-a/development-report.md
+    dev-agent-b: dev-agent-b/development-report.md
+    dev-agent-c: dev-agent-c/development-report.md
+  developmentRound2:
+    dev-agent-a: dev-agent-a/development-reaudit-1.md
+    dev-agent-c: dev-agent-c/development-reaudit-1.md
+verification:
+  implementedAt: "2026-05-26T03:49:31Z"
+  auditPassedAt: "2026-05-26T04:22:59Z"
+  commands:
+    - npm run test:types
+    - npm run test:node -- test/integrations/python-bridge-early-stop.test.ts
+    - npm run test:node -- test/graphrag-book-state.test.ts -t "cleans only failed stage-owned|does not clean residual outputs|rejects GraphRAG stage reports"
+    - npm run test:node -- test/integrations/graphrag-cost.test.ts
+    - npm run test:node -- test/cli.test.ts -t "GraphRAG EPUB batch runner|partial-output|retry_same_run_id"
+    - npm run build
+    - git diff --check
+inputs:
+  design: docs/architecture/graphrag-partial-output-early-stop.md
+  observedRun:
+    runId: epub-batch-20260525-full-real
+    book: "Code Complete A Practical Handbook of Software Construction (Steve McConnell).epub"
+    activeStage: community_report
+    observedSignals:
+      - "Community Report Extraction Error"
+      - "No report found for community"

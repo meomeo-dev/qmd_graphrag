@@ -13,6 +13,7 @@ import {
   assertGraphRagStageArtifactsReady,
   assertGraphRagStageReportHealthy,
   checkGraphRagStageReportHealth,
+  cleanFailedGraphRagStageOutputs,
   FileBookJobStateRepository,
   graphRagIndexLogOffset,
   graphRagBookOutputDir,
@@ -803,6 +804,68 @@ describe("syncGraphRagBookWorkspace", () => {
         stage: "community_report",
         logStartOffset: offset,
       })).rejects.toThrow("GraphRAG stage report contains recoverable provider");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("cleans only failed stage-owned GraphRAG residual outputs before retry", async () => {
+    const root = await createWorkspace();
+    try {
+      const outputDir = join(root, "graph_vault", "books", "book-1", "output");
+      await mkdir(join(outputDir, "lancedb", "table.lance"), { recursive: true });
+      await writeFile(join(outputDir, "documents.parquet"), "documents", "utf8");
+      await writeFile(join(outputDir, "text_units.parquet"), "text units", "utf8");
+      await writeFile(join(outputDir, "community_reports.parquet"), "partial", "utf8");
+      await writeFile(join(outputDir, "lancedb", "table.lance", "data"), "rows", "utf8");
+
+      const cleanup = await cleanFailedGraphRagStageOutputs({
+        outputDir,
+        stage: "community_report",
+        previousCheckpoint: {
+          status: "failed",
+          errorSummary: "GraphRAG stage report partial-output failure",
+          metadata: { failureKind: "partial_output" },
+        },
+      });
+
+      expect(cleanup).toMatchObject({
+        cleaned: true,
+        deletedLocators: ["community_reports.parquet"],
+      });
+      await expect(readFile(join(outputDir, "community_reports.parquet"), "utf8"))
+        .rejects.toThrow();
+      await expect(readFile(join(outputDir, "documents.parquet"), "utf8"))
+        .resolves.toBe("documents");
+      await expect(readFile(join(outputDir, "text_units.parquet"), "utf8"))
+        .resolves.toBe("text units");
+      await expect(readFile(join(outputDir, "lancedb", "table.lance", "data"), "utf8"))
+        .resolves.toBe("rows");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not clean residual outputs after non-retryable stage failure", async () => {
+    const root = await createWorkspace();
+    try {
+      const outputDir = join(root, "graph_vault", "books", "book-1", "output");
+      await mkdir(outputDir, { recursive: true });
+      await writeFile(join(outputDir, "community_reports.parquet"), "keep", "utf8");
+
+      const cleanup = await cleanFailedGraphRagStageOutputs({
+        outputDir,
+        stage: "community_report",
+        previousCheckpoint: {
+          status: "failed",
+          errorSummary: "schema mismatch",
+          metadata: {},
+        },
+      });
+
+      expect(cleanup).toMatchObject({ cleaned: false, deletedLocators: [] });
+      await expect(readFile(join(outputDir, "community_reports.parquet"), "utf8"))
+        .resolves.toBe("keep");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
