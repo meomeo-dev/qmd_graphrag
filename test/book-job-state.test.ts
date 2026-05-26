@@ -1912,6 +1912,467 @@ describe("FileBookJobStateRepository", () => {
     }
   });
 
+  test("recovers graph_extract readiness from current producer artifacts", async () => {
+    const root = await createFixtureDir();
+    try {
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "fixture epub content", "utf8");
+
+      const job = await repo.registerBookSource({
+        sourcePath,
+        normalizedContentHash: "normalized-content-hash",
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+      });
+      const outputDir = bookScopedOutputDir(graphVault, job.bookId);
+      await mkdir(outputDir, { recursive: true });
+      const oldArtifacts = await writeGraphExtractArtifacts(
+        repo,
+        job.bookId,
+        outputDir,
+        "run-graph-extract-1",
+      );
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "ingest",
+        runId: "run-ingest-1",
+        inputFingerprint: job.stageFingerprints!.ingest!,
+      });
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "normalize",
+        runId: "run-normalize-1",
+        inputFingerprint: job.stageFingerprints!.normalize!,
+      });
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "graph_extract",
+        runId: "run-graph-extract-1",
+        inputFingerprint: job.stageFingerprints!.graph_extract!,
+        artifactIds: oldArtifacts.map((artifact) => artifact.artifactId),
+      });
+
+      await writeFile(join(outputDir, "stats.json"), '{"workflows":{"ok":1}}', "utf8");
+      await repo.recordArtifacts(job.bookId, [
+        {
+          stage: "graph_extract",
+          kind: "graphrag_stats_json",
+          path: join(outputDir, "stats.json"),
+          contentHash: await hashFile(join(outputDir, "stats.json")),
+          producerRunId: "run-graph-extract-1",
+        },
+      ]);
+
+      const plan = await repo.getResumePlan(
+        job.bookId,
+        {
+          ingest: job.stageFingerprints!.ingest!,
+          normalize: job.stageFingerprints!.normalize!,
+          graph_extract: job.stageFingerprints!.graph_extract!,
+        },
+        {
+          graph_extract: [
+            "graphrag_documents_parquet",
+            "graphrag_text_units_parquet",
+            "graphrag_entities_parquet",
+            "graphrag_relationships_parquet",
+            "graphrag_communities_parquet",
+            "graphrag_context_json",
+            "graphrag_stats_json",
+          ],
+        },
+      );
+      const graphState = plan.stageStates.find((item) =>
+        item.stage === "graph_extract"
+      );
+
+      expect(graphState?.isSatisfied).toBe(true);
+      expect(graphState?.reason).toBe("ready");
+      expect(graphState?.runId).toBe("run-graph-extract-1");
+      expect(plan.nextStage).toBe("community_report");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not let newer running graph_extract shadow usable success", async () => {
+    const root = await createFixtureDir();
+    try {
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "fixture epub content", "utf8");
+
+      const job = await repo.registerBookSource({
+        sourcePath,
+        normalizedContentHash: "normalized-content-hash",
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+      });
+      const outputDir = bookScopedOutputDir(graphVault, job.bookId);
+      await mkdir(outputDir, { recursive: true });
+      const artifacts = await writeGraphExtractArtifacts(
+        repo,
+        job.bookId,
+        outputDir,
+        "run-graph-extract-1",
+      );
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "ingest",
+        runId: "run-ingest-1",
+        inputFingerprint: job.stageFingerprints!.ingest!,
+      });
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "normalize",
+        runId: "run-normalize-1",
+        inputFingerprint: job.stageFingerprints!.normalize!,
+      });
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "graph_extract",
+        runId: "run-graph-extract-1",
+        inputFingerprint: job.stageFingerprints!.graph_extract!,
+        artifactIds: artifacts.map((artifact) => artifact.artifactId),
+      });
+      await repo.startStage({
+        bookId: job.bookId,
+        stage: "graph_extract",
+        runId: "run-graph-extract-2",
+        inputFingerprint: job.stageFingerprints!.graph_extract!,
+      });
+
+      const plan = await repo.getResumePlan(
+        job.bookId,
+        {
+          ingest: job.stageFingerprints!.ingest!,
+          normalize: job.stageFingerprints!.normalize!,
+          graph_extract: job.stageFingerprints!.graph_extract!,
+        },
+        {
+          graph_extract: [
+            "graphrag_documents_parquet",
+            "graphrag_text_units_parquet",
+            "graphrag_entities_parquet",
+            "graphrag_relationships_parquet",
+            "graphrag_communities_parquet",
+            "graphrag_context_json",
+            "graphrag_stats_json",
+          ],
+        },
+      );
+      const graphState = plan.stageStates.find((item) =>
+        item.stage === "graph_extract"
+      );
+
+      expect(graphState?.isSatisfied).toBe(true);
+      expect(graphState?.reason).toBe("ready");
+      expect(graphState?.runId).toBe("run-graph-extract-1");
+      expect(plan.nextStage).toBe("community_report");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("loads query-ready capability with recovered producer artifact ids", async () => {
+    const root = await createFixtureDir();
+    try {
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "fixture epub content", "utf8");
+
+      const job = await repo.registerBookSource({
+        sourcePath,
+        normalizedContentHash: "normalized-content-hash",
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+      });
+      const outputDir = bookScopedOutputDir(graphVault, job.bookId);
+      const reportsPath = join(outputDir, "community_reports.parquet");
+      const lancedbPath = join(outputDir, "lancedb");
+      await mkdir(outputDir, { recursive: true });
+      await writeMinimalParquetFixture(reportsPath);
+      await writeCompleteLanceDbFixture(lancedbPath);
+      const graphExtractArtifacts = await writeGraphExtractArtifacts(
+        repo,
+        job.bookId,
+        outputDir,
+        "run-graph-extract-1",
+      );
+      const oldStatsArtifact = graphExtractArtifacts.find((artifact) =>
+        artifact.kind === "graphrag_stats_json"
+      );
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "ingest",
+        runId: "run-ingest-1",
+        inputFingerprint: job.stageFingerprints!.ingest!,
+      });
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "normalize",
+        runId: "run-normalize-1",
+        inputFingerprint: job.stageFingerprints!.normalize!,
+      });
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "graph_extract",
+        runId: "run-graph-extract-1",
+        inputFingerprint: job.stageFingerprints!.graph_extract!,
+        artifactIds: graphExtractArtifacts.map((artifact) => artifact.artifactId),
+      });
+      await writeFile(join(outputDir, "stats.json"), '{"workflows":{"ok":1}}', "utf8");
+      const [newStatsArtifact] = await repo.recordArtifacts(job.bookId, [
+        {
+          stage: "graph_extract",
+          kind: "graphrag_stats_json",
+          path: join(outputDir, "stats.json"),
+          contentHash: await hashFile(join(outputDir, "stats.json")),
+          producerRunId: "run-graph-extract-1",
+        },
+      ]);
+      const artifacts = await repo.recordArtifacts(job.bookId, [
+        {
+          stage: "community_report",
+          kind: "graphrag_community_reports_parquet",
+          path: reportsPath,
+          contentHash: await hashFile(reportsPath),
+          producerRunId: "run-community-report-1",
+        },
+        {
+          stage: "embed",
+          kind: "lancedb_index",
+          path: lancedbPath,
+          contentHash: await hashLanceDbDirectoryContents(lancedbPath),
+          producerRunId: "run-embed-1",
+        },
+      ]);
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "community_report",
+        runId: "run-community-report-1",
+        inputFingerprint: job.stageFingerprints!.community_report!,
+        artifactIds: [artifacts[0]!.artifactId],
+      });
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "embed",
+        runId: "run-embed-1",
+        inputFingerprint: job.stageFingerprints!.embed!,
+        artifactIds: [artifacts[1]!.artifactId],
+      });
+      await repo.recordGraphTextUnitIdentity({
+        schemaVersion: SchemaVersion,
+        bookId: job.bookId,
+        sourceId: `sha256:${job.sourceHash}`,
+        sourceHash: job.sourceHash,
+        documentId: job.documentId,
+        contentHash: "normalized-content-hash",
+        normalizedPath: "input/book.md",
+        graphDocumentId: "graph-doc-1",
+        graphTextUnitIds: ["tu-1"],
+      });
+      await repo.recordQmdCorpusRegistration({
+        documentId: job.documentId,
+        contentHash: "normalized-content-hash",
+        collection: "books",
+        relativePath: "book.md",
+      });
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "query_ready",
+        runId: "run-query-ready-1",
+        inputFingerprint: job.stageFingerprints!.query_ready!,
+        artifactIds: artifacts.map((artifact) => artifact.artifactId),
+      });
+      expect(await loadGraphQueryCapabilities({ graphVault })).toHaveLength(1);
+      await repo.startStage({
+        bookId: job.bookId,
+        stage: "graph_extract",
+        runId: "run-graph-extract-2",
+        inputFingerprint: job.stageFingerprints!.graph_extract!,
+      });
+
+      const capabilities = await loadGraphQueryCapabilities({ graphVault });
+
+      expect(capabilities).toHaveLength(1);
+      expect(capabilities[0]?.artifactIds).toContain(newStatsArtifact!.artifactId);
+      expect(capabilities[0]?.artifactIds).not.toContain(
+        oldStatsArtifact!.artifactId,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not load graph capability from stale query_ready fingerprint", async () => {
+    const root = await createFixtureDir();
+    try {
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "fixture epub content", "utf8");
+
+      const job = await repo.registerBookSource({
+        sourcePath,
+        normalizedContentHash: "normalized-content-hash",
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+        stageFingerprints: {
+          ingest: "fp-ingest",
+          normalize: "fp-normalize",
+          graph_extract: "fp-graph",
+          community_report: "fp-community",
+          embed: "fp-embed",
+          query_ready: "fp-query-old",
+        },
+        providerFingerprint: "provider-1",
+      });
+      const outputDir = bookScopedOutputDir(graphVault, job.bookId);
+      const reportsPath = join(outputDir, "community_reports.parquet");
+      const lancedbPath = join(outputDir, "lancedb");
+      await mkdir(outputDir, { recursive: true });
+      await writeMinimalParquetFixture(reportsPath);
+      await writeCompleteLanceDbFixture(lancedbPath);
+      const graphExtractArtifacts = await writeGraphExtractArtifacts(
+        repo,
+        job.bookId,
+        outputDir,
+        "run-graph-extract-1",
+      );
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "ingest",
+        runId: "run-ingest-1",
+        inputFingerprint: "fp-ingest",
+      });
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "normalize",
+        runId: "run-normalize-1",
+        inputFingerprint: "fp-normalize",
+      });
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "graph_extract",
+        runId: "run-graph-extract-1",
+        inputFingerprint: "fp-graph",
+        artifactIds: graphExtractArtifacts.map((artifact) => artifact.artifactId),
+      });
+      const artifacts = await repo.recordArtifacts(job.bookId, [
+        {
+          stage: "community_report",
+          kind: "graphrag_community_reports_parquet",
+          path: reportsPath,
+          contentHash: await hashFile(reportsPath),
+          producerRunId: "run-community-report-1",
+        },
+        {
+          stage: "embed",
+          kind: "lancedb_index",
+          path: lancedbPath,
+          contentHash: await hashLanceDbDirectoryContents(lancedbPath),
+          producerRunId: "run-embed-1",
+        },
+      ]);
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "community_report",
+        runId: "run-community-report-1",
+        inputFingerprint: "fp-community",
+        artifactIds: [artifacts[0]!.artifactId],
+      });
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "embed",
+        runId: "run-embed-1",
+        inputFingerprint: "fp-embed",
+        artifactIds: [artifacts[1]!.artifactId],
+      });
+      await repo.recordGraphTextUnitIdentity({
+        schemaVersion: SchemaVersion,
+        bookId: job.bookId,
+        sourceId: `sha256:${job.sourceHash}`,
+        sourceHash: job.sourceHash,
+        documentId: job.documentId,
+        contentHash: "normalized-content-hash",
+        normalizedPath: "input/book.md",
+        graphDocumentId: "graph-doc-1",
+        graphTextUnitIds: ["tu-1"],
+      });
+      await repo.recordQmdCorpusRegistration({
+        documentId: job.documentId,
+        contentHash: "normalized-content-hash",
+        collection: "books",
+        relativePath: "book.md",
+      });
+      await repo.completeStage({
+        bookId: job.bookId,
+        stage: "query_ready",
+        runId: "run-query-ready-1",
+        inputFingerprint: "fp-query-old",
+        artifactIds: artifacts.map((artifact) => artifact.artifactId),
+      });
+      await repo.registerBookSource({
+        sourcePath,
+        normalizedContentHash: "normalized-content-hash",
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+        stageFingerprints: {
+          ingest: "fp-ingest",
+          normalize: "fp-normalize",
+          graph_extract: "fp-graph",
+          community_report: "fp-community",
+          embed: "fp-embed",
+          query_ready: "fp-query-new",
+        },
+        providerFingerprint: "provider-1",
+      });
+
+      const plan = await repo.getResumePlan(
+        job.bookId,
+        {
+          graph_extract: "fp-graph",
+          community_report: "fp-community",
+          embed: "fp-embed",
+          query_ready: "fp-query-new",
+        },
+        {
+          graph_extract: [
+            "graphrag_documents_parquet",
+            "graphrag_text_units_parquet",
+            "graphrag_entities_parquet",
+            "graphrag_relationships_parquet",
+            "graphrag_communities_parquet",
+            "graphrag_context_json",
+            "graphrag_stats_json",
+          ],
+          community_report: ["graphrag_community_reports_parquet"],
+          embed: ["lancedb_index"],
+          query_ready: [
+            "graphrag_community_reports_parquet",
+            "lancedb_index",
+          ],
+        },
+      );
+
+      expect(plan.nextStage).toBe("query_ready");
+      expect(plan.canQuery).toBe(false);
+      expect(await loadGraphQueryCapabilities({ graphVault })).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("publishes graph capabilities after query-ready checkpoint validates", async () => {
     const root = await createFixtureDir();
     try {

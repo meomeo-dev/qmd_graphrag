@@ -8,7 +8,12 @@ import {
   BookArtifactManifestListSchema,
   BookJobCatalogSchema,
   BookJobCheckpointListSchema,
+  BookJobRunCatalogSchema,
+  BookJobRunRecordSchema,
   type BookArtifactManifest,
+  type BookJob,
+  type BookJobRunRecord,
+  type BookJobStageCheckpoint,
   type BookStage,
 } from "../contracts/book-job.js";
 import { DocumentIdentityCatalogSchema } from "../contracts/corpus.js";
@@ -41,6 +46,36 @@ const QUERY_READY_LINEAGE_ARTIFACT_KINDS = [
   ...QUERY_READY_ARTIFACT_KINDS,
 ] as const satisfies readonly BookArtifactKind[];
 
+const QUERY_READY_PRODUCER_STAGES = [
+  "graph_extract",
+  "community_report",
+  "embed",
+] as const satisfies readonly BookStage[];
+
+type QueryReadyProducerStage = (typeof QUERY_READY_PRODUCER_STAGES)[number];
+
+type CheckpointCandidate = Pick<
+  BookJobStageCheckpoint,
+  | "bookId"
+  | "stage"
+  | "status"
+  | "runId"
+  | "startedAt"
+  | "finishedAt"
+  | "inputFingerprint"
+  | "contentHash"
+  | "stageFingerprint"
+  | "providerFingerprint"
+  | "artifactIds"
+>;
+
+export type QueryReadyLineageProjection = {
+  artifactIds: string[];
+  artifacts: BookArtifactManifest[];
+  book: BookJob;
+  expectedProducerRunIds: Partial<Record<BookStage, string>>;
+};
+
 function uniqueStrings(values: readonly string[]): string[] {
   return [...new Set(values)];
 }
@@ -57,6 +92,220 @@ function filterArtifactIdsByKinds(
     );
     return artifact != null && kindSet.has(artifact.kind);
   });
+}
+
+function artifactIdsForProducerStage(input: {
+  artifacts: readonly BookArtifactManifest[];
+  bookId: string;
+  stage: QueryReadyProducerStage;
+  producerRunId: string;
+  requiredKinds: readonly BookArtifactKind[];
+}): string[] {
+  const requiredKindSet = new Set<BookArtifactKind>(input.requiredKinds);
+  return input.artifacts
+    .filter((artifact) =>
+      artifact.bookId === input.bookId &&
+      artifact.stage === input.stage &&
+      artifact.producerRunId === input.producerRunId &&
+      requiredKindSet.has(artifact.kind)
+    )
+    .map((artifact) => artifact.artifactId);
+}
+
+function artifactIdsForQueryReadyGate(input: {
+  artifacts: readonly BookArtifactManifest[];
+  bookId: string;
+  expectedProducerRunIds: Partial<Record<BookStage, string>>;
+}): string[] {
+  return [
+    input.expectedProducerRunIds.community_report == null
+      ? []
+      : artifactIdsForProducerStage({
+          artifacts: input.artifacts,
+          bookId: input.bookId,
+          stage: "community_report",
+          producerRunId: input.expectedProducerRunIds.community_report,
+          requiredKinds: QUERY_READY_PRODUCER_REQUIRED_KINDS.community_report,
+        }),
+    input.expectedProducerRunIds.embed == null
+      ? []
+      : artifactIdsForProducerStage({
+          artifacts: input.artifacts,
+          bookId: input.bookId,
+          stage: "embed",
+          producerRunId: input.expectedProducerRunIds.embed,
+          requiredKinds: QUERY_READY_PRODUCER_REQUIRED_KINDS.embed,
+        }),
+  ].flat();
+}
+
+function expectedContentHash(book: BookJob): string {
+  return book.normalizedContentHash ?? book.sourceHash;
+}
+
+function metadataString(
+  metadata: BookJobRunRecord["metadata"] | undefined,
+  key: string,
+): string | undefined {
+  const value = metadata?.[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function checkpointTimestamp(checkpoint: CheckpointCandidate): string {
+  return checkpoint.finishedAt ?? checkpoint.startedAt ?? "";
+}
+
+function runRecordToCheckpointCandidate(
+  record: BookJobRunRecord,
+  book: BookJob,
+): CheckpointCandidate {
+  return {
+    bookId: record.bookId,
+    stage: record.stage,
+    status: record.status,
+    runId: record.runId,
+    startedAt: record.startedAt,
+    finishedAt: record.finishedAt,
+    inputFingerprint: record.inputFingerprint,
+    contentHash: expectedContentHash(book),
+    stageFingerprint: metadataString(record.metadata, "stageFingerprint") ??
+      record.inputFingerprint,
+    providerFingerprint: metadataString(record.metadata, "providerFingerprint") ??
+      book.providerFingerprint,
+    artifactIds: record.artifactIds,
+  };
+}
+
+async function loadRunRecordCandidates(
+  graphVault: string,
+  book: BookJob,
+): Promise<CheckpointCandidate[]> {
+  const catalogRaw = await readYaml(join(graphVault, "catalog", "runs.yaml"));
+  const catalogResult = BookJobRunCatalogSchema.safeParse(catalogRaw);
+  if (!catalogResult.success) return [];
+
+  const records = await Promise.all(
+    catalogResult.data.items
+      .filter((item) => item.bookId === book.bookId)
+      .map(async (item) => {
+        const raw = await readYaml(
+          join(graphVault, "books", book.bookId, "runs", `${item.runId}.yaml`),
+        );
+        const result = BookJobRunRecordSchema.safeParse(raw);
+        return result.success ? result.data : null;
+      }),
+  );
+  return records
+    .filter((record): record is BookJobRunRecord => record != null)
+    .map((record) => runRecordToCheckpointCandidate(record, book));
+}
+
+async function loadCheckpointCandidates(
+  graphVault: string,
+  book: BookJob,
+): Promise<CheckpointCandidate[] | null> {
+  const checkpointsRaw = await readYaml(
+    join(graphVault, "books", book.bookId, "checkpoints.yaml"),
+  );
+  const checkpointsResult = BookJobCheckpointListSchema.safeParse(checkpointsRaw);
+  if (!checkpointsResult.success) return null;
+  return [
+    ...checkpointsResult.data.items,
+    ...await loadRunRecordCandidates(graphVault, book),
+  ].sort((left, right) =>
+    checkpointTimestamp(right).localeCompare(checkpointTimestamp(left)),
+  );
+}
+
+function checkpointMatchesBook(
+  checkpoint: CheckpointCandidate,
+  book: BookJob,
+  options: { requireRunId?: boolean } = {},
+): boolean {
+  const stageFingerprint = book.stageFingerprints?.[checkpoint.stage];
+  if (stageFingerprint == null || book.providerFingerprint == null) return false;
+  return checkpoint.bookId === book.bookId &&
+    checkpoint.status === "succeeded" &&
+    (options.requireRunId === false || checkpoint.runId != null) &&
+    checkpoint.contentHash === expectedContentHash(book) &&
+    checkpoint.stageFingerprint === stageFingerprint &&
+    checkpoint.providerFingerprint === book.providerFingerprint;
+}
+
+async function selectProducerCheckpoint(input: {
+  graphVault: string;
+  book: BookJob;
+  artifacts: readonly BookArtifactManifest[];
+  candidates: readonly CheckpointCandidate[];
+  stage: QueryReadyProducerStage;
+}): Promise<CheckpointCandidate | null> {
+  for (const checkpoint of input.candidates) {
+    if (
+      checkpoint.stage !== input.stage ||
+      !checkpointMatchesBook(checkpoint, input.book)
+    ) {
+      continue;
+    }
+    const requiredKinds = QUERY_READY_PRODUCER_REQUIRED_KINDS[input.stage];
+    const artifactIds = artifactIdsForProducerStage({
+      artifacts: input.artifacts,
+      bookId: input.book.bookId,
+      stage: input.stage,
+      producerRunId: checkpoint.runId!,
+      requiredKinds,
+    });
+    const validation = await validateBookArtifactSet({
+      graphVault: input.graphVault,
+      bookId: input.book.bookId,
+      artifactIds,
+      artifacts: input.artifacts,
+      requiredKinds,
+      allowedKinds: requiredKinds,
+      requireBookScopedGraphOutput: true,
+      expectedProducerRunIds: { [input.stage]: checkpoint.runId },
+      expectedStageFingerprints: input.book.stageFingerprints,
+      expectedProviderFingerprint: input.book.providerFingerprint,
+      expectedCorpusContentHash: expectedContentHash(input.book),
+    });
+    if (validation.isSatisfied) return checkpoint;
+  }
+  return null;
+}
+
+async function selectQueryReadyCheckpoint(input: {
+  graphVault: string;
+  book: BookJob;
+  artifacts: readonly BookArtifactManifest[];
+  candidates: readonly CheckpointCandidate[];
+  expectedProducerRunIds: Partial<Record<BookStage, string>>;
+}): Promise<CheckpointCandidate | null> {
+  for (const checkpoint of input.candidates) {
+    if (
+      checkpoint.stage !== "query_ready" ||
+      !checkpointMatchesBook(checkpoint, input.book, { requireRunId: false })
+    ) {
+      continue;
+    }
+    const validation = await validateBookArtifactSet({
+      graphVault: input.graphVault,
+      bookId: input.book.bookId,
+      artifactIds: artifactIdsForQueryReadyGate({
+        artifacts: input.artifacts,
+        bookId: input.book.bookId,
+        expectedProducerRunIds: input.expectedProducerRunIds,
+      }),
+      artifacts: input.artifacts,
+      requiredKinds: QUERY_READY_ARTIFACT_KINDS,
+      allowedKinds: QUERY_READY_ARTIFACT_KINDS,
+      requireBookScopedGraphOutput: true,
+      expectedProducerRunIds: input.expectedProducerRunIds,
+      expectedStageFingerprints: input.book.stageFingerprints,
+      expectedProviderFingerprint: input.book.providerFingerprint,
+      expectedCorpusContentHash: expectedContentHash(input.book),
+    });
+    if (validation.isSatisfied) return checkpoint;
+  }
+  return null;
 }
 
 export type ResolveGraphCapabilitiesInput = {
@@ -126,127 +375,81 @@ function methodCapabilities(
   ];
 }
 
-async function validateQueryReadyArtifacts(
+export async function projectQueryReadyLineage(
   graphVault: string,
   bookId: string,
-  artifactIds: readonly string[],
-): Promise<boolean> {
+): Promise<QueryReadyLineageProjection | null> {
   const booksRaw = await readYaml(join(graphVault, "catalog", "books.yaml"));
   const booksResult = BookJobCatalogSchema.safeParse(booksRaw);
-  if (!booksResult.success) return false;
+  if (!booksResult.success) return null;
   const book = booksResult.data.items.find((item) => item.bookId === bookId);
   if (
     book == null ||
     book.stageFingerprints == null ||
     book.providerFingerprint == null
   ) {
-    return false;
-  }
-
-  const checkpointsRaw = await readYaml(
-    join(graphVault, "books", bookId, "checkpoints.yaml"),
-  );
-  const checkpointsResult = BookJobCheckpointListSchema.safeParse(checkpointsRaw);
-  if (!checkpointsResult.success) return false;
-  const checkpointByStage = new Map(
-    checkpointsResult.data.items
-      .filter((checkpoint) => checkpoint.status === "succeeded")
-      .map((checkpoint) => [checkpoint.stage, checkpoint]),
-  );
-  const graphExtractRunId = checkpointByStage.get("graph_extract")?.runId;
-  const communityReportRunId = checkpointByStage.get("community_report")?.runId;
-  const embedRunId = checkpointByStage.get("embed")?.runId;
-  if (
-    graphExtractRunId == null ||
-    communityReportRunId == null ||
-    embedRunId == null
-  ) {
-    return false;
-  }
-  const expectedProducerRunIds: Partial<Record<BookStage, string>> = {
-    graph_extract: graphExtractRunId,
-    community_report: communityReportRunId,
-    embed: embedRunId,
-  };
-  const expectedContentHash = book.normalizedContentHash ?? book.sourceHash;
-
-  for (const stage of [
-    "graph_extract",
-    "community_report",
-    "embed",
-    "query_ready",
-  ] as const) {
-    const checkpoint = checkpointByStage.get(stage);
-    if (
-      checkpoint == null ||
-      checkpoint.contentHash !== expectedContentHash ||
-      checkpoint.stageFingerprint !== book.stageFingerprints[stage] ||
-      checkpoint.providerFingerprint !== book.providerFingerprint
-    ) {
-      return false;
-    }
+    return null;
   }
 
   const artifactsRaw = await readYaml(join(graphVault, "books", bookId, "artifacts.yaml"));
-  if (artifactsRaw == null) return false;
+  if (artifactsRaw == null) return null;
   const artifactsResult = BookArtifactManifestListSchema.safeParse(artifactsRaw);
-  if (!artifactsResult.success) return false;
+  if (!artifactsResult.success) return null;
   const artifacts = artifactsResult.data.items;
-  const byId = new Map(artifacts.map((artifact) => [artifact.artifactId, artifact]));
-  const selectedArtifacts = artifactIds
-    .map((artifactId) => byId.get(artifactId))
-    .filter((artifact): artifact is BookArtifactManifest => artifact != null);
-  if (selectedArtifacts.length !== artifactIds.length) return false;
-  if (selectedArtifacts.some((artifact) =>
-    artifact.bookId !== bookId
-  )) {
-    return false;
-  }
+  const candidates = await loadCheckpointCandidates(graphVault, book);
+  if (candidates == null) return null;
 
-  for (const stage of ["graph_extract", "community_report", "embed"] as const) {
-    const checkpoint = checkpointByStage.get(stage);
-    if (checkpoint == null) return false;
-    const producerValidation = await validateBookArtifactSet({
-      graphVault,
-      bookId,
-      artifactIds: filterArtifactIdsByKinds(
-        checkpoint.artifactIds,
+  const producerCheckpoints = await Promise.all(
+    QUERY_READY_PRODUCER_STAGES.map(async (stage) => ({
+      stage,
+      checkpoint: await selectProducerCheckpoint({
+        graphVault,
+        book,
         artifacts,
-        QUERY_READY_PRODUCER_REQUIRED_KINDS[stage],
-      ),
-      artifacts,
-      requiredKinds: QUERY_READY_PRODUCER_REQUIRED_KINDS[stage],
-      allowedKinds: QUERY_READY_PRODUCER_REQUIRED_KINDS[stage],
-      requireBookScopedGraphOutput: true,
-      expectedProducerRunIds: { [stage]: checkpoint.runId },
-      expectedStageFingerprints: book.stageFingerprints,
-      expectedProviderFingerprint: book.providerFingerprint,
-      expectedCorpusContentHash: expectedContentHash,
-    });
-    if (!producerValidation.isSatisfied) return false;
+        candidates,
+        stage,
+      }),
+    })),
+  );
+  if (producerCheckpoints.some((item) => item.checkpoint == null)) {
+    return null;
   }
-
-  const queryReadyCheckpoint = checkpointByStage.get("query_ready");
-  if (queryReadyCheckpoint == null) return false;
-  const queryReadyValidation = await validateBookArtifactSet({
+  const expectedProducerRunIds = Object.fromEntries(
+    producerCheckpoints.map(({ stage, checkpoint }) => [
+      stage,
+      checkpoint?.runId,
+    ]),
+  ) as Partial<Record<BookStage, string>>;
+  const queryReadyCheckpoint = await selectQueryReadyCheckpoint({
     graphVault,
-    bookId,
-    artifactIds: queryReadyCheckpoint.artifactIds,
+    book,
     artifacts,
-    requiredKinds: QUERY_READY_ARTIFACT_KINDS,
-    allowedKinds: QUERY_READY_ARTIFACT_KINDS,
-    requireBookScopedGraphOutput: true,
+    candidates,
     expectedProducerRunIds,
-    expectedStageFingerprints: book.stageFingerprints,
-    expectedProviderFingerprint: book.providerFingerprint,
-    expectedCorpusContentHash: expectedContentHash,
   });
-  if (!queryReadyValidation.isSatisfied) return false;
+  if (queryReadyCheckpoint == null) return null;
+
+  const artifactIds = [
+    ...QUERY_READY_PRODUCER_STAGES.flatMap((stage) =>
+      artifactIdsForProducerStage({
+        artifacts,
+        bookId,
+        stage,
+        producerRunId: expectedProducerRunIds[stage]!,
+        requiredKinds: QUERY_READY_PRODUCER_REQUIRED_KINDS[stage],
+      })
+    ),
+    ...artifactIdsForQueryReadyGate({
+      artifacts,
+      bookId,
+      expectedProducerRunIds,
+    }),
+  ];
 
   const validation = await validateBookArtifactSet({
     graphVault,
     bookId,
-    artifactIds,
+    artifactIds: uniqueStrings(artifactIds),
     artifacts,
     requiredKinds: QUERY_READY_LINEAGE_ARTIFACT_KINDS,
     allowedKinds: QUERY_READY_LINEAGE_ARTIFACT_KINDS,
@@ -254,52 +457,33 @@ async function validateQueryReadyArtifacts(
     expectedProducerRunIds,
     expectedStageFingerprints: book.stageFingerprints,
     expectedProviderFingerprint: book.providerFingerprint,
-    expectedCorpusContentHash: expectedContentHash,
+    expectedCorpusContentHash: expectedContentHash(book),
   });
-  return validation.isSatisfied;
+  if (!validation.isSatisfied) return null;
+
+  return {
+    artifactIds: uniqueStrings(artifactIds),
+    artifacts,
+    book,
+    expectedProducerRunIds,
+  };
+}
+
+async function validateQueryReadyArtifacts(
+  graphVault: string,
+  bookId: string,
+  artifactIds: readonly string[],
+): Promise<boolean> {
+  const projection = await projectQueryReadyLineage(graphVault, bookId);
+  if (projection == null) return false;
+  return isSubsetOf(artifactIds, projection.artifactIds);
 }
 
 async function loadQueryReadyLineageArtifactIds(
   graphVault: string,
   bookId: string,
 ): Promise<string[] | null> {
-  const checkpointsRaw = await readYaml(
-    join(graphVault, "books", bookId, "checkpoints.yaml"),
-  );
-  const checkpointsResult = BookJobCheckpointListSchema.safeParse(checkpointsRaw);
-  if (!checkpointsResult.success) return null;
-  const checkpointByStage = new Map(
-    checkpointsResult.data.items
-      .filter((checkpoint) => checkpoint.status === "succeeded")
-      .map((checkpoint) => [checkpoint.stage, checkpoint]),
-  );
-  const artifactsRaw = await readYaml(join(graphVault, "books", bookId, "artifacts.yaml"));
-  const artifactsResult = BookArtifactManifestListSchema.safeParse(artifactsRaw);
-  if (!artifactsResult.success) return null;
-  const artifacts = artifactsResult.data.items;
-  const ids = [
-    ...filterArtifactIdsByKinds(
-      checkpointByStage.get("graph_extract")?.artifactIds ?? [],
-      artifacts,
-      QUERY_READY_PRODUCER_REQUIRED_KINDS.graph_extract,
-    ),
-    ...filterArtifactIdsByKinds(
-      checkpointByStage.get("community_report")?.artifactIds ?? [],
-      artifacts,
-      QUERY_READY_PRODUCER_REQUIRED_KINDS.community_report,
-    ),
-    ...filterArtifactIdsByKinds(
-      checkpointByStage.get("embed")?.artifactIds ?? [],
-      artifacts,
-      QUERY_READY_PRODUCER_REQUIRED_KINDS.embed,
-    ),
-    ...filterArtifactIdsByKinds(
-      checkpointByStage.get("query_ready")?.artifactIds ?? [],
-      artifacts,
-      QUERY_READY_ARTIFACT_KINDS,
-    ),
-  ];
-  return ids.length > 0 ? uniqueStrings(ids) : null;
+  return (await projectQueryReadyLineage(graphVault, bookId))?.artifactIds ?? null;
 }
 
 function isSubsetOf(

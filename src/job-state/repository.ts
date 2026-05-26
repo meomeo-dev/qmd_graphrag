@@ -940,6 +940,7 @@ function filterArtifactIdsByKinds(
 
 type ArtifactStageValidity = {
   isSatisfied: boolean;
+  artifactIds: string[];
   missingArtifactIds: string[];
   missingArtifactKinds: BookArtifactKind[];
   invalidArtifacts: Array<{
@@ -949,6 +950,60 @@ type ArtifactStageValidity = {
     reason: string;
   }>;
 };
+
+function runRecordToStageCheckpoint(
+  record: BookJobRunRecord,
+  job: BookJob | null,
+): BookJobStageCheckpoint | null {
+  const contentHash = expectedCheckpointContentHash(job, record.stage);
+  const stageFingerprint =
+    metadataString(record.metadata, "stageFingerprint") ??
+    job?.stageFingerprints?.[record.stage] ??
+    record.inputFingerprint;
+  const providerFingerprint =
+    metadataString(record.metadata, "providerFingerprint") ??
+    job?.providerFingerprint;
+  try {
+    return BookJobStageCheckpointSchema.parse({
+      schemaVersion: SchemaVersion,
+      bookId: record.bookId,
+      stage: record.stage,
+      status: record.status,
+      attemptCount: record.attemptCount,
+      runId: record.runId,
+      startedAt: record.startedAt,
+      finishedAt: record.finishedAt,
+      inputFingerprint: record.inputFingerprint,
+      contentHash,
+      stageFingerprint,
+      providerFingerprint,
+      artifactIds: record.artifactIds,
+      errorSummary: record.errorSummary,
+      metadata: record.metadata,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function checkpointCandidateKey(checkpoint: BookJobStageCheckpoint): string {
+  return [
+    checkpoint.stage,
+    checkpoint.runId ?? "",
+    checkpoint.status,
+    checkpoint.inputFingerprint,
+    checkpoint.startedAt ?? "",
+    checkpoint.finishedAt ?? "",
+  ].join("\0");
+}
+
+function sortNewestCheckpoints(
+  checkpoints: readonly BookJobStageCheckpoint[],
+): BookJobStageCheckpoint[] {
+  return [...checkpoints].sort((left, right) =>
+    checkpointTimestamp(right).localeCompare(checkpointTimestamp(left)),
+  );
+}
 
 export class FileBookJobStateRepository {
   readonly rootDir: string;
@@ -1734,53 +1789,48 @@ export class FileBookJobStateRepository {
     return checkpoints.find((item) => item.stage === stage) ?? null;
   }
 
-  private async getStageCheckpointRunId(
-    bookId: string,
-    stage: BookStage,
-  ): Promise<string | undefined> {
-    const checkpoint = await this.getStageCheckpoint(bookId, stage);
-    return checkpoint?.status === "succeeded" ? checkpoint.runId : undefined;
-  }
-
   private async queryReadyProducerRunIds(
     bookId: string,
   ): Promise<Partial<Record<BookStage, string>> | undefined> {
-    const graphExtractRunId = await this.getStageCheckpointRunId(
+    const job = await this.getBookJob(bookId);
+    const currentCheckpoints = await this.listStageCheckpoints(bookId);
+    const effective = await this.buildEffectiveResumeState(
       bookId,
-      "graph_extract",
+      currentCheckpoints,
+      job?.stageFingerprints ?? {},
+      QUERY_READY_PRODUCER_REQUIRED_KINDS,
     );
-    const communityReportRunId = await this.getStageCheckpointRunId(
-      bookId,
-      "community_report",
+    return producerRunIdsForQueryReady(
+      new Map(effective.checkpoints.map((checkpoint) => [
+        checkpoint.stage,
+        checkpoint,
+      ])),
     );
-    const embedRunId = await this.getStageCheckpointRunId(bookId, "embed");
-    if (
-      graphExtractRunId == null ||
-      communityReportRunId == null ||
-      embedRunId == null
-    ) {
-      return undefined;
-    }
-    return {
-      graph_extract: graphExtractRunId,
-      community_report: communityReportRunId,
-      embed: embedRunId,
-    };
   }
 
   private async validateQueryReadyProducerStages(
     job: BookJob,
     artifacts: readonly BookArtifactManifest[],
   ): Promise<void> {
-    const checkpoints = await Promise.all(
-      QUERY_READY_PRODUCER_STAGES.map(async (stage) => ({
-        stage,
-        checkpoint: await this.getStageCheckpoint(job.bookId, stage),
-      })),
+    const currentCheckpoints = await this.listStageCheckpoints(job.bookId);
+    const effective = await this.buildEffectiveResumeState(
+      job.bookId,
+      currentCheckpoints,
+      job.stageFingerprints ?? {},
+      QUERY_READY_PRODUCER_REQUIRED_KINDS,
     );
+    const checkpointByStage = new Map(
+      effective.checkpoints.map((checkpoint) => [checkpoint.stage, checkpoint]),
+    );
+    const checkpoints = QUERY_READY_PRODUCER_STAGES.map((stage) => ({
+      stage,
+      checkpoint: checkpointByStage.get(stage),
+    }));
+    const validityByStage = effective.artifactValidity;
     const missingStages = checkpoints
-      .filter(({ checkpoint }) =>
-        checkpoint == null || checkpoint.status !== "succeeded" ||
+      .filter(({ stage, checkpoint }) =>
+        checkpoint == null ||
+        checkpoint.status !== "succeeded" ||
         checkpoint.runId == null
       )
       .map(({ stage }) => stage);
@@ -1791,37 +1841,87 @@ export class FileBookJobStateRepository {
       );
     }
 
-    for (const { stage, checkpoint } of checkpoints) {
-      if (checkpoint == null || checkpoint.runId == null) continue;
-      const requiredKinds = QUERY_READY_PRODUCER_REQUIRED_KINDS[stage];
-      const validation = await validateBookArtifactSet({
-        graphVault: this.rootDir,
-        bookId: job.bookId,
-        artifactIds: filterArtifactIdsByKinds(
-          checkpoint.artifactIds,
-          artifacts,
-          requiredKinds,
-        ),
+    for (const { stage } of checkpoints) {
+      const validity = validityByStage.get(stage);
+      if (validity?.isSatisfied) continue;
+      throw new Error(
+        "query_ready checkpoint requires valid GraphRAG producer evidence: " +
+          JSON.stringify({
+            stage,
+            missingArtifactIds: validity?.missingArtifactIds ?? [],
+            missingArtifactKinds: validity?.missingArtifactKinds ??
+              QUERY_READY_PRODUCER_REQUIRED_KINDS[stage],
+            invalidArtifacts: validity?.invalidArtifacts ?? [],
+          }),
+      );
+    }
+  }
+
+  private async queryReadyLineageArtifactIds(
+    job: BookJob,
+    queryReadyArtifactIds: readonly string[],
+  ): Promise<string[]> {
+    const artifacts = await this.listArtifacts(job.bookId);
+    const currentCheckpoints = await this.listStageCheckpoints(job.bookId);
+    const effective = await this.buildEffectiveResumeState(
+      job.bookId,
+      currentCheckpoints,
+      job.stageFingerprints ?? {},
+      {
+        ...QUERY_READY_PRODUCER_REQUIRED_KINDS,
+        query_ready: QUERY_READY_ARTIFACT_KINDS,
+      },
+    );
+    const lineageArtifactIds = [
+      ...QUERY_READY_PRODUCER_STAGES.flatMap((stage) =>
+        effective.artifactValidity.get(stage)?.artifactIds ?? []
+      ),
+      ...filterArtifactIdsByKinds(
+        queryReadyArtifactIds,
         artifacts,
-        requiredKinds,
-        allowedKinds: requiredKinds,
-        requireBookScopedGraphOutput: true,
-        expectedProducerRunIds: { [stage]: checkpoint.runId },
-        expectedStageFingerprints: job.stageFingerprints,
-        expectedProviderFingerprint: job.providerFingerprint,
-        expectedCorpusContentHash: job.normalizedContentHash ?? job.sourceHash,
-      });
-      if (!validation.isSatisfied) {
-        throw new Error(
-          "query_ready checkpoint requires valid GraphRAG producer evidence: " +
-            JSON.stringify({
-              stage,
-              missingArtifactIds: validation.missingArtifactIds,
-              missingArtifactKinds: validation.missingArtifactKinds,
-              invalidArtifacts: validation.invalidArtifacts,
-            }),
-        );
-      }
+        QUERY_READY_ARTIFACT_KINDS,
+      ),
+    ];
+    return [...new Set(lineageArtifactIds)];
+  }
+
+  private async validateQueryReadyArtifacts(input: {
+    job: BookJob;
+    artifactIds: readonly string[];
+    artifacts: readonly BookArtifactManifest[];
+  }): Promise<void> {
+    const expectedProducerRunIds = await this.queryReadyProducerRunIds(
+      input.job.bookId,
+    );
+    if (expectedProducerRunIds == null) {
+      throw new Error(
+        "query_ready checkpoint requires completed GraphRAG producer stages: " +
+          QUERY_READY_PRODUCER_STAGES.join(","),
+      );
+    }
+    const validation = await validateBookArtifactSet({
+      graphVault: this.rootDir,
+      bookId: input.job.bookId,
+      artifactIds: input.artifactIds,
+      artifacts: input.artifacts,
+      requiredKinds: QUERY_READY_ARTIFACT_KINDS,
+      allowedKinds: QUERY_READY_ARTIFACT_KINDS,
+      requireBookScopedGraphOutput: true,
+      expectedProducerRunIds,
+      expectedStageFingerprints: input.job.stageFingerprints,
+      expectedProviderFingerprint: input.job.providerFingerprint,
+      expectedCorpusContentHash:
+        input.job.normalizedContentHash ?? input.job.sourceHash,
+    });
+    if (!validation.isSatisfied) {
+      throw new Error(
+        "query_ready checkpoint requires valid GraphRAG query artifacts: " +
+          JSON.stringify({
+            missingArtifactIds: validation.missingArtifactIds,
+            missingArtifactKinds: validation.missingArtifactKinds,
+            invalidArtifacts: validation.invalidArtifacts,
+          }),
+      );
     }
   }
 
@@ -2023,12 +2123,18 @@ export class FileBookJobStateRepository {
     artifactRequirements: StageArtifactRequirementMap = {},
   ): Promise<BookResumePlan> {
     const checkpoints = await this.listStageCheckpoints(bookId);
-    const artifactValidity = await this.buildArtifactValidity(
+    const effective = await this.buildEffectiveResumeState(
       bookId,
       checkpoints,
+      fingerprints,
       artifactRequirements,
     );
-    return buildResumePlan(bookId, checkpoints, fingerprints, artifactValidity);
+    return buildResumePlan(
+      bookId,
+      effective.checkpoints,
+      fingerprints,
+      effective.artifactValidity,
+    );
   }
 
   private async migrateLegacyBookId(
@@ -2343,6 +2449,7 @@ export class FileBookJobStateRepository {
 
       result.set(checkpoint.stage, {
         isSatisfied: artifactValidation.isSatisfied,
+        artifactIds,
         missingArtifactIds: artifactValidation.missingArtifactIds,
         missingArtifactKinds: artifactValidation.missingArtifactKinds,
         invalidArtifacts: artifactValidation.invalidArtifacts,
@@ -2350,6 +2457,247 @@ export class FileBookJobStateRepository {
     }
 
     return result;
+  }
+
+  private async buildCheckpointCandidates(
+    bookId: string,
+    currentCheckpoints: readonly BookJobStageCheckpoint[],
+    job: BookJob | null,
+  ): Promise<BookJobStageCheckpoint[]> {
+    const candidates = [...currentCheckpoints];
+    for (const run of await this.listRunRecords(bookId)) {
+      if (run.bookId !== bookId) continue;
+      const checkpoint = runRecordToStageCheckpoint(run, job);
+      if (checkpoint != null) {
+        candidates.push(checkpoint);
+      }
+    }
+
+    const byKey = new Map<string, BookJobStageCheckpoint>();
+    for (const checkpoint of candidates) {
+      if (checkpoint.bookId !== bookId) continue;
+      const expectedContentHash = expectedCheckpointContentHash(job, checkpoint.stage);
+      if (
+        expectedContentHash != null &&
+        checkpoint.contentHash !== expectedContentHash
+      ) {
+        continue;
+      }
+      byKey.set(checkpointCandidateKey(checkpoint), checkpoint);
+    }
+    return sortNewestCheckpoints([...byKey.values()]);
+  }
+
+  private artifactIdsForCheckpointCandidate(input: {
+    checkpoint: BookJobStageCheckpoint;
+    artifacts: readonly BookArtifactManifest[];
+    requiredKinds: readonly BookArtifactKind[];
+  }): string[] {
+    const requiredKindSet = new Set<BookArtifactKind>(input.requiredKinds);
+    if (
+      input.checkpoint.runId == null ||
+      !HIGH_COST_STAGES.has(input.checkpoint.stage) ||
+      input.checkpoint.stage === "query_ready"
+    ) {
+      return input.checkpoint.artifactIds.filter((artifactId) => {
+        if (requiredKindSet.size === 0) return true;
+        const artifact = input.artifacts.find((candidate) =>
+          candidate.artifactId === artifactId
+        );
+        return artifact != null && requiredKindSet.has(artifact.kind);
+      });
+    }
+
+    return input.artifacts
+      .filter((artifact) =>
+        artifact.bookId === input.checkpoint.bookId &&
+        artifact.stage === input.checkpoint.stage &&
+        artifact.producerRunId === input.checkpoint.runId &&
+        (requiredKindSet.size === 0 || requiredKindSet.has(artifact.kind))
+      )
+      .map((artifact) => artifact.artifactId);
+  }
+
+  private async validateStageCheckpointCandidate(input: {
+    bookId: string;
+    job: BookJob | null;
+    checkpoint: BookJobStageCheckpoint;
+    artifacts: readonly BookArtifactManifest[];
+    requirements: StageArtifactRequirementMap;
+    checkpointByStage?: ReadonlyMap<BookStage, BookJobStageCheckpoint>;
+  }): Promise<ArtifactStageValidity> {
+    const requiredKinds = input.requirements[input.checkpoint.stage] ?? [];
+    const artifactIds = this.artifactIdsForCheckpointCandidate({
+      checkpoint: input.checkpoint,
+      artifacts: input.artifacts,
+      requiredKinds,
+    });
+    const queryReadyProducerRunIds = input.checkpoint.stage === "query_ready"
+      ? producerRunIdsForQueryReady(input.checkpointByStage ?? new Map())
+      : undefined;
+    const artifactValidation = await validateBookArtifactSet({
+      graphVault: this.rootDir,
+      bookId: input.bookId,
+      artifactIds,
+      artifacts: input.artifacts,
+      requiredKinds,
+      allowedKinds: input.checkpoint.stage === "query_ready"
+        ? QUERY_READY_ARTIFACT_KINDS
+        : requiredKinds.length > 0
+          ? requiredKinds
+          : undefined,
+      requireBookScopedGraphOutput: input.checkpoint.stage === "query_ready" ||
+        requiredKinds.some((kind) =>
+          kind === "graphrag_community_reports_parquet" ||
+          kind === "lancedb_index" ||
+          kind.startsWith("graphrag_")
+        ),
+      expectedProducerRunIds: input.checkpoint.stage === "query_ready"
+        ? queryReadyProducerRunIds ?? {
+            graph_extract: "__missing_query_ready_producer__",
+            community_report: "__missing_query_ready_producer__",
+            embed: "__missing_query_ready_producer__",
+          }
+        : input.checkpoint.runId == null || !HIGH_COST_STAGES.has(input.checkpoint.stage)
+          ? undefined
+          : { [input.checkpoint.stage]: input.checkpoint.runId },
+      expectedStageFingerprints: input.job?.stageFingerprints,
+      expectedProviderFingerprint: input.job?.providerFingerprint,
+      expectedCorpusContentHash: input.job == null
+        ? undefined
+        : input.job.normalizedContentHash ?? input.job.sourceHash,
+    });
+
+    return {
+      isSatisfied: artifactValidation.isSatisfied,
+      artifactIds,
+      missingArtifactIds: artifactValidation.missingArtifactIds,
+      missingArtifactKinds: artifactValidation.missingArtifactKinds,
+      invalidArtifacts: artifactValidation.invalidArtifacts,
+    };
+  }
+
+  private checkpointMatchesExpectedFingerprint(
+    checkpoint: BookJobStageCheckpoint,
+    fingerprints: StageFingerprintMap,
+  ): boolean {
+    const expectedFingerprint = fingerprints[checkpoint.stage];
+    return expectedFingerprint == null ||
+      checkpoint.inputFingerprint === expectedFingerprint;
+  }
+
+  private isCandidateMetadataUsable(
+    checkpoint: BookJobStageCheckpoint,
+  ): boolean {
+    return !(
+      HIGH_COST_STAGES.has(checkpoint.stage) &&
+      checkpoint.metadata?.bootstrap === true
+    );
+  }
+
+  private async selectUsableSucceededCheckpoint(input: {
+    bookId: string;
+    stage: BookStage;
+    candidates: readonly BookJobStageCheckpoint[];
+    fingerprints: StageFingerprintMap;
+    requirements: StageArtifactRequirementMap;
+    artifacts: readonly BookArtifactManifest[];
+    job: BookJob | null;
+    checkpointByStage: ReadonlyMap<BookStage, BookJobStageCheckpoint>;
+  }): Promise<{
+    checkpoint: BookJobStageCheckpoint;
+    validity: ArtifactStageValidity;
+  } | null> {
+    const stageCandidates = sortNewestCheckpoints(
+      input.candidates.filter((checkpoint) =>
+        checkpoint.stage === input.stage &&
+        checkpoint.status === "succeeded" &&
+        this.checkpointMatchesExpectedFingerprint(checkpoint, input.fingerprints) &&
+        this.isCandidateMetadataUsable(checkpoint)
+      ),
+    );
+    for (const checkpoint of stageCandidates) {
+      const validity = await this.validateStageCheckpointCandidate({
+        bookId: input.bookId,
+        job: input.job,
+        checkpoint,
+        artifacts: input.artifacts,
+        requirements: input.requirements,
+        checkpointByStage: input.checkpointByStage,
+      });
+      if (validity.isSatisfied) {
+        return { checkpoint, validity };
+      }
+    }
+    return null;
+  }
+
+  private async buildEffectiveResumeState(
+    bookId: string,
+    currentCheckpoints: BookJobStageCheckpoint[],
+    fingerprints: StageFingerprintMap,
+    requirements: StageArtifactRequirementMap,
+  ): Promise<{
+    checkpoints: BookJobStageCheckpoint[];
+    artifactValidity: Map<BookStage, ArtifactStageValidity>;
+  }> {
+    const job = await this.getBookJob(bookId);
+    const artifacts = await this.listArtifacts(bookId);
+    const candidates = await this.buildCheckpointCandidates(
+      bookId,
+      currentCheckpoints,
+      job,
+    );
+    const effectiveByStage = new Map(
+      currentCheckpoints.map((checkpoint) => [checkpoint.stage, checkpoint]),
+    );
+    const validity = new Map<BookStage, ArtifactStageValidity>();
+
+    for (const stage of BookStageOrder.filter((item) => item !== "query_ready")) {
+      const usable = await this.selectUsableSucceededCheckpoint({
+        bookId,
+        stage,
+        candidates,
+        fingerprints,
+        requirements,
+        artifacts,
+        job,
+        checkpointByStage: effectiveByStage,
+      });
+      if (usable == null) continue;
+      effectiveByStage.set(stage, usable.checkpoint);
+      validity.set(stage, usable.validity);
+    }
+
+    const queryReadyUsable = await this.selectUsableSucceededCheckpoint({
+      bookId,
+      stage: "query_ready",
+      candidates,
+      fingerprints,
+      requirements,
+      artifacts,
+      job,
+      checkpointByStage: effectiveByStage,
+    });
+    if (queryReadyUsable != null) {
+      effectiveByStage.set("query_ready", queryReadyUsable.checkpoint);
+      validity.set("query_ready", queryReadyUsable.validity);
+    }
+
+    const checkpoints = [...effectiveByStage.values()].sort((left, right) =>
+      stageIndex(left.stage) - stageIndex(right.stage),
+    );
+    const diagnosticValidity = await this.buildArtifactValidity(
+      bookId,
+      checkpoints,
+      requirements,
+    );
+    for (const [stage, stageValidity] of diagnosticValidity) {
+      if (!validity.has(stage)) {
+        validity.set(stage, stageValidity);
+      }
+    }
+    return { checkpoints, artifactValidity: validity };
   }
 
   private async repairCheckpointRunRecordStageConsistency(
@@ -2477,29 +2825,11 @@ export class FileBookJobStateRepository {
       }
       const artifacts = await this.listArtifacts(input.bookId);
       await this.validateQueryReadyProducerStages(job, artifacts);
-      const validation = await validateBookArtifactSet({
-        graphVault: this.rootDir,
-        bookId: input.bookId,
+      await this.validateQueryReadyArtifacts({
+        job,
         artifactIds: checkpoint.artifactIds,
         artifacts,
-        requiredKinds: QUERY_READY_ARTIFACT_KINDS,
-        allowedKinds: QUERY_READY_ARTIFACT_KINDS,
-        requireBookScopedGraphOutput: true,
-        expectedProducerRunIds: await this.queryReadyProducerRunIds(input.bookId),
-        expectedStageFingerprints: job.stageFingerprints,
-        expectedProviderFingerprint: job.providerFingerprint,
-        expectedCorpusContentHash: job.normalizedContentHash ?? job.sourceHash,
       });
-      if (!validation.isSatisfied) {
-        throw new Error(
-          "query_ready checkpoint requires valid GraphRAG query artifacts: " +
-            JSON.stringify({
-              missingArtifactIds: validation.missingArtifactIds,
-              missingArtifactKinds: validation.missingArtifactKinds,
-              invalidArtifacts: validation.invalidArtifacts,
-            }),
-        );
-      }
       await this.validateQueryReadyGraphIdentity(job);
     }
 
@@ -2592,29 +2922,10 @@ export class FileBookJobStateRepository {
     checkpoint: BookJobStageCheckpoint,
     createdAt: string,
   ): Promise<void> {
-    const artifacts = await this.listArtifacts(job.bookId);
-    const producerCheckpoints = await Promise.all(
-      QUERY_READY_PRODUCER_STAGES.map(async (stage) => ({
-        stage,
-        checkpoint: await this.getStageCheckpoint(job.bookId, stage),
-      })),
+    const lineageArtifactIds = await this.queryReadyLineageArtifactIds(
+      job,
+      checkpoint.artifactIds,
     );
-    const lineageArtifactIds = [
-      ...producerCheckpoints.flatMap(({ stage, checkpoint: producerCheckpoint }) =>
-        producerCheckpoint == null
-          ? []
-          : filterArtifactIdsByKinds(
-              producerCheckpoint.artifactIds,
-              artifacts,
-              QUERY_READY_PRODUCER_REQUIRED_KINDS[stage],
-            )
-      ),
-      ...filterArtifactIdsByKinds(
-        checkpoint.artifactIds,
-        artifacts,
-        QUERY_READY_ARTIFACT_KINDS,
-      ),
-    ];
     const base = {
       schemaVersion: SchemaVersion,
       bookId: job.bookId,
@@ -2623,7 +2934,7 @@ export class FileBookJobStateRepository {
       contentHash: job.normalizedContentHash ?? job.sourceHash,
       ready: true,
       readinessSource: "validated_checkpoint_plus_validated_manifest" as const,
-      artifactIds: [...new Set(lineageArtifactIds)],
+      artifactIds: lineageArtifactIds,
       createdAt,
     };
 
@@ -2763,27 +3074,12 @@ export class FileBookJobStateRepository {
     artifactIds: readonly string[],
     artifacts: readonly BookArtifactManifest[],
   ): Promise<boolean> {
-    const expectedProducerRunIds = await this.queryReadyProducerRunIds(job.bookId);
-    if (expectedProducerRunIds == null) return false;
     try {
       await this.validateQueryReadyProducerStages(job, artifacts);
+      await this.validateQueryReadyArtifacts({ job, artifactIds, artifacts });
     } catch {
       return false;
     }
-    const validation = await validateBookArtifactSet({
-      graphVault: this.rootDir,
-      bookId: job.bookId,
-      artifactIds,
-      artifacts,
-      requiredKinds: QUERY_READY_ARTIFACT_KINDS,
-      allowedKinds: QUERY_READY_ARTIFACT_KINDS,
-      requireBookScopedGraphOutput: true,
-      expectedProducerRunIds,
-      expectedStageFingerprints: job.stageFingerprints,
-      expectedProviderFingerprint: job.providerFingerprint,
-      expectedCorpusContentHash: job.normalizedContentHash ?? job.sourceHash,
-    });
-    if (!validation.isSatisfied) return false;
     try {
       await this.validateQueryReadyGraphIdentity(job);
       return true;

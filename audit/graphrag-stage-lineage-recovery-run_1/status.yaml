@@ -1,0 +1,45 @@
+schemaVersion: '1.0.0'
+case: graphrag-stage-lineage-recovery
+run: 1
+status: development_audit_passed
+startedAt: '2026-05-26T18:40:00Z'
+updatedAt: '2026-05-26T20:10:00Z'
+criteriaFrozen: true
+criteriaPaths:
+  - agent-a/audit-criteria.md
+  - agent-b/audit-criteria.md
+  - agent-c/audit-criteria.md
+developmentCriteriaPaths:
+  - agent-a/development-audit-criteria.md
+  - agent-b/development-audit-criteria.md
+  - agent-c/development-audit-criteria.md
+designAuditReports:
+  - agent-a/design-audit-report.md
+  - agent-b/design-audit-report.md
+  - agent-c/design-audit-report.md
+revisedDesign: revised-design.md
+designReauditReports:
+  - agent-a/design-reaudit-report.md
+  - agent-b/design-reaudit-report.md
+  - agent-c/design-reaudit-report.md
+developmentAuditReports:
+  - agent-a/development-audit-report.md
+  - agent-b/development-audit-report.md
+  - agent-c/development-audit-report.md
+developmentReauditReports:
+  - agent-a/development-reaudit-report.md
+  - agent-b/development-reaudit-report.md
+  - agent-c/development-reaudit-report.md
+developmentFinalReauditReports:
+  - agent-a/development-final-reaudit-report.md
+  - agent-b/development-final-reaudit-report.md
+  - agent-c/development-final-reaudit-report.md
+developmentUltimateReauditReports:
+  - agent-a/development-ultimate-reaudit-report.md
+  - agent-b/development-ultimate-reaudit-report.md
+  - agent-c/development-ultimate-reaudit-report.md
+verification:
+  - npm run test:node -- test/book-job-state.test.ts
+  - npm run test:node -- test/integrations/contracts.test.ts -t "restores qmd index and capability mirror"
+  - npm run typecheck
+  - git diff --check

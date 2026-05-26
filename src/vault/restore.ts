@@ -9,7 +9,6 @@ import {
   type BookArtifactManifest,
   BookJobCatalogSchema,
   BookJobCheckpointListSchema,
-  type BookStage,
 } from "../contracts/book-job.js";
 import {
   DocumentIdentityMapSchema,
@@ -29,6 +28,7 @@ import {
 import {
   loadExplicitCapabilityCatalog,
   loadGraphCapabilities,
+  projectQueryReadyLineage,
 } from "../graphrag/capability-catalog.js";
 import {
   sanitizeVaultMetadata,
@@ -43,26 +43,6 @@ import {
   upsertStoreCollection,
 } from "../store.js";
 import { resolveVaultRelativePath } from "./path.js";
-import {
-  GRAPH_EXTRACT_CORE_ARTIFACT_KINDS,
-  QUERY_READY_ARTIFACT_KINDS,
-  validateBookArtifactSet,
-} from "../job-state/artifact-validation.js";
-
-const QUERY_READY_PRODUCER_REQUIRED_KINDS = {
-  graph_extract: GRAPH_EXTRACT_CORE_ARTIFACT_KINDS,
-  community_report: ["graphrag_community_reports_parquet"],
-  embed: ["lancedb_index"],
-} as const satisfies Record<
-  "graph_extract" | "community_report" | "embed",
-  readonly BookArtifactManifest["kind"][]
->;
-
-const QUERY_READY_LINEAGE_ARTIFACT_KINDS = [
-  ...GRAPH_EXTRACT_CORE_ARTIFACT_KINDS,
-  ...QUERY_READY_ARTIFACT_KINDS,
-] as const satisfies readonly BookArtifactManifest["kind"][];
-
 async function readYaml(path: string): Promise<unknown | null> {
   try {
     return YAML.parse(await readFile(path, "utf8"));
@@ -162,20 +142,6 @@ function validateCapabilityForRestore(
 
 function uniqueStrings(values: readonly string[]): string[] {
   return [...new Set(values)];
-}
-
-function filterArtifactIdsByKinds(
-  artifactIds: readonly string[],
-  artifacts: readonly BookArtifactManifest[],
-  kinds: readonly BookArtifactManifest["kind"][],
-): string[] {
-  const kindSet = new Set<BookArtifactManifest["kind"]>(kinds);
-  return artifactIds.filter((artifactId) => {
-    const artifact = artifacts.find((candidate) =>
-      candidate.artifactId === artifactId
-    );
-    return artifact != null && kindSet.has(artifact.kind);
-  });
 }
 
 async function missingCapabilityPortablePaths(
@@ -334,46 +300,7 @@ async function loadQueryReadyLineageArtifactIdsForRestore(
   graphVault: string,
   bookId: string,
 ): Promise<string[] | null> {
-  const checkpointsRaw = await readYaml(
-    join(graphVault, "books", bookId, "checkpoints.yaml"),
-  );
-  const checkpointsResult =
-    BookJobCheckpointListSchema.safeParse(checkpointsRaw);
-  if (!checkpointsResult.success) return null;
-  const checkpointByStage = new Map(
-    checkpointsResult.data.items
-      .filter((checkpoint) => checkpoint.status === "succeeded")
-      .map((checkpoint) => [checkpoint.stage, checkpoint]),
-  );
-  const artifactsRaw = await readYaml(
-    join(graphVault, "books", bookId, "artifacts.yaml"),
-  );
-  const artifactsResult = BookArtifactManifestListSchema.safeParse(artifactsRaw);
-  if (!artifactsResult.success) return null;
-  const artifacts = artifactsResult.data.items;
-  const ids = [
-    ...filterArtifactIdsByKinds(
-      checkpointByStage.get("graph_extract")?.artifactIds ?? [],
-      artifacts,
-      QUERY_READY_PRODUCER_REQUIRED_KINDS.graph_extract,
-    ),
-    ...filterArtifactIdsByKinds(
-      checkpointByStage.get("community_report")?.artifactIds ?? [],
-      artifacts,
-      QUERY_READY_PRODUCER_REQUIRED_KINDS.community_report,
-    ),
-    ...filterArtifactIdsByKinds(
-      checkpointByStage.get("embed")?.artifactIds ?? [],
-      artifacts,
-      QUERY_READY_PRODUCER_REQUIRED_KINDS.embed,
-    ),
-    ...filterArtifactIdsByKinds(
-      checkpointByStage.get("query_ready")?.artifactIds ?? [],
-      artifacts,
-      QUERY_READY_ARTIFACT_KINDS,
-    ),
-  ];
-  return ids.length > 0 ? uniqueStrings(ids) : null;
+  return (await projectQueryReadyLineage(graphVault, bookId))?.artifactIds ?? null;
 }
 
 async function validateQueryReadyArtifactsForRestore(
@@ -381,69 +308,9 @@ async function validateQueryReadyArtifactsForRestore(
   bookId: string,
   artifactIds: readonly string[],
 ): Promise<boolean> {
-  const booksRaw = await readYaml(join(graphVault, "catalog", "books.yaml"));
-  const booksResult = BookJobCatalogSchema.safeParse(booksRaw);
-  if (!booksResult.success) return false;
-  const book = booksResult.data.items.find((item) => item.bookId === bookId);
-  if (
-    book == null ||
-    book.stageFingerprints == null ||
-    book.providerFingerprint == null
-  ) {
-    return false;
-  }
-
-  const checkpointsRaw = await readYaml(
-    join(graphVault, "books", bookId, "checkpoints.yaml"),
-  );
-  const checkpointsResult =
-    BookJobCheckpointListSchema.safeParse(checkpointsRaw);
-  if (!checkpointsResult.success) return false;
-  const checkpointByStage = new Map(
-    checkpointsResult.data.items
-      .filter((checkpoint) => checkpoint.status === "succeeded")
-      .map((checkpoint) => [checkpoint.stage, checkpoint]),
-  );
-  const graphExtractRunId = checkpointByStage.get("graph_extract")?.runId;
-  const communityReportRunId = checkpointByStage.get("community_report")?.runId;
-  const embedRunId = checkpointByStage.get("embed")?.runId;
-  if (
-    graphExtractRunId == null ||
-    communityReportRunId == null ||
-    embedRunId == null
-  ) {
-    return false;
-  }
-  const expectedProducerRunIds: Partial<Record<BookStage, string>> = {
-    graph_extract: graphExtractRunId,
-    community_report: communityReportRunId,
-    embed: embedRunId,
-  };
-  const expectedContentHash = book.normalizedContentHash ?? book.sourceHash;
-  for (const stage of [
-    "graph_extract",
-    "community_report",
-    "embed",
-    "query_ready",
-  ] as const) {
-    const checkpoint = checkpointByStage.get(stage);
-    if (
-      checkpoint == null ||
-      checkpoint.contentHash !== expectedContentHash ||
-      checkpoint.stageFingerprint !== book.stageFingerprints[stage] ||
-      checkpoint.providerFingerprint !== book.providerFingerprint
-    ) {
-      return false;
-    }
-  }
-
-  const artifactsRaw = await readYaml(
-    join(graphVault, "books", bookId, "artifacts.yaml"),
-  );
-  const artifactsResult = BookArtifactManifestListSchema.safeParse(artifactsRaw);
-  if (!artifactsResult.success) return false;
-  const artifacts = artifactsResult.data.items;
-  const byId = new Map(artifacts.map((artifact) => [
+  const projection = await projectQueryReadyLineage(graphVault, bookId);
+  if (projection == null) return false;
+  const byId = new Map(projection.artifacts.map((artifact) => [
     artifact.artifactId,
     artifact,
   ]));
@@ -451,60 +318,8 @@ async function validateQueryReadyArtifactsForRestore(
     const artifact = byId.get(artifactId);
     return artifact != null && artifact.bookId === bookId;
   });
-  if (!artifactIdsExist) return false;
-  for (const stage of ["graph_extract", "community_report", "embed"] as const) {
-    const checkpoint = checkpointByStage.get(stage);
-    if (checkpoint == null || checkpoint.runId == null) return false;
-    const producerValidation = await validateBookArtifactSet({
-      graphVault,
-      bookId,
-      artifactIds: filterArtifactIdsByKinds(
-        checkpoint.artifactIds,
-        artifacts as BookArtifactManifest[],
-        QUERY_READY_PRODUCER_REQUIRED_KINDS[stage],
-      ),
-      artifacts: artifacts as BookArtifactManifest[],
-      requiredKinds: QUERY_READY_PRODUCER_REQUIRED_KINDS[stage],
-      allowedKinds: QUERY_READY_PRODUCER_REQUIRED_KINDS[stage],
-      requireBookScopedGraphOutput: true,
-      expectedProducerRunIds: { [stage]: checkpoint.runId },
-      expectedStageFingerprints: book.stageFingerprints,
-      expectedProviderFingerprint: book.providerFingerprint,
-      expectedCorpusContentHash: expectedContentHash,
-    });
-    if (!producerValidation.isSatisfied) return false;
-  }
-  const queryReadyCheckpoint = checkpointByStage.get("query_ready");
-  if (queryReadyCheckpoint == null) return false;
-  const queryReadyValidation = await validateBookArtifactSet({
-    graphVault,
-    bookId,
-    artifactIds: queryReadyCheckpoint.artifactIds,
-    artifacts: artifacts as BookArtifactManifest[],
-    requiredKinds: QUERY_READY_ARTIFACT_KINDS,
-    allowedKinds: QUERY_READY_ARTIFACT_KINDS,
-    requireBookScopedGraphOutput: true,
-    expectedProducerRunIds,
-    expectedStageFingerprints: book.stageFingerprints,
-    expectedProviderFingerprint: book.providerFingerprint,
-    expectedCorpusContentHash: expectedContentHash,
-  });
-  if (!queryReadyValidation.isSatisfied) return false;
-
-  const lineageValidation = await validateBookArtifactSet({
-    graphVault,
-    bookId,
-    artifactIds,
-    artifacts: artifacts as BookArtifactManifest[],
-    requiredKinds: QUERY_READY_LINEAGE_ARTIFACT_KINDS,
-    allowedKinds: QUERY_READY_LINEAGE_ARTIFACT_KINDS,
-    requireBookScopedGraphOutput: true,
-    expectedProducerRunIds,
-    expectedStageFingerprints: book.stageFingerprints,
-    expectedProviderFingerprint: book.providerFingerprint,
-    expectedCorpusContentHash: expectedContentHash,
-  });
-  return lineageValidation.isSatisfied;
+  return artifactIdsExist &&
+    artifactIds.every((artifactId) => projection.artifactIds.includes(artifactId));
 }
 
 async function readRawGraphCapabilityItems(
