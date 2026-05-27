@@ -2,8 +2,8 @@
 
 ## 结论
 
-本轮实施审计通过。当前可恢复真实 batch，但本审计目录仍保持 `__open`，
-直到真实批处理越过本次 query_ready producer lineage gate 或暴露新的阻塞问题。
+本轮实施审计通过。真实 batch 已越过本次 query_ready producer lineage gate，
+本审计目录关闭为 `__closed`。
 
 ## 修复内容
 
@@ -63,3 +63,15 @@ git diff --check
 
 使用同一 `runId` 恢复真实 batch。执行恢复时必须清除 shell 中的 provider 环境变量，
 让项目 dotenv 解析路径接受真实验证。
+
+## 关闭证据
+
+真实 runner 使用同一 `runId` 恢复后，`Code Complete, Second Edition (Steve
+McConnell [Steve McConnell]).epub` 的 local artifact gate repair 已成功：
+
+- checkpoint status：`pending`。
+- recoveryDecision：`continue_pending`。
+- repairedProjection：`graph_capability`。
+- `localArtifactGateRepairCompleted=true`。
+- repair metadata 记录已复用的 `graph_extract`、`community_report`、`embed` 和
+  `query_ready` producer run ids。

@@ -1,10 +1,10 @@
 taskId: graphrag-query-ready-parallel-runner
 runId: 20260527_r1
-status: implementation_passed
+status: closed
 batchRunId: epub-batch-20260527-real-resume-1
 openedAt: 2026-05-27T11:47:03Z
 updatedAt: 2026-05-27T23:20:00Z
-currentPhase: resume_real_batch
+currentPhase: real_batch_continues
 designAudit:
   status: passed_after_design_updates
   decision: implement_producer_lineage_recovery_keep_parallel_runner_disabled
@@ -49,3 +49,10 @@ resumeCommand:
 closeCondition:
   - real batch resumes past producer lineage repair or real rebuild gate
   - no new blocking finding appears for this same issue
+closedAt: 2026-05-27T14:28:00Z
+closureEvidence:
+  sourceName: Code Complete, Second Edition (Steve McConnell [Steve McConnell]).epub
+  checkpointStatusAfterRepair: pending
+  recoveryDecisionAfterRepair: continue_pending
+  repairedProjection: graph_capability
+  localArtifactGateRepairCompleted: true
