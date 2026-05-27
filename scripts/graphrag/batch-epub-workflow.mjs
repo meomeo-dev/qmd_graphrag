@@ -55,6 +55,7 @@ const { values } = parseArgs({
     },
     "run-id": { type: "string", default: `epub-batch-${timestamp}` },
     "log-root": { type: "string", default: join("/tmp", `qmd-epub-batch-${timestamp}`) },
+    "project-dotenv": { type: "string", default: join(root, ".env") },
     query: {
       type: "string",
       default: "How does this book explain software design complexity?",
@@ -85,6 +86,7 @@ const configPath = resolve(String(values.config));
 const pythonBin = resolve(String(values["python-bin"]));
 const runId = String(values["run-id"]);
 const logRoot = resolve(String(values["log-root"]));
+const projectDotenvPath = resolve(String(values["project-dotenv"]));
 const query = String(values.query);
 const completedManifestPath = values["completed-manifest"]
   ? resolve(String(values["completed-manifest"]))
@@ -117,6 +119,7 @@ const maxProviderRecoveryWaits = Math.max(
   1,
   Number.parseInt(String(values["max-provider-recovery-waits"]), 10) || 3,
 );
+const maxProviderAuthReopenAttempts = 3;
 const commandTimeoutSeconds = Math.max(
   1,
   Number.parseInt(String(values["command-timeout-seconds"]), 10) || 21600,
@@ -133,6 +136,8 @@ const jsonFileLockStaleMs = 120000;
 const failFast = Boolean(values["fail-fast"]);
 const migrateOnly = Boolean(values["migrate-only"]);
 const statusJson = Boolean(values["status-json"]);
+const initialEnvNames = new Set(Object.keys(process.env));
+const extraExactRedactions = new Map();
 
 const RepairReasonSchema = z.enum([
   "graph_identity_projection_missing",
@@ -290,6 +295,36 @@ const BatchBuildStatusSchema = z.object({
   stage: z.string().min(1).optional(),
   reason: z.string().min(1).optional(),
   artifactIds: z.array(z.string().min(1)).default([]),
+  evidenceLocator: BatchProjectRelativeLocatorSchema.optional(),
+  producerRunId: z.string().min(1).optional(),
+  bookId: z.string().min(1).optional(),
+  sourceHash: z.string().min(1).optional(),
+  normalizedContentHash: z.string().min(1).optional(),
+});
+const QmdBuildManifestSchema = z.object({
+  schemaVersion: z.literal(SchemaVersion),
+  kind: z.literal("qmd_build_manifest"),
+  itemId: z.string().min(1),
+  runId: z.string().min(1),
+  bookId: z.string().min(1),
+  sourceName: z.string().min(1),
+  sourceRelativePath: BatchProjectRelativeLocatorSchema,
+  sourceHash: z.string().min(1),
+  normalizedPath: BatchProjectRelativeLocatorSchema,
+  normalizedContentHash: z.string().min(1),
+  qmdIndexLocator: BatchProjectRelativeLocatorSchema,
+  qmdIndexHash: z.string().min(1),
+  configLocator: BatchProjectRelativeLocatorSchema,
+  configHash: z.string().min(1),
+  commandCheckNames: z.array(z.string().min(1)).refine(
+    (names) =>
+      names.length === expectedQmdNativeCommandCheckCount ||
+      names.length === expectedCommandCheckCount,
+    "qmd build manifest must name qmd-native checks or the full legacy set",
+  ),
+  commandCheckFingerprint: z.string().min(1),
+  producerRunId: z.string().min(1),
+  createdAt: z.string().datetime(),
 });
 const BookStageSchema = z.enum([
   "ingest",
@@ -377,7 +412,8 @@ const GraphRagOutputProducerManifestSchema = z.object({
   stageProducerRunIds: z.record(z.string(), z.string().min(1)),
 });
 const GraphRagOutputProducerManifestLegacySchema =
-  GraphRagOutputProducerManifestSchema.extend({
+  GraphRagOutputProducerManifestSchema.omit({ outputDir: true }).extend({
+    outputDir: z.string().min(1),
     stageProducerRunIds: z.record(z.string(), z.string().min(1)).optional(),
   });
 const BatchItemCheckpointBaseSchema = z.object({
@@ -519,6 +555,7 @@ const BatchRecoverySummaryItemSchema = z.object({
   status: BatchItemStatusSchema,
   attempts: z.number().int().nonnegative(),
   qmdBuildStatus: BatchBuildStatusSchema,
+  commandCheckStatus: BatchBuildStatusSchema.optional(),
   graphBuildStatus: BatchBuildStatusSchema,
   graphQueryStatus: BatchBuildStatusSchema,
   failureKind: BatchFailureKindSchema.optional(),
@@ -566,6 +603,33 @@ const BatchRecoverySummaryItemSchema = z.object({
   settingsProjectionReason: z.string().min(1).optional(),
   localArtifactGateRepairRequiresRealRebuild: z.boolean().optional(),
   localArtifactGateRepairRebuildStage: z.string().min(1).optional(),
+  providerAuthReopenDecision: z.string().min(1).optional(),
+  providerAuthReopenEligible: z.boolean().optional(),
+  providerAuthReopenReason: z.string().min(1).optional(),
+  providerAuthReopenBlockedReason: z.string().min(1).optional(),
+  providerAuthConfigChanged: z.boolean().optional(),
+  providerAuthFailureFingerprint: z.string().min(1).optional(),
+  currentProviderAuthFingerprint: z.string().min(1).optional(),
+  lastProviderAuthReopenFingerprint: z.string().min(1).optional(),
+  providerAuthConfigReadStatus: z.string().min(1).optional(),
+  providerAuthConfigReadError: z.string().min(1).optional(),
+  providerAuthRequiredKeys: z.array(z.string().min(1)).optional(),
+  providerAuthRequiredEndpoints: z.array(z.string().min(1)).optional(),
+  providerAuthRequiredNames: z.array(z.string().min(1)).optional(),
+  providerAuthKeyPresence: z.record(z.string(), z.string().min(1)).optional(),
+  providerAuthCredentialSources: z.record(z.string(), z.string().min(1)).optional(),
+  providerAuthReadinessStatus: z.string().min(1).optional(),
+  providerAuthMissingRequiredKeys: z.array(z.string().min(1)).optional(),
+  providerAuthShadowedEnvNames: z.array(z.string().min(1)).optional(),
+  providerAuthDotenvShadowedEnvNames: z.array(z.string().min(1)).optional(),
+  providerAuthRootDotenvFingerprints:
+    z.record(z.string(), z.string().min(1)).optional(),
+  providerAuthGraphVaultDotenvFingerprints:
+    z.record(z.string(), z.string().min(1)).optional(),
+  providerAuthRootDotenvPresent: z.boolean().optional(),
+  providerAuthGraphVaultDotenvPresent: z.boolean().optional(),
+  providerAuthReopenAttemptCount: z.number().int().nonnegative().optional(),
+  legacyProviderAuthFingerprintMissing: z.boolean().optional(),
   errorSummary: z.string().max(1000).optional(),
 });
 const BatchRecoverySummarySchema = z.object({
@@ -759,6 +823,531 @@ function checkpointHasUnrecoverableProviderAuthFailure(checkpoint) {
     "forbidden",
     "authentication",
   ].some((token) => failureText.includes(token));
+}
+
+function envValueFingerprint(value) {
+  if (typeof value !== "string" || value.trim() === "") return undefined;
+  return sha256Text(value).slice(0, 12);
+}
+
+function providerAuthConfig() {
+  let config = {};
+  let configReadStatus = "loaded";
+  let configReadError;
+  try {
+    config = loadProjectConfigForSettingsProjection();
+    validateSettingsProjectionSourceConfig(config);
+  } catch (error) {
+    config = {};
+    configReadStatus = "invalid";
+    configReadError = error instanceof Error ? error.message : String(error);
+  }
+  const openai = config?.providers?.openai ?? {};
+  const jina = config?.providers?.jina ?? {};
+  const openaiBaseUrlEnv = openai.base_url_env ?? "OPENAI_BASE_URL";
+  const requiredEndpointNames = [openaiBaseUrlEnv];
+  return {
+    providerConfigFingerprint: deterministicHash({
+      providers: config?.providers ?? {},
+      models: config?.models ?? {},
+      graphrag: config?.graphrag ?? {},
+      query: config?.query ?? {},
+      configReadStatus,
+    }).slice(0, 24),
+    configReadStatus,
+    configReadError,
+    requiredKeyNames: [...new Set([
+      openai.api_key_env ?? "OPENAI_API_KEY",
+      jina.api_key_env ?? "JINA_API_KEY",
+    ])].sort(),
+    requiredEndpointNames: [...new Set(requiredEndpointNames)].sort(),
+    observedEnvNames: [...new Set([
+      openai.api_key_env ?? "OPENAI_API_KEY",
+      openaiBaseUrlEnv,
+      jina.api_key_env ?? "JINA_API_KEY",
+      jina.base_url_env ?? "JINA_API_BASE",
+    ])].sort(),
+  };
+}
+
+function providerAuthSourceForKey(key, value, rootEnv, vaultEnv) {
+  const rootValue = rootEnv[key];
+  const vaultValue = vaultEnv[key];
+  const rootHasValue = typeof rootValue === "string" && rootValue.trim() !== "";
+  const vaultHasValue = typeof vaultValue === "string" && vaultValue.trim() !== "";
+  const hasValue = typeof value === "string" && value.trim() !== "";
+  const processHadInitialValue = initialEnvNames.has(key);
+  if (!hasValue) {
+    if (rootHasValue || vaultHasValue) return "dotenv_not_loaded";
+    return "missing";
+  }
+  const matchesRoot = rootHasValue && value === rootValue;
+  const matchesVault = vaultHasValue && value === vaultValue;
+  if (processHadInitialValue && vaultHasValue && !matchesVault) {
+    return "process_env_shadows_dotenv";
+  }
+  if (processHadInitialValue && vaultHasValue && matchesVault) {
+    return "process_env_matches_graph_vault_dotenv";
+  }
+  if (processHadInitialValue && rootHasValue && !matchesRoot) {
+    return "process_env_shadows_dotenv";
+  }
+  if (processHadInitialValue && rootHasValue && matchesRoot) {
+    return "process_env_matches_project_dotenv";
+  }
+  if (processHadInitialValue) return "process_env";
+  if (matchesRoot && matchesVault) return "project_and_graph_vault_dotenv";
+  if (matchesVault && rootHasValue) return "graph_vault_dotenv_shadows_project_dotenv";
+  if (matchesVault) return "graph_vault_dotenv";
+  if (matchesRoot) return "project_dotenv";
+  if (rootHasValue || vaultHasValue) return "process_env_shadows_dotenv";
+  return "process_env";
+}
+
+function providerAuthContext() {
+  const rootEnv = parseDotenvFile(projectDotenvPath);
+  const vaultEnv = parseDotenvFile(join(stateRoot, ".env"));
+  const config = providerAuthConfig();
+  const envFingerprints = {};
+  const keyPresence = {};
+  const credentialSources = {};
+  const shadowedEnvNames = [];
+  const dotenvShadowedEnvNames = [];
+  const rootDotenvFingerprints = {};
+  const graphVaultDotenvFingerprints = {};
+  for (const key of config.observedEnvNames) {
+    const value = process.env[key];
+    const rootFingerprint = envValueFingerprint(rootEnv[key]);
+    const vaultFingerprint = envValueFingerprint(vaultEnv[key]);
+    if (rootFingerprint != null) rootDotenvFingerprints[key] = rootFingerprint;
+    if (vaultFingerprint != null) graphVaultDotenvFingerprints[key] = vaultFingerprint;
+    const fingerprint = envValueFingerprint(value);
+    const present = fingerprint != null;
+    envFingerprints[key] = present ? fingerprint : "missing";
+    keyPresence[key] = present ? "present" : "missing";
+    const source = providerAuthSourceForKey(key, value, rootEnv, vaultEnv);
+    credentialSources[key] = source;
+    if (source === "process_env_shadows_dotenv") shadowedEnvNames.push(key);
+    if (source === "graph_vault_dotenv_shadows_project_dotenv") {
+      dotenvShadowedEnvNames.push(key);
+    }
+  }
+  const requiredNames = [
+    ...new Set([
+      ...config.requiredKeyNames,
+      ...config.requiredEndpointNames,
+    ]),
+  ].sort();
+  const missingRequiredNames = requiredNames
+    .filter((key) => keyPresence[key] !== "present");
+  const readinessStatus = config.configReadStatus !== "loaded"
+    ? "provider_auth_config_unreadable"
+    : missingRequiredNames.length > 0
+    ? "missing_required_keys"
+    : shadowedEnvNames.length > 0
+      ? "process_env_shadows_dotenv"
+      : "ready";
+  return withoutUndefined({
+    readinessStatus,
+    ready: readinessStatus === "ready",
+    currentProviderAuthFingerprint: deterministicHash({
+      providerConfigFingerprint: config.providerConfigFingerprint,
+      envFingerprints,
+    }).slice(0, 24),
+    providerConfigFingerprint: config.providerConfigFingerprint,
+    providerAuthConfigReadStatus: config.configReadStatus,
+    providerAuthConfigReadError: config.configReadError
+      ? redacted(config.configReadError)
+      : undefined,
+    requiredKeyNames: config.requiredKeyNames,
+    requiredEndpointNames: config.requiredEndpointNames,
+    requiredNames,
+    observedEnvNames: config.observedEnvNames,
+    keyPresence,
+    credentialSources,
+    missingRequiredKeys: missingRequiredNames,
+    shadowedEnvNames,
+    dotenvShadowedEnvNames,
+    rootDotenvFingerprints,
+    graphVaultDotenvFingerprints,
+    configLocator: relative(root, configPath),
+    rootDotenvPresent: existsSync(projectDotenvPath),
+    graphVaultDotenvPresent: existsSync(join(stateRoot, ".env")),
+  });
+}
+
+function providerAuthMetadataFromContext(context) {
+  return withoutUndefined({
+    currentProviderAuthFingerprint: context.currentProviderAuthFingerprint,
+    providerAuthConfigFingerprint: context.providerConfigFingerprint,
+    providerAuthConfigReadStatus: context.providerAuthConfigReadStatus,
+    providerAuthConfigReadError: context.providerAuthConfigReadError,
+    providerAuthRequiredKeys: context.requiredKeyNames,
+    providerAuthRequiredEndpoints: context.requiredEndpointNames,
+    providerAuthRequiredNames: context.requiredNames,
+    providerAuthKeyPresence: context.keyPresence,
+    providerAuthCredentialSources: context.credentialSources,
+    providerAuthReadinessStatus: context.readinessStatus,
+    providerAuthMissingRequiredKeys: context.missingRequiredKeys,
+    providerAuthShadowedEnvNames: context.shadowedEnvNames,
+    providerAuthDotenvShadowedEnvNames: context.dotenvShadowedEnvNames,
+    providerAuthRootDotenvFingerprints: context.rootDotenvFingerprints,
+    providerAuthGraphVaultDotenvFingerprints: context.graphVaultDotenvFingerprints,
+    providerAuthRootDotenvPresent: context.rootDotenvPresent,
+    providerAuthGraphVaultDotenvPresent: context.graphVaultDotenvPresent,
+    providerAuthConfigLocator: context.configLocator,
+  });
+}
+
+function providerAuthStatusCode(checkpoint) {
+  return checkpointProviderStatusCodes(checkpoint)
+    .find((code) => code === 401 || code === 403) ??
+    checkpointProviderStatusCodes(checkpoint)[0];
+}
+
+function providerAuthReopenFingerprints(checkpoint) {
+  const values = checkpoint?.metadata?.providerAuthReopenedFingerprints;
+  return Array.isArray(values)
+    ? values.filter((value) => typeof value === "string" && value.length > 0)
+    : [];
+}
+
+function providerAuthReopenAttemptCount(checkpoint) {
+  return Math.max(
+    providerAuthReopenFingerprints(checkpoint).length,
+    Number(checkpoint?.metadata?.providerAuthReopenAttemptCount ?? 0) || 0,
+  );
+}
+
+function providerAuthFailureFingerprint(checkpoint) {
+  const metadata = checkpoint?.metadata ?? {};
+  for (const key of [
+    "providerAuthFailureFingerprint",
+    "lastProviderAuthFailureFingerprint",
+    "failureProviderFingerprint",
+  ]) {
+    if (typeof metadata[key] === "string" && metadata[key].length > 0) {
+      return metadata[key];
+    }
+  }
+  return undefined;
+}
+
+function providerAuthReopenDecision(checkpoint, context = providerAuthContext()) {
+  const candidate = checkpoint?.status === "failed" &&
+    checkpoint.retryable === false &&
+    checkpoint.recoveryDecision === "stop_until_fixed" &&
+    checkpointHasUnrecoverableProviderAuthFailure(checkpoint);
+  if (!candidate) return { candidate: false, reopen: false };
+  const failureFingerprint = providerAuthFailureFingerprint(checkpoint);
+  const currentFingerprint = context.currentProviderAuthFingerprint;
+  const reopenedFingerprints = providerAuthReopenFingerprints(checkpoint);
+  const attemptCount = providerAuthReopenAttemptCount(checkpoint);
+  const configChanged = failureFingerprint == null
+    ? undefined
+    : failureFingerprint !== currentFingerprint;
+  const base = {
+    candidate: true,
+    context,
+    failureFingerprint,
+    currentFingerprint,
+    configChanged,
+    providerStatusCode: providerAuthStatusCode(checkpoint),
+    attemptCount,
+    legacyProviderAuthFingerprintMissing: failureFingerprint == null,
+  };
+  if (!context.ready) {
+    return {
+      ...base,
+      reopen: false,
+      decision: "blocked_provider_auth_not_ready",
+      reason: context.readinessStatus,
+    };
+  }
+  if (currentFingerprint == null) {
+    return {
+      ...base,
+      reopen: false,
+      decision: "blocked_current_provider_auth_fingerprint_missing",
+      reason: "current_provider_auth_fingerprint_missing",
+    };
+  }
+  if (attemptCount >= maxProviderAuthReopenAttempts) {
+    return {
+      ...base,
+      reopen: false,
+      decision: "blocked_provider_auth_reopen_attempt_limit",
+      reason: "provider_auth_reopen_attempt_limit",
+    };
+  }
+  if (failureFingerprint != null && failureFingerprint === currentFingerprint) {
+    return {
+      ...base,
+      reopen: false,
+      decision: "blocked_provider_auth_fingerprint_unchanged",
+      reason: "current_provider_auth_fingerprint_matches_failure",
+    };
+  }
+  if (reopenedFingerprints.includes(currentFingerprint)) {
+    return {
+      ...base,
+      reopen: false,
+      decision: "blocked_provider_auth_fingerprint_already_reopened",
+      reason: "current_provider_auth_fingerprint_already_reopened",
+    };
+  }
+  return {
+    ...base,
+    reopen: true,
+    decision: failureFingerprint == null
+      ? "reopen_legacy_provider_auth_key_present"
+      : "reopen_provider_auth_config_changed",
+    reason: failureFingerprint == null
+      ? "legacy_provider_auth_failure_key_present"
+      : "provider_auth_config_changed_key_present",
+  };
+}
+
+function providerAuthSummaryProjection(checkpoint) {
+  const metadata = checkpoint?.metadata ?? {};
+  const hasProviderAuthHistory =
+    metadata.providerAuthReopenDecision != null ||
+    metadata.providerAuthFailureDetected === true ||
+    metadata.providerAuthFailureFingerprint != null ||
+    metadata.lastProviderAuthReopenFingerprint != null ||
+    metadata.providerAuthReopenedAt != null;
+  if (!hasProviderAuthHistory && !checkpointHasUnrecoverableProviderAuthFailure(checkpoint)) {
+    return {};
+  }
+  const decision = providerAuthReopenDecision(checkpoint);
+  if (!decision.candidate) {
+    return withoutUndefined({
+      providerAuthFailureFingerprint: metadata.providerAuthFailureFingerprint,
+      lastProviderAuthReopenFingerprint: metadata.lastProviderAuthReopenFingerprint,
+      providerAuthReopenAttemptCount:
+        providerAuthReopenAttemptCount(checkpoint),
+      legacyProviderAuthFingerprintMissing:
+        metadata.legacyProviderAuthFingerprintMissing,
+    });
+  }
+  return withoutUndefined({
+    providerAuthReopenDecision: decision.decision,
+    providerAuthReopenEligible: decision.reopen,
+    providerAuthReopenReason: decision.reopen ? decision.reason : undefined,
+    providerAuthReopenBlockedReason: decision.reopen ? undefined : decision.reason,
+    providerAuthConfigChanged: decision.configChanged,
+    providerAuthFailureFingerprint: decision.failureFingerprint,
+    currentProviderAuthFingerprint: decision.currentFingerprint,
+    lastProviderAuthReopenFingerprint: metadata.lastProviderAuthReopenFingerprint,
+    providerAuthRequiredKeys: decision.context?.requiredKeyNames,
+    providerAuthRequiredEndpoints: decision.context?.requiredEndpointNames,
+    providerAuthRequiredNames: decision.context?.requiredNames,
+    providerAuthKeyPresence: decision.context?.keyPresence,
+    providerAuthCredentialSources: decision.context?.credentialSources,
+    providerAuthReadinessStatus: decision.context?.readinessStatus,
+    providerAuthConfigReadStatus: decision.context?.providerAuthConfigReadStatus,
+    providerAuthConfigReadError: decision.context?.providerAuthConfigReadError,
+    providerAuthMissingRequiredKeys: decision.context?.missingRequiredKeys,
+    providerAuthShadowedEnvNames: decision.context?.shadowedEnvNames,
+    providerAuthDotenvShadowedEnvNames: decision.context?.dotenvShadowedEnvNames,
+    providerAuthRootDotenvFingerprints: decision.context?.rootDotenvFingerprints,
+    providerAuthGraphVaultDotenvFingerprints:
+      decision.context?.graphVaultDotenvFingerprints,
+    providerAuthRootDotenvPresent: decision.context?.rootDotenvPresent,
+    providerAuthGraphVaultDotenvPresent: decision.context?.graphVaultDotenvPresent,
+    providerAuthReopenAttemptCount: decision.attemptCount,
+    legacyProviderAuthFingerprintMissing:
+      decision.legacyProviderAuthFingerprintMissing,
+  });
+}
+
+function providerAuthFailureMetadata(commandCheck) {
+  const providerAuthFailure =
+    commandCheck?.providerStatusCode === 401 ||
+    commandCheck?.providerStatusCode === 403 ||
+    checkpointHasUnrecoverableProviderAuthFailure({
+      ...commandCheck,
+      status: "failed",
+      commandChecks: commandCheck ? [commandCheck] : [],
+      errorSummary: commandCheck?.errorSummary,
+    });
+  if (!providerAuthFailure) return {};
+  const context = providerAuthContext();
+  return {
+    providerAuthFailureDetected: true,
+    providerAuthFailureFingerprint: context.currentProviderAuthFingerprint,
+    providerAuthFailureFingerprintSource: "current_runtime_provider_auth_context",
+    providerAuthFailureProviderStatusCode: commandCheck?.providerStatusCode,
+    providerAuthFailureStage: commandCheck?.name,
+    providerAuthFailureRecordedAt: now(),
+    providerAuthReopenDecision: "blocked_provider_auth_fingerprint_unchanged",
+    providerAuthReopenEligible: false,
+    providerAuthReopenReason: undefined,
+    providerAuthReopenBlockedReason:
+      "current_provider_auth_fingerprint_matches_failure",
+    providerAuthConfigChanged: false,
+    ...providerAuthMetadataFromContext(context),
+  };
+}
+
+function reopenProviderAuthCheckpoint(item, checkpoint, decision) {
+  const reopenedAt = now();
+  const reopenedFingerprints = [
+    ...new Set([
+      ...providerAuthReopenFingerprints(checkpoint),
+      decision.currentFingerprint,
+    ].filter(Boolean)),
+  ];
+  const nextReopenAttemptCount = Math.max(
+    providerAuthReopenAttemptCount(checkpoint) + 1,
+    reopenedFingerprints.length,
+  );
+  const metadata = {
+    ...(checkpoint.metadata ?? {}),
+    providerAuthFailureFingerprint:
+      checkpoint.metadata?.providerAuthFailureFingerprint ??
+      decision.failureFingerprint,
+    providerAuthReopenDecision: decision.decision,
+    providerAuthReopenEligible: true,
+    providerAuthReopenReason: decision.reason,
+    providerAuthReopenBlockedReason: undefined,
+    providerAuthConfigChanged: decision.configChanged ?? true,
+    currentProviderAuthFingerprint: decision.currentFingerprint,
+    lastProviderAuthReopenFingerprint: decision.currentFingerprint,
+    providerAuthReopenedFingerprints: reopenedFingerprints,
+    providerAuthReopenAttemptCount: nextReopenAttemptCount,
+    providerAuthReopenedAt: reopenedAt,
+    legacyProviderAuthFingerprintMissing:
+      decision.legacyProviderAuthFingerprintMissing,
+    originalFailureKind: checkpoint.failureKind,
+    originalProviderStatusCode: decision.providerStatusCode,
+    originalFailedStage: checkpoint.failedStage,
+    reopenedFromStatus: checkpoint.status,
+    reopenedToStatus: "pending",
+    reopenedFromRecoveryDecision:
+      checkpoint.recoveryDecision ?? "stop_until_fixed",
+    normalCommandChecksRequired: true,
+    waitingForProviderRecovery: false,
+    ...providerAuthMetadataFromContext(decision.context),
+  };
+  event({
+    itemId: item.itemId,
+    event: "item_provider_auth_reopened",
+    status: "pending",
+    failureKind: checkpoint.failureKind ?? "permanent",
+    retryable: false,
+    recoveryDecision: "continue_pending",
+    failedStage: checkpoint.failedStage,
+    providerStatusCode: decision.providerStatusCode,
+    message: checkpoint.errorSummary,
+    metadata: {
+      providerAuthReopenDecision: decision.decision,
+      providerAuthReopenReason: decision.reason,
+      reopenedFromStatus: checkpoint.status,
+      reopenedToStatus: "pending",
+      reopenedFromRecoveryDecision:
+        checkpoint.recoveryDecision ?? "stop_until_fixed",
+      providerAuthConfigChanged: decision.configChanged ?? true,
+      providerAuthFailureFingerprint: decision.failureFingerprint,
+      currentProviderAuthFingerprint: decision.currentFingerprint,
+      providerAuthReopenAttemptCount: nextReopenAttemptCount,
+      legacyProviderAuthFingerprintMissing:
+        decision.legacyProviderAuthFingerprintMissing,
+      ...providerAuthMetadataFromContext(decision.context),
+    },
+  });
+  return {
+    ...checkpoint,
+    status: "pending",
+    failedAt: undefined,
+    errorSummary: undefined,
+    failureKind: undefined,
+    retryable: undefined,
+    retryExhausted: undefined,
+    recoveryDecision: "continue_pending",
+    failedStage: undefined,
+    activeCommand: checkpoint.activeCommand ?? checkpoint.currentCommand ??
+      checkpoint.failedStage,
+    currentCommand: undefined,
+    currentCommandStartedAt: undefined,
+    nextRetryAt: undefined,
+    retryDelaySeconds: undefined,
+    runnerSessionId: undefined,
+    runnerHost: undefined,
+    runnerPid: undefined,
+    runnerHeartbeatAt: now(),
+    commandChecks: [],
+    metadata,
+  };
+}
+
+function applyProviderAuthReopenPass(items, checkpoints) {
+  let reopenedCount = 0;
+  const context = providerAuthContext();
+  for (const item of items) {
+    const checkpoint = checkpoints.get(item.itemId);
+    const decision = providerAuthReopenDecision(checkpoint, context);
+    if (!decision.candidate) continue;
+    if (!decision.reopen) {
+      event({
+        itemId: item.itemId,
+        event: "item_provider_auth_reopen_blocked",
+        status: "failed",
+        failureKind: checkpoint.failureKind ?? "permanent",
+        retryable: false,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: checkpoint.failedStage,
+        providerStatusCode: decision.providerStatusCode,
+        message: checkpoint.errorSummary,
+        metadata: {
+          providerAuthReopenDecision: decision.decision,
+          providerAuthReopenBlockedReason: decision.reason,
+          providerAuthConfigChanged: decision.configChanged,
+          providerAuthFailureFingerprint: decision.failureFingerprint,
+          currentProviderAuthFingerprint: decision.currentFingerprint,
+          providerAuthReopenAttemptCount: decision.attemptCount,
+          legacyProviderAuthFingerprintMissing:
+            decision.legacyProviderAuthFingerprintMissing,
+          ...providerAuthMetadataFromContext(context),
+        },
+      });
+      continue;
+    }
+    const reopened = lockedReadWriteTypedJson(
+      itemPath(item),
+      BatchItemCheckpointSchema,
+      (loaded) => {
+        const current = loaded ?? checkpoint;
+        if (
+          current.status !== checkpoint.status ||
+          current.attempts !== checkpoint.attempts ||
+          current.failedAt !== checkpoint.failedAt ||
+          current.recoveryDecision !== checkpoint.recoveryDecision ||
+          current.runnerSessionId !== checkpoint.runnerSessionId ||
+          current.runnerHeartbeatAt !== checkpoint.runnerHeartbeatAt
+        ) {
+          throw new Error(
+            `checkpoint changed before provider auth reopen; refusing duplicate runner for ${item.itemId}`,
+          );
+        }
+        const currentDecision = providerAuthReopenDecision(current, context);
+        if (!currentDecision.reopen) {
+          throw new Error(
+            `provider auth reopen became ineligible while locked for ${item.itemId}: ` +
+            `${currentDecision.decision ?? "not_candidate"}`,
+          );
+        }
+        const activeItem = runtimeItemForCheckpoint(item, current);
+        return withBuildStatusSnapshot(
+          activeItem,
+          reopenProviderAuthCheckpoint(activeItem, current, currentDecision),
+        );
+      },
+    );
+    checkpoints.set(item.itemId, reopened);
+    reopenedCount += 1;
+  }
+  return reopenedCount;
 }
 
 function parseRepairMetadata(metadata) {
@@ -1079,12 +1668,16 @@ function redactLog(text) {
 
 function redactExactEnvValues(text) {
   let output = String(text);
-  const secrets = Object.keys(process.env)
+  const envSecrets = Object.keys(process.env)
     .filter((key) =>
       /(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTHORIZATION|BASE_URL|API_BASE)/iu.test(key),
     )
     .map((key) => ({ key, value: process.env[key] }))
-    .filter((item) => item.value && item.value.length >= 4)
+    .filter((item) => item.value && item.value.length >= 4);
+  const dotenvSecrets = Array.from(extraExactRedactions.entries())
+    .map(([key, value]) => ({ key, value }))
+    .filter((item) => item.value && item.value.length >= 4);
+  const secrets = [...envSecrets, ...dotenvSecrets]
     .sort((a, b) => b.value.length - a.value.length);
   for (const { key, value } of secrets) {
     output = output.split(value).join(`[REDACTED:${key}]`);
@@ -1166,11 +1759,9 @@ function ensureDirs() {
   mkdirSync(join(stateRoot, "input"), { recursive: true });
 }
 
-function loadDotenv() {
-  if (values["skip-dotenv"]) return;
-  const path = join(root, ".env");
-  if (!existsSync(path)) return;
-  for (const line of readFileSync(path, "utf8").split(/\r?\n/u)) {
+function parseDotenvText(text) {
+  const parsed = {};
+  for (const line of String(text ?? "").split(/\r?\n/u)) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
     const body = trimmed.startsWith("export ")
@@ -1179,7 +1770,7 @@ function loadDotenv() {
     const separator = body.indexOf("=");
     if (separator <= 0) continue;
     const key = body.slice(0, separator).trim();
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key) || process.env[key] != null) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key)) {
       continue;
     }
     let value = body.slice(separator + 1).trim();
@@ -1194,7 +1785,43 @@ function loadDotenv() {
       const commentIndex = value.search(/\s#/u);
       if (commentIndex >= 0) value = value.slice(0, commentIndex).trimEnd();
     }
-    process.env[key] = value;
+    parsed[key] = value;
+  }
+  return parsed;
+}
+
+function parseDotenvFile(path) {
+  if (!existsSync(path)) return {};
+  const parsed = parseDotenvText(readFileSync(path, "utf8"));
+  registerExactRedactionsForEnv(parsed);
+  return parsed;
+}
+
+function registerExactRedactionsForEnv(parsed) {
+  for (const [key, value] of Object.entries(parsed)) {
+    if (
+      value &&
+      value.length >= 4 &&
+      /(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTHORIZATION|BASE_URL|API_BASE)/iu
+        .test(key)
+    ) {
+      extraExactRedactions.set(key, value);
+    }
+  }
+}
+
+function loadDotenv() {
+  if (values["skip-dotenv"]) return;
+  for (const dotenvPath of [projectDotenvPath, join(stateRoot, ".env")]) {
+    const parsed = parseDotenvFile(dotenvPath);
+    const authoritative = dotenvPath === join(stateRoot, ".env");
+    for (const [key, value] of Object.entries(parsed)) {
+      if (process.env[key] == null || (
+        authoritative && !initialEnvNames.has(key)
+      )) {
+        process.env[key] = value;
+      }
+    }
   }
 }
 
@@ -1279,6 +1906,16 @@ function withJsonFileLock(path, callback) {
       }
     }
   }
+}
+
+function lockedReadWriteTypedJson(path, schema, callback) {
+  if (statusJson) return callback(undefined);
+  return withJsonFileLock(path, () => {
+    const current = existsSync(path) ? schema.parse(readJson(path)) : undefined;
+    const next = schema.parse(withoutUndefined(callback(current)));
+    writeJsonAtomic(path, JSON.stringify(next, null, 2) + "\n");
+    return next;
+  });
 }
 
 function writeTypedJson(path, schema, value) {
@@ -1533,6 +2170,36 @@ function hydrateCheckpoint(item, checkpoint) {
   });
 }
 
+function evidenceItemForCheckpoint(item, checkpoint) {
+  return {
+    ...item,
+    sourceIdentityPath: typeof checkpoint?.sourceIdentityPath === "string"
+      ? checkpoint.sourceIdentityPath
+      : item.sourceIdentityPath,
+    sourceHash: typeof checkpoint?.sourceHash === "string"
+      ? checkpoint.sourceHash
+      : item.sourceHash,
+    bookId: typeof checkpoint?.bookId === "string" ? checkpoint.bookId : item.bookId,
+    normalizedPath: typeof checkpoint?.normalizedPath === "string"
+      ? checkpoint.normalizedPath
+      : item.normalizedPath,
+  };
+}
+
+function absoluteRuntimePath(path) {
+  return isAbsolute(path) ? path : join(root, path);
+}
+
+function runtimeItemForCheckpoint(item, checkpoint) {
+  const checkpointItem = evidenceItemForCheckpoint(item, checkpoint);
+  return {
+    ...checkpointItem,
+    sourcePath: item.sourcePath,
+    normalizedPath: absoluteRuntimePath(checkpointItem.normalizedPath),
+    normalizedRel: relative(root, absoluteRuntimePath(checkpointItem.normalizedPath)),
+  };
+}
+
 function loadCheckpoint(item, completedSeed) {
   const path = itemPath(item);
   if (!existsSync(path)) {
@@ -1550,28 +2217,57 @@ function loadCheckpoint(item, completedSeed) {
     );
   }
   const hydrated = hydrateCheckpoint(item, readJson(path));
+  const hydratedEvidenceItem = evidenceItemForCheckpoint(item, hydrated);
+  if (migrateOnly) {
+    const checkpoint = recoverProviderTransientCheckpoint(item,
+      downgradeCompletedIfClosedLoopInvalid(
+        hydratedEvidenceItem,
+        hydrated,
+      ),
+    );
+    const checkpointEvidenceItem = evidenceItemForCheckpoint(item, checkpoint);
+    if (statusJson) {
+      return BatchItemCheckpointSchema.parse(
+        withCheckpointPersistenceInvariants(
+          withBuildStatusSnapshot(checkpointEvidenceItem, checkpoint),
+        ),
+      );
+    }
+    return writeTypedJson(
+      path,
+      BatchItemCheckpointSchema,
+      withCheckpointPersistenceInvariants(
+        withBuildStatusSnapshot(checkpointEvidenceItem, checkpoint),
+      ),
+    );
+  }
   const checkpoint = recoverProviderTransientCheckpoint(item,
     recoverOrphanedRunningCheckpoint(item, downgradeCompletedIfClosedLoopInvalid(
-      item,
+      hydratedEvidenceItem,
       hydrated,
     )),
   );
+  const checkpointEvidenceItem = evidenceItemForCheckpoint(item, checkpoint);
   if (statusJson) {
     return BatchItemCheckpointSchema.parse(
-      withCheckpointPersistenceInvariants(withBuildStatusSnapshot(item, checkpoint)),
+      withCheckpointPersistenceInvariants(
+        withBuildStatusSnapshot(checkpointEvidenceItem, checkpoint),
+      ),
     );
   }
   return writeTypedJson(
     path,
     BatchItemCheckpointSchema,
-    withCheckpointPersistenceInvariants(withBuildStatusSnapshot(item, checkpoint)),
+    withCheckpointPersistenceInvariants(
+      withBuildStatusSnapshot(checkpointEvidenceItem, checkpoint),
+    ),
   );
 }
 
 function withBuildStatusSnapshot(item, checkpoint) {
   return {
     ...checkpoint,
-    qmdBuildStatus: redactJsonValue(qmdBuildEvidence(checkpoint)),
+    qmdBuildStatus: redactJsonValue(qmdBuildEvidence(item)),
     graphBuildStatus: redactJsonValue(graphBuildEvidence(item)),
     graphQueryStatus: redactJsonValue(graphQueryEvidence(checkpoint)),
   };
@@ -1593,6 +2289,23 @@ function saveCheckpoint(item, checkpoint) {
     BatchItemCheckpointSchema,
     withCheckpointPersistenceInvariants(withBuildStatusSnapshot(item, checkpoint)),
   );
+}
+
+function appendCommandCheckCheckpoint(item, checkpoint, check) {
+  if (statusJson) return checkpoint;
+  const nextChecks = [
+    ...(checkpoint.commandChecks ?? [])
+      .filter((item) => item.name !== check.name),
+    check,
+  ];
+  const updated = {
+    ...checkpoint,
+    commandChecks: nextChecks,
+    runnerHeartbeatAt: now(),
+    activeCommand: check.name,
+  };
+  saveCheckpoint(item, updated);
+  return updated;
 }
 
 function heartbeatMonitorScript() {
@@ -1855,6 +2568,25 @@ function checkpointArtifactIds(checkpoint) {
 
 function graphRagBookOutputLocator(bookId) {
   return `books/${bookId}/output`;
+}
+
+function qmdBuildManifestLocator(item) {
+  return `books/${item.bookId}/qmd/qmd_build_manifest.json`;
+}
+
+function qmdBuildManifestPath(item) {
+  return join(stateRoot, qmdBuildManifestLocator(item));
+}
+
+function qmdBuildArtifactId(item, normalizedContentHash) {
+  return stableHash({
+    kind: "qmd_build_manifest",
+    runId,
+    itemId: item.itemId,
+    bookId: item.bookId,
+    sourceHash: item.sourceHash,
+    normalizedContentHash,
+  });
 }
 
 function normalizeForStableHash(input) {
@@ -2220,29 +2952,16 @@ function stageCandidateArtifacts({
 }) {
   const requiredKindSet = new Set(requiredKinds);
   if (stage === "query_ready") {
-    const communityReportRunId = producer?.stageProducerRunIds?.community_report;
-    const embedRunId = producer?.stageProducerRunIds?.embed;
     return artifacts.filter((artifact) =>
       artifact?.bookId === item.bookId &&
       requiredKindSet.has(artifact.kind) &&
-      (
-        (
-          artifact.stage === "community_report" &&
-          artifact.producerRunId === communityReportRunId
-        ) ||
-        (
-          artifact.stage === "embed" &&
-          artifact.producerRunId === embedRunId
-        )
-      )
+      (artifact.stage === "community_report" || artifact.stage === "embed")
     );
   }
-  const producerRunId = expectedProducerRunId ?? checkpoint?.runId;
-  if (graphProducerStages.includes(stage) && typeof producerRunId === "string") {
+  if (graphProducerStages.includes(stage)) {
     return artifacts.filter((artifact) =>
       artifact?.bookId === item.bookId &&
       artifact.stage === stage &&
-      artifact.producerRunId === producerRunId &&
       requiredKindSet.has(artifact.kind)
     );
   }
@@ -2615,7 +3334,7 @@ function migrateGraphOutputProducerManifests() {
   }
 }
 
-function qmdBuildEvidence(checkpoint) {
+function qmdCommandCheckEvidence(checkpoint) {
   const checkedAt = now();
   const checks = (checkpoint.commandChecks ?? [])
     .filter((check) => qmdNativeCommandCheckNames.includes(check.name));
@@ -2636,7 +3355,7 @@ function qmdBuildEvidence(checkpoint) {
       status: "pending",
       checkedAt,
       stage: missing,
-      reason: "qmd_build_check_missing",
+      reason: "qmd_command_check_missing",
       artifactIds: [],
     };
   }
@@ -2653,16 +3372,202 @@ function qmdBuildEvidence(checkpoint) {
       checkedAt,
       stage: unexpected?.name ?? "qmd-command-checks",
       reason: unexpected
-        ? "qmd_build_check_unexpected"
-        : "qmd_build_check_set_incomplete",
+        ? "qmd_command_check_unexpected"
+        : "qmd_command_check_set_incomplete",
       artifactIds: [],
     };
   }
   return {
     status: "succeeded",
     checkedAt,
-    stage: "qmd-query-json",
+    stage: "qmd-command-checks",
     artifactIds: [],
+  };
+}
+
+function readQmdBuildManifest(item) {
+  return readJsonSchemaIfExists(qmdBuildManifestPath(item), QmdBuildManifestSchema);
+}
+
+function writeQmdBuildManifest(item, commandChecks) {
+  const commandCheckStatus = qmdCommandCheckEvidence({ commandChecks });
+  if (commandCheckStatus.status !== "succeeded") {
+    throw Object.assign(
+      new Error(
+        `qmd-native command checks did not complete: ${commandCheckStatus.reason}`,
+      ),
+      {
+        commandCheck: commandChecks.find((check) =>
+          check.name === commandCheckStatus.stage
+        ),
+      },
+    );
+  }
+  if (!existsSync(item.normalizedPath)) {
+    throw Object.assign(
+      new Error("qmd build input missing: normalized markdown not found"),
+      {
+        commandCheck: {
+          name: "qmd-build",
+          status: "failed",
+          attempts: 1,
+          exitCode: 1,
+          stdoutBytes: 0,
+          stderrBytes: 0,
+          startedAt: now(),
+          completedAt: now(),
+          failureKind: "permanent",
+          retryable: false,
+          attemptExhausted: true,
+          recoveryDecision: "stop_until_fixed",
+          errorSummary: "normalized markdown missing",
+        },
+      },
+    );
+  }
+  if (!existsSync(qmdIndexPath)) {
+    throw Object.assign(new Error("qmd build index missing"), {
+      commandCheck: {
+        name: "qmd-build",
+        status: "failed",
+        attempts: 1,
+        exitCode: 1,
+        stdoutBytes: 0,
+        stderrBytes: 0,
+        startedAt: now(),
+        completedAt: now(),
+        failureKind: "permanent",
+        retryable: false,
+        attemptExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        errorSummary: "qmd index missing",
+      },
+    });
+  }
+  const manifest = {
+    schemaVersion: SchemaVersion,
+    kind: "qmd_build_manifest",
+    itemId: item.itemId,
+    runId,
+    bookId: item.bookId,
+    sourceName: item.sourceName,
+    sourceRelativePath: item.sourceRelativePath,
+    sourceHash: item.sourceHash,
+    normalizedPath: relative(root, item.normalizedPath),
+    normalizedContentHash: sha256File(item.normalizedPath),
+    qmdIndexLocator: relative(root, qmdIndexPath),
+    qmdIndexHash: sha256File(qmdIndexPath),
+    configLocator: relative(root, configPath),
+    configHash: sha256File(configPath),
+    commandCheckNames: qmdNativeCommandCheckNames,
+    commandCheckFingerprint: stableHash(qmdNativeCommandCheckNames),
+    producerRunId: runnerSessionId,
+    createdAt: now(),
+  };
+  return writeTypedJson(
+    qmdBuildManifestPath(item),
+    QmdBuildManifestSchema,
+    manifest,
+  );
+}
+
+function qmdBuildEvidence(item) {
+  const checkedAt = now();
+  const evidenceLocator = qmdBuildManifestLocator(item);
+  const manifest = readQmdBuildManifest(item);
+  if (manifest == null) {
+    return {
+      status: "pending",
+      checkedAt,
+      stage: "qmd-build",
+      reason: "qmd_build_manifest_missing",
+      artifactIds: [],
+      evidenceLocator,
+    };
+  }
+  const normalizedPath = isAbsolute(item.normalizedPath)
+    ? item.normalizedPath
+    : join(root, item.normalizedPath);
+  const expectedNormalizedLocator = relative(root, normalizedPath);
+  const expectedQmdIndexLocator = relative(root, qmdIndexPath);
+  const expectedConfigLocator = relative(root, configPath);
+  const normalizedExists = existsSync(normalizedPath);
+  const indexExists = existsSync(qmdIndexPath);
+  const configExists = existsSync(configPath);
+  const commandNames = Array.isArray(manifest.commandCheckNames)
+    ? manifest.commandCheckNames
+    : [];
+  const commandNamesMatch =
+    (
+      commandNames.length === expectedQmdNativeCommandCheckCount &&
+      new Set(commandNames).size === expectedQmdNativeCommandCheckCount &&
+      qmdNativeCommandCheckNames.every((name) => commandNames.includes(name))
+    ) ||
+    (
+      commandNames.length === expectedCommandCheckCount &&
+      new Set(commandNames).size === expectedCommandCheckCount &&
+      requiredCommandCheckNames.every((name) => commandNames.includes(name))
+    );
+  const expectedCommandFingerprints = new Set([
+    stableHash(qmdNativeCommandCheckNames),
+    stableHash(requiredCommandCheckNames),
+  ]);
+  const mismatch = [
+    manifest.runId === runId ? null : "run_id_mismatch",
+    manifest.itemId === item.itemId ? null : "item_id_mismatch",
+    manifest.bookId === item.bookId ? null : "book_id_mismatch",
+    manifest.sourceRelativePath === item.sourceRelativePath
+      ? null
+      : "source_path_mismatch",
+    manifest.sourceHash === item.sourceHash ? null : "source_hash_mismatch",
+    manifest.normalizedPath === expectedNormalizedLocator
+      ? null
+      : "normalized_path_mismatch",
+    normalizedExists ? null : "normalized_file_missing",
+    normalizedExists && manifest.normalizedContentHash === sha256File(normalizedPath)
+      ? null
+      : normalizedExists ? "normalized_content_hash_mismatch" : null,
+    manifest.qmdIndexLocator === expectedQmdIndexLocator
+      ? null
+      : "qmd_index_locator_mismatch",
+    indexExists ? null : "qmd_index_missing",
+    manifest.configLocator === expectedConfigLocator
+      ? null
+      : "config_locator_mismatch",
+    configExists ? null : "config_missing",
+    commandNamesMatch ? null : "command_check_names_mismatch",
+    expectedCommandFingerprints.has(manifest.commandCheckFingerprint)
+      ? null
+      : "command_check_fingerprint_mismatch",
+  ].find(Boolean);
+  const artifactId = qmdBuildArtifactId(
+    item,
+    manifest.normalizedContentHash ?? "missing",
+  );
+  if (mismatch != null) {
+    return {
+      status: "stale",
+      checkedAt,
+      stage: "qmd-build",
+      reason: `qmd_build_manifest_invalid:${mismatch}`,
+      artifactIds: [artifactId],
+      evidenceLocator,
+      producerRunId: manifest.producerRunId,
+      bookId: manifest.bookId,
+      sourceHash: manifest.sourceHash,
+      normalizedContentHash: manifest.normalizedContentHash,
+    };
+  }
+  return {
+    status: "succeeded",
+    checkedAt,
+    stage: "qmd-build",
+    artifactIds: [artifactId],
+    evidenceLocator,
+    producerRunId: manifest.producerRunId,
+    bookId: manifest.bookId,
+    sourceHash: manifest.sourceHash,
+    normalizedContentHash: manifest.normalizedContentHash,
   };
 }
 
@@ -2779,6 +3684,24 @@ function reopenRecoveryFromStatus(reopenStatus) {
       waitingForProviderRecovery: true,
     };
   }
+  const classified = classifyFailure(
+    [
+      reopenStatus.reason,
+      failedCheck?.errorSummary,
+    ].filter(Boolean).join("\n"),
+  );
+  if (classified.failureKind === "transient" && classified.retryable === true) {
+    return {
+      recoveryDecision: "retry_same_run_id",
+      failureKind: "transient",
+      retryable: true,
+      retryExhausted: false,
+      nextRetryAt: failedCheck?.nextRetryAt,
+      retryDelaySeconds: failedCheck?.retryDelaySeconds,
+      retryBudgetSeconds,
+      waitingForProviderRecovery: true,
+    };
+  }
   return {
     recoveryDecision: "continue_pending",
     failureKind: failedCheck?.failureKind,
@@ -2794,7 +3717,7 @@ function reopenRecoveryFromStatus(reopenStatus) {
 function downgradeCompletedIfClosedLoopInvalid(item, checkpoint) {
   if (checkpoint.status !== "completed") return checkpoint;
   const commandCheckStatus = commandCheckSetEvidence(checkpoint);
-  const qmdBuildStatus = qmdBuildEvidence(checkpoint);
+  const qmdBuildStatus = qmdBuildEvidence(item);
   const graphBuildStatus = graphBuildEvidence(item);
   const graphQueryStatus = graphQueryEvidence(checkpoint);
   if (
@@ -2812,10 +3735,10 @@ function downgradeCompletedIfClosedLoopInvalid(item, checkpoint) {
   }
   const reopenStatus = commandCheckStatus.status !== "succeeded"
     ? commandCheckStatus
-    : graphBuildStatus.status !== "succeeded"
-    ? graphBuildStatus
     : qmdBuildStatus.status !== "succeeded"
       ? qmdBuildStatus
+    : graphBuildStatus.status !== "succeeded"
+      ? graphBuildStatus
       : graphQueryStatus;
   const reopenRecovery = reopenRecoveryFromStatus({
     ...reopenStatus,
@@ -2932,7 +3855,16 @@ function recoverProviderTransientCheckpoint(item, checkpoint) {
   }
   if (
     checkpoint.metadata?.waitingForProviderRecovery === true &&
-    !providerRecoveryWaitAvailable(checkpoint)
+    (
+      !providerRecoveryWaitAvailable(checkpoint) ||
+      (
+        checkpoint.status === "pending" &&
+        checkpoint.failureKind === "transient" &&
+        checkpoint.retryable === true &&
+        checkpoint.recoveryDecision === "retry_same_run_id" &&
+        checkpoint.nextRetryAt != null
+      )
+    )
   ) {
     return checkpoint;
   }
@@ -2996,6 +3928,21 @@ function recoverProviderTransientCheckpoint(item, checkpoint) {
     },
   });
   return recovered;
+}
+
+function recoverProviderTransientCheckpoints(items, checkpoints) {
+  let recoveredCount = 0;
+  for (const item of items) {
+    const checkpoint = checkpoints.get(item.itemId);
+    if (checkpoint == null) continue;
+    const activeItem = runtimeItemForCheckpoint(item, checkpoint);
+    const recovered = recoverProviderTransientCheckpoint(activeItem, checkpoint);
+    if (recovered === checkpoint) continue;
+    saveCheckpoint(activeItem, recovered);
+    checkpoints.set(item.itemId, recovered);
+    recoveredCount += 1;
+  }
+  return recoveredCount;
 }
 
 function updateManifest(manifest, checkpoints) {
@@ -3086,6 +4033,7 @@ function persistFailFastInterruptedManifest(manifest, checkpoints, reason) {
 function buildRecoverySummary(manifest, checkpoints) {
   const items = checkpoints.map((item) => {
     const qmdStatus = qmdBuildEvidence(item);
+    const commandCheckStatus = commandCheckSetEvidence(item);
     const graphStatus = graphBuildEvidence(item);
     const graphQueryStatus = graphQueryEvidence(item);
     const failedCommands = (item.commandChecks ?? [])
@@ -3104,6 +4052,7 @@ function buildRecoverySummary(manifest, checkpoints) {
       status: item.status,
       attempts: item.attempts,
       qmdBuildStatus: redactJsonValue(qmdStatus),
+      commandCheckStatus: redactJsonValue(commandCheckStatus),
       graphBuildStatus: redactJsonValue(graphStatus),
       graphQueryStatus: redactJsonValue(graphQueryStatus),
       failureKind: item.failureKind,
@@ -3157,6 +4106,7 @@ function buildRecoverySummary(manifest, checkpoints) {
         item.metadata?.localArtifactGateRepairRequiresRealRebuild,
       localArtifactGateRepairRebuildStage:
         item.metadata?.localArtifactGateRepairRebuildStage,
+      ...providerAuthSummaryProjection(item),
       errorSummary: item.errorSummary ? redacted(item.errorSummary) : undefined,
     });
   });
@@ -3418,12 +4368,26 @@ function assertNoBookScopedRawReports() {
 }
 
 function qmdRunner() {
+  if (
+    process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS === "1" &&
+    initialEnvNames.has("QMD_GRAPHRAG_ENABLE_TEST_HOOKS") &&
+    process.env.QMD_GRAPHRAG_TEST_QMD_RUNNER === "1" &&
+    initialEnvNames.has("QMD_GRAPHRAG_TEST_QMD_RUNNER") &&
+    initialEnvNames.has("QMD_GRAPHRAG_QMD_RUNNER") &&
+    process.env.QMD_GRAPHRAG_QMD_RUNNER
+  ) {
+    return { command: process.execPath, args: [process.env.QMD_GRAPHRAG_QMD_RUNNER] };
+  }
   return { command: join(root, "bin", "qmd"), args: [] };
 }
 
 function resumeRunnerArgs() {
   if (
+    process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS === "1" &&
+    initialEnvNames.has("QMD_GRAPHRAG_ENABLE_TEST_HOOKS") &&
     process.env.QMD_GRAPHRAG_TEST_RESUME_RUNNER === "1" &&
+    initialEnvNames.has("QMD_GRAPHRAG_TEST_RESUME_RUNNER") &&
+    initialEnvNames.has("QMD_GRAPHRAG_RESUME_RUNNER") &&
     process.env.QMD_GRAPHRAG_RESUME_RUNNER
   ) {
     return [process.env.QMD_GRAPHRAG_RESUME_RUNNER];
@@ -4058,41 +5022,83 @@ function validateCommandChecks(commandChecks) {
   }
 }
 
-function runCliChecks(item) {
-  const checks = [];
-  const record = (result) => checks.push(result.check);
-  record(qmd(item, "qmd-version", ["--version"]));
-  record(qmd(item, "qmd-status", ["status"]));
-  record(qmd(item, "qmd-doctor-json", ["doctor", "--json"]));
-  record(qmd(item, "qmd-pull", ["pull"]));
-  record(qmd(item, "qmd-update", ["update"]));
-  record(qmd(item, "qmd-embed", ["embed", "--max-docs-per-batch", "1"], maxCommandAttempts));
-  record(qmd(item, "qmd-ls-books", ["ls", "books"]));
-  record(qmd(item, "qmd-search-json", ["search", "--json", "software design complexity"]));
-  record(qmd(item, "qmd-search-csv", ["search", "--csv", "software design complexity"]));
-  record(qmd(item, "qmd-search-md", ["search", "--md", "software design complexity"]));
-  record(qmd(item, "qmd-search-xml", ["search", "--xml", "software design complexity"]));
-  record(qmd(item, "qmd-search-files", ["search", "--files", "software design complexity"]));
-  record(qmd(item, "qmd-vsearch-json", ["vsearch", "--json", "software design complexity"], maxCommandAttempts));
-  record(qmd(item, "qmd-query-json", ["query", "--json", query], maxCommandAttempts));
-  record(qmd(item, "qmd-query-auto-json", ["query", "--mode", "auto", "--json", query], maxCommandAttempts));
-  record(qmd(
-    item,
+function runCliChecks(item, checkpoint) {
+  const reusableChecks = (checkpoint.commandChecks ?? []).filter((check) =>
+    check.status === "passed" && requiredCommandCheckNames.includes(check.name)
+  );
+  let activeCheckpoint = {
+    ...checkpoint,
+    commandChecks: reusableChecks,
+  };
+  if (reusableChecks.length !== (checkpoint.commandChecks ?? []).length) {
+    activeCheckpoint = saveCheckpoint(item, activeCheckpoint);
+  }
+  const checks = [...reusableChecks];
+  const seen = new Set(checks.map((check) => check.name));
+  const record = (result) => {
+    checks.push(result.check);
+    seen.add(result.check.name);
+    activeCheckpoint = appendCommandCheckCheckpoint(
+      item,
+      activeCheckpoint,
+      result.check,
+    );
+  };
+  const recordQmd = (name, args, attempts = 1) => {
+    if (seen.has(name)) return;
+    record(qmd(item, name, args, attempts));
+  };
+  recordQmd("qmd-version", ["--version"]);
+  recordQmd("qmd-status", ["status"]);
+  recordQmd("qmd-doctor-json", ["doctor", "--json"]);
+  recordQmd("qmd-pull", ["pull"]);
+  recordQmd("qmd-update", ["update"]);
+  recordQmd(
+    "qmd-embed",
+    ["embed", "--max-docs-per-batch", "1"],
+    maxCommandAttempts,
+  );
+  recordQmd("qmd-ls-books", ["ls", "books"]);
+  recordQmd("qmd-search-json", ["search", "--json", "software design complexity"]);
+  recordQmd("qmd-search-csv", ["search", "--csv", "software design complexity"]);
+  recordQmd("qmd-search-md", ["search", "--md", "software design complexity"]);
+  recordQmd("qmd-search-xml", ["search", "--xml", "software design complexity"]);
+  recordQmd("qmd-search-files", ["search", "--files", "software design complexity"]);
+  recordQmd(
+    "qmd-vsearch-json",
+    ["vsearch", "--json", "software design complexity"],
+    maxCommandAttempts,
+  );
+  recordQmd("qmd-query-json", ["query", "--json", query], maxCommandAttempts);
+  recordQmd(
+    "qmd-get-book",
+    ["get", `qmd://books/${basename(item.normalizedPath)}`, "-l", "5"],
+  );
+  recordQmd("qmd-multi-get-json", ["multi-get", "books/*.md", "-l", "1", "--json"]);
+  recordQmd("qmd-collection-list", ["collection", "list"]);
+  recordQmd("qmd-collection-show-books", ["collection", "show", "books"]);
+  recordQmd("qmd-context-list", ["context", "list"]);
+  recordQmd("qmd-skills-list-json", ["skills", "list", "--json"]);
+  recordQmd("qmd-skills-get-json", ["skills", "get", "qmd", "--json"]);
+  recordQmd("qmd-skills-path-json", ["skills", "path", "qmd", "--json"]);
+  recordQmd("qmd-skill-show", ["skill", "show"]);
+  recordQmd("qmd-dspy-status-json", ["dspy", "status", "--json"]);
+  recordQmd("qmd-cleanup", ["cleanup"]);
+  writeQmdBuildManifest(item, checks);
+  activeCheckpoint = saveCheckpoint(item, {
+    ...activeCheckpoint,
+    commandChecks: checks,
+  });
+  recordQmd(
+    "qmd-query-auto-json",
+    ["query", "--mode", "auto", "--json", query],
+    maxCommandAttempts,
+  );
+  recordQmd(
     "qmd-query-graphrag-json",
     ["query", "--graphrag", "--graph-book-id", item.bookId, "--json", query],
     maxCommandAttempts,
-  ));
-  record(qmd(item, "qmd-get-book", ["get", `qmd://books/${basename(item.normalizedPath)}`, "-l", "5"]));
-  record(qmd(item, "qmd-multi-get-json", ["multi-get", "books/*.md", "-l", "1", "--json"]));
-  record(qmd(item, "qmd-collection-list", ["collection", "list"]));
-  record(qmd(item, "qmd-collection-show-books", ["collection", "show", "books"]));
-  record(qmd(item, "qmd-context-list", ["context", "list"]));
-  record(qmd(item, "qmd-skills-list-json", ["skills", "list", "--json"]));
-  record(qmd(item, "qmd-skills-get-json", ["skills", "get", "qmd", "--json"]));
-  record(qmd(item, "qmd-skills-path-json", ["skills", "path", "qmd", "--json"]));
-  record(qmd(item, "qmd-skill-show", ["skill", "show"]));
-  record(qmd(item, "qmd-dspy-status-json", ["dspy", "status", "--json"]));
-  record(qmd(item, "qmd-cleanup", ["cleanup"]));
+  );
   validateCommandChecks(checks);
   return checks;
 }
@@ -4102,35 +5108,85 @@ function runItem(item, checkpoint) {
   const resumeResult = runGraphResume(item, checkpoint);
   const resolvedBookId = resumeResult?.bookId ?? checkpoint.bookId;
   const projectionMetadata = settingsProjectionMetadata(resumeResult?.resume);
-  const resolvedItem = { ...item, bookId: resolvedBookId };
-  const commandChecks = runCliChecks(resolvedItem);
-  const qmdBuildStatus = qmdBuildEvidence({ commandChecks });
+  const resolvedItem = {
+    ...item,
+    sourceIdentityPath: checkpoint.sourceIdentityPath ?? item.sourceIdentityPath,
+    sourceHash: checkpoint.sourceHash ?? item.sourceHash,
+    normalizedPath: checkpoint.normalizedPath
+      ? absoluteRuntimePath(checkpoint.normalizedPath)
+      : item.normalizedPath,
+    normalizedRel: checkpoint.normalizedPath
+      ? relative(root, absoluteRuntimePath(checkpoint.normalizedPath))
+      : item.normalizedRel,
+    bookId: checkpoint.bookId ?? resolvedBookId,
+  };
+  if (
+    resumeResult?.bookId != null &&
+    checkpoint.bookId != null &&
+    resumeResult.bookId !== checkpoint.bookId
+  ) {
+    throw Object.assign(new Error(
+      `GraphRAG resume book id mismatch: expected ${checkpoint.bookId} ` +
+      `got ${resumeResult.bookId}`,
+    ), {
+      commandCheck: {
+        name: "resume-book",
+        status: "failed",
+        attempts: 1,
+        exitCode: 1,
+        stdoutBytes: 0,
+        stderrBytes: 0,
+        startedAt: now(),
+        completedAt: now(),
+        failureKind: "permanent",
+        retryable: false,
+        attemptExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        errorSummary: "GraphRAG resume book id mismatch",
+      },
+    });
+  }
+  const commandChecks = runCliChecks(resolvedItem, checkpoint);
+  const qmdBuildStatus = qmdBuildEvidence(resolvedItem);
   const graphBuildStatus = graphBuildEvidence(resolvedItem);
   const graphQueryStatus = graphQueryEvidence({ commandChecks });
   if (qmdBuildStatus.status !== "succeeded") {
     throw Object.assign(new Error(`qmd build did not succeed: ${qmdBuildStatus.reason}`), {
-      commandCheck: commandChecks.find((check) => check.name === qmdBuildStatus.stage),
+      commandCheck: {
+        name: qmdBuildStatus.stage ?? "qmd-build",
+        status: "failed",
+        attempts: 1,
+        exitCode: 1,
+        stdoutBytes: 0,
+        stderrBytes: 0,
+        startedAt: qmdBuildStatus.checkedAt ?? now(),
+        completedAt: now(),
+        failureKind: "permanent",
+        retryable: false,
+        attemptExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        errorSummary: qmdBuildStatus.reason ?? "qmd build evidence missing",
+      },
     });
   }
   if (graphBuildStatus.status !== "succeeded") {
+    const graphBuildCommandCheck = {
+      name: graphBuildStatus.stage ?? "graphrag-build",
+      status: "failed",
+      attempts: 1,
+      exitCode: 1,
+      stdoutBytes: 0,
+      stderrBytes: 0,
+      startedAt: graphBuildStatus.checkedAt ?? now(),
+      completedAt: now(),
+      failureKind: "permanent",
+      retryable: false,
+      attemptExhausted: true,
+      errorSummary: graphBuildStatus.reason,
+    };
     throw Object.assign(
       new Error(`GraphRAG build did not succeed: ${graphBuildStatus.reason}`),
-      {
-        commandCheck: {
-          name: graphBuildStatus.stage ?? "graphrag-build",
-          status: "failed",
-          attempts: 1,
-          exitCode: 1,
-          stdoutBytes: 0,
-          stderrBytes: 0,
-          startedAt: graphBuildStatus.checkedAt ?? now(),
-          completedAt: now(),
-          failureKind: "permanent",
-          retryable: false,
-          attemptExhausted: true,
-          errorSummary: graphBuildStatus.reason,
-        },
-      },
+      { commandCheck: graphBuildCommandCheck },
     );
   }
   if (graphQueryStatus.status !== "succeeded") {
@@ -4165,7 +5221,7 @@ function runItem(item, checkpoint) {
       ...projectionMetadata,
     },
   };
-  saveCheckpoint(item, completed);
+  saveCheckpoint(resolvedItem, completed);
   event({ itemId: item.itemId, event: "item_completed", status: "completed" });
   return completed;
 }
@@ -4195,6 +5251,7 @@ function buildRecoverableTransientCheckpoint({ item, running, commandCheck, erro
     metadata: {
       ...(running.metadata ?? {}),
       waitingForProviderRecovery: true,
+      providerRecoveryReason: "transient_failure_recovered",
       lastRetryableFailureAt: now(),
       retryBudgetSeconds,
       maxProviderRecoveryWaits,
@@ -4205,40 +5262,59 @@ function buildRecoverableTransientCheckpoint({ item, running, commandCheck, erro
 
 function markItemRunning(item, checkpoint, checkpoints, manifest) {
   const startedAt = now();
-  const running = {
-    ...checkpoint,
-    status: "running",
-    attempts: checkpoint.attempts + 1,
-    startedAt: checkpoint.startedAt ?? startedAt,
-    retryStartedAt: checkpoint.retryStartedAt,
-    nextRetryAt: undefined,
-    retryDelaySeconds: undefined,
-    failedAt: undefined,
-    errorSummary: undefined,
-    failureKind: undefined,
-    retryable: undefined,
-    retryExhausted: undefined,
-    recoveryDecision: "none",
-    failedStage: undefined,
-    expectedCommandCheckCount,
-    maxCommandAttempts,
-    maxTransientCommandAttempts,
-    maxResumePasses,
-    retryBaseDelaySeconds,
-    retryMaxDelaySeconds,
-    retryBudgetSeconds,
-    maxProviderRecoveryWaits,
-    commandTimeoutSeconds,
-    runnerSessionId,
-    runnerHost,
-    runnerPid,
-    runnerHeartbeatAt: startedAt,
-    metadata: {
-      ...(checkpoint.metadata ?? {}),
-      waitingForProviderRecovery: false,
+  const running = lockedReadWriteTypedJson(
+    itemPath(item),
+    BatchItemCheckpointSchema,
+    (loaded) => {
+      const current = loaded ??
+        BatchItemCheckpointSchema.parse(withBuildStatusSnapshot(item, checkpoint));
+      if (
+        current.status !== checkpoint.status ||
+        current.attempts !== checkpoint.attempts ||
+        current.completedAt !== checkpoint.completedAt ||
+        current.failedAt !== checkpoint.failedAt ||
+        current.runnerSessionId !== checkpoint.runnerSessionId ||
+        current.runnerHeartbeatAt !== checkpoint.runnerHeartbeatAt
+      ) {
+        throw new Error(
+          `checkpoint changed before item start; refusing duplicate runner for ${item.itemId}`,
+        );
+      }
+      return withBuildStatusSnapshot(item, {
+        ...current,
+        status: "running",
+        attempts: current.attempts + 1,
+        startedAt: current.startedAt ?? startedAt,
+        retryStartedAt: current.retryStartedAt,
+        nextRetryAt: undefined,
+        retryDelaySeconds: undefined,
+        failedAt: undefined,
+        errorSummary: undefined,
+        failureKind: undefined,
+        retryable: undefined,
+        retryExhausted: undefined,
+        recoveryDecision: "none",
+        failedStage: undefined,
+        expectedCommandCheckCount,
+        maxCommandAttempts,
+        maxTransientCommandAttempts,
+        maxResumePasses,
+        retryBaseDelaySeconds,
+        retryMaxDelaySeconds,
+        retryBudgetSeconds,
+        maxProviderRecoveryWaits,
+        commandTimeoutSeconds,
+        runnerSessionId,
+        runnerHost,
+        runnerPid,
+        runnerHeartbeatAt: startedAt,
+        metadata: {
+          ...(current.metadata ?? {}),
+          waitingForProviderRecovery: false,
+        },
+      });
     },
-  };
-  saveCheckpoint(item, running);
+  );
   checkpoints.set(item.itemId, running);
   updateManifest(manifest, Array.from(checkpoints.values()));
   event({ itemId: item.itemId, event: "item_start", status: "running" });
@@ -4292,6 +5368,7 @@ function eventProviderRecoveryWaitLimit(items, checkpoints) {
     );
   if (limited.length === 0) return false;
   for (const { item, checkpoint } of limited) {
+    const activeItem = runtimeItemForCheckpoint(item, checkpoint);
     const updated = {
       ...checkpoint,
       retryExhausted: false,
@@ -4307,7 +5384,7 @@ function eventProviderRecoveryWaitLimit(items, checkpoints) {
         providerRecoveryWaitLimitReached: true,
       },
     };
-    saveCheckpoint(item, updated);
+    saveCheckpoint(activeItem, updated);
     checkpoints.set(item.itemId, updated);
   }
   const nextRetryAt = limited
@@ -4331,11 +5408,7 @@ function eventProviderRecoveryWaitLimit(items, checkpoints) {
 function shouldStopBatchAfterFailure(checkpoint) {
   return checkpoint?.status === "failed" &&
     checkpoint.retryable === false &&
-    checkpoint.recoveryDecision === "stop_until_fixed" &&
-    (
-      checkpointHasDataCompatibilityFailure(checkpoint) ||
-      checkpointHasUnrecoverableProviderAuthFailure(checkpoint)
-    );
+    checkpoint.recoveryDecision === "stop_until_fixed";
 }
 
 function shouldStopBatchBeforeProcessing(checkpoint) {
@@ -4463,6 +5536,20 @@ function main() {
   while (processedInPass) {
     processedInPass = false;
     let deferredForRetryWindow = false;
+    const providerAuthReopenedCount =
+      applyProviderAuthReopenPass(items, checkpoints);
+    if (providerAuthReopenedCount > 0) {
+      manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+      writeRecoverySummary(manifest, Array.from(checkpoints.values()));
+      processedInPass = true;
+    }
+    const recoveredProviderTransientCount =
+      recoverProviderTransientCheckpoints(items, checkpoints);
+    if (recoveredProviderTransientCount > 0) {
+      manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+      writeRecoverySummary(manifest, Array.from(checkpoints.values()));
+      processedInPass = true;
+    }
     const stopCheckpoint = items
       .map((item) => checkpoints.get(item.itemId))
       .find((checkpoint) => shouldStopBatchBeforeProcessing(checkpoint));
@@ -4488,10 +5575,19 @@ function main() {
         continue;
       }
       let checkpoint = checkpoints.get(item.itemId);
+      let activeItem = runtimeItemForCheckpoint(item, checkpoint);
       if (
         shouldStopBatchAfterFailure(checkpoint) &&
         !canRepairLocalArtifactGate(checkpoint)
       ) {
+        const recovered = recoverProviderTransientCheckpoint(activeItem, checkpoint);
+        if (recovered !== checkpoint) {
+          saveCheckpoint(activeItem, recovered);
+          checkpoints.set(item.itemId, recovered);
+          manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+          processedInPass = true;
+          continue;
+        }
         if (!stopLoggedThisRun.has(checkpoint.itemId)) {
           emitBatchStoppedAfterNonTransientFailure(checkpoint);
           stopLoggedThisRun.add(checkpoint.itemId);
@@ -4522,7 +5618,8 @@ function main() {
             reopenedSkippedForRealBuild: true,
           },
         };
-        saveCheckpoint(item, checkpoint);
+        activeItem = runtimeItemForCheckpoint(item, checkpoint);
+        saveCheckpoint(activeItem, checkpoint);
         checkpoints.set(item.itemId, checkpoint);
         manifest = updateManifest(manifest, Array.from(checkpoints.values()));
         event({
@@ -4534,6 +5631,14 @@ function main() {
         });
       }
       if (checkpoint?.status === "failed" && checkpoint.retryable === false) {
+        const recovered = recoverProviderTransientCheckpoint(activeItem, checkpoint);
+        if (recovered !== checkpoint) {
+          saveCheckpoint(activeItem, recovered);
+          checkpoints.set(item.itemId, recovered);
+          manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+          processedInPass = true;
+          continue;
+        }
         if (canRepairLocalArtifactGate(checkpoint)) {
           event({
             itemId: item.itemId,
@@ -4546,8 +5651,9 @@ function main() {
             message: checkpoint.errorSummary,
           });
           try {
-            const repaired = repairLocalArtifactGate(item, checkpoint);
-            saveCheckpoint(item, repaired);
+            activeItem = runtimeItemForCheckpoint(item, checkpoint);
+            const repaired = repairLocalArtifactGate(activeItem, checkpoint);
+            saveCheckpoint(activeItem, repaired);
             checkpoints.set(item.itemId, repaired);
             manifest = updateManifest(manifest, Array.from(checkpoints.values()));
             if (repaired.metadata?.localArtifactGateRepairBlocked === true) {
@@ -4596,7 +5702,7 @@ function main() {
                   : commandCheck,
               ];
             }
-            saveCheckpoint(item, failed);
+            saveCheckpoint(activeItem, failed);
             checkpoints.set(item.itemId, failed);
             manifest = updateManifest(manifest, Array.from(checkpoints.values()));
             event({
@@ -4640,9 +5746,10 @@ function main() {
         }
       }
       if (checkpoint?.status === "failed" && checkpoint.retryable === true) {
-        const recovered = recoverProviderTransientCheckpoint(item, checkpoint);
+        activeItem = runtimeItemForCheckpoint(item, checkpoint);
+        const recovered = recoverProviderTransientCheckpoint(activeItem, checkpoint);
         if (recovered !== checkpoint) {
-          saveCheckpoint(item, recovered);
+          saveCheckpoint(activeItem, recovered);
           checkpoints.set(item.itemId, recovered);
           manifest = updateManifest(manifest, Array.from(checkpoints.values()));
           continue;
@@ -4663,8 +5770,9 @@ function main() {
         checkpoint.failureKind === "transient" &&
         checkpoint.retryExhausted === true
       ) {
-        const recovered = recoverProviderTransientCheckpoint(item, checkpoint);
-        saveCheckpoint(item, recovered);
+        activeItem = runtimeItemForCheckpoint(item, checkpoint);
+        const recovered = recoverProviderTransientCheckpoint(activeItem, checkpoint);
+        saveCheckpoint(activeItem, recovered);
         checkpoints.set(item.itemId, recovered);
         manifest = updateManifest(manifest, Array.from(checkpoints.values()));
         continue;
@@ -4688,13 +5796,14 @@ function main() {
 
       try {
         const starting = checkpoint ?? defaultCheckpoint(item, completedSeed);
+        activeItem = runtimeItemForCheckpoint(item, starting);
         const retryWindowDelay = retryWindowDelayMs(starting);
         if (retryWindowDelay > 0) {
-          eventRetryWindowDeferred(item, starting, retryWindowDelay);
+          eventRetryWindowDeferred(activeItem, starting, retryWindowDelay);
           deferredForRetryWindow = true;
           continue;
         }
-        const activeBook = activeRunningBookCheckpoint(item, checkpoints);
+        const activeBook = activeRunningBookCheckpoint(activeItem, checkpoints);
         if (activeBook != null) {
           event({
             itemId: item.itemId,
@@ -4703,7 +5812,7 @@ function main() {
             recoveryDecision: "continue_pending",
             metadata: {
               activeItemId: activeBook.itemId,
-              bookId: item.bookId,
+              bookId: activeItem.bookId,
               runnerSessionId: activeBook.runnerSessionId,
               runnerHost: activeBook.runnerHost,
               runnerPid: activeBook.runnerPid,
@@ -4713,15 +5822,16 @@ function main() {
           deferredForRetryWindow = true;
           continue;
         }
-        const running = markItemRunning(item, starting, checkpoints, manifest);
-        const completed = runItem(item, running);
+        const running = markItemRunning(activeItem, starting, checkpoints, manifest);
+        const completed = runItem(activeItem, running);
         checkpoints.set(item.itemId, completed);
         manifest = updateManifest(manifest, Array.from(checkpoints.values()));
         processedInPass = true;
       } catch (error) {
         const running = existsSync(itemPath(item))
-          ? loadCheckpoint(item, completedSeed)
+          ? loadCheckpoint(activeItem, completedSeed)
           : checkpoint ?? defaultCheckpoint(item, completedSeed);
+        activeItem = runtimeItemForCheckpoint(item, running);
         const commandCheck = error?.commandCheck;
         const failureKind = commandCheck?.failureKind ?? "unknown";
         const retryable = commandCheck?.retryable ?? false;
@@ -4729,12 +5839,12 @@ function main() {
           retryable && failureKind === "transient" && transientBudgetAvailable(running);
         if (canRecoverInThisRun) {
           const recoverable = buildRecoverableTransientCheckpoint({
-            item,
+            item: activeItem,
             running,
             commandCheck,
             error,
           });
-          saveCheckpoint(item, recoverable);
+          saveCheckpoint(activeItem, recoverable);
           checkpoints.set(item.itemId, recoverable);
           manifest = updateManifest(manifest, Array.from(checkpoints.values()));
           event({
@@ -4802,7 +5912,7 @@ function main() {
               providerRecoveryWaitCount: waitCount,
               maxProviderRecoveryWaits,
               retryBudgetSeconds,
-              sourceName: item.sourceName,
+              sourceName: activeItem.sourceName,
               providerRecoveryWaitLimitReached: true,
             },
           };
@@ -4818,7 +5928,7 @@ function main() {
                 : commandCheck,
             ];
           }
-          saveCheckpoint(item, limited);
+          saveCheckpoint(activeItem, limited);
           checkpoints.set(item.itemId, limited);
           manifest = updateManifest(manifest, Array.from(checkpoints.values()));
           event({
@@ -4853,55 +5963,65 @@ function main() {
           : undefined;
         const projectionRejectionMetadata =
           rejectedSettingsProjectionMetadata(error);
-        const failed = recoverableProviderFailure ? {
-          ...running,
-          status: "pending",
-          failedAt: undefined,
-          errorSummary: redacted(error instanceof Error ? error.message : String(error)),
-          failureKind: "transient",
-          retryable: true,
-          retryExhausted: false,
-          recoveryDecision: "retry_same_run_id",
-          failedStage: commandCheck?.name,
-          retryStartedAt: running.retryStartedAt ?? commandCheck?.completedAt ?? now(),
-          nextRetryAt: isoAfterSeconds(providerRecoveryDelay),
-          retryDelaySeconds: providerRecoveryDelay,
-          runnerHeartbeatAt: now(),
-          activeCommand: commandCheck?.name ?? running.activeCommand ??
-            running.currentCommand ?? running.failedStage,
-          metadata: {
-            ...(running.metadata ?? {}),
-            waitingForProviderRecovery: true,
-            providerRecoveryWaitStartedAt: now(),
-            providerRecoveryReason: providerRecoveryWaitStillAvailable
-              ? "transient_retry_budget_window_elapsed"
-              : "provider_recovery_wait_limit_reached",
-            providerRecoveryWaitCount: recoveryWaitCount,
-            maxProviderRecoveryWaits,
-            retryBudgetSeconds,
-            sourceName: item.sourceName,
-          },
-        } : {
-          ...running,
-          status: "failed",
-          failedAt: now(),
-          errorSummary: redacted(error instanceof Error ? error.message : String(error)),
-          failureKind,
-          retryable: false,
-          retryExhausted: Boolean(commandCheck?.attemptExhausted) ||
-            (retryable && failureKind === "transient"),
-          recoveryDecision: "stop_until_fixed",
-          failedStage: commandCheck?.name,
-          nextRetryAt: undefined,
-          retryDelaySeconds: undefined,
-          runnerHeartbeatAt: now(),
-          activeCommand: commandCheck?.name ?? running.activeCommand ??
-            running.currentCommand ?? running.failedStage,
-          metadata: {
-            ...(running.metadata ?? {}),
-            ...projectionRejectionMetadata,
-          },
-        };
+        const authFailureMetadata = providerAuthFailureMetadata(commandCheck);
+        const failed = recoverableProviderFailure
+          ? {
+              ...running,
+              status: "pending",
+              failedAt: undefined,
+              errorSummary: redacted(
+                error instanceof Error ? error.message : String(error),
+              ),
+              failureKind: "transient",
+              retryable: true,
+              retryExhausted: false,
+              recoveryDecision: "retry_same_run_id",
+              failedStage: commandCheck?.name,
+              retryStartedAt:
+                running.retryStartedAt ?? commandCheck?.completedAt ?? now(),
+              nextRetryAt: isoAfterSeconds(providerRecoveryDelay),
+              retryDelaySeconds: providerRecoveryDelay,
+              runnerHeartbeatAt: now(),
+              activeCommand: commandCheck?.name ?? running.activeCommand ??
+                running.currentCommand ?? running.failedStage,
+              metadata: {
+                ...(running.metadata ?? {}),
+                waitingForProviderRecovery: true,
+                providerRecoveryWaitStartedAt: now(),
+                providerRecoveryReason: providerRecoveryWaitStillAvailable
+                  ? "transient_retry_budget_window_elapsed"
+                  : "provider_recovery_wait_limit_reached",
+                providerRecoveryWaitCount: recoveryWaitCount,
+                maxProviderRecoveryWaits,
+                retryBudgetSeconds,
+                sourceName: activeItem.sourceName,
+              },
+            }
+          : {
+              ...running,
+              status: "failed",
+              failedAt: now(),
+              errorSummary: redacted(
+                error instanceof Error ? error.message : String(error),
+              ),
+              failureKind,
+              retryable: false,
+              retryExhausted: Boolean(commandCheck?.attemptExhausted) ||
+                (retryable && failureKind === "transient"),
+              recoveryDecision: "stop_until_fixed",
+              failedStage: commandCheck?.name,
+              nextRetryAt: undefined,
+              retryDelaySeconds: undefined,
+              runnerHeartbeatAt: now(),
+              activeCommand: commandCheck?.name ?? running.activeCommand ??
+                running.currentCommand ?? running.failedStage,
+              metadata: {
+                ...(running.metadata ?? {}),
+                ...projectionRejectionMetadata,
+                ...authFailureMetadata,
+                waitingForProviderRecovery: false,
+              },
+            };
         if (commandCheck) {
           failed.commandChecks = [
             ...(failed.commandChecks ?? []),
@@ -4914,7 +6034,7 @@ function main() {
               : commandCheck,
           ];
         }
-        saveCheckpoint(item, failed);
+        saveCheckpoint(activeItem, failed);
         checkpoints.set(item.itemId, failed);
         manifest = updateManifest(manifest, Array.from(checkpoints.values()));
         event({
@@ -4943,8 +6063,33 @@ function main() {
                 activeCommand: failed.activeCommand,
                 command: commandCheck?.name,
                 ...projectionRejectionMetadata,
+                ...authFailureMetadata,
               },
         });
+        if (
+          !recoverableProviderFailure &&
+          authFailureMetadata.providerAuthFailureDetected === true
+        ) {
+          event({
+            itemId: item.itemId,
+            event: "item_provider_auth_refailed",
+            status: "failed",
+            message: failed.errorSummary,
+            failureKind: failed.failureKind,
+            retryable: false,
+            attemptExhausted: failed.retryExhausted,
+            providerStatusCode: commandCheck?.providerStatusCode,
+            recoveryDecision: "stop_until_fixed",
+            failedStage: failed.failedStage,
+            metadata: {
+              activeCommand: failed.activeCommand,
+              command: commandCheck?.name,
+              providerAuthReopenAttemptCount:
+                providerAuthReopenAttemptCount(failed),
+              ...authFailureMetadata,
+            },
+          });
+        }
         if (failFast) {
           manifest = persistFailFastInterruptedManifest(
             manifest,

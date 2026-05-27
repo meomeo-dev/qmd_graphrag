@@ -118,10 +118,13 @@ item 仍保持 `pending` 并真实执行 qmd 与 GraphRAG 闭环。只有 `--mig
 item。真实准入批次必须让每本 EPUB 形成 `completed` checkpoint。
 
 旧 `completed` checkpoint 在加载时必须重新校验闭环证据。`qmdBuildStatus`
-不得作为信任源；批量执行器必须从 `commandChecks` 重新计算 qmd 构建状态。
-缺少 27 个固定名称 command checks、任一 command check 非 `passed`、缺少真实
-GraphRAG producer lineage，或 `graphBuildStatus.status` 不能重新计算为
-`succeeded`、`graphQueryStatus.status` 不能重新计算为 `succeeded` 的
+不得作为信任源；批量执行器必须从当前书的
+`books/<bookId>/qmd/qmd_build_manifest.json` 重新计算 qmd 构建证据（build
+evidence），并单独从 `commandChecks` 重新计算 27 个 CLI 检查证据。
+缺少独立 qmd build manifest、缺少 27 个固定名称 command checks、任一
+command check 非 `passed`、缺少真实 GraphRAG producer lineage，或
+`graphBuildStatus.status` 不能重新计算为 `succeeded`、
+`graphQueryStatus.status` 不能重新计算为 `succeeded` 的
 checkpoint，必须降级为 `pending`，写入 `item_completed_reopened` 事件，并以
 恢复证据决定下一步：若失败的 command check 是
 `failureKind=transient` 且 `retryable=true`，则保持
@@ -202,6 +205,11 @@ runId 恢复；缺失/不完整证据或非 transient command check 降级为
 - `timeout`
 - HTTP `429`
 - HTTP `5xx`
+- 结构化 GraphRAG query provider failure：
+  `route=graphrag`、`stage=graphrag_query`、`provider=graphrag`、
+  `capability=graph_query`、`code=provider_unavailable`
+- Jina/OpenAI/httpx/aiohttp/urllib3/APIConnection/SSL/TLS/DNS/connection reset
+  等网络或 provider 连接错误
 
 除 `429` 外的 HTTP `4xx` 归类为 permanent failure，不自动重试。
 
@@ -235,6 +243,13 @@ transient failure 发生后：
   `output/reports/indexing-engine.log` 片段。片段内出现 provider transient
   error、`Community Report Extraction Error` 或 `No report found for
   community` 时，本 stage 失败并进入相同恢复路径，不发布 stage checkpoint。
+- `qmd-query-graphrag-json` 收到结构化
+  `stage=graphrag_query`、`code=provider_unavailable` 时，执行器按 provider
+  recovery wait 处理。`stage=provider` 的 provider-not-configured 配置缺失仍为
+  non-retryable，不进入 provider recovery wait。历史 checkpoint 若已把 query
+  stage payload 误写成
+  `failureKind=unknown`、`retryable=false`、`recoveryDecision=stop_until_fixed`，
+  当前加载、`--status-json` 和正式续跑都必须重分类为 transient pending。
 
 重试预算耗尽后：
 
@@ -340,8 +355,27 @@ stdout 的单一 JSON 对象中。
 `recovery-summary.json` 与 `--status-json` 输出均受
 `BatchRecoverySummarySchema` 约束。摘要记录批次恢复决策、重试策略、
 `maxProviderRecoveryWaits`、`retryableItemCount`、最早 `nextRetryAt`，以及每本书的
-`qmdBuildStatus`、`graphBuildStatus`、`graphQueryStatus`、runner ownership 和
-orphan 检测状态。摘要不得包含密钥、Bearer token、原始 provider 请求体或响应体。
+`qmdBuildStatus`、`commandCheckStatus`、`graphBuildStatus`、
+`graphQueryStatus`、runner ownership 和 orphan 检测状态。摘要不得包含密钥、
+Bearer token、原始 provider 请求体或响应体。
+
+GraphRAG query provider outage 的期望观测面：
+
+- `status=pending`
+- `failureKind=transient`
+- `retryable=true`
+- `retryExhausted=false`
+- `recoveryDecision=retry_same_run_id`
+- `failedStage=qmd-query-graphrag-json`
+- `waitingForProviderRecovery=true`
+- `nextRetryAt`
+- `retryDelaySeconds`
+- `providerRecoveryReason`
+
+若同一批次中存在任意
+`failed + retryable=false + recoveryDecision=stop_until_fixed` 的非 transient item，
+当前 writer 必须停止调度后续图书。该规则不限于 provider auth 或 data
+compatibility；泛化永久失败同样必须阻止后续 `command_start`。
 
 ## 只读验证命令
 
@@ -433,8 +467,10 @@ NODE
 每个 completed checkpoint 必须包含 27 个 `commandChecks`，名称集合必须与上述检查
 集 exact match，且全部为 `passed`。缺项、重复项、额外项或失败项均不得写入
 completed。
-每个 completed checkpoint 必须同时包含 `qmdBuildStatus.status=succeeded` 与
-`graphBuildStatus.status=succeeded`、`graphQueryStatus.status=succeeded`。
+每个 completed checkpoint 必须同时包含 `qmdBuildStatus.status=succeeded`、
+`commandCheckStatus.status=succeeded`、`graphBuildStatus.status=succeeded`
+与 `graphQueryStatus.status=succeeded`。其中 `qmdBuildStatus` 来自独立 qmd
+build manifest，`commandCheckStatus` 来自 27 个 CLI 子命令检查。
 
 `qmd vsearch` 是向量检索（vector search）检查，只允许 embedding/vector
 lookup，不允许 query expansion、OpenAI Responses generation、DSPy expansion、

@@ -36,6 +36,17 @@ function currentRetryPolicy({
   };
 }
 
+function checkpointIdentityFields({ item, checkpoint, defaultBookId }) {
+  return {
+    sourceIdentityPath: checkpoint.sourceIdentityPath ?? item.sourceIdentityPath ??
+      item.sourceRelativePath,
+    sourceHash: checkpoint.sourceHash ?? item.sourceHash,
+    normalizedPath: checkpoint.normalizedPath ?? item.normalizedRel ??
+      item.normalizedPath,
+    bookId: checkpoint.bookId ?? item.bookId ?? defaultBookId,
+  };
+}
+
 export function hydrateBatchCheckpoint({
   item,
   checkpoint,
@@ -74,10 +85,7 @@ export function hydrateBatchCheckpoint({
     return {
       ...checkpoint,
       status: "pending",
-      sourceIdentityPath: checkpoint.sourceIdentityPath ?? item.sourceIdentityPath ??
-        item.sourceRelativePath,
-      sourceHash: checkpoint.sourceHash ?? item.sourceHash,
-      bookId: item.bookId ?? defaultBookId,
+      ...checkpointIdentityFields({ item, checkpoint, defaultBookId }),
       ...policy,
       failedAt: undefined,
       errorSummary: checkpoint.errorSummary,
@@ -104,10 +112,7 @@ export function hydrateBatchCheckpoint({
   ) {
     return {
       ...checkpoint,
-      sourceIdentityPath: checkpoint.sourceIdentityPath ?? item.sourceIdentityPath ??
-        item.sourceRelativePath,
-      sourceHash: checkpoint.sourceHash ?? item.sourceHash,
-      bookId: item.bookId ?? defaultBookId,
+      ...checkpointIdentityFields({ item, checkpoint, defaultBookId }),
       ...policy,
       failedAt: undefined,
       errorSummary: undefined,
@@ -194,10 +199,7 @@ export function hydrateBatchCheckpoint({
   return {
     ...checkpoint,
     status,
-    sourceIdentityPath: checkpoint.sourceIdentityPath ?? item.sourceIdentityPath ??
-      item.sourceRelativePath,
-    sourceHash: checkpoint.sourceHash ?? item.sourceHash,
-    bookId: item.bookId ?? defaultBookId,
+    ...checkpointIdentityFields({ item, checkpoint, defaultBookId }),
     ...policy,
     failureKind: knownFailure
       ? inferredFailure.failureKind

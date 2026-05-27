@@ -57,6 +57,45 @@ function isRetryableGraphRagQueryError(error: unknown): boolean {
     message.includes("temporarily unavailable") ||
     message.includes("stream_read_error") ||
     message.includes("timeout") ||
+    message.includes("timed out") ||
+    message.includes("service unavailable") ||
+    message.includes("gateway timeout") ||
+    message.includes("bad gateway") ||
+    message.includes("apiconnectionerror") ||
+    message.includes("api connection error") ||
+    message.includes("connectionerror") ||
+    message.includes("connecterror") ||
+    message.includes("connecttimeout") ||
+    message.includes("readtimeout") ||
+    message.includes("clientconnectorerror") ||
+    message.includes("serverdisconnectederror") ||
+    message.includes("remote protocol error") ||
+    message.includes("jina_aiexception") ||
+    message.includes("jina ai exception") ||
+    message.includes("jina_ai exception") ||
+    message.includes("cannot connect to host") ||
+    message.includes("network error") ||
+    message.includes("fetch failed") ||
+    message.includes("ssl") ||
+    message.includes("unexpected_eof_while_reading") ||
+    message.includes("eof occurred in violation of protocol") ||
+    message.includes("connection reset") ||
+    message.includes("connection reset by peer") ||
+    message.includes("read reset") ||
+    message.includes("connection aborted") ||
+    message.includes("connection refused") ||
+    message.includes("socket hang up") ||
+    message.includes("temporary failure in name resolution") ||
+    message.includes("getaddrinfo") ||
+    message.includes("dns") ||
+    message.includes("httpx.") ||
+    message.includes("aiohttp.") ||
+    message.includes("urllib3.") ||
+    message.includes("econnreset") ||
+    message.includes("econnrefused") ||
+    message.includes("enotfound") ||
+    message.includes("etimedout") ||
+    message.includes("eai_again") ||
     message.includes("(429)") ||
     statusMatch != null
   );

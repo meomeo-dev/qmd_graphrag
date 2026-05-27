@@ -35,14 +35,6 @@ export const BatchRecoveryDecisionSchema = z.enum([
   "stop_until_fixed",
 ]);
 
-export const BatchBuildStatusSchema = z.object({
-  status: z.enum(["pending", "running", "succeeded", "failed", "stale"]),
-  checkedAt: z.string().datetime().optional(),
-  stage: z.string().min(1).optional(),
-  reason: z.string().min(1).optional(),
-  artifactIds: z.array(z.string().min(1)).default([]),
-});
-
 export const BatchProjectRelativeLocatorSchema = z.string().min(1).refine(
   (value) => {
     if (value.includes("\0")) return false;
@@ -53,6 +45,19 @@ export const BatchProjectRelativeLocatorSchema = z.string().min(1).refine(
   },
   "path must be project-relative and portable",
 );
+
+export const BatchBuildStatusSchema = z.object({
+  status: z.enum(["pending", "running", "succeeded", "failed", "stale"]),
+  checkedAt: z.string().datetime().optional(),
+  stage: z.string().min(1).optional(),
+  reason: z.string().min(1).optional(),
+  artifactIds: z.array(z.string().min(1)).default([]),
+  evidenceLocator: BatchProjectRelativeLocatorSchema.optional(),
+  producerRunId: z.string().min(1).optional(),
+  bookId: z.string().min(1).optional(),
+  sourceHash: z.string().min(1).optional(),
+  normalizedContentHash: z.string().min(1).optional(),
+});
 
 export const BatchCommandCheckSchema = z.object({
   name: z.string().min(1),
@@ -220,6 +225,7 @@ export const BatchRecoverySummaryItemSchema = z.object({
   status: BatchItemStatusSchema,
   attempts: z.number().int().nonnegative(),
   qmdBuildStatus: BatchBuildStatusSchema,
+  commandCheckStatus: BatchBuildStatusSchema.optional(),
   graphBuildStatus: BatchBuildStatusSchema,
   graphQueryStatus: BatchBuildStatusSchema,
   failureKind: BatchFailureKindSchema.optional(),
@@ -267,6 +273,33 @@ export const BatchRecoverySummaryItemSchema = z.object({
   settingsProjectionReason: z.string().min(1).optional(),
   localArtifactGateRepairRequiresRealRebuild: z.boolean().optional(),
   localArtifactGateRepairRebuildStage: z.string().min(1).optional(),
+  providerAuthReopenDecision: z.string().min(1).optional(),
+  providerAuthReopenEligible: z.boolean().optional(),
+  providerAuthReopenReason: z.string().min(1).optional(),
+  providerAuthReopenBlockedReason: z.string().min(1).optional(),
+  providerAuthConfigChanged: z.boolean().optional(),
+  providerAuthFailureFingerprint: z.string().min(1).optional(),
+  currentProviderAuthFingerprint: z.string().min(1).optional(),
+  lastProviderAuthReopenFingerprint: z.string().min(1).optional(),
+  providerAuthConfigReadStatus: z.string().min(1).optional(),
+  providerAuthConfigReadError: z.string().min(1).optional(),
+  providerAuthRequiredKeys: z.array(z.string().min(1)).optional(),
+  providerAuthRequiredEndpoints: z.array(z.string().min(1)).optional(),
+  providerAuthRequiredNames: z.array(z.string().min(1)).optional(),
+  providerAuthKeyPresence: z.record(z.string(), z.string().min(1)).optional(),
+  providerAuthCredentialSources: z.record(z.string(), z.string().min(1)).optional(),
+  providerAuthReadinessStatus: z.string().min(1).optional(),
+  providerAuthMissingRequiredKeys: z.array(z.string().min(1)).optional(),
+  providerAuthShadowedEnvNames: z.array(z.string().min(1)).optional(),
+  providerAuthDotenvShadowedEnvNames: z.array(z.string().min(1)).optional(),
+  providerAuthRootDotenvFingerprints:
+    z.record(z.string(), z.string().min(1)).optional(),
+  providerAuthGraphVaultDotenvFingerprints:
+    z.record(z.string(), z.string().min(1)).optional(),
+  providerAuthRootDotenvPresent: z.boolean().optional(),
+  providerAuthGraphVaultDotenvPresent: z.boolean().optional(),
+  providerAuthReopenAttemptCount: z.number().int().nonnegative().optional(),
+  legacyProviderAuthFingerprintMissing: z.boolean().optional(),
   errorSummary: z.string().max(1000).optional(),
 });
 

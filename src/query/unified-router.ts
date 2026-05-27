@@ -294,6 +294,7 @@ function typedGraphProviderError(input: {
   request: UnifiedQueryRequest;
   code: "provider_unavailable" | "provider_response_invalid";
   stage?: TypedQueryError["stage"];
+  retryable?: boolean;
   redactedMessage: string;
 }): TypedQueryErrorException {
   return new TypedQueryErrorException(createTypedQueryError({
@@ -302,9 +303,64 @@ function typedGraphProviderError(input: {
     provider: "graphrag",
     capability: "graph_query",
     code: input.code,
-    retryable: false,
+    retryable: input.retryable ?? false,
     redactedMessage: input.redactedMessage,
   }));
+}
+
+function isTransientGraphProviderError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return [
+    "concurrency limit",
+    "rate limit",
+    "temporarily unavailable",
+    "stream_read_error",
+    "timeout",
+    "timed out",
+    "service unavailable",
+    "gateway timeout",
+    "bad gateway",
+    "apiconnectionerror",
+    "api connection error",
+    "connectionerror",
+    "connecterror",
+    "connecttimeout",
+    "readtimeout",
+    "clientconnectorerror",
+    "serverdisconnectederror",
+    "remote protocol error",
+    "jina_aiexception",
+    "jina ai exception",
+    "jina_ai exception",
+    "cannot connect to host",
+    "network error",
+    "fetch failed",
+    "ssl",
+    "unexpected_eof_while_reading",
+    "eof occurred in violation of protocol",
+    "connection reset",
+    "connection reset by peer",
+    "read reset",
+    "connection aborted",
+    "connection refused",
+    "socket hang up",
+    "temporary failure in name resolution",
+    "getaddrinfo",
+    "dns",
+    "httpx.",
+    "aiohttp.",
+    "urllib3.",
+    "econnreset",
+    "econnrefused",
+    "enotfound",
+    "etimedout",
+    "eai_again",
+    "(429)",
+  ].some((token) => message.includes(token)) ||
+    /(?:http|status(?: code)?|error code|code)[^\d]*([5]\d\d)/iu
+      .test(message) ||
+    /\(([5]\d\d)\)/iu.test(message);
 }
 
 function typedGraphCapabilityResolutionError(input: {
@@ -522,9 +578,11 @@ export async function routeQuery(
           redactedMessage: "GraphRAG provider returned an invalid typed response.",
         });
       }
+      const retryable = isTransientGraphProviderError(error);
       throw typedGraphProviderError({
         request: parsedRequest,
         code: "provider_unavailable",
+        retryable,
         redactedMessage: "GraphRAG query provider failed before returning a response.",
       });
     }

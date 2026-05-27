@@ -1089,6 +1089,63 @@ describe("GraphRAG EPUB batch runner", () => {
     return `book-${sourceHash.slice(0, 12)}-${pathHash.slice(0, 8)}`;
   }
 
+  function stableJsonHash(value: unknown): string {
+    return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  }
+
+  async function writeQmdBuildFixture(input: {
+    tmpRoot: string;
+    stateRoot: string;
+    configDir: string;
+    runId: string;
+    itemId: string;
+    bookId: string;
+    sourceName?: string;
+    sourceRelativePath: string;
+    sourceHash: string;
+    normalizedPath: string;
+  }): Promise<void> {
+    const normalizedContent = "# Book\n\nSoftware design complexity.\n";
+    const normalizedContentHash = createHash("sha256")
+      .update(normalizedContent)
+      .digest("hex");
+    const qmdIndexPath = join(input.tmpRoot, "index.sqlite");
+    const configPath = join(input.configDir, "index.yml");
+    await mkdir(dirname(input.normalizedPath), { recursive: true });
+    await writeFile(input.normalizedPath, normalizedContent);
+    await writeFile(qmdIndexPath, `qmd index for ${input.bookId}\n`);
+    await mkdir(join(input.stateRoot, "books", input.bookId, "qmd"), {
+      recursive: true,
+    });
+    await writeFile(
+      join(input.stateRoot, "books", input.bookId, "qmd", "qmd_build_manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        kind: "qmd_build_manifest",
+        itemId: input.itemId,
+        runId: input.runId,
+        bookId: input.bookId,
+        sourceName: input.sourceName ?? "Book.epub",
+        sourceRelativePath: input.sourceRelativePath,
+        sourceHash: input.sourceHash,
+        normalizedPath: relative(projectRoot, input.normalizedPath),
+        normalizedContentHash,
+        qmdIndexLocator: relative(projectRoot, qmdIndexPath),
+        qmdIndexHash: createHash("sha256")
+          .update(readFileSync(qmdIndexPath))
+          .digest("hex"),
+        configLocator: relative(projectRoot, configPath),
+        configHash: createHash("sha256")
+          .update(readFileSync(configPath))
+          .digest("hex"),
+        commandCheckNames: requiredBatchCommandCheckNames,
+        commandCheckFingerprint: stableJsonHash(requiredBatchCommandCheckNames),
+        producerRunId: "qmd-build-run",
+        createdAt: "2026-05-23T00:00:00.000Z",
+      }),
+    );
+  }
+
   async function writeMinimalParquetFixture(path: string): Promise<void> {
     await writeFile(path, MinimalParquetFixture);
   }
@@ -1114,6 +1171,348 @@ describe("GraphRAG EPUB batch runner", () => {
         "utf8",
       );
     }
+  }
+
+  async function writeMinimalEpubFixture(path: string, title = "Book"): Promise<void> {
+    const script = [
+      "import zipfile",
+      "import sys",
+      "path, title = sys.argv[1:3]",
+      "entries = {",
+      " 'META-INF/container.xml': '<?xml version=\"1.0\"?><container xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\"><rootfiles><rootfile full-path=\"OPS/package.opf\" media-type=\"application/oebps-package+xml\"/></rootfiles></container>',",
+      " 'OPS/package.opf': '<?xml version=\"1.0\"?><package xmlns=\"http://www.idpf.org/2007/opf\" unique-identifier=\"bookid\"><metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title>' + title + '</dc:title></metadata><manifest><item id=\"chap1\" href=\"chapter.xhtml\" media-type=\"application/xhtml+xml\"/></manifest><spine><itemref idref=\"chap1\"/></spine></package>',",
+      " 'OPS/chapter.xhtml': '<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><h1>' + title + '</h1><p>Software design complexity.</p></body></html>',",
+      "}",
+      "with zipfile.ZipFile(path, 'w') as zf:",
+      "  for name, body in entries.items():",
+      "    zf.writestr(name, body)",
+    ].join("\n");
+    await new Promise<void>((resolveResult, reject) => {
+      const proc = spawn("python3", ["-c", script, path, title]);
+      let stderr = "";
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => {
+        if (exitCode === 0) resolveResult();
+        else reject(new Error(stderr || `python3 exited ${exitCode}`));
+      });
+      proc.on("error", reject);
+    });
+  }
+
+  async function writeProviderAuthReopenGraphFixture(input: {
+    stateRoot: string;
+    bookId: string;
+    sourceHash: string;
+  }): Promise<void> {
+    const outputRel = join("books", input.bookId, "output");
+    const outputDir = join(input.stateRoot, outputRel);
+    const contentHash = input.sourceHash;
+    const documentId = `doc-${input.sourceHash.slice(0, 12)}`;
+    const stageFingerprints = {
+      ingest: "fp-ingest",
+      normalize: "fp-normalize",
+      graph_extract: "fp-graph-extract",
+      community_report: "fp-community-report",
+      embed: "fp-embed",
+      query_ready: "fp-query-ready",
+    };
+    const providerFingerprint = "provider-fp";
+    const artifactIds = {
+      documents: `${input.bookId}:graph_extract:documents`,
+      textUnits: `${input.bookId}:graph_extract:text_units`,
+      entities: `${input.bookId}:graph_extract:entities`,
+      relationships: `${input.bookId}:graph_extract:relationships`,
+      communities: `${input.bookId}:graph_extract:communities`,
+      context: `${input.bookId}:graph_extract:context`,
+      stats: `${input.bookId}:graph_extract:stats`,
+      reports: `${input.bookId}:community_report:reports`,
+      lancedb: `${input.bookId}:embed:lancedb`,
+    };
+    await mkdir(outputDir, { recursive: true });
+    for (const name of [
+      "documents.parquet", "text_units.parquet", "entities.parquet",
+      "relationships.parquet", "communities.parquet", "community_reports.parquet",
+    ]) {
+      await writeMinimalParquetFixture(join(outputDir, name));
+    }
+    await writeFile(join(outputDir, "context.json"), "{}", "utf8");
+    await writeFile(join(outputDir, "stats.json"), "{}", "utf8");
+    await writeCompleteLanceDbFixture(join(outputDir, "lancedb"));
+    const graphArtifacts = await graphArtifactManifests({
+      outputDir,
+      outputRel,
+      bookId: input.bookId,
+      artifactIds,
+      stageFingerprints,
+      providerFingerprint,
+      corpusContentHash: contentHash,
+    });
+    await writeFile(
+      join(outputDir, "qmd_output_manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        bookId: input.bookId,
+        sourceHash: input.sourceHash,
+        documentId,
+        contentHash,
+        stageFingerprints,
+        providerFingerprint,
+        outputDir: outputRel,
+        producerRunId: "run-query-ready",
+        stageProducerRunIds: {
+          graph_extract: "run-graph-extract",
+          community_report: "run-community-report",
+          embed: "run-embed",
+        },
+      }),
+    );
+    await mkdir(join(input.stateRoot, "catalog"), { recursive: true });
+    await mkdir(join(input.stateRoot, "books", input.bookId), { recursive: true });
+    await writeFile(
+      join(input.stateRoot, "catalog", "books.yaml"),
+      YAML.stringify({
+        schemaVersion: SchemaVersion,
+        items: [{
+          schemaVersion: SchemaVersion,
+          bookId: input.bookId,
+          documentId,
+          sourcePath: `sources/${input.bookId}/source.epub`,
+          sourceHash: input.sourceHash,
+          normalizedContentHash: contentHash,
+          normalizedPath: `books/${input.bookId}/input/book.md`,
+          configFingerprint: "config-fp",
+          promptFingerprint: "prompt-fp",
+          modelFingerprint: "model-fp",
+          stageFingerprints,
+          providerFingerprint,
+          overallStatus: "succeeded",
+          createdAt: "2026-05-23T00:00:00.000Z",
+          updatedAt: "2026-05-23T00:00:01.000Z",
+        }],
+      }),
+    );
+    await writeFile(
+      join(input.stateRoot, "books", input.bookId, "artifacts.yaml"),
+      YAML.stringify({ schemaVersion: SchemaVersion, items: graphArtifacts }),
+    );
+    await writeFile(
+      join(input.stateRoot, "books", input.bookId, "checkpoints.yaml"),
+      YAML.stringify({
+        schemaVersion: SchemaVersion,
+        items: [
+          {
+            schemaVersion: SchemaVersion,
+            bookId: input.bookId,
+            stage: "graph_extract",
+            status: "succeeded",
+            attemptCount: 1,
+            runId: "run-graph-extract",
+            inputFingerprint: "fp-graph-extract",
+            contentHash,
+            stageFingerprint: "fp-graph-extract",
+            providerFingerprint,
+            artifactIds: [
+              artifactIds.documents, artifactIds.textUnits, artifactIds.entities,
+              artifactIds.relationships, artifactIds.communities,
+              artifactIds.context, artifactIds.stats,
+            ],
+          },
+          {
+            schemaVersion: SchemaVersion,
+            bookId: input.bookId,
+            stage: "community_report",
+            status: "succeeded",
+            attemptCount: 1,
+            runId: "run-community-report",
+            inputFingerprint: "fp-community-report",
+            contentHash,
+            stageFingerprint: "fp-community-report",
+            providerFingerprint,
+            artifactIds: [artifactIds.reports],
+          },
+          {
+            schemaVersion: SchemaVersion,
+            bookId: input.bookId,
+            stage: "embed",
+            status: "succeeded",
+            attemptCount: 1,
+            runId: "run-embed",
+            inputFingerprint: "fp-embed",
+            contentHash,
+            stageFingerprint: "fp-embed",
+            providerFingerprint,
+            artifactIds: [artifactIds.lancedb],
+          },
+          {
+            schemaVersion: SchemaVersion,
+            bookId: input.bookId,
+            stage: "query_ready",
+            status: "succeeded",
+            attemptCount: 1,
+            runId: "run-query-ready",
+            inputFingerprint: "fp-query-ready",
+            contentHash,
+            stageFingerprint: "fp-query-ready",
+            providerFingerprint,
+            artifactIds: [artifactIds.reports, artifactIds.lancedb],
+          },
+        ],
+      }),
+    );
+  }
+
+  async function writeProviderAuthStoppedBatchFixture(input: {
+    tmpRoot: string;
+    sourceDir: string;
+    stateRoot: string;
+    configDir: string;
+    runId: string;
+    sourceName?: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<{ itemId: string; bookId: string; sourceHash: string; sourceRelativePath: string }> {
+    await mkdir(input.sourceDir, { recursive: true });
+    await mkdir(input.configDir, { recursive: true });
+    await mkdir(join(input.stateRoot, "catalog", "batch-runs", input.runId, "items"), {
+      recursive: true,
+    });
+    await writeFile(join(input.configDir, "index.yml"), "collections: {}\n");
+    await writeFile(
+      join(input.tmpRoot, ".env"),
+      [
+        "OPENAI_API_KEY=file-openai-key",
+        "OPENAI_BASE_URL=https://api.openai.example",
+        "JINA_API_KEY=file-jina-key",
+        "JINA_API_BASE=https://api.jina.example",
+      ].join("\n"),
+    );
+    await writeFile(
+      join(input.stateRoot, ".env"),
+      [
+        "OPENAI_API_KEY=file-openai-key",
+        "OPENAI_BASE_URL=https://api.openai.example",
+        "JINA_API_KEY=file-jina-key",
+        "JINA_API_BASE=https://api.jina.example",
+      ].join("\n"),
+    );
+    const sourcePath = join(input.sourceDir, input.sourceName ?? "A-Auth.epub");
+    await writeMinimalEpubFixture(sourcePath, "A Auth");
+    const sourceHash = createHash("sha256")
+      .update(readFileSync(sourcePath))
+      .digest("hex");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const bookId = batchBookId(sourceHash, sourceRelativePath);
+    await writeFile(
+      join(input.stateRoot, "catalog", "batch-runs", input.runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId: input.runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        pendingItems: 0,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    const providerError =
+      "Error code: 401 - {'code': 'INVALID_API_KEY', " +
+      "'message': 'Invalid API key'}";
+    await writeFile(
+      join(input.stateRoot, "catalog", "batch-runs", input.runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId: input.runId,
+        status: "failed",
+        sourceName: input.sourceName ?? "A-Auth.epub",
+        sourceRelativePath,
+        sourceIdentityPath: sourceRelativePath,
+        sourceHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "a-auth.md"),
+        bookId,
+        attempts: 1,
+        failedAt: "2026-05-23T00:10:00.000Z",
+        failureKind: "permanent",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "resume-book-1",
+        errorSummary: providerError,
+        commandChecks: [{
+          name: "resume-book-1",
+          status: "failed",
+          attempts: 1,
+          exitCode: 1,
+          stdoutBytes: 0,
+          stderrBytes: 120,
+          startedAt: "2026-05-23T00:00:00.000Z",
+          completedAt: "2026-05-23T00:01:00.000Z",
+          failureKind: "permanent",
+          retryable: false,
+          attemptExhausted: true,
+          providerStatusCode: 401,
+          recoveryDecision: "stop_until_fixed",
+          errorSummary: providerError,
+        }],
+        metadata: input.metadata,
+      }),
+    );
+    return { itemId, bookId, sourceHash, sourceRelativePath };
+  }
+
+  async function runBatchStatusJson(input: {
+    tmpRoot: string;
+    sourceDir: string;
+    stateRoot: string;
+    logRoot: string;
+    configDir: string;
+    runId: string;
+    env?: Record<string, string>;
+    args?: string[];
+  }): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+    return new Promise((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        input.sourceDir,
+        "--state-root",
+        input.stateRoot,
+        "--log-root",
+        input.logRoot,
+        "--config",
+        join(input.configDir, "index.yml"),
+        "--qmd-index-path",
+        join(input.tmpRoot, "index.sqlite"),
+        "--run-id",
+        input.runId,
+        "--status-json",
+        ...(input.args ?? []),
+      ], {
+        cwd: input.tmpRoot,
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+          ...(input.env ?? {}),
+        },
+      });
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => { stdout += String(chunk); });
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
   }
 
   async function graphArtifactManifests(input: {
@@ -1221,6 +1620,18 @@ describe("GraphRAG EPUB batch runner", () => {
     await mkdir(outputDir, { recursive: true });
     await writeFile(sourcePath, input.sourceBytes);
     await writeFile(join(input.configDir, "index.yml"), "collections: {}\n");
+    const normalizedPath = join(input.stateRoot, "input", "book.md");
+    await writeQmdBuildFixture({
+      tmpRoot: input.tmpRoot,
+      stateRoot: input.stateRoot,
+      configDir: input.configDir,
+      runId: input.runId,
+      itemId,
+      bookId,
+      sourceRelativePath,
+      sourceHash,
+      normalizedPath,
+    });
     for (const name of [
       "documents.parquet", "text_units.parquet", "entities.parquet",
       "relationships.parquet", "communities.parquet", "community_reports.parquet",
@@ -1391,7 +1802,7 @@ describe("GraphRAG EPUB batch runner", () => {
         sourceName: "Book.epub",
         sourceRelativePath,
         sourceHash,
-        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        normalizedPath: relative(projectRoot, normalizedPath),
         bookId,
         attempts: 1,
         qmdBuildStatus: { status: "succeeded" },
@@ -1579,7 +1990,8 @@ describe("GraphRAG EPUB batch runner", () => {
       ], {
         env: {
           ...process.env,
-          QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+          QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
+            QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
           QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
         },
       });
@@ -1949,18 +2361,54 @@ describe("GraphRAG EPUB batch runner", () => {
       failureKind: "transient",
       retryable: true,
     });
+    const graphQueryProviderUnavailable = JSON.stringify({
+      schemaVersion: "1.0.0",
+      route: "graphrag",
+      stage: "graphrag_query",
+      provider: "graphrag",
+      capability: "graph_query",
+      code: "provider_unavailable",
+      retryable: false,
+      redactedMessage:
+        "GraphRAG query provider failed before returning a response.",
+    }, null, 2);
+    expect(classifyFailure(graphQueryProviderUnavailable)).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+    });
+    expect(classifyFailure(
+      "qmd-query failed:\n" + graphQueryProviderUnavailable +
+      "\nhttpx.ConnectError: [SSL: UNEXPECTED_EOF_WHILE_READING]",
+    )).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+    });
+    const graphQueryProviderNotConfigured = JSON.stringify({
+      schemaVersion: "1.0.0",
+      route: "graphrag",
+      stage: "provider",
+      provider: "graphrag",
+      capability: "graph_query",
+      code: "provider_unavailable",
+      retryable: false,
+      redactedMessage: "GraphRAG query provider is not configured.",
+    }, null, 2);
+    expect(classifyFailure(graphQueryProviderNotConfigured)).toMatchObject({
+      failureKind: "unknown",
+      retryable: false,
+    });
     expect(script).not.toContain("function isTransient(");
     expect(script).toContain("function recoveryDecisionForBatch(checkpoints)");
     expect(script).toContain("item.status !== \"completed\"");
     expect(script).toContain("item.recoveryDecision === \"retry_same_run_id\"");
     expect(script).toContain("checkpoint?.status === \"failed\" && checkpoint.retryable === false");
     expect(script).not.toContain("event: \"item_retry_exhausted\"");
-    expect(script).toContain("recoverProviderTransientCheckpoint(item, checkpoint)");
+    expect(script).toContain("recoverProviderTransientCheckpoint(activeItem, checkpoint)");
     expect(script).toContain("transientBudgetAvailable(running)");
     expect(script).toContain("if (options.allowTransientBudget) {");
     expect(script).toContain("throw Object.assign(new Error(check.errorSummary)");
     expect(script).toContain("failedStage: name");
-    expect(script).toContain("markItemRunning(item, starting, checkpoints, manifest)");
+    expect(script).toContain("markItemRunning(activeItem, starting, checkpoints, manifest)");
   });
 
   test("classifies query-ready projection failures as local artifact gates", () => {
@@ -2222,7 +2670,8 @@ describe("GraphRAG EPUB batch runner", () => {
       ], {
         env: {
           ...process.env,
-          QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+          QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
+            QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
           QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
         },
       });
@@ -2251,6 +2700,10 @@ describe("GraphRAG EPUB batch runner", () => {
       retryExhausted: false,
       recoveryDecision: "retry_same_run_id",
       failedStage: "resume-book-1",
+      metadata: {
+        waitingForProviderRecovery: true,
+        providerRecoveryReason: "transient_failure_recovered",
+      },
     });
     expect(checkpoint.nextRetryAt).toEqual(expect.any(String));
     expect(checkpoint.commandChecks.at(-1)).toMatchObject({
@@ -2840,8 +3293,14 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(summary.items[0]).toMatchObject({
       status: "pending",
       qmdBuildStatus: {
-        status: "succeeded",
-        stage: "qmd-query-json",
+        status: "pending",
+        stage: "qmd-build",
+        reason: "qmd_build_manifest_missing",
+      },
+      commandCheckStatus: {
+        status: "failed",
+        stage: "resume-book-2",
+        reason: "command_check_failed",
       },
       graphBuildStatus: {
         status: "pending",
@@ -3273,6 +3732,166 @@ describe("GraphRAG EPUB batch runner", () => {
     });
   });
 
+  test("provider recovery wait limit preserves checkpoint identity during catalog drift", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-wait-identity-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "provider-wait-identity";
+    const sourceBytes = "provider wait identity";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    const sourcePath = join(sourceDir, "Book.epub");
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const persistedSourceIdentityPath = join(
+      ".tmp-tests",
+      "legacy",
+      "provider-wait-source.epub",
+    );
+    const persistedBookId = batchBookId(sourceHash, persistedSourceIdentityPath);
+    const driftBookId = `${persistedBookId}-catalog-drift`;
+    const persistedNormalizedPath = join(stateRoot, "input", "provider-wait.md");
+    await writeQmdBuildFixture({
+      tmpRoot,
+      stateRoot,
+      configDir,
+      runId,
+      itemId,
+      bookId: persistedBookId,
+      sourceRelativePath,
+      sourceHash,
+      normalizedPath: persistedNormalizedPath,
+    });
+    await writeProviderAuthReopenGraphFixture({
+      stateRoot,
+      bookId: persistedBookId,
+      sourceHash,
+    });
+    const catalogPath = join(stateRoot, "catalog", "books.yaml");
+    const catalog = YAML.parse(readFileSync(catalogPath, "utf8"));
+    catalog.items.push({
+      ...catalog.items[0],
+      bookId: driftBookId,
+      documentId: `doc-${driftBookId}`,
+      sourcePath: `sources/${driftBookId}/source.epub`,
+      metadata: { sourceIdentityPath: sourceRelativePath },
+      normalizedPath: `books/${driftBookId}/input/book.md`,
+      createdAt: "2026-05-23T00:00:02.000Z",
+      updatedAt: "2026-05-23T00:00:03.000Z",
+    });
+    await writeFile(catalogPath, YAML.stringify(catalog));
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "running",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        pendingItems: 1,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 0,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "pending",
+        sourceName: "Book.epub",
+        sourceRelativePath,
+        sourceIdentityPath: persistedSourceIdentityPath,
+        sourceHash,
+        normalizedPath: relative(projectRoot, persistedNormalizedPath),
+        bookId: persistedBookId,
+        attempts: 12,
+        retryStartedAt: "2026-05-23T00:00:00.000Z",
+        failureKind: "transient",
+        retryable: true,
+        retryExhausted: false,
+        recoveryDecision: "retry_same_run_id",
+        failedStage: "resume-book-2",
+        nextRetryAt: "2099-01-01T00:00:00.000Z",
+        retryDelaySeconds: 300,
+        errorSummary: "GraphRAG provider recovery wait",
+        commandChecks: [],
+        metadata: {
+          waitingForProviderRecovery: true,
+          providerRecoveryWaitCount: 9,
+          maxProviderRecoveryWaits: 1,
+        },
+      }),
+    );
+
+    const result = await new Promise<{ stderr: string; exitCode: number | null }>(
+      (resolveResult) => {
+        const proc = spawn(process.execPath, [
+          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+          "--source-dir",
+          sourceDir,
+          "--state-root",
+          stateRoot,
+          "--log-root",
+          logRoot,
+          "--config",
+          join(configDir, "index.yml"),
+          "--qmd-index-path",
+          join(tmpRoot, "index.sqlite"),
+          "--run-id",
+          runId,
+          "--skip-dotenv",
+          "--max-provider-recovery-waits",
+          "1",
+        ]);
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+        proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+      },
+    );
+
+    const checkpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      "utf8",
+    ));
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toBe("");
+    expect(checkpoint).toMatchObject({
+      status: "pending",
+      bookId: persistedBookId,
+      sourceIdentityPath: persistedSourceIdentityPath,
+      normalizedPath: relative(projectRoot, persistedNormalizedPath),
+      qmdBuildStatus: { status: "succeeded", bookId: persistedBookId },
+      graphBuildStatus: { status: "succeeded" },
+    });
+    expect(checkpoint.bookId).not.toBe(driftBookId);
+    expect(checkpoint.graphBuildStatus.artifactIds.every((artifactId: string) =>
+      artifactId.includes(persistedBookId)
+    )).toBe(true);
+    expect(JSON.stringify(checkpoint.graphBuildStatus)).not.toContain(driftBookId);
+  });
+
   test("status-json recovers legacy stop-until-fixed transient failures", async () => {
     const tmpRoot = await mkProjectTmpDir("qmd-batch-legacy-stop-transient-");
     const sourceDir = join(tmpRoot, "source");
@@ -3531,6 +4150,174 @@ describe("GraphRAG EPUB batch runner", () => {
       maxProviderRecoveryWaits: 3,
       providerRecoveryReason: "retry_budget_window_elapsed",
     });
+  });
+
+  test("status-json recovers GraphRAG query provider_unavailable as provider transient", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-graphrag-query-provider-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "graphrag-query-provider-unavailable";
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sourcePath = join(sourceDir, "Book.epub");
+    const secondPath = join(sourceDir, "Second.epub");
+    const sourceBytes = "graph query provider unavailable";
+    const secondBytes = "pending after graph query provider unavailable";
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(secondPath, secondBytes);
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    const secondHash = createHash("sha256").update(secondBytes).digest("hex");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const secondRelativePath = relative(projectRoot, secondPath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const secondItemId = `item-${secondHash.slice(0, 12)}-${
+      createHash("sha256").update(secondRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const bookId = batchBookId(sourceHash, sourceRelativePath);
+    const normalizedPath = join(stateRoot, "input", "book.md");
+    await writeQmdBuildFixture({
+      tmpRoot,
+      stateRoot,
+      configDir,
+      runId,
+      itemId,
+      bookId,
+      sourceRelativePath,
+      sourceHash,
+      normalizedPath,
+    });
+    await writeProviderAuthReopenGraphFixture({ stateRoot, bookId, sourceHash });
+    const errorSummary = JSON.stringify({
+      schemaVersion: "1.0.0",
+      route: "graphrag",
+      stage: "graphrag_query",
+      provider: "graphrag",
+      capability: "graph_query",
+      code: "provider_unavailable",
+      retryable: false,
+      redactedMessage:
+        "GraphRAG query provider failed before returning a response.",
+    }, null, 2);
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 2,
+        pendingItems: 1,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId, secondItemId],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "failed",
+        sourceName: "Book.epub",
+        sourceRelativePath,
+        sourceIdentityPath: sourceRelativePath,
+        sourceHash,
+        normalizedPath: relative(projectRoot, normalizedPath),
+        bookId,
+        attempts: 1,
+        failedAt: "2026-05-23T00:10:00.000Z",
+        failureKind: "unknown",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "qmd-query-graphrag-json",
+        errorSummary,
+        metadata: { waitingForProviderRecovery: false },
+        commandChecks: [{
+          name: "qmd-query-graphrag-json",
+          status: "failed",
+          attempts: 1,
+          exitCode: 1,
+          stdoutBytes: 0,
+          stderrBytes: errorSummary.length,
+          startedAt: "2026-05-23T00:00:00.000Z",
+          completedAt: "2026-05-23T00:01:00.000Z",
+          retryDelaySeconds: 31,
+          failureKind: "unknown",
+          retryable: false,
+          attemptExhausted: true,
+          recoveryDecision: "stop_until_fixed",
+          errorSummary,
+        }],
+      }),
+    );
+
+    const result = await runBatchStatusJson({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      logRoot,
+      configDir,
+      runId,
+      args: ["--skip-dotenv"],
+    });
+
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    const recovered = summary.items.find((item: { itemId: string }) =>
+      item.itemId === itemId
+    );
+    expect(summary.recoveryDecision).toBe("retry_same_run_id");
+    expect(summary.retryableItemCount).toBe(1);
+    expect(summary.manifest).toMatchObject({
+      pendingItems: 2,
+      completedItems: 0,
+      failedItems: 0,
+    });
+    expect(recovered).toMatchObject({
+      status: "pending",
+      failureKind: "transient",
+      retryable: true,
+      retryExhausted: false,
+      recoveryDecision: "retry_same_run_id",
+      failedStage: "qmd-query-graphrag-json",
+      waitingForProviderRecovery: true,
+      providerRecoveryWaitCount: 1,
+      maxProviderRecoveryWaits: 3,
+      providerRecoveryReason: expect.any(String),
+      qmdBuildStatus: { status: "succeeded", bookId },
+      commandCheckStatus: {
+        status: "failed",
+        stage: "qmd-query-graphrag-json",
+      },
+      graphBuildStatus: { status: "succeeded", stage: "query_ready" },
+      graphQueryStatus: {
+        status: "failed",
+        stage: "qmd-query-graphrag-json",
+      },
+    });
+    expect(recovered.nextRetryAt).toEqual(expect.any(String));
+    expect(recovered.retryDelaySeconds).toBeGreaterThan(0);
+    expect(recovered.errorSummary).toContain("\"code\": \"provider_unavailable\"");
   });
 
   test("status-json keeps local GraphRAG artifact gate failures stop-until-fixed", async () => {
@@ -3887,7 +4674,8 @@ describe("GraphRAG EPUB batch runner", () => {
         env: {
           ...process.env,
           QMD_FAKE_RESUME_MARKER: markerPath,
-          QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+          QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
+            QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
           QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
         },
       });
@@ -4126,7 +4914,8 @@ describe("GraphRAG EPUB batch runner", () => {
         env: {
           ...process.env,
           QMD_FAKE_RESUME_MARKER: markerPath,
-          QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+          QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
+            QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
           QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
         },
       });
@@ -4398,7 +5187,8 @@ describe("GraphRAG EPUB batch runner", () => {
       ], {
         env: {
           ...process.env,
-          QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+          QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
+            QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
           QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
         },
       });
@@ -4596,6 +5386,7 @@ describe("GraphRAG EPUB batch runner", () => {
         ], {
           env: {
             ...process.env,
+            QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
             QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
             QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
           },
@@ -4744,6 +5535,7 @@ describe("GraphRAG EPUB batch runner", () => {
         ], {
           env: {
             ...process.env,
+            QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
             QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
             QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
           },
@@ -4842,6 +5634,7 @@ describe("GraphRAG EPUB batch runner", () => {
         ], {
           env: {
             ...process.env,
+            QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
             QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
             QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
           },
@@ -4997,6 +5790,7 @@ describe("GraphRAG EPUB batch runner", () => {
         ], {
           env: {
             ...process.env,
+            QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
             QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
             QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
           },
@@ -5160,6 +5954,7 @@ describe("GraphRAG EPUB batch runner", () => {
         ], {
           env: {
             ...process.env,
+            QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
             QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
             QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
           },
@@ -5674,6 +6469,170 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(summary.counts).toMatchObject({ failed: 1, pending: 1 });
   });
 
+  test("generic stop-until-fixed failure stops before next book", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-generic-stop-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "generic-stop-until-fixed";
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    await writeFile(join(sourceDir, "A-Failed.epub"), "failed generic");
+    await writeFile(join(sourceDir, "B-Pending.epub"), "pending should not run");
+
+    const firstPath = join(sourceDir, "A-Failed.epub");
+    const secondPath = join(sourceDir, "B-Pending.epub");
+    const firstHash = createHash("sha256").update("failed generic").digest("hex");
+    const secondHash = createHash("sha256")
+      .update("pending should not run")
+      .digest("hex");
+    const firstRelativePath = relative(projectRoot, firstPath);
+    const secondRelativePath = relative(projectRoot, secondPath);
+    const firstItemId = `item-${firstHash.slice(0, 12)}-${
+      createHash("sha256").update(firstRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const secondItemId = `item-${secondHash.slice(0, 12)}-${
+      createHash("sha256").update(secondRelativePath).digest("hex").slice(0, 8)
+    }`;
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 2,
+        pendingItems: 1,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [firstItemId, secondItemId],
+      }),
+    );
+    const permanentError = "search output contract mismatch";
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${firstItemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId: firstItemId,
+        runId,
+        status: "failed",
+        sourceName: "A-Failed.epub",
+        sourceRelativePath: firstRelativePath,
+        sourceIdentityPath: firstRelativePath,
+        sourceHash: firstHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "failed.md"),
+        bookId: batchBookId(firstHash, firstRelativePath),
+        attempts: 1,
+        failedAt: "2026-05-23T00:10:00.000Z",
+        failureKind: "permanent",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "qmd-search-json",
+        errorSummary: permanentError,
+        commandChecks: [{
+          name: "qmd-search-json",
+          status: "failed",
+          attempts: 1,
+          exitCode: 1,
+          stdoutBytes: 0,
+          stderrBytes: permanentError.length,
+          startedAt: "2026-05-23T00:00:00.000Z",
+          completedAt: "2026-05-23T00:01:00.000Z",
+          failureKind: "permanent",
+          retryable: false,
+          attemptExhausted: true,
+          recoveryDecision: "stop_until_fixed",
+          errorSummary: permanentError,
+        }],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${secondItemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId: secondItemId,
+        runId,
+        status: "pending",
+        sourceName: "B-Pending.epub",
+        sourceRelativePath: secondRelativePath,
+        sourceIdentityPath: secondRelativePath,
+        sourceHash: secondHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "pending.md"),
+        bookId: batchBookId(secondHash, secondRelativePath),
+        attempts: 0,
+        recoveryDecision: "none",
+        commandChecks: [],
+      }),
+    );
+
+    const result = await new Promise<{ stderr: string; exitCode: number | null }>(
+      (resolveResult) => {
+        const proc = spawn(process.execPath, [
+          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+          "--source-dir",
+          sourceDir,
+          "--state-root",
+          stateRoot,
+          "--log-root",
+          logRoot,
+          "--config",
+          join(configDir, "index.yml"),
+          "--qmd-index-path",
+          join(tmpRoot, "index.sqlite"),
+          "--run-id",
+          runId,
+          "--skip-dotenv",
+        ]);
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+        proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+      },
+    );
+
+    const events = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
+      "utf8",
+    ).trim().split("\n").map((line) => JSON.parse(line));
+    const summary = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "recovery-summary.json"),
+      "utf8",
+    ));
+    const secondCheckpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${secondItemId}.json`),
+      "utf8",
+    ));
+
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toBe("");
+    expect(events.some((event) =>
+      event.event === "batch_stopped_after_non_transient_failure" &&
+      event.itemId === firstItemId &&
+      event.metadata?.stopReason === "non_transient"
+    )).toBe(true);
+    expect(events.some((event) =>
+      event.event === "command_start" &&
+      event.itemId === secondItemId
+    )).toBe(false);
+    expect(secondCheckpoint).toMatchObject({ status: "pending", attempts: 0 });
+    expect(summary.recoveryDecision).toBe("stop_until_fixed");
+    expect(summary.counts).toMatchObject({ failed: 1, pending: 1 });
+  });
+
   test("unrecoverable provider auth failure stops before next book", async () => {
     const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-auth-stop-");
     const sourceDir = join(tmpRoot, "source");
@@ -5873,6 +6832,1585 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(summary.counts).toMatchObject({ failed: 1, pending: 1 });
   });
 
+  test("provider auth repair reopens legacy checkpoint once and reruns closed loop", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-auth-reopen-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "provider-auth-reopen";
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    await writeFile(
+      join(tmpRoot, ".env"),
+      [
+        "OPENAI_API_KEY=repaired-openai-key",
+        "OPENAI_BASE_URL=https://api.openai.example",
+        "JINA_API_KEY=repaired-jina-key",
+        "JINA_API_BASE=https://api.jina.example",
+      ].join("\n"),
+    );
+    await writeFile(
+      join(stateRoot, ".env"),
+      [
+        "OPENAI_API_KEY=repaired-openai-key",
+        "OPENAI_BASE_URL=https://api.openai.example",
+        "JINA_API_KEY=repaired-jina-key",
+        "JINA_API_BASE=https://api.jina.example",
+      ].join("\n"),
+    );
+
+    const sourcePath = join(sourceDir, "A-Auth.epub");
+    await writeMinimalEpubFixture(sourcePath, "A Auth");
+    const sourceHash = createHash("sha256")
+      .update(readFileSync(sourcePath))
+      .digest("hex");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const bookId = batchBookId(sourceHash, sourceRelativePath);
+    await writeProviderAuthReopenGraphFixture({ stateRoot, bookId, sourceHash });
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        pendingItems: 0,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    const providerError =
+      "Error code: 401 - {'code': 'INVALID_API_KEY', " +
+      "'message': 'Invalid API key'}";
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "failed",
+        sourceName: "A-Auth.epub",
+        sourceRelativePath,
+        sourceIdentityPath: sourceRelativePath,
+        sourceHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "a-auth.md"),
+        bookId,
+        attempts: 1,
+        failedAt: "2026-05-23T00:10:00.000Z",
+        failureKind: "permanent",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "resume-book-1",
+        errorSummary: providerError,
+        commandChecks: [{
+          name: "resume-book-1",
+          status: "failed",
+          attempts: 1,
+          exitCode: 1,
+          stdoutBytes: 0,
+          stderrBytes: 120,
+          startedAt: "2026-05-23T00:00:00.000Z",
+          completedAt: "2026-05-23T00:01:00.000Z",
+          failureKind: "permanent",
+          retryable: false,
+          attemptExhausted: true,
+          providerStatusCode: 401,
+          recoveryDecision: "stop_until_fixed",
+          errorSummary: providerError,
+        }],
+      }),
+    );
+    const resumeScript = join(tmpRoot, "fake-ready-resume.mjs");
+    await writeFile(
+      resumeScript,
+      [
+        "const sourceIndex = process.argv.indexOf('--source-path');",
+        "const sourcePath = sourceIndex >= 0 ? process.argv[sourceIndex + 1] : '';",
+        "const name = sourcePath.includes('A-Auth.epub') ? 'A-Auth.epub' : sourcePath;",
+        "console.log(JSON.stringify({ status: 'ready', bookId: process.env.TEST_BOOK_ID, sourceName: name }));",
+      ].join("\n"),
+    );
+    const qmdScript = join(tmpRoot, "fake-qmd.mjs");
+    await writeFile(
+      qmdScript,
+      [
+        "import { mkdirSync, writeFileSync } from 'node:fs';",
+        "import { dirname } from 'node:path';",
+        "const args = process.argv.slice(2);",
+        "if (process.env.INDEX_PATH) {",
+        "  mkdirSync(dirname(process.env.INDEX_PATH), { recursive: true });",
+        "  writeFileSync(process.env.INDEX_PATH, 'fake qmd index\\n');",
+        "}",
+        "if (args.includes('--version')) console.log('qmd-test 1.0.0');",
+        "else if (args.includes('--json')) console.log('{}');",
+        "else if (args.includes('--csv')) console.log('title');",
+        "else if (args.includes('--xml')) console.log('<ok/>');",
+        "else if (args.includes('--md')) console.log('# ok');",
+        "else console.log('ok');",
+      ].join("\n"),
+    );
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--max-command-attempts",
+        "1",
+        "--max-resume-passes",
+        "1",
+      ], {
+        cwd: tmpRoot,
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+          QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
+            QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+          QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
+          QMD_GRAPHRAG_TEST_QMD_RUNNER: "1",
+          QMD_GRAPHRAG_QMD_RUNNER: qmdScript,
+          TEST_BOOK_ID: bookId,
+          OPENAI_API_KEY: "repaired-openai-key",
+          OPENAI_BASE_URL: "https://api.openai.example",
+          JINA_API_KEY: "repaired-jina-key",
+          JINA_API_BASE: "https://api.jina.example",
+        },
+      });
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => { stdout += String(chunk); });
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    const checkpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      "utf8",
+    ));
+    const events = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
+      "utf8",
+    ).trim().split("\n").map((line) => JSON.parse(line));
+    const summary = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "recovery-summary.json"),
+      "utf8",
+    ));
+    await rm(tmpRoot, { recursive: true, force: true });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(checkpoint.status).toBe("completed");
+    expect(checkpoint.commandChecks.map((check: { name: string }) => check.name))
+      .toEqual([
+        ...requiredBatchCommandCheckNames.filter((name) =>
+          name !== "qmd-query-auto-json" &&
+          name !== "qmd-query-graphrag-json"
+        ),
+        "qmd-query-auto-json",
+        "qmd-query-graphrag-json",
+      ]);
+    expect(checkpoint.metadata).toMatchObject({
+      providerAuthReopenDecision: "reopen_legacy_provider_auth_key_present",
+      providerAuthReopenEligible: true,
+      legacyProviderAuthFingerprintMissing: true,
+      normalCommandChecksRequired: true,
+    });
+    expect(events.some((event) =>
+      event.itemId === itemId &&
+      event.event === "item_provider_auth_reopened" &&
+      event.status === "pending" &&
+      event.metadata?.providerAuthRequiredKeys?.includes("OPENAI_API_KEY")
+    )).toBe(true);
+    expect(events.some((event) =>
+      event.itemId === itemId &&
+      event.event === "resume_pass_completed"
+    )).toBe(true);
+    expect(summary.recoveryDecision).toBe("none");
+    expect(summary.counts).toMatchObject({ completed: 1 });
+    const serializedState = JSON.stringify({ checkpoint, events, summary });
+    expect(serializedState).not.toContain("repaired-openai-key");
+    expect(serializedState).not.toContain("repaired-jina-key");
+  });
+
+  test("provider auth reopen preserves checkpoint identity during catalog drift", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-auth-identity-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "provider-auth-identity";
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    await writeFile(
+      join(tmpRoot, ".env"),
+      [
+        "OPENAI_API_KEY=identity-openai-key",
+        "OPENAI_BASE_URL=https://api.openai.example",
+        "JINA_API_KEY=identity-jina-key",
+        "JINA_API_BASE=https://api.jina.example",
+      ].join("\n"),
+    );
+    await writeFile(
+      join(stateRoot, ".env"),
+      [
+        "OPENAI_API_KEY=identity-openai-key",
+        "OPENAI_BASE_URL=https://api.openai.example",
+        "JINA_API_KEY=identity-jina-key",
+        "JINA_API_BASE=https://api.jina.example",
+      ].join("\n"),
+    );
+
+    const firstSourcePath = join(sourceDir, "A-Auth.epub");
+    const secondSourcePath = join(sourceDir, "B-Auth.epub");
+    await writeMinimalEpubFixture(firstSourcePath, "A Auth");
+    await writeMinimalEpubFixture(secondSourcePath, "B Auth");
+    const firstSourceHash = createHash("sha256")
+      .update(readFileSync(firstSourcePath))
+      .digest("hex");
+    const secondSourceHash = createHash("sha256")
+      .update(readFileSync(secondSourcePath))
+      .digest("hex");
+    const firstSourceRelativePath = relative(projectRoot, firstSourcePath);
+    const secondSourceRelativePath = relative(projectRoot, secondSourcePath);
+    const firstItemId = `item-${firstSourceHash.slice(0, 12)}-${
+      createHash("sha256").update(firstSourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const secondItemId = `item-${secondSourceHash.slice(0, 12)}-${
+      createHash("sha256").update(secondSourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const persistedSourceIdentityPath = join(
+      ".tmp-tests",
+      "legacy",
+      "provider-auth-source.epub",
+    );
+    const persistedBookId = batchBookId(firstSourceHash, persistedSourceIdentityPath);
+    const driftBookId = `${persistedBookId}-catalog-drift`;
+    const secondBookId = batchBookId(secondSourceHash, secondSourceRelativePath);
+    const persistedNormalizedPath = join(stateRoot, "input", "provider-auth.md");
+    await writeQmdBuildFixture({
+      tmpRoot,
+      stateRoot,
+      configDir,
+      runId,
+      itemId: firstItemId,
+      bookId: persistedBookId,
+      sourceName: "A-Auth.epub",
+      sourceRelativePath: firstSourceRelativePath,
+      sourceHash: firstSourceHash,
+      normalizedPath: persistedNormalizedPath,
+    });
+    await writeProviderAuthReopenGraphFixture({
+      stateRoot,
+      bookId: persistedBookId,
+      sourceHash: firstSourceHash,
+    });
+    const catalogPath = join(stateRoot, "catalog", "books.yaml");
+    const catalog = YAML.parse(readFileSync(catalogPath, "utf8"));
+    catalog.items.push({
+      ...catalog.items[0],
+      bookId: driftBookId,
+      documentId: `doc-${driftBookId}`,
+      sourcePath: `sources/${driftBookId}/source.epub`,
+      metadata: { sourceIdentityPath: firstSourceRelativePath },
+      normalizedPath: `books/${driftBookId}/input/book.md`,
+      createdAt: "2026-05-23T00:00:02.000Z",
+      updatedAt: "2026-05-23T00:00:03.000Z",
+    });
+    await writeFile(catalogPath, YAML.stringify(catalog));
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 2,
+        pendingItems: 0,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 2,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [firstItemId, secondItemId],
+      }),
+    );
+    const providerError =
+      "Error code: 401 - {'code': 'INVALID_API_KEY', " +
+      "'message': 'Invalid API key'}";
+    const failedProviderCheck = {
+      name: "resume-book-1",
+      status: "failed",
+      attempts: 1,
+      exitCode: 1,
+      stdoutBytes: 0,
+      stderrBytes: 120,
+      startedAt: "2026-05-23T00:00:00.000Z",
+      completedAt: "2026-05-23T00:01:00.000Z",
+      failureKind: "permanent",
+      retryable: false,
+      attemptExhausted: true,
+      providerStatusCode: 401,
+      recoveryDecision: "stop_until_fixed",
+      errorSummary: providerError,
+    };
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${firstItemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId: firstItemId,
+        runId,
+        status: "failed",
+        sourceName: "A-Auth.epub",
+        sourceRelativePath: firstSourceRelativePath,
+        sourceIdentityPath: persistedSourceIdentityPath,
+        sourceHash: firstSourceHash,
+        normalizedPath: relative(projectRoot, persistedNormalizedPath),
+        bookId: persistedBookId,
+        attempts: 1,
+        failedAt: "2026-05-23T00:10:00.000Z",
+        failureKind: "permanent",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "resume-book-1",
+        errorSummary: providerError,
+        commandChecks: [failedProviderCheck],
+        metadata: {
+          providerAuthFailureFingerprint: "old-provider-auth-fingerprint",
+        },
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${secondItemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId: secondItemId,
+        runId,
+        status: "failed",
+        sourceName: "B-Auth.epub",
+        sourceRelativePath: secondSourceRelativePath,
+        sourceIdentityPath: secondSourceRelativePath,
+        sourceHash: secondSourceHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "b-auth.md"),
+        bookId: secondBookId,
+        attempts: 1,
+        failedAt: "2026-05-23T00:10:00.000Z",
+        failureKind: "permanent",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "resume-book-1",
+        errorSummary: providerError,
+        commandChecks: [failedProviderCheck],
+        metadata: {
+          providerAuthFailureFingerprint: "old-provider-auth-fingerprint",
+          providerAuthReopenAttemptCount: 3,
+        },
+      }),
+    );
+
+    const result = await new Promise<{ stderr: string; exitCode: number | null }>(
+      (resolveResult) => {
+        const proc = spawn(process.execPath, [
+          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+          "--source-dir",
+          sourceDir,
+          "--state-root",
+          stateRoot,
+          "--log-root",
+          logRoot,
+          "--config",
+          join(configDir, "index.yml"),
+          "--qmd-index-path",
+          join(tmpRoot, "index.sqlite"),
+          "--run-id",
+          runId,
+          "--skip-dotenv",
+        ], {
+          cwd: tmpRoot,
+          env: {
+            PATH: process.env.PATH ?? "",
+            HOME: process.env.HOME ?? "",
+            OPENAI_API_KEY: "identity-openai-key",
+            OPENAI_BASE_URL: "https://api.openai.example",
+            JINA_API_KEY: "identity-jina-key",
+            JINA_API_BASE: "https://api.jina.example",
+          },
+        });
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+        proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+      },
+    );
+
+    const firstCheckpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${firstItemId}.json`),
+      "utf8",
+    ));
+    const secondCheckpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${secondItemId}.json`),
+      "utf8",
+    ));
+    const events = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
+      "utf8",
+    ).trim().split("\n").map((line) => JSON.parse(line));
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toBe("");
+    expect(firstCheckpoint).toMatchObject({
+      status: "pending",
+      bookId: persistedBookId,
+      sourceIdentityPath: persistedSourceIdentityPath,
+      normalizedPath: relative(projectRoot, persistedNormalizedPath),
+      qmdBuildStatus: { status: "succeeded", bookId: persistedBookId },
+      graphBuildStatus: { status: "succeeded" },
+    });
+    expect(firstCheckpoint.bookId).not.toBe(driftBookId);
+    expect(firstCheckpoint.graphBuildStatus.artifactIds.every((artifactId: string) =>
+      artifactId.includes(persistedBookId)
+    )).toBe(true);
+    expect(JSON.stringify(firstCheckpoint.graphBuildStatus)).not.toContain(driftBookId);
+    expect(secondCheckpoint.status).toBe("failed");
+    expect(events.some((event) =>
+      event.itemId === firstItemId &&
+      event.event === "item_provider_auth_reopened"
+    )).toBe(true);
+  });
+
+  test("status-json blocks provider auth reopen when shell env shadows dotenv", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-auth-shadow-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "provider-auth-shadow";
+    const { itemId } = await writeProviderAuthStoppedBatchFixture({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      configDir,
+      runId,
+    });
+    const checkpointBefore = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      "utf8",
+    );
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--status-json",
+      ], {
+        cwd: tmpRoot,
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+          OPENAI_API_KEY: "shadow-openai-key",
+          OPENAI_BASE_URL: "https://api.openai.example",
+          JINA_API_KEY: "file-jina-key",
+          JINA_API_BASE: "https://api.jina.example",
+        },
+      });
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => { stdout += String(chunk); });
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    const checkpointAfter = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      "utf8",
+    );
+    await rm(tmpRoot, { recursive: true, force: true });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(checkpointAfter).toBe(checkpointBefore);
+    const summary = JSON.parse(result.stdout);
+    expect(summary.items[0]).toMatchObject({
+      status: "failed",
+      providerAuthReopenDecision: "blocked_provider_auth_not_ready",
+      providerAuthReopenEligible: false,
+      providerAuthReopenBlockedReason: "process_env_shadows_dotenv",
+    });
+    const serialized = JSON.stringify(summary);
+    expect(serialized).not.toContain("shadow-openai-key");
+    expect(serialized).not.toContain("file-openai-key");
+  });
+
+  test("status-json blocks provider auth reopen when observed endpoint env shadows dotenv", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-auth-endpoint-shadow-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "provider-auth-endpoint-shadow";
+    await writeProviderAuthStoppedBatchFixture({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      configDir,
+      runId,
+    });
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--status-json",
+      ], {
+        cwd: tmpRoot,
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+          OPENAI_API_KEY: "file-openai-key",
+          OPENAI_BASE_URL: "https://api.openai.example",
+          JINA_API_KEY: "file-jina-key",
+          JINA_API_BASE: "https://shadow.jina.example",
+        },
+      });
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => { stdout += String(chunk); });
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    await rm(tmpRoot, { recursive: true, force: true });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary.items[0]).toMatchObject({
+      status: "failed",
+      providerAuthReopenDecision: "blocked_provider_auth_not_ready",
+      providerAuthReopenEligible: false,
+      providerAuthReopenBlockedReason: "process_env_shadows_dotenv",
+      providerAuthCredentialSources: {
+        JINA_API_BASE: "process_env_shadows_dotenv",
+      },
+    });
+    expect(summary.items[0].providerAuthShadowedEnvNames)
+      .toContain("JINA_API_BASE");
+    const serialized = JSON.stringify(summary);
+    expect(serialized).not.toContain("https://shadow.jina.example");
+    expect(serialized).not.toContain("https://api.jina.example");
+  });
+
+  test("status-json current provider auth readiness overrides stale reopen metadata", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-auth-stale-ready-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "provider-auth-stale-ready";
+    await writeProviderAuthStoppedBatchFixture({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      configDir,
+      runId,
+      metadata: {
+        providerAuthReopenDecision: "reopen_legacy_provider_auth_key_present",
+        providerAuthReopenEligible: true,
+        providerAuthReopenReason: "legacy_provider_auth_failure_key_present",
+        currentProviderAuthFingerprint: "old-fingerprint",
+        providerAuthReadinessStatus: "ready",
+      },
+    });
+
+    const result = await runBatchStatusJson({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      logRoot,
+      configDir,
+      runId,
+      args: ["--skip-dotenv"],
+      env: {
+        OPENAI_API_KEY: "shadow-openai-key",
+        OPENAI_BASE_URL: "https://api.openai.example",
+        JINA_API_KEY: "file-jina-key",
+        JINA_API_BASE: "https://api.jina.example",
+      },
+    });
+
+    await rm(tmpRoot, { recursive: true, force: true });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary.items[0]).toMatchObject({
+      status: "failed",
+      providerAuthReopenDecision: "blocked_provider_auth_not_ready",
+      providerAuthReopenEligible: false,
+      providerAuthReopenBlockedReason: "process_env_shadows_dotenv",
+      providerAuthReadinessStatus: "process_env_shadows_dotenv",
+    });
+    expect(summary.items[0].providerAuthReopenReason).toBeUndefined();
+    expect(summary.items[0].providerAuthShadowedEnvNames)
+      .toContain("OPENAI_API_KEY");
+    const serialized = JSON.stringify(summary);
+    expect(serialized).not.toContain("shadow-openai-key");
+    expect(serialized).not.toContain("file-openai-key");
+  });
+
+  test("test qmd runner hook is not activated from dotenv", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-test-hook-dotenv-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "test-hook-dotenv";
+    const { itemId, bookId, sourceHash } = await writeProviderAuthStoppedBatchFixture({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      configDir,
+      runId,
+    });
+    await writeProviderAuthReopenGraphFixture({
+      stateRoot,
+      bookId,
+      sourceHash,
+    });
+    const resumeScript = join(tmpRoot, "fake-ready-resume.mjs");
+    await writeFile(
+      resumeScript,
+      "console.log(JSON.stringify({ status: 'ready' }));\n",
+    );
+    const qmdScript = join(tmpRoot, "fake-qmd.mjs");
+    await writeFile(
+      qmdScript,
+      [
+        "await import('node:fs').then(fs => fs.writeFileSync(process.env.HOOK_MARKER, 'ran'));",
+        "console.log('qmd-test');",
+      ].join("\n"),
+    );
+    const hookMarker = join(tmpRoot, "hook-marker.txt");
+    await writeFile(
+      join(stateRoot, ".env"),
+      [
+        "OPENAI_API_KEY=file-openai-key",
+        "OPENAI_BASE_URL=https://api.openai.example",
+        "JINA_API_KEY=file-jina-key",
+        "JINA_API_BASE=https://api.jina.example",
+        "QMD_GRAPHRAG_ENABLE_TEST_HOOKS=1",
+        "QMD_GRAPHRAG_TEST_QMD_RUNNER=1",
+        `QMD_GRAPHRAG_QMD_RUNNER=${qmdScript}`,
+      ].join("\n"),
+    );
+
+    const result = await new Promise<{
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--max-command-attempts",
+        "1",
+        "--max-resume-passes",
+        "1",
+      ], {
+        cwd: tmpRoot,
+        env: {
+          PATH: "/nonexistent",
+          HOME: process.env.HOME ?? "",
+          QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
+          QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+          QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
+          HOOK_MARKER: hookMarker,
+        },
+      });
+      let stderr = "";
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+    });
+
+    const checkpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      "utf8",
+    ));
+    const hookMarkerExists = existsSync(hookMarker);
+    await rm(tmpRoot, { recursive: true, force: true });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toBe("");
+    expect(hookMarkerExists).toBe(false);
+    expect(checkpoint.status).not.toBe("completed");
+  });
+
+  test("provider auth status-json lets graph_vault dotenv override root dotenv", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-auth-vault-env-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "provider-auth-vault-env";
+    const { itemId } = await writeProviderAuthStoppedBatchFixture({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      configDir,
+      runId,
+    });
+    await writeFile(
+      join(tmpRoot, ".env"),
+      [
+        "OPENAI_API_KEY=root-openai-key",
+        "OPENAI_BASE_URL=https://root.openai.example",
+        "JINA_API_KEY=root-jina-key",
+        "JINA_API_BASE=https://root.jina.example",
+      ].join("\n"),
+    );
+    await writeFile(
+      join(stateRoot, ".env"),
+      [
+        "OPENAI_API_KEY=vault-openai-key",
+        "OPENAI_BASE_URL=https://vault.openai.example",
+        "JINA_API_KEY=vault-jina-key",
+        "JINA_API_BASE=https://vault.jina.example",
+      ].join("\n"),
+    );
+    const checkpointBefore = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      "utf8",
+    );
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--project-dotenv",
+        join(tmpRoot, ".env"),
+        "--run-id",
+        runId,
+        "--status-json",
+      ], {
+        cwd: tmpRoot,
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+        },
+      });
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => { stdout += String(chunk); });
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    const checkpointAfter = readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      "utf8",
+    );
+    await rm(tmpRoot, { recursive: true, force: true });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(checkpointAfter).toBe(checkpointBefore);
+    const summary = JSON.parse(result.stdout);
+    expect(summary.items[0]).toMatchObject({
+      status: "failed",
+      providerAuthReopenDecision: "reopen_legacy_provider_auth_key_present",
+      providerAuthReopenEligible: true,
+      providerAuthCredentialSources: {
+        OPENAI_API_KEY: "graph_vault_dotenv_shadows_project_dotenv",
+        OPENAI_BASE_URL: "graph_vault_dotenv_shadows_project_dotenv",
+        JINA_API_KEY: "graph_vault_dotenv_shadows_project_dotenv",
+        JINA_API_BASE: "graph_vault_dotenv_shadows_project_dotenv",
+      },
+    });
+    expect(summary.items[0].providerAuthDotenvShadowedEnvNames)
+      .toEqual(["JINA_API_BASE", "JINA_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL"]);
+    const serialized = JSON.stringify(summary);
+    for (const secret of [
+      "root-openai-key",
+      "root-jina-key",
+      "vault-openai-key",
+      "vault-jina-key",
+      "https://root.openai.example",
+      "https://vault.openai.example",
+    ]) {
+      expect(serialized).not.toContain(secret);
+    }
+  });
+
+  test("provider auth status-json blocks missing OpenAI base URL", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-auth-missing-base-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "provider-auth-missing-base";
+    const { itemId } = await writeProviderAuthStoppedBatchFixture({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      configDir,
+      runId,
+    });
+    await writeFile(
+      join(stateRoot, ".env"),
+      [
+        "OPENAI_API_KEY=file-openai-key",
+        "JINA_API_KEY=file-jina-key",
+        "JINA_API_BASE=https://api.jina.example",
+      ].join("\n"),
+    );
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--status-json",
+      ], {
+        cwd: tmpRoot,
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+          OPENAI_API_KEY: "file-openai-key",
+          JINA_API_KEY: "file-jina-key",
+          JINA_API_BASE: "https://api.jina.example",
+        },
+      });
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => { stdout += String(chunk); });
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    await rm(tmpRoot, { recursive: true, force: true });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary.items[0]).toMatchObject({
+      status: "failed",
+      providerAuthReopenDecision: "blocked_provider_auth_not_ready",
+      providerAuthReopenEligible: false,
+      providerAuthReopenBlockedReason: "missing_required_keys",
+    });
+    expect(summary.items[0].providerAuthRequiredEndpoints)
+      .toEqual(["OPENAI_BASE_URL"]);
+    expect(summary.items[0].providerAuthMissingRequiredKeys)
+      .toEqual(["OPENAI_BASE_URL"]);
+  });
+
+  test("provider auth status-json blocks missing OpenAI API key", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-auth-missing-key-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "provider-auth-missing-key";
+    await writeProviderAuthStoppedBatchFixture({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      configDir,
+      runId,
+    });
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--status-json",
+      ], {
+        cwd: tmpRoot,
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+          OPENAI_BASE_URL: "https://api.openai.example",
+          JINA_API_KEY: "file-jina-key",
+          JINA_API_BASE: "https://api.jina.example",
+        },
+      });
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => { stdout += String(chunk); });
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    await rm(tmpRoot, { recursive: true, force: true });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary.items[0]).toMatchObject({
+      providerAuthReopenDecision: "blocked_provider_auth_not_ready",
+      providerAuthReopenEligible: false,
+      providerAuthReopenBlockedReason: "missing_required_keys",
+    });
+    expect(summary.items[0].providerAuthMissingRequiredKeys)
+      .toContain("OPENAI_API_KEY");
+  });
+
+  test("skip-dotenv blocks provider auth reopen when only dotenv has required values", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-auth-skip-dotenv-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "provider-auth-skip-dotenv";
+    await writeProviderAuthStoppedBatchFixture({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      configDir,
+      runId,
+    });
+
+    const result = await runBatchStatusJson({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      logRoot,
+      configDir,
+      runId,
+      args: ["--skip-dotenv"],
+    });
+
+    await rm(tmpRoot, { recursive: true, force: true });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary.items[0]).toMatchObject({
+      providerAuthReopenDecision: "blocked_provider_auth_not_ready",
+      providerAuthReopenEligible: false,
+      providerAuthReopenBlockedReason: "missing_required_keys",
+      providerAuthCredentialSources: {
+        OPENAI_API_KEY: "dotenv_not_loaded",
+        OPENAI_BASE_URL: "dotenv_not_loaded",
+        JINA_API_KEY: "dotenv_not_loaded",
+        JINA_API_BASE: "dotenv_not_loaded",
+      },
+    });
+    expect(summary.items[0].providerAuthMissingRequiredKeys)
+      .toEqual(["JINA_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL"]);
+    expect(summary.items[0].providerAuthRootDotenvPresent).toBe(true);
+    expect(summary.items[0].providerAuthGraphVaultDotenvPresent).toBe(true);
+    const serialized = JSON.stringify(summary);
+    expect(serialized).not.toContain("file-openai-key");
+    expect(serialized).not.toContain("file-jina-key");
+  });
+
+  test("provider auth status-json blocks unreadable provider config", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-auth-bad-config-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "provider-auth-bad-config";
+    await writeProviderAuthStoppedBatchFixture({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      configDir,
+      runId,
+    });
+    await writeFile(join(configDir, "index.yml"), "collections:\n  bad: [unterminated\n");
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--status-json",
+      ], {
+        cwd: tmpRoot,
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+          OPENAI_API_KEY: "file-openai-key",
+          OPENAI_BASE_URL: "https://api.openai.example",
+          JINA_API_KEY: "file-jina-key",
+          JINA_API_BASE: "https://api.jina.example",
+        },
+      });
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => { stdout += String(chunk); });
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    await rm(tmpRoot, { recursive: true, force: true });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary.items[0]).toMatchObject({
+      providerAuthReopenDecision: "blocked_provider_auth_not_ready",
+      providerAuthReopenEligible: false,
+      providerAuthReopenBlockedReason: "provider_auth_config_unreadable",
+      providerAuthConfigReadStatus: "invalid",
+    });
+  });
+
+  test("provider auth reopen respects attempt limit without count downgrade", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-auth-limit-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "provider-auth-limit";
+    const { itemId } = await writeProviderAuthStoppedBatchFixture({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      configDir,
+      runId,
+      metadata: {
+        providerAuthReopenAttemptCount: 3,
+        providerAuthReopenedFingerprints: [],
+      },
+    });
+
+    const result = await new Promise<{
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+      ], {
+        cwd: tmpRoot,
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+          OPENAI_API_KEY: "file-openai-key",
+          OPENAI_BASE_URL: "https://api.openai.example",
+          JINA_API_KEY: "file-jina-key",
+          JINA_API_BASE: "https://api.jina.example",
+        },
+      });
+      let stderr = "";
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+    });
+
+    const checkpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      "utf8",
+    ));
+    const summary = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "recovery-summary.json"),
+      "utf8",
+    ));
+    await rm(tmpRoot, { recursive: true, force: true });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toBe("");
+    expect(checkpoint).toMatchObject({
+      status: "failed",
+      recoveryDecision: "stop_until_fixed",
+    });
+    expect(summary.items[0]).toMatchObject({
+      providerAuthReopenDecision: "blocked_provider_auth_reopen_attempt_limit",
+      providerAuthReopenEligible: false,
+      providerAuthReopenAttemptCount: 3,
+    });
+  });
+
+  test("provider auth status-json blocks already reopened current fingerprint", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-auth-already-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "provider-auth-already";
+    const { itemId } = await writeProviderAuthStoppedBatchFixture({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      configDir,
+      runId,
+    });
+
+    const readyResult = await runBatchStatusJson({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      logRoot,
+      configDir,
+      runId,
+    });
+    expect(readyResult.exitCode).toBe(0);
+    const readySummary = JSON.parse(readyResult.stdout);
+    const currentFingerprint =
+      readySummary.items[0].currentProviderAuthFingerprint;
+    expect(typeof currentFingerprint).toBe("string");
+
+    const checkpointPath = join(
+      stateRoot,
+      "catalog",
+      "batch-runs",
+      runId,
+      "items",
+      `${itemId}.json`,
+    );
+    const checkpoint = JSON.parse(readFileSync(checkpointPath, "utf8"));
+    checkpoint.metadata = {
+      ...(checkpoint.metadata ?? {}),
+      providerAuthReopenedFingerprints: [currentFingerprint],
+      providerAuthReopenAttemptCount: 1,
+      providerAuthReopenDecision: "reopen_legacy_provider_auth_key_present",
+      providerAuthReopenEligible: true,
+    };
+    await writeFile(checkpointPath, JSON.stringify(checkpoint));
+
+    const result = await runBatchStatusJson({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      logRoot,
+      configDir,
+      runId,
+    });
+
+    await rm(tmpRoot, { recursive: true, force: true });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary.items[0]).toMatchObject({
+      providerAuthReopenDecision:
+        "blocked_provider_auth_fingerprint_already_reopened",
+      providerAuthReopenEligible: false,
+      providerAuthReopenBlockedReason:
+        "current_provider_auth_fingerprint_already_reopened",
+      providerAuthReopenAttemptCount: 1,
+    });
+    expect(summary.items[0].currentProviderAuthFingerprint)
+      .toBe(currentFingerprint);
+  });
+
+  test("provider auth status-json blocks unchanged current fingerprint", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-auth-unchanged-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "provider-auth-unchanged";
+    const { itemId } = await writeProviderAuthStoppedBatchFixture({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      configDir,
+      runId,
+    });
+
+    const readyResult = await runBatchStatusJson({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      logRoot,
+      configDir,
+      runId,
+    });
+    expect(readyResult.exitCode).toBe(0);
+    const readySummary = JSON.parse(readyResult.stdout);
+    const currentFingerprint =
+      readySummary.items[0].currentProviderAuthFingerprint;
+    expect(typeof currentFingerprint).toBe("string");
+
+    const checkpointPath = join(
+      stateRoot,
+      "catalog",
+      "batch-runs",
+      runId,
+      "items",
+      `${itemId}.json`,
+    );
+    const checkpoint = JSON.parse(readFileSync(checkpointPath, "utf8"));
+    checkpoint.metadata = {
+      ...(checkpoint.metadata ?? {}),
+      providerAuthFailureFingerprint: currentFingerprint,
+      providerAuthReopenDecision: "reopen_legacy_provider_auth_key_present",
+      providerAuthReopenEligible: true,
+    };
+    await writeFile(checkpointPath, JSON.stringify(checkpoint));
+
+    const result = await runBatchStatusJson({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      logRoot,
+      configDir,
+      runId,
+    });
+
+    await rm(tmpRoot, { recursive: true, force: true });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary.items[0]).toMatchObject({
+      providerAuthReopenDecision: "blocked_provider_auth_fingerprint_unchanged",
+      providerAuthReopenEligible: false,
+      providerAuthReopenBlockedReason:
+        "current_provider_auth_fingerprint_matches_failure",
+      providerAuthConfigChanged: false,
+      providerAuthFailureFingerprint: currentFingerprint,
+    });
+  });
+
+  test("provider auth refailure clears stale reopen eligibility", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-auth-refail-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "provider-auth-refail";
+    const { itemId } = await writeProviderAuthStoppedBatchFixture({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      configDir,
+      runId,
+      metadata: {
+        providerAuthReopenDecision: "reopen_legacy_provider_auth_key_present",
+        providerAuthReopenEligible: true,
+        providerAuthReopenReason: "legacy_provider_auth_failure_key_present",
+        currentProviderAuthFingerprint: "old-fingerprint",
+        providerAuthReopenedFingerprints: ["old-fingerprint"],
+        providerAuthReopenAttemptCount: 1,
+      },
+    });
+    const normalizedPath = join(stateRoot, "input", "a-auth.md");
+    await mkdir(dirname(normalizedPath), { recursive: true });
+    await writeFile(normalizedPath, "# A\n\nProvider auth refail.\n");
+    const resumeScript = join(tmpRoot, "fake-refail-resume.mjs");
+    await writeFile(
+      resumeScript,
+      [
+        "console.error(\"Error code: 401 - {'code': 'INVALID_API_KEY', " +
+          "'message': 'Invalid API key'}\");",
+        "process.exit(1);",
+      ].join("\n"),
+    );
+
+    const result = await new Promise<{
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--max-command-attempts",
+        "1",
+        "--max-resume-passes",
+        "1",
+      ], {
+        cwd: tmpRoot,
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+          QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
+            QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+          QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
+          OPENAI_API_KEY: "file-openai-key",
+          OPENAI_BASE_URL: "https://api.openai.example",
+          JINA_API_KEY: "file-jina-key",
+          JINA_API_BASE: "https://api.jina.example",
+        },
+      });
+      let stderr = "";
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+    });
+
+    const checkpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      "utf8",
+    ));
+    const summary = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "recovery-summary.json"),
+      "utf8",
+    ));
+    await rm(tmpRoot, { recursive: true, force: true });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toBe("");
+    expect(checkpoint).toMatchObject({
+      status: "failed",
+      recoveryDecision: "stop_until_fixed",
+      metadata: {
+        providerAuthFailureDetected: true,
+        providerAuthReopenDecision: "blocked_provider_auth_fingerprint_unchanged",
+        providerAuthReopenEligible: false,
+        providerAuthReopenBlockedReason:
+          "current_provider_auth_fingerprint_matches_failure",
+        providerAuthConfigChanged: false,
+      },
+    });
+    expect(summary.items[0]).toMatchObject({
+      providerAuthReopenDecision: "blocked_provider_auth_fingerprint_unchanged",
+      providerAuthReopenEligible: false,
+      providerAuthConfigChanged: false,
+    });
+    const serialized = JSON.stringify({ checkpoint, summary });
+    expect(serialized).not.toContain("file-openai-key");
+    expect(serialized).not.toContain("file-jina-key");
+  });
+
+  test("status-json does not project stale provider auth reopen state on completed item", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-auth-completed-stale-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "provider-auth-completed-stale";
+    const { itemId } = await writeCompletedGraphBatchFixture({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      configDir,
+      runId,
+      sourceBytes: "completed after provider auth reopen",
+    });
+    const checkpointPath = join(
+      stateRoot,
+      "catalog",
+      "batch-runs",
+      runId,
+      "items",
+      `${itemId}.json`,
+    );
+    const checkpoint = JSON.parse(readFileSync(checkpointPath, "utf8"));
+    checkpoint.metadata = {
+      ...(checkpoint.metadata ?? {}),
+      providerAuthReopenDecision: "reopen_legacy_provider_auth_key_present",
+      providerAuthReopenEligible: true,
+      providerAuthReopenReason: "legacy_provider_auth_failure_key_present",
+      providerAuthReopenBlockedReason: "old_blocked_reason",
+      providerAuthConfigChanged: true,
+      providerAuthFailureFingerprint: "old-failure-fingerprint",
+      currentProviderAuthFingerprint: "old-current-fingerprint",
+      providerAuthReadinessStatus: "ready",
+      providerAuthCredentialSources: {
+        OPENAI_API_KEY: "graph_vault_dotenv",
+      },
+      providerAuthReopenAttemptCount: 1,
+      lastProviderAuthReopenFingerprint: "old-current-fingerprint",
+      legacyProviderAuthFingerprintMissing: true,
+    };
+    await writeFile(checkpointPath, JSON.stringify(checkpoint));
+    const checkpointBefore = readFileSync(checkpointPath, "utf8");
+
+    const result = await runBatchStatusJson({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      logRoot,
+      configDir,
+      runId,
+      args: ["--skip-dotenv"],
+    });
+
+    const checkpointAfter = readFileSync(checkpointPath, "utf8");
+    await rm(tmpRoot, { recursive: true, force: true });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(checkpointAfter).toBe(checkpointBefore);
+    const summary = JSON.parse(result.stdout);
+    expect(summary.items[0]).toMatchObject({
+      status: "completed",
+      providerAuthFailureFingerprint: "old-failure-fingerprint",
+      lastProviderAuthReopenFingerprint: "old-current-fingerprint",
+      providerAuthReopenAttemptCount: 1,
+      legacyProviderAuthFingerprintMissing: true,
+    });
+    expect(summary.items[0].providerAuthReopenDecision).toBeUndefined();
+    expect(summary.items[0].providerAuthReopenEligible).toBeUndefined();
+    expect(summary.items[0].providerAuthReopenReason).toBeUndefined();
+    expect(summary.items[0].providerAuthReopenBlockedReason).toBeUndefined();
+    expect(summary.items[0].providerAuthConfigChanged).toBeUndefined();
+    expect(summary.items[0].currentProviderAuthFingerprint).toBeUndefined();
+    expect(summary.items[0].providerAuthReadinessStatus).toBeUndefined();
+    expect(summary.items[0].providerAuthCredentialSources).toBeUndefined();
+  });
+
   test("runtime provider auth failure stops before next book", async () => {
     const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-auth-runtime-");
     const sourceDir = join(tmpRoot, "source");
@@ -5955,7 +8493,8 @@ describe("GraphRAG EPUB batch runner", () => {
       ], {
         env: {
           ...process.env,
-          QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+          QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
+            QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
           QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
         },
       });
@@ -6894,6 +9433,7 @@ describe("GraphRAG EPUB batch runner", () => {
         ], {
           env: {
             ...process.env,
+            QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
             QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
             QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
           },
@@ -6928,7 +9468,7 @@ describe("GraphRAG EPUB batch runner", () => {
     });
   });
 
-  test("migrate-only reopens completed items without real GraphRAG evidence", async () => {
+  test("migrate-only reopens completed items without real closed-loop evidence", async () => {
     const tmpRoot = await mkProjectTmpDir("qmd-batch-reopen-completed-");
     const sourceDir = join(tmpRoot, "source");
     const stateRoot = join(tmpRoot, "graph_vault");
@@ -7048,15 +9588,15 @@ describe("GraphRAG EPUB batch runner", () => {
     });
     expect(checkpoint).toMatchObject({
       status: "pending",
-      recoveryDecision: "continue_pending",
-      qmdBuildStatus: { status: "succeeded" },
+      qmdBuildStatus: {
+        status: "pending",
+        stage: "qmd-build",
+        reason: "qmd_build_manifest_missing",
+      },
       graphBuildStatus: {
         status: "pending",
         stage: "graph_extract",
         reason: "real_graphrag_stage_missing",
-      },
-      metadata: {
-        reopenedFromCompleted: true,
       },
     });
     expect(events.some((event) => event.event === "item_completed_reopened"))
@@ -7227,6 +9767,18 @@ describe("GraphRAG EPUB batch runner", () => {
     await mkdir(outputDir, { recursive: true });
     await writeFile(sourcePath, sourceBytes);
     await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const normalizedPath = join(stateRoot, "input", "book.md");
+    await writeQmdBuildFixture({
+      tmpRoot,
+      stateRoot,
+      configDir,
+      runId,
+      itemId,
+      bookId,
+      sourceRelativePath,
+      sourceHash,
+      normalizedPath,
+    });
     for (const name of [
       "documents.parquet", "text_units.parquet", "entities.parquet",
       "relationships.parquet", "communities.parquet", "community_reports.parquet",
@@ -7390,7 +9942,7 @@ describe("GraphRAG EPUB batch runner", () => {
         sourceName: "Book.epub",
         sourceRelativePath,
         sourceHash,
-        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        normalizedPath: relative(projectRoot, normalizedPath),
         bookId,
         attempts: 1,
         qmdBuildStatus: { status: "succeeded" },
@@ -7486,6 +10038,461 @@ describe("GraphRAG EPUB batch runner", () => {
     await rm(tmpRoot, { recursive: true, force: true });
   });
 
+  test("status-json preserves completed checkpoint book identity during catalog drift", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-checkpoint-identity-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "checkpoint-identity-fixture";
+    const fixture = await writeCompletedGraphBatchFixture({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      configDir,
+      runId,
+      sourceBytes: "completed with persisted checkpoint identity",
+    });
+    const driftBookId = `${fixture.bookId}-catalog-drift`;
+    const catalogPath = join(stateRoot, "catalog", "books.yaml");
+    const catalog = YAML.parse(readFileSync(catalogPath, "utf8"));
+    catalog.items.push({
+      ...catalog.items[0],
+      bookId: driftBookId,
+      documentId: `doc-${driftBookId}`,
+      sourcePath: `sources/${driftBookId}/source.epub`,
+      normalizedPath: `books/${driftBookId}/input/book.md`,
+      metadata: { sourceIdentityPath: fixture.sourceRelativePath },
+      createdAt: "2026-05-23T00:00:02.000Z",
+      updatedAt: "2026-05-23T00:00:03.000Z",
+    });
+    await writeFile(catalogPath, YAML.stringify(catalog));
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--status-json",
+      ]);
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => { stdout += String(chunk); });
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    const checkpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${fixture.itemId}.json`),
+      "utf8",
+    ));
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary).toMatchObject({
+      recoveryDecision: "none",
+      counts: { completed: 1 },
+    });
+    expect(summary.items[0]).toMatchObject({
+      status: "completed",
+      bookId: fixture.bookId,
+      qmdBuildStatus: { status: "succeeded", bookId: fixture.bookId },
+      graphBuildStatus: { status: "succeeded", stage: "query_ready" },
+      graphQueryStatus: { status: "succeeded" },
+      commandCheckStatus: { status: "succeeded" },
+    });
+    expect(summary.items[0].bookId).not.toBe(driftBookId);
+    expect(checkpoint).toMatchObject({
+      status: "completed",
+      bookId: fixture.bookId,
+    });
+  });
+
+  test("status-json reopens completed checkpoint using persisted invalid book identity", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-checkpoint-identity-invalid-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "checkpoint-identity-invalid-fixture";
+    const fixture = await writeCompletedGraphBatchFixture({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      configDir,
+      runId,
+      sourceBytes: "completed with invalid persisted checkpoint identity",
+    });
+    const driftBookId = `${fixture.bookId}-catalog-drift`;
+    const oldNormalizedPath = join(stateRoot, "input", "book.md");
+    await writeProviderAuthReopenGraphFixture({
+      stateRoot,
+      bookId: driftBookId,
+      sourceHash: fixture.sourceHash,
+    });
+    await writeQmdBuildFixture({
+      tmpRoot,
+      stateRoot,
+      configDir,
+      runId,
+      itemId: fixture.itemId,
+      bookId: driftBookId,
+      sourceRelativePath: fixture.sourceRelativePath,
+      sourceHash: fixture.sourceHash,
+      normalizedPath: oldNormalizedPath,
+    });
+    await rm(
+      join(stateRoot, "books", fixture.bookId, "qmd", "qmd_build_manifest.json"),
+      { force: true },
+    );
+    const stageFingerprints = {
+      ingest: "fp-ingest",
+      normalize: "fp-normalize",
+      graph_extract: "fp-graph-extract",
+      community_report: "fp-community-report",
+      embed: "fp-embed",
+      query_ready: "fp-query-ready",
+    };
+    await writeFile(
+      join(stateRoot, "catalog", "books.yaml"),
+      YAML.stringify({
+        schemaVersion: SchemaVersion,
+        items: [
+          {
+            schemaVersion: SchemaVersion,
+            bookId: fixture.bookId,
+            documentId: `doc-${fixture.sourceHash.slice(0, 12)}`,
+            sourcePath: `sources/${fixture.bookId}/source.epub`,
+            sourceHash: fixture.sourceHash,
+            normalizedContentHash: fixture.sourceHash,
+            normalizedPath: `books/${fixture.bookId}/input/book.md`,
+            configFingerprint: "config-fp",
+            promptFingerprint: "prompt-fp",
+            modelFingerprint: "model-fp",
+            stageFingerprints,
+            providerFingerprint: "provider-fp",
+            overallStatus: "succeeded",
+            createdAt: "2026-05-23T00:00:00.000Z",
+            updatedAt: "2026-05-23T00:00:01.000Z",
+          },
+          {
+            schemaVersion: SchemaVersion,
+            bookId: driftBookId,
+            documentId: `doc-${driftBookId}`,
+            sourcePath: `sources/${driftBookId}/source.epub`,
+            sourceHash: fixture.sourceHash,
+            metadata: { sourceIdentityPath: fixture.sourceRelativePath },
+            normalizedContentHash: fixture.sourceHash,
+            normalizedPath: `books/${driftBookId}/input/book.md`,
+            configFingerprint: "config-fp",
+            promptFingerprint: "prompt-fp",
+            modelFingerprint: "model-fp",
+            stageFingerprints,
+            providerFingerprint: "provider-fp",
+            overallStatus: "succeeded",
+            createdAt: "2026-05-23T00:00:02.000Z",
+            updatedAt: "2026-05-23T00:00:03.000Z",
+          },
+        ],
+      }),
+    );
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--status-json",
+      ]);
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => { stdout += String(chunk); });
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    const checkpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${fixture.itemId}.json`),
+      "utf8",
+    ));
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary).toMatchObject({
+      recoveryDecision: "continue_pending",
+      counts: { pending: 1 },
+    });
+    expect(summary.items[0]).toMatchObject({
+      status: "pending",
+      bookId: fixture.bookId,
+      qmdBuildStatus: {
+        status: "pending",
+        reason: "qmd_build_manifest_missing",
+      },
+      graphBuildStatus: { status: "succeeded", stage: "query_ready" },
+      commandCheckStatus: { status: "succeeded" },
+    });
+    expect(summary.items[0].bookId).not.toBe(driftBookId);
+    expect(checkpoint).toMatchObject({
+      status: "completed",
+      bookId: fixture.bookId,
+    });
+  });
+
+  test("normal run uses checkpoint identity after catalog drift", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-checkpoint-identity-run-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "checkpoint-identity-normal-run";
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sourcePath = join(sourceDir, "Book.epub");
+    await writeMinimalEpubFixture(sourcePath, "Checkpoint Identity");
+    const sourceHash = createHash("sha256")
+      .update(readFileSync(sourcePath))
+      .digest("hex");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const persistedSourceIdentityPath = join(
+      ".tmp-tests",
+      "legacy",
+      "persisted-source.epub",
+    );
+    const persistedBookId = batchBookId(sourceHash, persistedSourceIdentityPath);
+    const driftBookId = `${persistedBookId}-catalog-drift`;
+    const persistedNormalizedPath = join(stateRoot, "input", "persisted-book.md");
+    await writeProviderAuthReopenGraphFixture({
+      stateRoot,
+      bookId: persistedBookId,
+      sourceHash,
+    });
+    const catalogPath = join(stateRoot, "catalog", "books.yaml");
+    const catalog = YAML.parse(readFileSync(catalogPath, "utf8"));
+    catalog.items.push({
+      ...catalog.items[0],
+      bookId: driftBookId,
+      documentId: `doc-${driftBookId}`,
+      sourcePath: `sources/${driftBookId}/source.epub`,
+      metadata: { sourceIdentityPath: sourceRelativePath },
+      normalizedPath: `books/${driftBookId}/input/book.md`,
+      createdAt: "2026-05-23T00:00:02.000Z",
+      updatedAt: "2026-05-23T00:00:03.000Z",
+    });
+    await writeFile(catalogPath, YAML.stringify(catalog));
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "running",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        pendingItems: 1,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 0,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "pending",
+        sourceName: "Book.epub",
+        sourceRelativePath,
+        sourceIdentityPath: persistedSourceIdentityPath,
+        sourceHash,
+        normalizedPath: relative(projectRoot, persistedNormalizedPath),
+        bookId: persistedBookId,
+        attempts: 0,
+        recoveryDecision: "continue_pending",
+        commandChecks: [],
+      }),
+    );
+
+    const resumeCapturePath = join(tmpRoot, "resume-capture.json");
+    const resumeScript = join(tmpRoot, "fake-ready-resume.mjs");
+    await writeFile(
+      resumeScript,
+      [
+        "import { writeFileSync } from 'node:fs';",
+        "const args = process.argv.slice(2);",
+        "const value = (name) => {",
+        "  const index = args.indexOf(name);",
+        "  return index >= 0 ? args[index + 1] : '';",
+        "};",
+        "const capture = {",
+        "  sourceIdentityPath: value('--source-identity-path'),",
+        "  normalizedPath: value('--normalized-path'),",
+        "};",
+        "writeFileSync(process.env.RESUME_CAPTURE_PATH, JSON.stringify(capture));",
+        "if (capture.sourceIdentityPath !== process.env.EXPECTED_SOURCE_IDENTITY_PATH) {",
+        "  console.error('unexpected source identity: ' + capture.sourceIdentityPath);",
+        "  process.exit(2);",
+        "}",
+        "if (capture.normalizedPath !== process.env.EXPECTED_NORMALIZED_PATH) {",
+        "  console.error('unexpected normalized path: ' + capture.normalizedPath);",
+        "  process.exit(3);",
+        "}",
+        "console.log(JSON.stringify({ status: 'ready', bookId: process.env.EXPECTED_BOOK_ID }));",
+      ].join("\n"),
+    );
+    const qmdScript = join(tmpRoot, "fake-qmd.mjs");
+    await writeFile(
+      qmdScript,
+      [
+        "import { mkdirSync, writeFileSync } from 'node:fs';",
+        "import { dirname } from 'node:path';",
+        "const args = process.argv.slice(2);",
+        "if (process.env.INDEX_PATH) {",
+        "  mkdirSync(dirname(process.env.INDEX_PATH), { recursive: true });",
+        "  writeFileSync(process.env.INDEX_PATH, 'fake qmd index\\n');",
+        "}",
+        "if (args.includes('--version')) console.log('qmd-test 1.0.0');",
+        "else if (args.includes('--json')) console.log('{}');",
+        "else if (args.includes('--csv')) console.log('title');",
+        "else if (args.includes('--xml')) console.log('<ok/>');",
+        "else if (args.includes('--md')) console.log('# ok');",
+        "else console.log('ok');",
+      ].join("\n"),
+    );
+
+    const result = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--max-command-attempts",
+        "1",
+        "--max-resume-passes",
+        "1",
+      ], {
+        cwd: tmpRoot,
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+          QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
+          QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+          QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
+          QMD_GRAPHRAG_TEST_QMD_RUNNER: "1",
+          QMD_GRAPHRAG_QMD_RUNNER: qmdScript,
+          RESUME_CAPTURE_PATH: resumeCapturePath,
+          EXPECTED_SOURCE_IDENTITY_PATH: persistedSourceIdentityPath,
+          EXPECTED_NORMALIZED_PATH: persistedNormalizedPath,
+          EXPECTED_BOOK_ID: persistedBookId,
+        },
+      });
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (chunk) => { stdout += String(chunk); });
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
+    });
+
+    const checkpoint = JSON.parse(readFileSync(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      "utf8",
+    ));
+    const capture = JSON.parse(readFileSync(resumeCapturePath, "utf8"));
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(capture).toMatchObject({
+      sourceIdentityPath: persistedSourceIdentityPath,
+      normalizedPath: persistedNormalizedPath,
+    });
+    expect(checkpoint).toMatchObject({
+      status: "completed",
+      bookId: persistedBookId,
+      sourceIdentityPath: persistedSourceIdentityPath,
+      normalizedPath: relative(projectRoot, persistedNormalizedPath),
+      qmdBuildStatus: {
+        status: "succeeded",
+        bookId: persistedBookId,
+      },
+      graphBuildStatus: {
+        status: "succeeded",
+        stage: "query_ready",
+      },
+      graphQueryStatus: { status: "succeeded" },
+    });
+    expect(checkpoint.bookId).not.toBe(driftBookId);
+    expect(checkpoint.commandChecks.map((check: { name: string }) => check.name))
+      .toEqual([
+        ...requiredBatchCommandCheckNames.filter((name) =>
+          name !== "qmd-query-auto-json" &&
+          name !== "qmd-query-graphrag-json"
+        ),
+        "qmd-query-auto-json",
+        "qmd-query-graphrag-json",
+      ]);
+  });
+
   test("status-json reopens completed items when GraphRAG query check failed", async () => {
     const tmpRoot = await mkProjectTmpDir("qmd-batch-graph-query-failed-");
     const sourceDir = join(tmpRoot, "source");
@@ -7533,6 +10540,18 @@ describe("GraphRAG EPUB batch runner", () => {
     await mkdir(outputDir, { recursive: true });
     await writeFile(sourcePath, sourceBytes);
     await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const normalizedPath = join(stateRoot, "input", "book.md");
+    await writeQmdBuildFixture({
+      tmpRoot,
+      stateRoot,
+      configDir,
+      runId,
+      itemId,
+      bookId,
+      sourceRelativePath,
+      sourceHash,
+      normalizedPath,
+    });
     for (const name of [
       "documents.parquet", "text_units.parquet", "entities.parquet",
       "relationships.parquet", "communities.parquet", "community_reports.parquet",
@@ -7711,7 +10730,7 @@ describe("GraphRAG EPUB batch runner", () => {
         sourceName: "Book.epub",
         sourceRelativePath,
         sourceHash,
-        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        normalizedPath: relative(projectRoot, normalizedPath),
         bookId,
         attempts: 1,
         qmdBuildStatus: { status: "succeeded" },
@@ -7768,6 +10787,210 @@ describe("GraphRAG EPUB batch runner", () => {
     });
   });
 
+  test("normal run keeps qmd build succeeded when GraphRAG query check fails", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-qmd-build-before-query-fail-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "qmd-build-before-query-fail-fixture";
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sourcePath = join(sourceDir, "Book.epub");
+    await writeMinimalEpubFixture(sourcePath, "QMD Build Before Query Failure");
+    const sourceHash = createHash("sha256")
+      .update(readFileSync(sourcePath))
+      .digest("hex");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const bookId = batchBookId(sourceHash, sourceRelativePath);
+    await writeProviderAuthReopenGraphFixture({ stateRoot, bookId, sourceHash });
+
+    const resumeScript = join(tmpRoot, "fake-ready-resume.mjs");
+    await writeFile(
+      resumeScript,
+      [
+        "console.log(JSON.stringify({ status: 'ready', bookId: process.env.TEST_BOOK_ID }));",
+      ].join("\n"),
+    );
+    const qmdScript = join(tmpRoot, "fake-qmd-query-fail.mjs");
+    const graphQueryError = {
+      schemaVersion: "1.0.0",
+      route: "graphrag",
+      stage: "graphrag_query",
+      provider: "graphrag",
+      capability: "graph_query",
+      code: "provider_unavailable",
+      retryable: false,
+      redactedMessage:
+        "GraphRAG query provider failed before returning a response.",
+    };
+    await writeFile(
+      qmdScript,
+      [
+        "import { mkdirSync, writeFileSync } from 'node:fs';",
+        "import { dirname } from 'node:path';",
+        "const args = process.argv.slice(2);",
+        "if (process.env.INDEX_PATH) {",
+        "  mkdirSync(dirname(process.env.INDEX_PATH), { recursive: true });",
+        "  writeFileSync(process.env.INDEX_PATH, 'fake qmd index\\n');",
+        "}",
+        "if (args.includes('--graphrag')) {",
+        `  console.error(${JSON.stringify(JSON.stringify(graphQueryError, null, 2))});`,
+        "  process.exit(1);",
+        "}",
+        "if (args.includes('--version')) console.log('qmd-test 1.0.0');",
+        "else if (args.includes('--json')) console.log('{}');",
+        "else if (args.includes('--csv')) console.log('title');",
+        "else if (args.includes('--xml')) console.log('<ok/>');",
+        "else if (args.includes('--md')) console.log('# ok');",
+        "else console.log('ok');",
+      ].join("\n"),
+    );
+
+    const result = await new Promise<{
+      stderr: string;
+      exitCode: number | null;
+    }>((resolveResult) => {
+      const proc = spawn(process.execPath, [
+        join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+        "--source-dir",
+        sourceDir,
+        "--state-root",
+        stateRoot,
+        "--log-root",
+        logRoot,
+        "--config",
+        join(configDir, "index.yml"),
+        "--qmd-index-path",
+        join(tmpRoot, "index.sqlite"),
+        "--run-id",
+        runId,
+        "--skip-dotenv",
+        "--fail-fast",
+        "--max-command-attempts",
+        "1",
+        "--max-resume-passes",
+        "1",
+        "--retry-base-delay-seconds",
+        "1",
+        "--retry-max-delay-seconds",
+        "1",
+        "--retry-budget-seconds",
+        "60",
+      ], {
+        cwd: tmpRoot,
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+          QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
+          QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+          QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
+          QMD_GRAPHRAG_TEST_QMD_RUNNER: "1",
+          QMD_GRAPHRAG_QMD_RUNNER: qmdScript,
+          TEST_BOOK_ID: bookId,
+        },
+      });
+      let stderr = "";
+      proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      proc.on("close", (exitCode) => resolveResult({ stderr, exitCode }));
+    });
+
+    const checkpointPath = join(
+      stateRoot,
+      "catalog",
+      "batch-runs",
+      runId,
+      "items",
+      `${itemId}.json`,
+    );
+    const checkpoint = JSON.parse(readFileSync(checkpointPath, "utf8"));
+    const qmdBuildManifestPath = join(
+      stateRoot,
+      "books",
+      bookId,
+      "qmd",
+      "qmd_build_manifest.json",
+    );
+    const qmdBuildManifest = JSON.parse(
+      readFileSync(qmdBuildManifestPath, "utf8"),
+    );
+    const statusResult = await runBatchStatusJson({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      logRoot,
+      configDir,
+      runId,
+      args: ["--skip-dotenv"],
+    });
+
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("\"stage\": \"graphrag_query\"");
+    expect(qmdBuildManifest).toMatchObject({
+      kind: "qmd_build_manifest",
+      itemId,
+      runId,
+      bookId,
+      commandCheckNames: expect.not.arrayContaining([
+        "qmd-query-auto-json",
+        "qmd-query-graphrag-json",
+      ]),
+    });
+    expect(qmdBuildManifest.commandCheckNames).toHaveLength(
+      requiredBatchCommandCheckNames.length - 2,
+    );
+    expect(checkpoint).toMatchObject({
+      status: "pending",
+      bookId,
+      failureKind: "transient",
+      retryable: true,
+      retryExhausted: false,
+      recoveryDecision: "retry_same_run_id",
+      failedStage: "qmd-query-graphrag-json",
+      qmdBuildStatus: { status: "succeeded", bookId },
+      graphBuildStatus: { status: "succeeded", stage: "query_ready" },
+      graphQueryStatus: {
+        status: "failed",
+        stage: "qmd-query-graphrag-json",
+      },
+    });
+    expect(checkpoint.commandChecks.map((check: { name: string }) => check.name))
+      .toEqual([
+        ...requiredBatchCommandCheckNames.filter((name) =>
+          name !== "qmd-query-auto-json" &&
+          name !== "qmd-query-graphrag-json"
+        ),
+        "qmd-query-auto-json",
+        "qmd-query-graphrag-json",
+      ]);
+    const summary = JSON.parse(statusResult.stdout);
+    expect(statusResult.exitCode).toBe(0);
+    expect(statusResult.stderr).toBe("");
+    expect(summary).toMatchObject({
+      recoveryDecision: "retry_same_run_id",
+      retryableItemCount: 1,
+      counts: { pending: 1 },
+    });
+    expect(summary.items[0]).toMatchObject({
+      status: "pending",
+      qmdBuildStatus: { status: "succeeded", bookId },
+      commandCheckStatus: {
+        status: "failed",
+        stage: "qmd-query-graphrag-json",
+      },
+      graphBuildStatus: { status: "succeeded", stage: "query_ready" },
+      graphQueryStatus: {
+        status: "failed",
+        stage: "qmd-query-graphrag-json",
+      },
+    });
+  });
+
   test("status-json reopens completed items with incomplete command check set", async () => {
     const tmpRoot = await mkProjectTmpDir("qmd-batch-incomplete-command-checks-");
     const sourceDir = join(tmpRoot, "source");
@@ -7815,6 +11038,18 @@ describe("GraphRAG EPUB batch runner", () => {
     await mkdir(outputDir, { recursive: true });
     await writeFile(sourcePath, sourceBytes);
     await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const normalizedPath = join(stateRoot, "input", "book.md");
+    await writeQmdBuildFixture({
+      tmpRoot,
+      stateRoot,
+      configDir,
+      runId,
+      itemId,
+      bookId,
+      sourceRelativePath,
+      sourceHash,
+      normalizedPath,
+    });
     for (const name of [
       "documents.parquet", "text_units.parquet", "entities.parquet",
       "relationships.parquet", "communities.parquet", "community_reports.parquet",
@@ -7978,7 +11213,7 @@ describe("GraphRAG EPUB batch runner", () => {
         sourceName: "Book.epub",
         sourceRelativePath,
         sourceHash,
-        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        normalizedPath: relative(projectRoot, normalizedPath),
         bookId,
         attempts: 1,
         qmdBuildStatus: { status: "succeeded" },
@@ -8024,7 +11259,12 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(summary.items[0]).toMatchObject({
       status: "pending",
       failedStage: "qmd-cleanup",
-      qmdBuildStatus: { status: "pending" },
+      qmdBuildStatus: { status: "succeeded" },
+      commandCheckStatus: {
+        status: "pending",
+        stage: "qmd-cleanup",
+        reason: "command_check_missing",
+      },
       graphBuildStatus: { status: "succeeded", stage: "query_ready" },
       graphQueryStatus: { status: "succeeded" },
     });
@@ -8103,9 +11343,13 @@ describe("GraphRAG EPUB batch runner", () => {
       recoveryDecision: "continue_pending",
       failedStage: "qmd-search-json",
       qmdBuildStatus: {
+        status: "succeeded",
+        stage: "qmd-build",
+      },
+      commandCheckStatus: {
         status: "failed",
         stage: "qmd-search-json",
-        reason: "qmd_command_check_failed",
+        reason: "command_check_failed",
       },
       graphBuildStatus: { status: "succeeded", stage: "query_ready" },
       graphQueryStatus: { status: "succeeded" },
@@ -8160,6 +11404,18 @@ describe("GraphRAG EPUB batch runner", () => {
     await mkdir(outputDir, { recursive: true });
     await writeFile(sourcePath, sourceBytes);
     await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const normalizedPath = join(stateRoot, "input", "book.md");
+    await writeQmdBuildFixture({
+      tmpRoot,
+      stateRoot,
+      configDir,
+      runId,
+      itemId,
+      bookId,
+      sourceRelativePath,
+      sourceHash,
+      normalizedPath,
+    });
     for (const name of [
       "documents.parquet", "text_units.parquet", "entities.parquet",
       "relationships.parquet", "communities.parquet", "community_reports.parquet",
@@ -8328,7 +11584,7 @@ describe("GraphRAG EPUB batch runner", () => {
         sourceName: "Book.epub",
         sourceRelativePath,
         sourceHash,
-        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        normalizedPath: relative(projectRoot, normalizedPath),
         bookId,
         attempts: 1,
         qmdBuildStatus: { status: "succeeded" },

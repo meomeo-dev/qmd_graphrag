@@ -1,0 +1,47 @@
+case: graphrag-query-ready-identity-settings
+run: 1
+status: design_reaudit_passed_implementation_audit_passed
+baseline:
+  fixed: true
+  locations:
+    - audit/graphrag-query-ready-identity-settings-run_1__closed/dev-agent-a/baseline.md
+    - audit/graphrag-query-ready-identity-settings-run_1__closed/dev-agent-b/baseline.md
+    - audit/graphrag-query-ready-identity-settings-run_1__closed/dev-agent-c/baseline.md
+designScope:
+  files:
+    - docs/architecture/graphrag-integration.md
+    - docs/architecture/unified-retrieval-plane.md
+    - docs/architecture/unified-retrieval-plane.type-dd.yaml
+    - docs/operations/graphrag-epub-batch-runbook.md
+observedFailures:
+  - "GraphRAG document identity is missing for query_ready"
+  - "capabilityScope references unknown or not-ready graphCapabilityId(s)"
+  - "GraphRAG document identity sidecar does not match query_ready"
+  - "graph_vault/settings.yaml is not the managed projection of .qmd/index.yml"
+audit:
+  reportTargets:
+    - audit/graphrag-query-ready-identity-settings-run_1__closed/dev-agent-a/report.md
+    - audit/graphrag-query-ready-identity-settings-run_1__closed/dev-agent-b/report.md
+    - audit/graphrag-query-ready-identity-settings-run_1__closed/dev-agent-c/report.md
+  reauditTargets:
+    - audit/graphrag-query-ready-identity-settings-run_1__closed/dev-agent-a/reaudit-1.md
+    - audit/graphrag-query-ready-identity-settings-run_1__closed/dev-agent-b/reaudit-1.md
+    - audit/graphrag-query-ready-identity-settings-run_1__closed/dev-agent-c/reaudit-1.md
+  designReauditResult: passed
+  finalReport: audit/graphrag-query-ready-identity-settings-run_1__closed/final-report.md
+implementation:
+  auditRun: audit/graphrag-query-ready-identity-settings-dev-run_1__closed
+  auditResult: passed
+  completedAt: "2026-05-25"
+remediation:
+  completedAt: "2026-05-25"
+  scope:
+    - normalizedPath typed locator and sidecar adoption invariant
+    - settings projection loader-equivalent comparison
+    - safe managed settings rewrite and fail-closed user-owned rejection
+    - settings projection repair idempotency and observability
+    - real failure acceptance for managed settings projection drift
+  reauditTargets:
+    - audit/graphrag-query-ready-identity-settings-run_1__closed/dev-agent-a/reaudit-1.md
+    - audit/graphrag-query-ready-identity-settings-run_1__closed/dev-agent-b/reaudit-1.md
+    - audit/graphrag-query-ready-identity-settings-run_1__closed/dev-agent-c/reaudit-1.md

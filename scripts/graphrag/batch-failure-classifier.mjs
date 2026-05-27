@@ -30,6 +30,13 @@ export function classifyFailure(text) {
       ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
     };
   }
+  const typedQueryFailure = classifyTypedQueryFailure(text);
+  if (typedQueryFailure != null) {
+    return {
+      ...typedQueryFailure,
+      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+    };
+  }
   if (isProviderTransientFailureText(message)) {
     return {
       failureKind: "transient",
@@ -56,6 +63,55 @@ export function classifyFailure(text) {
     retryable: false,
     ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
   };
+}
+
+function classifyTypedQueryFailure(text) {
+  const payload = parseTypedQueryErrorPayload(text);
+  if (payload == null) return null;
+  if (
+    payload.provider === "graphrag" &&
+    payload.stage === "graphrag_query" &&
+    payload.capability === "graph_query" &&
+    payload.code === "provider_unavailable"
+  ) {
+    return { failureKind: "transient", retryable: true };
+  }
+  if (payload.retryable === true) {
+    return { failureKind: "transient", retryable: true };
+  }
+  return null;
+}
+
+function parseTypedQueryErrorPayload(text) {
+  const raw = String(text ?? "").trim();
+  if (!raw) return null;
+  for (const candidate of jsonObjectCandidates(raw)) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        parsed.schemaVersion === "1.0.0" &&
+        typeof parsed.route === "string" &&
+        typeof parsed.stage === "string" &&
+        typeof parsed.code === "string" &&
+        typeof parsed.retryable === "boolean"
+      ) {
+        return parsed;
+      }
+    } catch {
+      // Keep scanning: command stderr can wrap a JSON payload in extra text.
+    }
+  }
+  return null;
+}
+
+function jsonObjectCandidates(raw) {
+  const candidates = [raw];
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start >= 0 && end > start) candidates.push(raw.slice(start, end + 1));
+  return [...new Set(candidates)];
 }
 
 export function isProviderTransientFailureText(text) {
@@ -95,6 +151,9 @@ export function isProviderTransientFailureText(text) {
     "cannot connect to host",
     "network error",
     "fetch failed",
+    "ssl",
+    "unexpected_eof_while_reading",
+    "eof occurred in violation of protocol",
     "connection reset",
     "connection reset by peer",
     "read reset",

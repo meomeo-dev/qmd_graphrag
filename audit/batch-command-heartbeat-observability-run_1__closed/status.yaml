@@ -1,0 +1,34 @@
+case: batch-command-heartbeat-observability
+run: 1
+status: passed
+baseline:
+  fixed: true
+  locations:
+    - audit/batch-command-heartbeat-observability-run_1__closed/dev-agent-a/baseline.md
+    - audit/batch-command-heartbeat-observability-run_1__closed/dev-agent-b/baseline.md
+    - audit/batch-command-heartbeat-observability-run_1__closed/dev-agent-c/baseline.md
+implementation:
+  files:
+    - scripts/graphrag/batch-epub-workflow.mjs
+    - src/contracts/batch-run.ts
+    - test/cli.test.ts
+    - test/integrations/contracts.test.ts
+verification:
+  focusedVitest: pass
+  batchRunnerVitest: pass
+  contractVitest: pass
+  typecheck: pass
+  diffCheck: pass
+reaudit:
+  round: 1
+  startedAt: "2026-05-25T14:04:30-07:00"
+  completedAt: "2026-05-25T14:12:30-07:00"
+  result: pass
+  agentResults:
+    dev-agent-a: pass
+    dev-agent-b: pass
+    dev-agent-c: pass
+  reportTargets:
+    - audit/batch-command-heartbeat-observability-run_1__closed/dev-agent-a/reaudit-1.md
+    - audit/batch-command-heartbeat-observability-run_1__closed/dev-agent-b/reaudit-1.md
+    - audit/batch-command-heartbeat-observability-run_1__closed/dev-agent-c/reaudit-1.md
