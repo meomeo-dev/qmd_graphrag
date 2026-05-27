@@ -40,6 +40,11 @@ QUERY_READY_PRODUCER_REQUIRED_KINDS = {
     "community_report": {"graphrag_community_reports_parquet"},
     "embed": {"lancedb_index"},
 }
+QUERY_READY_PRODUCER_STAGES = (
+    "graph_extract",
+    "community_report",
+    "embed",
+)
 QUERY_READY_LINEAGE_ARTIFACT_KINDS = (
     GRAPH_EXTRACT_CORE_ARTIFACT_KINDS | QUERY_READY_ARTIFACT_KINDS
 )
@@ -553,15 +558,120 @@ def _load_checkpoints(root_dir: Path, book_id: str) -> list[dict[str, Any]]:
     ]
 
 
-def _succeeded_checkpoint_by_stage(
-    root_dir: Path,
-    book_id: str,
-) -> dict[str, dict[str, Any]]:
-    return {
-        str(item.get("stage")): item
-        for item in _load_checkpoints(root_dir, book_id)
-        if item.get("status") == "succeeded" and item.get("stage")
+def _expected_book_content_hash(book: dict[str, Any]) -> str:
+    return str(book.get("normalizedContentHash") or book.get("sourceHash") or "")
+
+
+def _metadata_string(metadata: Any, key: str) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _checkpoint_timestamp(checkpoint: dict[str, Any]) -> str:
+    return str(checkpoint.get("finishedAt") or checkpoint.get("startedAt") or "")
+
+
+def _run_record_to_checkpoint_candidate(
+    record: dict[str, Any],
+    book: dict[str, Any],
+) -> dict[str, Any] | None:
+    stage = str(record.get("stage") or "")
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    stage_fingerprint = (
+        _metadata_string(metadata, "stageFingerprint")
+        or str(record.get("inputFingerprint") or "")
+    )
+    provider_fingerprint = (
+        _metadata_string(metadata, "providerFingerprint")
+        or str(book.get("providerFingerprint") or "")
+    )
+    candidate = {
+        "schemaVersion": record.get("schemaVersion", SCHEMA_VERSION),
+        "bookId": record.get("bookId"),
+        "stage": stage,
+        "status": record.get("status"),
+        "attemptCount": record.get("attemptCount", 0),
+        "runId": record.get("runId"),
+        "startedAt": record.get("startedAt"),
+        "finishedAt": record.get("finishedAt"),
+        "inputFingerprint": record.get("inputFingerprint"),
+        "contentHash": _expected_book_content_hash(book),
+        "stageFingerprint": stage_fingerprint,
+        "providerFingerprint": provider_fingerprint,
+        "artifactIds": record.get("artifactIds") or [],
+        "errorSummary": record.get("errorSummary"),
+        "metadata": metadata,
     }
+    if not candidate["bookId"] or not candidate["stage"]:
+        return None
+    return candidate
+
+
+def _load_run_record_candidates(
+    root_dir: Path,
+    book: dict[str, Any],
+) -> list[dict[str, Any]]:
+    try:
+        import yaml  # type: ignore
+    except Exception as error:  # noqa: BLE001
+        raise RuntimeError("PyYAML is required to enforce GraphRAG capability scope") from error
+
+    book_id = str(book.get("bookId") or "")
+    catalog_path = root_dir / "catalog" / "runs.yaml"
+    if not book_id or not catalog_path.exists():
+        return []
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8")) or {}
+    candidates: list[dict[str, Any]] = []
+    for item in catalog.get("items", []):
+        if not isinstance(item, dict) or item.get("bookId") != book_id:
+            continue
+        run_id = str(item.get("runId") or "")
+        if not run_id:
+            continue
+        run_path = root_dir / "books" / book_id / "runs" / f"{run_id}.yaml"
+        if not run_path.exists():
+            continue
+        record = yaml.safe_load(run_path.read_text(encoding="utf-8")) or {}
+        if not isinstance(record, dict):
+            continue
+        candidate = _run_record_to_checkpoint_candidate(record, book)
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
+
+
+def _load_checkpoint_candidates(
+    root_dir: Path,
+    book: dict[str, Any],
+) -> list[dict[str, Any]]:
+    book_id = str(book.get("bookId") or "")
+    candidates = [
+        *_load_checkpoints(root_dir, book_id),
+        *_load_run_record_candidates(root_dir, book),
+    ]
+    return sorted(candidates, key=_checkpoint_timestamp, reverse=True)
+
+
+def _checkpoint_matches_book(
+    checkpoint: dict[str, Any],
+    book: dict[str, Any],
+    require_run_id: bool = True,
+) -> bool:
+    stage = str(checkpoint.get("stage") or "")
+    stage_fingerprints = book.get("stageFingerprints") or {}
+    metadata = checkpoint.get("metadata")
+    run_id = checkpoint.get("runId")
+    return (
+        checkpoint.get("bookId") == book.get("bookId")
+        and checkpoint.get("status") == "succeeded"
+        and not (isinstance(metadata, dict) and metadata.get("bootstrap") is True)
+        and (not require_run_id or isinstance(run_id, str) and bool(run_id))
+        and checkpoint.get("contentHash") == _expected_book_content_hash(book)
+        and checkpoint.get("stageFingerprint") == stage_fingerprints.get(stage)
+        and checkpoint.get("providerFingerprint") == book.get("providerFingerprint")
+    )
 
 
 def _unique_strings(values: list[str]) -> list[str]:
@@ -585,6 +695,229 @@ def _filter_artifact_ids_by_kinds(
         for artifact_id in artifact_ids
         if str((artifacts_by_id.get(artifact_id) or {}).get("kind") or "") in kinds
     ]
+
+
+def _artifact_ids_for_producer_stage(
+    artifacts_by_id: dict[str, dict[str, Any]],
+    book_id: str,
+    stage: str,
+    producer_run_id: str | None,
+    required_kinds: set[str],
+    checkpoint_artifact_ids: list[str] | None = None,
+) -> list[str]:
+    if producer_run_id:
+        selected = [
+            artifact_id
+            for artifact_id, artifact in artifacts_by_id.items()
+            if artifact.get("bookId") == book_id
+            and artifact.get("stage") == stage
+            and artifact.get("producerRunId") == producer_run_id
+            and str(artifact.get("kind") or "") in required_kinds
+        ]
+        if selected:
+            return _unique_strings(selected)
+    return _filter_artifact_ids_by_kinds(
+        checkpoint_artifact_ids or [],
+        artifacts_by_id,
+        required_kinds,
+    )
+
+
+def _select_producer_checkpoint(
+    root_dir: Path,
+    book: dict[str, Any],
+    artifacts_by_id: dict[str, dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    stage: str,
+) -> dict[str, Any] | None:
+    book_id = str(book.get("bookId") or "")
+    stage_fingerprints = book.get("stageFingerprints") or {}
+    provider_fingerprint = str(book.get("providerFingerprint") or "")
+    corpus_content_hash = _expected_book_content_hash(book)
+    required_kinds = QUERY_READY_PRODUCER_REQUIRED_KINDS[stage]
+    for checkpoint in candidates:
+        if checkpoint.get("stage") != stage or not _checkpoint_matches_book(
+            checkpoint,
+            book,
+        ):
+            continue
+        producer_run_id = str(checkpoint.get("runId") or "")
+        artifact_ids = _artifact_ids_for_producer_stage(
+            artifacts_by_id,
+            book_id,
+            stage,
+            producer_run_id,
+            required_kinds,
+            [
+                str(item)
+                for item in checkpoint.get("artifactIds", [])
+                if item is not None
+            ],
+        )
+        if _validate_artifact_subset(
+            root_dir,
+            book_id,
+            artifact_ids,
+            artifacts_by_id,
+            required_kinds,
+            required_kinds,
+            stage_fingerprints,
+            provider_fingerprint,
+            corpus_content_hash,
+            {stage: producer_run_id},
+        ):
+            return checkpoint
+    return None
+
+
+def _query_ready_gate_artifact_ids(
+    artifacts_by_id: dict[str, dict[str, Any]],
+    book_id: str,
+    expected_producer_run_ids: dict[str, str],
+    checkpoint_artifact_ids: list[str],
+) -> list[str]:
+    return _unique_strings([
+        *_artifact_ids_for_producer_stage(
+            artifacts_by_id,
+            book_id,
+            "community_report",
+            expected_producer_run_ids["community_report"],
+            {"graphrag_community_reports_parquet"},
+            checkpoint_artifact_ids,
+        ),
+        *_artifact_ids_for_producer_stage(
+            artifacts_by_id,
+            book_id,
+            "embed",
+            expected_producer_run_ids["embed"],
+            {"lancedb_index"},
+            checkpoint_artifact_ids,
+        ),
+    ])
+
+
+def _select_query_ready_checkpoint(
+    root_dir: Path,
+    book: dict[str, Any],
+    artifacts_by_id: dict[str, dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    expected_producer_run_ids: dict[str, str],
+) -> dict[str, Any] | None:
+    book_id = str(book.get("bookId") or "")
+    stage_fingerprints = book.get("stageFingerprints") or {}
+    provider_fingerprint = str(book.get("providerFingerprint") or "")
+    corpus_content_hash = _expected_book_content_hash(book)
+    for checkpoint in candidates:
+        if checkpoint.get("stage") != "query_ready" or not _checkpoint_matches_book(
+            checkpoint,
+            book,
+            require_run_id=False,
+        ):
+            continue
+        artifact_ids = _query_ready_gate_artifact_ids(
+            artifacts_by_id,
+            book_id,
+            expected_producer_run_ids,
+            [
+                str(item)
+                for item in checkpoint.get("artifactIds", [])
+                if item is not None
+            ],
+        )
+        if _validate_artifact_subset(
+            root_dir,
+            book_id,
+            artifact_ids,
+            artifacts_by_id,
+            QUERY_READY_ARTIFACT_KINDS,
+            QUERY_READY_ARTIFACT_KINDS,
+            stage_fingerprints,
+            provider_fingerprint,
+            corpus_content_hash,
+            expected_producer_run_ids,
+        ):
+            return checkpoint
+    return None
+
+
+def _project_query_ready_lineage(
+    root_dir: Path,
+    book_id: str,
+) -> dict[str, Any] | None:
+    book = _load_books_by_id(root_dir).get(book_id)
+    if not isinstance(book, dict):
+        return None
+    if not isinstance(book.get("stageFingerprints"), dict):
+        return None
+    if not isinstance(book.get("providerFingerprint"), str):
+        return None
+    if not (root_dir / "books" / book_id / "checkpoints.yaml").exists():
+        return None
+
+    artifacts_by_id = _load_artifacts_by_id(root_dir, [book_id])
+    candidates = _load_checkpoint_candidates(root_dir, book)
+    checkpoint_by_stage: dict[str, dict[str, Any]] = {}
+    expected_producer_run_ids: dict[str, str] = {}
+    for stage in QUERY_READY_PRODUCER_STAGES:
+        checkpoint = _select_producer_checkpoint(
+            root_dir,
+            book,
+            artifacts_by_id,
+            candidates,
+            stage,
+        )
+        if checkpoint is None:
+            return None
+        checkpoint_by_stage[stage] = checkpoint
+        expected_producer_run_ids[stage] = str(checkpoint.get("runId") or "")
+
+    query_ready = _select_query_ready_checkpoint(
+        root_dir,
+        book,
+        artifacts_by_id,
+        candidates,
+        expected_producer_run_ids,
+    )
+    if query_ready is None:
+        return None
+    checkpoint_by_stage["query_ready"] = query_ready
+
+    artifact_ids: list[str] = []
+    for stage in QUERY_READY_PRODUCER_STAGES:
+        checkpoint = checkpoint_by_stage[stage]
+        artifact_ids.extend(
+            _artifact_ids_for_producer_stage(
+                artifacts_by_id,
+                book_id,
+                stage,
+                expected_producer_run_ids[stage],
+                QUERY_READY_PRODUCER_REQUIRED_KINDS[stage],
+                [
+                    str(item)
+                    for item in checkpoint.get("artifactIds", [])
+                    if item is not None
+                ],
+            )
+        )
+    artifact_ids.extend(
+        _query_ready_gate_artifact_ids(
+            artifacts_by_id,
+            book_id,
+            expected_producer_run_ids,
+            [
+                str(item)
+                for item in query_ready.get("artifactIds", [])
+                if item is not None
+            ],
+        )
+    )
+    return {
+        "book": book,
+        "artifactsById": artifacts_by_id,
+        "checkpointByStage": checkpoint_by_stage,
+        "expectedProducerRunIds": expected_producer_run_ids,
+        "artifactIds": _unique_strings(artifact_ids),
+    }
 
 
 def _derive_graph_query_capability(
@@ -990,54 +1323,32 @@ def _load_graph_capabilities(
 
 
 def _load_query_ready_artifact_ids(root_dir: Path, book_id: str) -> list[str] | None:
-    for checkpoint in _load_checkpoints(root_dir, book_id):
-        if (
-            checkpoint.get("stage") == "query_ready"
-            and checkpoint.get("status") == "succeeded"
-        ):
-            artifact_ids = [
-                str(item)
-                for item in checkpoint.get("artifactIds", [])
-                if item is not None
-            ]
-            return artifact_ids or None
-    return None
+    projection = _project_query_ready_lineage(root_dir, book_id)
+    if projection is None:
+        return None
+    return _query_ready_gate_artifact_ids(
+        projection["artifactsById"],
+        book_id,
+        projection["expectedProducerRunIds"],
+        [
+            str(item)
+            for item in projection["checkpointByStage"]["query_ready"].get(
+                "artifactIds",
+                [],
+            )
+            if item is not None
+        ],
+    ) or None
 
 
 def _load_query_ready_lineage_artifact_ids(
     root_dir: Path,
     book_id: str,
 ) -> list[str] | None:
-    checkpoint_by_stage = _succeeded_checkpoint_by_stage(root_dir, book_id)
-    artifacts_by_id = _load_artifacts_by_id(root_dir, [book_id])
-    ids: list[str] = []
-    for stage, kinds in QUERY_READY_PRODUCER_REQUIRED_KINDS.items():
-        checkpoint = checkpoint_by_stage.get(stage) or {}
-        ids.extend(
-            _filter_artifact_ids_by_kinds(
-                [
-                    str(item)
-                    for item in checkpoint.get("artifactIds", [])
-                    if item is not None
-                ],
-                artifacts_by_id,
-                kinds,
-            )
-        )
-    query_ready = checkpoint_by_stage.get("query_ready") or {}
-    ids.extend(
-        _filter_artifact_ids_by_kinds(
-            [
-                str(item)
-                for item in query_ready.get("artifactIds", [])
-                if item is not None
-            ],
-            artifacts_by_id,
-            QUERY_READY_ARTIFACT_KINDS,
-        )
-    )
-    ids = _unique_strings(ids)
-    return ids or None
+    projection = _project_query_ready_lineage(root_dir, book_id)
+    if projection is None:
+        return None
+    return projection["artifactIds"] or None
 
 
 def _validate_query_ready_artifacts(
@@ -1069,14 +1380,11 @@ def _validate_query_ready_artifacts(
     if not isinstance(corpus_content_hash, str) or not corpus_content_hash:
         return False
 
-    checkpoint_by_stage = _succeeded_checkpoint_by_stage(root_dir, book_id)
-    expected_producer_run_ids = {
-        "graph_extract": checkpoint_by_stage.get("graph_extract", {}).get("runId"),
-        "community_report": checkpoint_by_stage.get("community_report", {}).get(
-            "runId"
-        ),
-        "embed": checkpoint_by_stage.get("embed", {}).get("runId"),
-    }
+    projection = _project_query_ready_lineage(root_dir, book_id)
+    if projection is None:
+        return False
+    checkpoint_by_stage = projection["checkpointByStage"]
+    expected_producer_run_ids = projection["expectedProducerRunIds"]
     if not all(isinstance(value, str) and value for value in expected_producer_run_ids.values()):
         return False
     for stage in ("graph_extract", "community_report", "embed", "query_ready"):
@@ -1090,32 +1398,28 @@ def _validate_query_ready_artifacts(
         if checkpoint.get("providerFingerprint") != provider_fingerprint:
             return False
 
-    lineage_artifact_ids = set(
-        _load_query_ready_lineage_artifact_ids(root_dir, book_id) or []
-    )
+    lineage_artifact_ids = set(projection["artifactIds"])
     if not artifact_ids or not set(artifact_ids).issubset(lineage_artifact_ids):
         return False
 
-    artifacts = yaml.safe_load(artifacts_path.read_text(encoding="utf-8")) or {}
-    by_id = {
-        str(item.get("artifactId")): item
-        for item in artifacts.get("items", [])
-        if isinstance(item, dict) and item.get("artifactId")
-    }
+    by_id = projection["artifactsById"]
     selected = [by_id.get(artifact_id) for artifact_id in artifact_ids]
     if any(item is None for item in selected):
         return False
 
     for stage, required_kinds in QUERY_READY_PRODUCER_REQUIRED_KINDS.items():
         producer_checkpoint = checkpoint_by_stage.get(stage) or {}
-        producer_artifact_ids = _filter_artifact_ids_by_kinds(
+        producer_artifact_ids = _artifact_ids_for_producer_stage(
+            by_id,
+            book_id,
+            stage,
+            str(producer_checkpoint.get("runId") or "") or None,
+            required_kinds,
             [
                 str(item)
                 for item in producer_checkpoint.get("artifactIds", [])
                 if item is not None
             ],
-            by_id,
-            required_kinds,
         )
         if not _validate_artifact_subset(
             root_dir,
@@ -1132,14 +1436,15 @@ def _validate_query_ready_artifacts(
             return False
 
     query_ready_checkpoint = checkpoint_by_stage.get("query_ready") or {}
-    query_ready_artifact_ids = _filter_artifact_ids_by_kinds(
+    query_ready_artifact_ids = _query_ready_gate_artifact_ids(
+        by_id,
+        book_id,
+        expected_producer_run_ids,
         [
             str(item)
             for item in query_ready_checkpoint.get("artifactIds", [])
             if item is not None
         ],
-        by_id,
-        QUERY_READY_ARTIFACT_KINDS,
     )
     if not _validate_artifact_subset(
         root_dir,

@@ -1,0 +1,118 @@
+schemaVersion: '1.0.0'
+case: graphrag-capability-scope-bridge-validation
+run: 1
+status: development_audit_passed
+startedAt: '2026-05-27T00:05:00Z'
+updatedAt: '2026-05-27T01:48:00Z'
+criteriaFrozen: true
+criteriaPaths:
+  - agent-a/audit-criteria.md
+  - agent-b/audit-criteria.md
+  - agent-c/audit-criteria.md
+design: design.md
+designAuditReports:
+  - agent-a/design-audit-report.md
+  - agent-b/design-audit-report.md
+  - agent-c/design-audit-report.md
+revisedDesign: revised-design.md
+designReauditReason:
+  - >-
+    Agent B required explicit graphCapabilityIds request scope invariants and
+    tests.
+  - >-
+    Agent C required replacing the nonexistent npm test:python command with the
+    executable Python unittest command used by this repository.
+designSecondReauditReason:
+  - >-
+    Agent C found the first unittest module path still not importable in this
+    repository; revised-design.md now uses the verified discover command with
+    -k capability_scope.
+designReauditReports:
+  - agent-a/design-reaudit-report.md
+  - agent-b/design-reaudit-report.md
+  - agent-c/design-second-reaudit-report.md
+developmentCriteriaFrozen: true
+developmentCriteriaPaths:
+  - agent-a/development-audit-criteria.md
+  - agent-b/development-audit-criteria.md
+  - agent-c/development-audit-criteria.md
+implementation:
+  files:
+    - python/qmd_graphrag/bridge.py
+    - test/python/test_graphrag_bridge_scope.py
+  summary:
+    - >-
+      Python bridge now selects GraphRAG producer artifacts from current
+      artifacts.yaml by bookId, stage, producerRunId and kind before falling
+      back to checkpoint artifact ids.
+    - >-
+      query_ready lineage projection and validation now use the same current
+      manifest selection semantics as the TypeScript capability projection.
+    - >-
+      Regression tests cover stale checkpoint stats artifact ids and
+      fail-closed manifest missing, producer run mismatch and fingerprint
+      mismatch cases.
+    - >-
+      Python bridge now loads checkpoint candidates from both checkpoints.yaml
+      and catalog/runs.yaml-backed run records, matching TypeScript
+      projectQueryReadyLineage candidate selection semantics.
+    - >-
+      Run record candidate tests cover valid recovery when a producer
+      checkpoint is missing and fail-closed behavior when stage fingerprint
+      evidence is stale.
+verification:
+  passed:
+    - >-
+      python -m unittest discover -s test/python -p
+      'test_graphrag_bridge_scope.py' -k capability_scope
+    - python -m py_compile python/qmd_graphrag/bridge.py test/python/test_graphrag_bridge_scope.py
+    - >-
+      PYTHONPATH=python python - <<'PY' ... _load_graph_capabilities real
+      failure probe for book-356ff4920cdf-0bbd8bdb and
+      book-2d1d667301e9-e5c877e8
+    - >-
+      npm run test:node -- test/cli.test.ts -t "reopens query-ready 'graph
+      capability' projection gate failures"
+    - npm run test:node -- test/book-job-state.test.ts
+    - npm run typecheck
+    - git diff --check
+  notes:
+    - >-
+      An earlier cli.test.ts command using -t "capabilityScope references
+      unknown" matched no test and was not counted as verification.
+developmentAuditReports:
+  - agent-a/development-audit-report.md
+  - agent-b/development-audit-report.md
+  - agent-c/development-audit-report.md
+developmentReauditReason:
+  - >-
+    Agent B found the first implementation still ignored run record
+    candidates, so Python bridge did not fully match TypeScript
+    projectQueryReadyLineage semantics. The implementation now includes
+    catalog/runs.yaml-backed run record candidates and added regression tests.
+developmentReauditReports:
+  - agent-a/development-reaudit-report.md
+  - agent-b/development-reaudit-report.md
+  - agent-c/development-reaudit-report.md
+finalReport: final-report.md
+trigger:
+  runId: epub-batch-20260526-after-sidecar-fix
+  failingItems:
+    - itemId: item-356ff4920cdf-c7e96dce
+      bookId: book-356ff4920cdf-0bbd8bdb
+      error: >-
+        capabilityScope references unknown or not-ready graphCapabilityId(s):
+        book-356ff4920cdf-0bbd8bdb:graph_query
+    - itemId: item-2d1d667301e9-095a11e7
+      bookId: book-2d1d667301e9-e5c877e8
+      error: >-
+        capabilityScope references unknown or not-ready graphCapabilityId(s):
+        book-2d1d667301e9-e5c877e8:graph_query
+evidence:
+  summary:
+    - TypeScript projection resolves both graph_query capabilities.
+    - Python bridge rejects the same graph_query capabilities.
+    - Python graph_extract validation sees 6 required kinds because checkpoint
+      references stale stats artifact ids absent from current artifacts.yaml.
+    - Current artifacts.yaml contains valid stats artifacts for the same
+      producer run, so Python artifact selection is stale relative to TS.

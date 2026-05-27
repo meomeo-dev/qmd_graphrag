@@ -404,6 +404,97 @@ def _write_complete_lancedb_fixture(root: Path) -> None:
         )
 
 
+def _artifact_manifest(root: Path, book_id: str) -> dict:
+    path = root / "books" / book_id / "artifacts.yaml"
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def _write_artifact_manifest(root: Path, book_id: str, manifest: dict) -> None:
+    path = root / "books" / book_id / "artifacts.yaml"
+    path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+
+
+def _checkpoint_manifest(root: Path, book_id: str) -> dict:
+    path = root / "books" / book_id / "checkpoints.yaml"
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def _write_checkpoint_manifest(root: Path, book_id: str, manifest: dict) -> None:
+    path = root / "books" / book_id / "checkpoints.yaml"
+    path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+
+
+def _write_run_record_catalog(root: Path, book_id: str, runs: list[dict]) -> None:
+    catalog = root / "catalog"
+    catalog.mkdir(parents=True, exist_ok=True)
+    (catalog / "runs.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "schemaVersion": "1.0.0",
+                "items": [
+                    {
+                        "schemaVersion": "1.0.0",
+                        "runId": run["runId"],
+                        "bookId": book_id,
+                        "stage": run["stage"],
+                        "status": run["status"],
+                        "startedAt": run["startedAt"],
+                        "finishedAt": run.get("finishedAt"),
+                    }
+                    for run in runs
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    runs_dir = root / "books" / book_id / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    for run in runs:
+        (runs_dir / f"{run['runId']}.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "schemaVersion": "1.0.0",
+                    "runId": run["runId"],
+                    "bookId": book_id,
+                    "stage": run["stage"],
+                    "status": run["status"],
+                    "attemptCount": 1,
+                    "startedAt": run["startedAt"],
+                    "finishedAt": run.get("finishedAt"),
+                    "inputFingerprint": run["inputFingerprint"],
+                    "artifactIds": run["artifactIds"],
+                    "metadata": run.get("metadata"),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+
+def _remove_checkpoint_stage(root: Path, book_id: str, stage: str) -> None:
+    manifest = _checkpoint_manifest(root, book_id)
+    manifest["items"] = [
+        item for item in manifest["items"] if item["stage"] != stage
+    ]
+    _write_checkpoint_manifest(root, book_id, manifest)
+
+
+def _replace_graph_extract_stats_checkpoint_id_with_stale_id(
+    root: Path,
+    book_id: str,
+    artifact_prefix: str,
+) -> None:
+    manifest = _checkpoint_manifest(root, book_id)
+    for checkpoint in manifest["items"]:
+        if checkpoint["stage"] == "graph_extract":
+            checkpoint["artifactIds"] = [
+                "stale-stats-artifact"
+                if item == f"{artifact_prefix}-stats"
+                else item
+                for item in checkpoint["artifactIds"]
+            ]
+    _write_checkpoint_manifest(root, book_id, manifest)
+
+
 def _hash_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -1028,6 +1119,182 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                 },
                 capabilities,
             )
+
+    def test_capability_scope_derives_from_current_manifest_when_checkpoint_stats_id_is_stale(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmd-bridge-scope-") as tmp:
+            root = Path(tmp)
+            _write_books(root)
+            _replace_graph_extract_stats_checkpoint_id_with_stale_id(
+                root,
+                "book-1",
+                "artifact-1",
+            )
+
+            book_ids, capabilities = _resolve_capability_scoped_book_ids(
+                root,
+                ["book-1"],
+                ["book-1:graph_query"],
+            )
+
+            self.assertEqual(book_ids, ["book-1"])
+            self.assertEqual(capabilities[0]["capabilityId"], "book-1:graph_query")
+            self.assertEqual(
+                capabilities[0]["artifactIds"],
+                _lineage_artifact_ids("artifact-1"),
+            )
+
+    def test_capability_scope_uses_run_record_candidate_when_checkpoint_stage_missing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmd-bridge-scope-") as tmp:
+            root = Path(tmp)
+            _write_books(root)
+            checkpoint = next(
+                item for item in _checkpoint_manifest(root, "book-1")["items"]
+                if item["stage"] == "graph_extract"
+            )
+            _remove_checkpoint_stage(root, "book-1", "graph_extract")
+            _write_run_record_catalog(
+                root,
+                "book-1",
+                [
+                    {
+                        "runId": checkpoint["runId"],
+                        "stage": "graph_extract",
+                        "status": "succeeded",
+                        "startedAt": "2026-05-21T00:00:00.000Z",
+                        "finishedAt": "2026-05-21T00:00:00.000Z",
+                        "inputFingerprint": checkpoint["inputFingerprint"],
+                        "artifactIds": checkpoint["artifactIds"],
+                        "metadata": {
+                            "stageFingerprint": checkpoint["stageFingerprint"],
+                            "providerFingerprint": checkpoint["providerFingerprint"],
+                        },
+                    },
+                ],
+            )
+
+            book_ids, capabilities = _resolve_capability_scoped_book_ids(
+                root,
+                ["book-1"],
+                ["book-1:graph_query"],
+            )
+
+            self.assertEqual(book_ids, ["book-1"])
+            self.assertEqual(capabilities[0]["artifactIds"], _lineage_artifact_ids("artifact-1"))
+
+    def test_capability_scope_rejects_run_record_candidate_without_stage_fingerprint(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmd-bridge-scope-") as tmp:
+            root = Path(tmp)
+            _write_books(root)
+            checkpoint = next(
+                item for item in _checkpoint_manifest(root, "book-1")["items"]
+                if item["stage"] == "graph_extract"
+            )
+            _remove_checkpoint_stage(root, "book-1", "graph_extract")
+            _write_run_record_catalog(
+                root,
+                "book-1",
+                [
+                    {
+                        "runId": checkpoint["runId"],
+                        "stage": "graph_extract",
+                        "status": "succeeded",
+                        "startedAt": "2026-05-21T00:00:00.000Z",
+                        "finishedAt": "2026-05-21T00:00:00.000Z",
+                        "inputFingerprint": "old-stage-graph-extract",
+                        "artifactIds": checkpoint["artifactIds"],
+                        "metadata": {
+                            "providerFingerprint": checkpoint["providerFingerprint"],
+                        },
+                    },
+                ],
+            )
+
+            with self.assertRaisesRegex(ValueError, "unknown or not-ready"):
+                _resolve_capability_scoped_book_ids(
+                    root,
+                    ["book-1"],
+                    ["book-1:graph_query"],
+                )
+
+    def test_capability_scope_rejects_manifest_missing_current_stats_artifact(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmd-bridge-scope-") as tmp:
+            root = Path(tmp)
+            _write_books(root)
+            _replace_graph_extract_stats_checkpoint_id_with_stale_id(
+                root,
+                "book-1",
+                "artifact-1",
+            )
+            manifest = _artifact_manifest(root, "book-1")
+            manifest["items"] = [
+                item
+                for item in manifest["items"]
+                if item["artifactId"] != "artifact-1-stats"
+            ]
+            _write_artifact_manifest(root, "book-1", manifest)
+
+            with self.assertRaisesRegex(ValueError, "unknown or not-ready"):
+                _resolve_capability_scoped_book_ids(
+                    root,
+                    ["book-1"],
+                    ["book-1:graph_query"],
+                )
+
+    def test_capability_scope_rejects_manifest_stats_artifact_wrong_run(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmd-bridge-scope-") as tmp:
+            root = Path(tmp)
+            _write_books(root)
+            _replace_graph_extract_stats_checkpoint_id_with_stale_id(
+                root,
+                "book-1",
+                "artifact-1",
+            )
+            manifest = _artifact_manifest(root, "book-1")
+            for artifact in manifest["items"]:
+                if artifact["artifactId"] == "artifact-1-stats":
+                    artifact["producerRunId"] = "old-run-graph-extract"
+            _write_artifact_manifest(root, "book-1", manifest)
+
+            with self.assertRaisesRegex(ValueError, "unknown or not-ready"):
+                _resolve_capability_scoped_book_ids(
+                    root,
+                    ["book-1"],
+                    ["book-1:graph_query"],
+                )
+
+    def test_capability_scope_rejects_manifest_stats_artifact_wrong_fingerprint(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmd-bridge-scope-") as tmp:
+            root = Path(tmp)
+            _write_books(root)
+            _replace_graph_extract_stats_checkpoint_id_with_stale_id(
+                root,
+                "book-1",
+                "artifact-1",
+            )
+            manifest = _artifact_manifest(root, "book-1")
+            for artifact in manifest["items"]:
+                if artifact["artifactId"] == "artifact-1-stats":
+                    artifact["stageFingerprint"] = "old-stage-graph-extract"
+            _write_artifact_manifest(root, "book-1", manifest)
+
+            with self.assertRaisesRegex(ValueError, "unknown or not-ready"):
+                _resolve_capability_scoped_book_ids(
+                    root,
+                    ["book-1"],
+                    ["book-1:graph_query"],
+                )
 
     def test_capability_scope_derives_missing_capability_with_explicit_catalog(
         self,
