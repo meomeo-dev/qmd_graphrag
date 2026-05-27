@@ -69,6 +69,13 @@ _TRANSIENT_MESSAGE_FRAGMENTS = (
     "(425)",
     "(429)",
 )
+_TRANSIENT_RESPONSES_ERROR_KINDS = {
+    "rate_limit_exceeded",
+    "responses_output_none",
+    "server_error",
+    "timeout",
+}
+_MISSING = object()
 _RESPONSES_GATE_LOCK = Lock()
 _RESPONSES_GATES: dict[tuple[str, str, int], "_ResponsesConcurrencyGate"] = {}
 
@@ -218,13 +225,9 @@ def _create_completion_response(
     *,
     response: Any,
     model: str,
-    output_text: str | None = None,
+    output_text: str,
 ) -> LLMCompletionResponse:
-    text = (
-        output_text
-        if output_text is not None
-        else getattr(response, "output_text", "") or ""
-    )
+    text = output_text
     created = int(getattr(response, "created_at", 0) or 0)
     response_id = str(getattr(response, "id", "responses-completion"))
 
@@ -280,12 +283,63 @@ def _event_type(event: Any) -> str:
     return str(getattr(event, "type", ""))
 
 
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _response_incomplete_reason(response: Any) -> str | None:
+    details = _field(response, "incomplete_details")
+    reason = _field(details, "reason")
+    return str(reason) if reason else None
+
+
+def _response_status_code(value: Any) -> int | None:
+    for candidate in (
+        _field(value, "status_code"),
+        _field(value, "code"),
+        _field(_field(value, "error"), "status_code"),
+        _field(_field(value, "error"), "code"),
+    ):
+        try:
+            parsed = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return None
+
+
+def _error_object_message(error: Any) -> str:
+    message = _field(error, "message")
+    if message:
+        return str(message)
+    return str(error)
+
+
+def _response_error_message(response: Any) -> str:
+    error = _field(response, "error")
+    if error is not None:
+        return _error_object_message(error)
+    status = _field(response, "status")
+    if status:
+        return f"Responses API response ended with status={status}"
+    return "Responses API response ended without output text"
+
+
 def _stream_error_message(event: Any) -> str:
     message = getattr(event, "message", None)
     if message:
         return str(message)
 
     response = getattr(event, "response", None)
+    incomplete_reason = _response_incomplete_reason(response)
+    if incomplete_reason:
+        return f"Responses API response incomplete: reason={incomplete_reason}"
+
     error = getattr(response, "error", None)
     if error is None:
         return f"Responses API stream ended with event: {_event_type(event)}"
@@ -321,21 +375,7 @@ def _stream_error_status_code(event: Any) -> int | None:
         if parsed > 0:
             return parsed
 
-    response = getattr(event, "response", None)
-    error = getattr(response, "error", None)
-    for candidate in (
-        getattr(response, "status_code", None),
-        getattr(error, "status_code", None),
-        getattr(error, "code", None),
-    ):
-        try:
-            parsed = int(candidate)
-        except (TypeError, ValueError):
-            continue
-        if parsed > 0:
-            return parsed
-
-    return None
+    return _response_status_code(getattr(event, "response", None))
 
 
 def _raise_stream_failure(event: Any) -> None:
@@ -435,6 +475,10 @@ def _responses_gate_for(
 
 
 def _is_transient_responses_error(error: BaseException) -> bool:
+    kind = getattr(error, "kind", None)
+    if isinstance(kind, str) and kind in _TRANSIENT_RESPONSES_ERROR_KINDS:
+        return True
+
     status_code = getattr(error, "status_code", None)
     if isinstance(status_code, int) and status_code in _TRANSIENT_STATUS_CODES:
         return True
@@ -512,7 +556,71 @@ async def _run_with_responses_recovery_async(
 
 
 def _completed_response_output_text(response: Any) -> str:
-    return str(getattr(response, "output_text", "") or "")
+    status = str(_field(response, "status", "") or "").lower()
+    incomplete_reason = _response_incomplete_reason(response)
+    if incomplete_reason:
+        raise RuntimeError(
+            "Responses API response incomplete: "
+            f"reason={_sanitize_error_message(incomplete_reason)}"
+        )
+    if status == "incomplete":
+        raise RuntimeError("Responses API response incomplete")
+
+    response_error = _field(response, "error")
+    if response_error is not None:
+        message = _response_error_message(response)
+        error = OpenAIResponsesTransientError(
+            message=message,
+            kind=str(_field(response_error, "code", "transient") or "transient"),
+            status_code=_response_status_code(response),
+        )
+        if _is_transient_responses_error(error):
+            raise error
+        raise RuntimeError(message)
+    if status in {"cancelled", "canceled", "failed"}:
+        raise RuntimeError(_response_error_message(response))
+
+    output = _field(response, "output", _MISSING)
+    if output is _MISSING:
+        raise RuntimeError("Responses API completed response output field was missing")
+    if output is None:
+        raise OpenAIResponsesTransientError(
+            message="completed response output was null",
+            kind="responses_output_none",
+        )
+    if not isinstance(output, Sequence) or isinstance(output, (str, bytes, bytearray)):
+        raise RuntimeError("Responses API completed response output is not iterable")
+    if len(output) == 0:
+        raise RuntimeError("Responses API completed response output was empty")
+
+    text_parts: list[str] = []
+    refusal_parts: list[str] = []
+    for output_item in output:
+        content = _field(output_item, "content", [])
+        if content is None:
+            continue
+        if not isinstance(content, Sequence) or isinstance(content, (str, bytes, bytearray)):
+            content = [content]
+        for block in content:
+            block_type = str(_field(block, "type", "") or "")
+            if block_type == "refusal" or _field(block, "refusal") is not None:
+                refusal_parts.append(str(_field(block, "refusal", "") or ""))
+                continue
+            text = _field(block, "text")
+            if text is None:
+                text = _field(block, "value")
+            if text is not None and block_type in {"", "output_text", "text"}:
+                text_parts.append(str(text))
+
+    if refusal_parts:
+        refusal = " ".join(part for part in refusal_parts if part).strip()
+        detail = f": {_sanitize_error_message(refusal)}" if refusal else ""
+        raise RuntimeError(f"Responses API response refusal{detail}")
+
+    text = "".join(text_parts)
+    if text:
+        return text
+    raise RuntimeError("Responses API completed response contained no output text")
 
 
 def _collect_response_stream(
@@ -521,6 +629,7 @@ def _collect_response_stream(
     model: str,
 ) -> LLMCompletionResponse:
     text_parts: list[str] = []
+    refusal_parts: list[str] = []
     completed_response: Any | None = None
 
     for event in stream:
@@ -533,6 +642,14 @@ def _collect_response_stream(
             if text and not text_parts:
                 text_parts.append(str(text))
             continue
+        if event_type == "response.refusal.delta":
+            refusal_parts.append(str(getattr(event, "delta", "") or ""))
+            continue
+        if event_type == "response.refusal.done":
+            text = getattr(event, "text", None)
+            if text and not refusal_parts:
+                refusal_parts.append(str(text))
+            continue
         if event_type == "response.completed":
             completed_response = getattr(event, "response", None)
             continue
@@ -540,12 +657,16 @@ def _collect_response_stream(
             _raise_stream_failure(event)
 
     output_text = "".join(text_parts)
+    if refusal_parts:
+        refusal = " ".join(part for part in refusal_parts if part).strip()
+        detail = f": {_sanitize_error_message(refusal)}" if refusal else ""
+        raise RuntimeError(f"Responses API response refusal{detail}")
     if completed_response is not None:
-        final_text = _completed_response_output_text(completed_response)
+        final_text = output_text or _completed_response_output_text(completed_response)
         return _create_completion_response(
             response=completed_response,
             model=model,
-            output_text=final_text or output_text,
+            output_text=final_text,
         )
 
     return _create_completion_response(
@@ -561,6 +682,7 @@ async def _collect_response_stream_async(
     model: str,
 ) -> LLMCompletionResponse:
     text_parts: list[str] = []
+    refusal_parts: list[str] = []
     completed_response: Any | None = None
 
     async for event in stream:
@@ -573,6 +695,14 @@ async def _collect_response_stream_async(
             if text and not text_parts:
                 text_parts.append(str(text))
             continue
+        if event_type == "response.refusal.delta":
+            refusal_parts.append(str(getattr(event, "delta", "") or ""))
+            continue
+        if event_type == "response.refusal.done":
+            text = getattr(event, "text", None)
+            if text and not refusal_parts:
+                refusal_parts.append(str(text))
+            continue
         if event_type == "response.completed":
             completed_response = getattr(event, "response", None)
             continue
@@ -580,12 +710,16 @@ async def _collect_response_stream_async(
             _raise_stream_failure(event)
 
     output_text = "".join(text_parts)
+    if refusal_parts:
+        refusal = " ".join(part for part in refusal_parts if part).strip()
+        detail = f": {_sanitize_error_message(refusal)}" if refusal else ""
+        raise RuntimeError(f"Responses API response refusal{detail}")
     if completed_response is not None:
-        final_text = _completed_response_output_text(completed_response)
+        final_text = output_text or _completed_response_output_text(completed_response)
         return _create_completion_response(
             response=completed_response,
             model=model,
-            output_text=final_text or output_text,
+            output_text=final_text,
         )
 
     return _create_completion_response(
@@ -602,6 +736,9 @@ def _iter_response_chunks(
 ) -> Iterator[LLMCompletionChunk]:
     response_id = "responses-completion"
     created = 0
+    emitted_text = False
+    refusal_parts: list[str] = []
+    completed_response: Any | None = None
 
     for event in stream:
         response = getattr(event, "response", None)
@@ -613,6 +750,7 @@ def _iter_response_chunks(
         if event_type == "response.output_text.delta":
             delta = str(getattr(event, "delta", "") or "")
             if delta:
+                emitted_text = True
                 yield _create_completion_chunk(
                     content=delta,
                     model=model,
@@ -620,17 +758,41 @@ def _iter_response_chunks(
                     created=created,
                 )
             continue
+        if event_type == "response.refusal.delta":
+            refusal_parts.append(str(getattr(event, "delta", "") or ""))
+            continue
+        if event_type == "response.refusal.done":
+            text = getattr(event, "text", None)
+            if text and not refusal_parts:
+                refusal_parts.append(str(text))
+            continue
         if event_type == "response.completed":
-            yield _create_completion_chunk(
-                content="",
-                model=model,
-                response_id=response_id,
-                created=created,
-                finish_reason="stop",
-            )
+            completed_response = response
             continue
         if event_type in _RESPONSE_STREAM_FAILURE_EVENT_TYPES:
             _raise_stream_failure(event)
+
+    if refusal_parts:
+        refusal = " ".join(part for part in refusal_parts if part).strip()
+        detail = f": {_sanitize_error_message(refusal)}" if refusal else ""
+        raise RuntimeError(f"Responses API response refusal{detail}")
+    if completed_response is not None:
+        if not emitted_text:
+            final_text = _completed_response_output_text(completed_response)
+            if final_text:
+                yield _create_completion_chunk(
+                    content=final_text,
+                    model=model,
+                    response_id=response_id,
+                    created=created,
+                )
+        yield _create_completion_chunk(
+            content="",
+            model=model,
+            response_id=response_id,
+            created=created,
+            finish_reason="stop",
+        )
 
 
 async def _iter_response_chunks_async(
@@ -640,6 +802,9 @@ async def _iter_response_chunks_async(
 ) -> AsyncIterator[LLMCompletionChunk]:
     response_id = "responses-completion"
     created = 0
+    emitted_text = False
+    refusal_parts: list[str] = []
+    completed_response: Any | None = None
 
     async for event in stream:
         response = getattr(event, "response", None)
@@ -651,6 +816,7 @@ async def _iter_response_chunks_async(
         if event_type == "response.output_text.delta":
             delta = str(getattr(event, "delta", "") or "")
             if delta:
+                emitted_text = True
                 yield _create_completion_chunk(
                     content=delta,
                     model=model,
@@ -658,17 +824,41 @@ async def _iter_response_chunks_async(
                     created=created,
                 )
             continue
+        if event_type == "response.refusal.delta":
+            refusal_parts.append(str(getattr(event, "delta", "") or ""))
+            continue
+        if event_type == "response.refusal.done":
+            text = getattr(event, "text", None)
+            if text and not refusal_parts:
+                refusal_parts.append(str(text))
+            continue
         if event_type == "response.completed":
-            yield _create_completion_chunk(
-                content="",
-                model=model,
-                response_id=response_id,
-                created=created,
-                finish_reason="stop",
-            )
+            completed_response = response
             continue
         if event_type in _RESPONSE_STREAM_FAILURE_EVENT_TYPES:
             _raise_stream_failure(event)
+
+    if refusal_parts:
+        refusal = " ".join(part for part in refusal_parts if part).strip()
+        detail = f": {_sanitize_error_message(refusal)}" if refusal else ""
+        raise RuntimeError(f"Responses API response refusal{detail}")
+    if completed_response is not None:
+        if not emitted_text:
+            final_text = _completed_response_output_text(completed_response)
+            if final_text:
+                yield _create_completion_chunk(
+                    content=final_text,
+                    model=model,
+                    response_id=response_id,
+                    created=created,
+                )
+        yield _create_completion_chunk(
+            content="",
+            model=model,
+            response_id=response_id,
+            created=created,
+            finish_reason="stop",
+        )
 
 
 def _translate_call_args(kwargs: dict[str, Any]) -> dict[str, Any]:

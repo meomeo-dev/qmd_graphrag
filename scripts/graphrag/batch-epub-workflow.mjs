@@ -740,13 +740,131 @@ function nextProviderRecoveryWaitCount(checkpoint) {
   );
 }
 
+function providerRecoveryReasonFromFailureText(text) {
+  const message = String(text ?? "").toLowerCase();
+  if (message.includes("kind=responses_output_none")) {
+    return "responses_output_none";
+  }
+  return undefined;
+}
+
 function checkpointFailureText(checkpoint) {
   return [...new Set([
     checkpoint?.errorSummary,
+    checkpoint?.metadata?.providerRecoveryEvidenceSummary,
     ...(checkpoint?.commandChecks ?? [])
       .filter((check) => check.status === "failed")
       .map((check) => check.errorSummary),
   ].filter(Boolean))].join("\n");
+}
+
+function isLegacyResponsesOutputNoneSummary(text) {
+  const message = String(text ?? "").toLowerCase();
+  return message.includes("graphrag index workflow failed") &&
+    message.includes("\"workflow\":\"extract_graph\"") &&
+    message.includes("'nonetype' object is not iterable");
+}
+
+function hasLegacyResponsesOutputNoneAdapterEvidence(text) {
+  const message = String(text ?? "").toLowerCase();
+  return message.includes("typeerror: 'nonetype' object is not iterable") &&
+    message.includes("_completed_response_output_text") &&
+    (
+      message.includes("response.output_text") ||
+      message.includes("getattr(response, \"output_text\"")
+    ) &&
+    message.includes("graphrag_responses_completion.py");
+}
+
+function legacyResponsesOutputNoneLogPath(item, checkpoint) {
+  const summaryStage = isLegacyResponsesOutputNoneSummary(
+    checkpointFailureText(checkpoint),
+  )
+    ? "graph_extract"
+    : undefined;
+  const graphStatus = checkpoint?.graphBuildStatus;
+  const stage = summaryStage ?? (
+    graphStatus?.stage === "graph_extract" ||
+    graphStatus?.reason === "real_graphrag_stage_failed:graph_extract"
+    ? "graph_extract"
+    : checkpoint?.metadata?.graphWorkflow === "extract_graph"
+      ? "graph_extract"
+      : undefined
+  );
+  if (stage !== "graph_extract") return null;
+  const bookId = checkpoint?.bookId ?? item?.bookId;
+  if (!bookId) return null;
+  return join(logRoot, "graphrag-reports", bookId, stage, "indexing-engine.log");
+}
+
+function legacyResponsesOutputNoneEvidence(item, checkpoint) {
+  const failureText = checkpointFailureText(checkpoint);
+  if (!isLegacyResponsesOutputNoneSummary(failureText)) return null;
+  const logPath = legacyResponsesOutputNoneLogPath(item, checkpoint);
+  if (!logPath || !existsSync(logPath)) return null;
+  let logText = "";
+  try {
+    logText = readFileSync(logPath, "utf8");
+  } catch {
+    return null;
+  }
+  if (!hasLegacyResponsesOutputNoneAdapterEvidence(logText)) return null;
+  return {
+    evidenceText:
+      "Responses API transient error kind=responses_output_none " +
+      "status_code=unknown: completed response output was null",
+    evidenceLocator: relative(root, logPath),
+  };
+}
+
+function recoverLegacyResponsesOutputNoneCheckpoint(item, checkpoint) {
+  if (
+    checkpoint?.status !== "failed" ||
+    checkpoint.failureKind !== "unknown" ||
+    checkpoint.retryable !== false ||
+    checkpoint.recoveryDecision !== "stop_until_fixed"
+  ) {
+    return checkpoint;
+  }
+  const evidence = legacyResponsesOutputNoneEvidence(item, checkpoint);
+  if (evidence == null) return checkpoint;
+  const commandChecks = (checkpoint.commandChecks ?? []).map((check) =>
+    check.status === "failed"
+      ? {
+          ...check,
+          errorSummary: [
+            check.errorSummary,
+            evidence.evidenceText,
+          ].filter(Boolean).join("\n"),
+          failureKind: "transient",
+          retryable: true,
+          attemptExhausted: false,
+          recoveryDecision: "retry_same_run_id",
+        }
+      : check
+  );
+  return {
+    ...checkpoint,
+    errorSummary: [
+      checkpoint.errorSummary,
+      evidence.evidenceText,
+    ].filter(Boolean).join("\n"),
+    failureKind: "transient",
+    retryable: true,
+    retryExhausted: false,
+    recoveryDecision: "retry_same_run_id",
+    commandChecks,
+    metadata: {
+      ...(checkpoint.metadata ?? {}),
+      reclassifiedByCurrentFailureClassifier: true,
+      originalFailureKind: checkpoint.failureKind,
+      originalRecoveryDecision: checkpoint.recoveryDecision,
+      providerRecoveryReason: "responses_output_none",
+      providerFailureCode: "responses_output_none",
+      providerRecoveryEvidenceLocator: evidence.evidenceLocator,
+      providerRecoveryEvidenceSummary: evidence.evidenceText,
+    },
+  };
 }
 
 function checkpointHasLocalArtifactGateFailure(checkpoint) {
@@ -2223,9 +2341,11 @@ function loadCheckpoint(item, completedSeed) {
   const hydratedEvidenceItem = evidenceItemForCheckpoint(item, hydrated);
   if (migrateOnly) {
     const checkpoint = recoverProviderTransientCheckpoint(item,
-      downgradeCompletedIfClosedLoopInvalid(
-        hydratedEvidenceItem,
-        hydrated,
+      recoverLegacyResponsesOutputNoneCheckpoint(item,
+        downgradeCompletedIfClosedLoopInvalid(
+          hydratedEvidenceItem,
+          hydrated,
+        ),
       ),
     );
     const checkpointEvidenceItem = evidenceItemForCheckpoint(item, checkpoint);
@@ -2245,10 +2365,12 @@ function loadCheckpoint(item, completedSeed) {
     );
   }
   const checkpoint = recoverProviderTransientCheckpoint(item,
-    recoverOrphanedRunningCheckpoint(item, downgradeCompletedIfClosedLoopInvalid(
-      hydratedEvidenceItem,
-      hydrated,
-    )),
+    recoverLegacyResponsesOutputNoneCheckpoint(item,
+      recoverOrphanedRunningCheckpoint(item, downgradeCompletedIfClosedLoopInvalid(
+        hydratedEvidenceItem,
+        hydrated,
+      )),
+    ),
   );
   const checkpointEvidenceItem = evidenceItemForCheckpoint(item, checkpoint);
   if (statusJson) {
@@ -3885,6 +4007,16 @@ function recoverProviderTransientCheckpoint(item, checkpoint) {
   const nextRetryAt = checkpoint.nextRetryAt ?? isoAfterSeconds(delaySeconds);
   const retryStartedAt = checkpoint.retryStartedAt ?? checkpoint.failedAt ?? now();
   const retryProbe = { ...checkpoint, retryStartedAt };
+  const providerRecoveryReason =
+    checkpoint.metadata?.providerRecoveryReason ??
+    providerRecoveryReasonFromFailureText(checkpointFailureText(checkpoint)) ??
+    (
+      checkpoint.retryExhausted === true
+        ? "legacy_retry_exhausted_transient"
+        : retryBudgetExhausted(retryProbe)
+          ? "retry_budget_window_elapsed"
+          : "transient_failure_recovered"
+    );
   const recovered = {
     ...checkpoint,
     status: "pending",
@@ -3902,11 +4034,7 @@ function recoverProviderTransientCheckpoint(item, checkpoint) {
       waitingForProviderRecovery: true,
       providerRecoveryWaitStartedAt:
         checkpoint.metadata?.providerRecoveryWaitStartedAt ?? now(),
-      providerRecoveryReason: checkpoint.retryExhausted === true
-        ? "legacy_retry_exhausted_transient"
-        : retryBudgetExhausted(retryProbe)
-          ? "retry_budget_window_elapsed"
-          : "transient_failure_recovered",
+      providerRecoveryReason,
       providerRecoveryWaitCount: waitCount,
       maxProviderRecoveryWaits,
     },

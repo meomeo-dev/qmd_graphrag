@@ -129,6 +129,7 @@ export function isProviderTransientFailureText(text) {
     "an error occurred while processing your request. you can retry your request",
     "kind=server_error",
     "kind=rate_limit_exceeded",
+    "kind=responses_output_none",
     "kind=timeout",
     "stream_read_error",
     "timeout",

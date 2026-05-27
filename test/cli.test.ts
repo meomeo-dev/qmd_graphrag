@@ -2328,6 +2328,45 @@ describe("GraphRAG EPUB batch runner", () => {
       retryable: true,
     });
     expect(classifyFailure(
+      "Responses API transient error kind=responses_output_none " +
+      "status_code=unknown: completed response output was null",
+    )).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+    });
+    expect(classifyFailure(
+      "GraphRAG index workflow failed: " +
+      "[{\"workflow\":\"extract_graph\",\"errorMessage\":\"Responses API " +
+      "transient failure after 13 attempts: OpenAIResponsesTransientError: " +
+      "Responses API transient error kind=responses_output_none " +
+      "status_code=unknown: completed response output was null\"}]",
+    )).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+    });
+    expect(classifyFailure(
+      "GraphRAG index workflow failed: " +
+      "[{\"workflow\":\"extract_graph\",\"errorMessage\":\"'NoneType' object " +
+      "is not iterable\"}]",
+    )).toMatchObject({
+      failureKind: "unknown",
+      retryable: false,
+    });
+    expect(classifyFailure(
+      "GraphRAG index workflow failed: " +
+      "[{\"workflow\":\"extract_graph\",\"errorMessage\":\"TypeError: local " +
+      "parser object is not iterable\"}]",
+    )).toMatchObject({
+      failureKind: "unknown",
+      retryable: false,
+    });
+    expect(classifyFailure(
+      "Responses API completed response output field was missing",
+    )).toMatchObject({
+      failureKind: "unknown",
+      retryable: false,
+    });
+    expect(classifyFailure(
       "GraphRAG index workflow failed: " +
       "[{\"workflow\":\"extract_graph\",\"errorMessage\":\"An error occurred " +
       "while processing your request. You can retry your request, or contact " +
@@ -4158,6 +4197,259 @@ describe("GraphRAG EPUB batch runner", () => {
       providerRecoveryWaitCount: 1,
       maxProviderRecoveryWaits: 3,
       providerRecoveryReason: "retry_budget_window_elapsed",
+    });
+  });
+
+  test("status-json recovers legacy Responses output-none as provider transient", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-legacy-output-none-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "legacy-responses-output-none";
+    const sourceBytes = "legacy responses output none";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    const sourcePath = join(sourceDir, "Book.epub");
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const errorSummary =
+      "Error: GraphRAG index workflow failed: " +
+      "[{\"workflow\":\"extract_graph\",\"errorMessage\":\"Responses API " +
+      "transient failure after 13 attempts: OpenAIResponsesTransientError: " +
+      "Responses API transient error kind=responses_output_none " +
+      "status_code=unknown: completed response output was null\"}]";
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        pendingItems: 0,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "failed",
+        sourceName: "Book.epub",
+        sourceRelativePath,
+        sourceHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        bookId: batchBookId(sourceHash, sourceRelativePath),
+        attempts: 3,
+        retryStartedAt: "2026-05-23T00:00:00.000Z",
+        failedAt: "2026-05-23T00:10:00.000Z",
+        failureKind: "unknown",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "resume-book-1",
+        errorSummary,
+        commandChecks: [{
+          name: "resume-book-1",
+          status: "failed",
+          attempts: 12,
+          exitCode: 1,
+          stdoutBytes: 0,
+          stderrBytes: errorSummary.length,
+          startedAt: "2026-05-23T00:00:00.000Z",
+          completedAt: "2026-05-23T00:10:00.000Z",
+          failureKind: "unknown",
+          retryable: false,
+          attemptExhausted: true,
+          recoveryDecision: "stop_until_fixed",
+          errorSummary,
+        }],
+      }),
+    );
+
+    const result = await runBatchStatusJson({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      logRoot,
+      configDir,
+      runId,
+      args: ["--skip-dotenv"],
+    });
+
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary.recoveryDecision).toBe("retry_same_run_id");
+    expect(summary.retryableItemCount).toBe(1);
+    expect(summary.items[0]).toMatchObject({
+      status: "pending",
+      failureKind: "transient",
+      retryable: true,
+      retryExhausted: false,
+      recoveryDecision: "retry_same_run_id",
+      failedStage: "resume-book-1",
+      waitingForProviderRecovery: true,
+      providerRecoveryWaitCount: 1,
+      maxProviderRecoveryWaits: 3,
+      providerRecoveryReason: "responses_output_none",
+    });
+  });
+
+  test("status-json recovers legacy bare output-none with adapter log evidence", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-legacy-output-none-log-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "legacy-responses-output-none-log";
+    const sourceBytes = "legacy responses output none log";
+    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
+      recursive: true,
+    });
+    const sourcePath = join(sourceDir, "Book.epub");
+    await writeFile(sourcePath, sourceBytes);
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    const sourceRelativePath = relative(projectRoot, sourcePath);
+    const itemId = `item-${sourceHash.slice(0, 12)}-${
+      createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    }`;
+    const bookId = batchBookId(sourceHash, sourceRelativePath);
+    const errorSummary =
+      "Error: GraphRAG index workflow failed: " +
+      "[{\"workflow\":\"extract_graph\",\"errorMessage\":\"'NoneType' object " +
+      "is not iterable\"}]";
+    await mkdir(join(logRoot, "graphrag-reports", bookId, "graph_extract"), {
+      recursive: true,
+    });
+    await writeFile(
+      join(logRoot, "graphrag-reports", bookId, "graph_extract", "indexing-engine.log"),
+      [
+        "Traceback (most recent call last):",
+        "  File \"python/qmd_graphrag/graphrag_responses_completion.py\", " +
+          "line 584, in _collect_response_stream_async",
+        "    final_text = _completed_response_output_text(completed_response)",
+        "  File \"python/qmd_graphrag/graphrag_responses_completion.py\", " +
+          "line 515, in _completed_response_output_text",
+        "    return str(getattr(response, \"output_text\", \"\") or \"\")",
+        "  File \".venv-graphrag/lib/python3.13/site-packages/openai/types/" +
+          "responses/response.py\", line 316, in output_text",
+        "    for output in self.output:",
+        "TypeError: 'NoneType' object is not iterable",
+      ].join("\n"),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        status: "failed",
+        sourceRootName: "source",
+        stateRootLocator: ".tmp-tests/unused/graph_vault",
+        qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
+        configLocator: ".tmp-tests/unused/config/index.yml",
+        totalItems: 1,
+        pendingItems: 0,
+        runningItems: 0,
+        completedItems: 0,
+        skippedItems: 0,
+        importedCompletedItems: 0,
+        failedItems: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        updatedAt: "2026-05-23T00:01:00.000Z",
+        itemIds: [itemId],
+      }),
+    );
+    await writeFile(
+      join(stateRoot, "catalog", "batch-runs", runId, "items", `${itemId}.json`),
+      JSON.stringify({
+        schemaVersion: SchemaVersion,
+        itemId,
+        runId,
+        status: "failed",
+        sourceName: "Book.epub",
+        sourceRelativePath,
+        sourceHash,
+        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        bookId,
+        attempts: 3,
+        retryStartedAt: "2026-05-23T00:00:00.000Z",
+        failedAt: "2026-05-23T00:10:00.000Z",
+        failureKind: "unknown",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        failedStage: "resume-book-1",
+        errorSummary,
+        commandChecks: [{
+          name: "resume-book-1",
+          status: "failed",
+          attempts: 12,
+          exitCode: 1,
+          stdoutBytes: 0,
+          stderrBytes: errorSummary.length,
+          startedAt: "2026-05-23T00:00:00.000Z",
+          completedAt: "2026-05-23T00:10:00.000Z",
+          failureKind: "unknown",
+          retryable: false,
+          attemptExhausted: true,
+          recoveryDecision: "stop_until_fixed",
+          errorSummary,
+        }],
+      }),
+    );
+
+    const result = await runBatchStatusJson({
+      tmpRoot,
+      sourceDir,
+      stateRoot,
+      logRoot,
+      configDir,
+      runId,
+      args: ["--skip-dotenv"],
+    });
+
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary.recoveryDecision).toBe("retry_same_run_id");
+    expect(summary.items[0]).toMatchObject({
+      status: "pending",
+      failureKind: "transient",
+      retryable: true,
+      retryExhausted: false,
+      recoveryDecision: "retry_same_run_id",
+      failedStage: "resume-book-1",
+      waitingForProviderRecovery: true,
+      providerRecoveryWaitCount: 1,
+      maxProviderRecoveryWaits: 3,
+      providerRecoveryReason: "responses_output_none",
     });
   });
 

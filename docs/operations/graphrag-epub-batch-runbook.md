@@ -210,10 +210,18 @@ runId 恢复；缺失/不完整证据或非 transient command check 降级为
 - 结构化 GraphRAG query provider failure：
   `route=graphrag`、`stage=graphrag_query`、`provider=graphrag`、
   `capability=graph_query`、`code=provider_unavailable`
+- OpenAI Responses provider response integrity failure：
+  `Responses API transient error kind=responses_output_none
+  status_code=unknown`
 - Jina/OpenAI/httpx/aiohttp/urllib3/APIConnection/SSL/TLS/DNS/connection reset
   等网络或 provider 连接错误
 
 除 `429` 外的 HTTP `4xx` 归类为 permanent failure，不自动重试。
+裸 `NoneType`、`TypeError`、`not iterable`、`extract_graph` 文本不构成 transient
+证据。只有 Python Responses adapter 输出 typed `responses_output_none`，或
+GraphRAG workflow wrapper 包含该 typed message 时，才进入 provider recovery。
+真实空输出、refusal、content filter、`max_output_tokens`、schema parse failure、
+provider-not-configured 和 401/403 仍 fail-closed。
 
 批量执行器对 transient failure 做退避重试。GraphRAG 单书 resume 使用长
 transient budget；普通 qmd CLI 检查仍使用较短命令重试。默认策略：
@@ -245,6 +253,11 @@ transient failure 发生后：
   `output/reports/indexing-engine.log` 片段。片段内出现 provider transient
   error、`Community Report Extraction Error` 或 `No report found for
   community` 时，本 stage 失败并进入相同恢复路径，不发布 stage checkpoint。
+- GraphRAG `extract_graph` 若因 typed `responses_output_none` 失败，当前
+  `graph_extract` attempt 不发布 succeeded checkpoint、producer manifest 或
+  graph capability。status JSON 应显示 `failureKind=transient`、
+  `retryable=true`、`recoveryDecision=retry_same_run_id`，并通过同一 `runId`
+  恢复当前书。
 - `qmd-query-graphrag-json` 收到结构化
   `stage=graphrag_query`、`code=provider_unavailable` 时，执行器按 provider
   recovery wait 处理。`stage=provider` 的 provider-not-configured 配置缺失仍为

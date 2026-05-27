@@ -43,6 +43,10 @@ def _completed() -> SimpleNamespace:
         response=SimpleNamespace(
             id="resp_test",
             created_at=123,
+            output=[{
+                "type": "message",
+                "content": [{"type": "output_text", "text": ""}],
+            }],
             output_text="",
             usage=SimpleNamespace(
                 input_tokens=2,
@@ -65,10 +69,56 @@ def _error(message: str) -> SimpleNamespace:
     )
 
 
+class _OutputTextRaisesResponse:
+    id = "resp_raises"
+    created_at = 456
+    usage = SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2)
+
+    def __init__(self, output):
+        self.output = output
+
+    @property
+    def output_text(self):
+        raise TypeError("'NoneType' object is not iterable")
+
+
+def _completed_with_response(response):
+    return SimpleNamespace(
+        response=response,
+        sequence_number=3,
+        type="response.completed",
+    )
+
+
+def _response_with_output_text(text: str) -> _OutputTextRaisesResponse:
+    return _OutputTextRaisesResponse([{
+        "type": "message",
+        "content": [{"type": "output_text", "text": text}],
+    }])
+
+
+def _response_with_output(output) -> _OutputTextRaisesResponse:
+    return _OutputTextRaisesResponse(output)
+
+
+def _refusal(text: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        item_id="msg_1",
+        output_index=0,
+        sequence_number=2,
+        text=text,
+        type="response.refusal.done",
+    )
+
+
 async def _async_events():
     yield _delta("hel", 1)
     yield _delta("lo", 2)
     yield _completed()
+
+
+async def _async_output_none_events():
+    yield _completed_with_response(_response_with_output(None))
 
 
 def test_collect_response_stream_returns_responses_compat_completion():
@@ -106,6 +156,148 @@ def test_collect_response_stream_async_returns_responses_compat_completion():
     assert response.id == "resp_test"
     assert response.choices[0].message.content == "hello"
     assert response.usage.total_tokens == 5
+
+
+def test_collect_response_stream_uses_completed_output_without_sdk_property():
+    response = _collect_response_stream(
+        iter([_completed_with_response(_response_with_output_text("from output"))]),
+        model="gpt-5.4",
+    )
+
+    assert response.id == "resp_raises"
+    assert response.choices[0].message.content == "from output"
+    assert response.usage.total_tokens == 2
+
+
+def test_collect_response_stream_output_none_raises_typed_transient():
+    try:
+        _collect_response_stream(
+            iter([_completed_with_response(_response_with_output(None))]),
+            model="gpt-5.4",
+        )
+    except OpenAIResponsesTransientError as error:
+        assert error.kind == "responses_output_none"
+        assert "completed response output was null" in str(error)
+    else:
+        raise AssertionError("expected OpenAIResponsesTransientError")
+
+
+def test_collect_response_stream_missing_output_is_non_transient():
+    response = SimpleNamespace(
+        id="resp_missing_output",
+        created_at=123,
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
+    )
+    try:
+        _collect_response_stream(
+            iter([_completed_with_response(response)]),
+            model="gpt-5.4",
+        )
+    except RuntimeError as error:
+        assert not isinstance(error, OpenAIResponsesTransientError)
+        assert "output field was missing" in str(error)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_collect_response_stream_prefers_stream_text_when_output_none():
+    response = _collect_response_stream(
+        iter([
+            _delta("stream text", 1),
+            _completed_with_response(_response_with_output(None)),
+        ]),
+        model="gpt-5.4",
+    )
+
+    assert response.choices[0].message.content == "stream text"
+
+
+def test_collect_response_stream_empty_output_is_non_transient():
+    try:
+        _collect_response_stream(
+            iter([_completed_with_response(_response_with_output([]))]),
+            model="gpt-5.4",
+        )
+    except RuntimeError as error:
+        assert not isinstance(error, OpenAIResponsesTransientError)
+        assert "output was empty" in str(error)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_collect_response_stream_no_output_text_is_non_transient():
+    try:
+        _collect_response_stream(
+            iter([_completed_with_response(_response_with_output([{
+                "type": "message",
+                "content": [{"type": "summary_text", "text": ""}],
+            }]))]),
+            model="gpt-5.4",
+        )
+    except RuntimeError as error:
+        assert not isinstance(error, OpenAIResponsesTransientError)
+        assert "no output text" in str(error)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_collect_response_stream_refusal_is_non_transient():
+    try:
+        _collect_response_stream(
+            iter([_refusal("cannot comply"), _completed()]),
+            model="gpt-5.4",
+        )
+    except RuntimeError as error:
+        assert not isinstance(error, OpenAIResponsesTransientError)
+        assert "refusal" in str(error)
+        assert "cannot comply" in str(error)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_collect_response_stream_content_filter_is_non_transient():
+    response = _response_with_output(None)
+    response.incomplete_details = SimpleNamespace(reason="content_filter")
+    try:
+        _collect_response_stream(
+            iter([_completed_with_response(response)]),
+            model="gpt-5.4",
+        )
+    except RuntimeError as error:
+        assert not isinstance(error, OpenAIResponsesTransientError)
+        assert "content_filter" in str(error)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_collect_response_stream_max_tokens_is_non_transient():
+    response = _response_with_output(None)
+    response.incomplete_details = {"reason": "max_output_tokens"}
+    try:
+        _collect_response_stream(
+            iter([_completed_with_response(response)]),
+            model="gpt-5.4",
+        )
+    except RuntimeError as error:
+        assert not isinstance(error, OpenAIResponsesTransientError)
+        assert "max_output_tokens" in str(error)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_collect_response_stream_async_output_none_raises_typed_transient():
+    async def run():
+        return await _collect_response_stream_async(
+            _async_output_none_events(),
+            model="gpt-5.4",
+        )
+
+    try:
+        asyncio.run(run())
+    except OpenAIResponsesTransientError as error:
+        assert error.kind == "responses_output_none"
+    else:
+        raise AssertionError("expected OpenAIResponsesTransientError")
 
 
 def test_iter_response_chunks_async_returns_responses_compat_chunks():
@@ -280,6 +472,36 @@ def test_responses_recovery_retries_stream_consumption_transient():
     assert response.choices[0].message.content == "ok"
 
 
+def test_responses_recovery_retries_output_none_transient():
+    attempts = 0
+
+    def run_once():
+        nonlocal attempts
+        attempts += 1
+        output = None if attempts == 1 else [{
+            "type": "message",
+            "content": [{"type": "output_text", "text": "ok after retry"}],
+        }]
+        return _collect_response_stream(
+            iter([_completed_with_response(_response_with_output(output))]),
+            model="gpt-5.4",
+        )
+
+    response = _run_with_responses_recovery(
+        run_once,
+        gate=_ResponsesConcurrencyGate(1),
+        retry_policy=_ResponsesRetryPolicy(
+            max_retries=1,
+            base_delay=0.001,
+            max_delay=0.001,
+            jitter=False,
+        ),
+    )
+
+    assert attempts == 2
+    assert response.choices[0].message.content == "ok after retry"
+
+
 def test_responses_recovery_preserves_transient_message_after_exhaustion():
     def run_once():
         raise RuntimeError("Concurrency limit exceeded for account")
@@ -396,6 +618,40 @@ def test_responses_recovery_async_retries_stream_consumption_transient():
     assert response.choices[0].message.content == "hello"
 
 
+def test_responses_recovery_async_retries_output_none_transient():
+    attempts = 0
+
+    async def run_once():
+        nonlocal attempts
+        attempts += 1
+
+        async def events():
+            output = None if attempts == 1 else [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "async ok"}],
+            }]
+            yield _completed_with_response(_response_with_output(output))
+
+        return await _collect_response_stream_async(events(), model="gpt-5.4")
+
+    async def run():
+        return await _run_with_responses_recovery_async(
+            run_once,
+            gate=_ResponsesConcurrencyGate(1),
+            retry_policy=_ResponsesRetryPolicy(
+                max_retries=1,
+                base_delay=0.001,
+                max_delay=0.001,
+                jitter=False,
+            ),
+        )
+
+    response = asyncio.run(run())
+
+    assert attempts == 2
+    assert response.choices[0].message.content == "async ok"
+
+
 def test_responses_gate_is_shared_per_model_and_limit():
     first = _responses_gate_for(api_base="https://gateway.test", model="gpt-5.4", limit=5)
     second = _responses_gate_for(api_base="https://gateway.test", model="gpt-5.4", limit=5)
@@ -410,6 +666,16 @@ if __name__ == "__main__":
     test_iter_response_chunks_returns_responses_compat_chunks()
     test_collect_response_stream_async_returns_responses_compat_completion()
     test_iter_response_chunks_async_returns_responses_compat_chunks()
+    test_collect_response_stream_uses_completed_output_without_sdk_property()
+    test_collect_response_stream_output_none_raises_typed_transient()
+    test_collect_response_stream_missing_output_is_non_transient()
+    test_collect_response_stream_prefers_stream_text_when_output_none()
+    test_collect_response_stream_empty_output_is_non_transient()
+    test_collect_response_stream_no_output_text_is_non_transient()
+    test_collect_response_stream_refusal_is_non_transient()
+    test_collect_response_stream_content_filter_is_non_transient()
+    test_collect_response_stream_max_tokens_is_non_transient()
+    test_collect_response_stream_async_output_none_raises_typed_transient()
     test_collect_response_stream_raises_on_error_event()
     test_iter_response_chunks_raises_on_error_event()
     test_collect_response_stream_raises_typed_transient_error()
@@ -422,10 +688,12 @@ if __name__ == "__main__":
     test_translate_call_args_rejects_non_stream_responses_transport()
     test_translate_call_args_rejects_non_strict_structured_output()
     test_responses_recovery_retries_stream_consumption_transient()
+    test_responses_recovery_retries_output_none_transient()
     test_responses_recovery_preserves_transient_message_after_exhaustion()
     test_responses_recovery_redacts_sensitive_error_details()
     test_responses_retry_policy_caps_sleep_after_jitter()
     test_responses_recovery_does_not_retry_non_transient_errors()
     test_responses_recovery_async_retries_stream_consumption_transient()
+    test_responses_recovery_async_retries_output_none_transient()
     test_responses_gate_is_shared_per_model_and_limit()
     print("responses stream unit harness passed")

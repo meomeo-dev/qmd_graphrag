@@ -1,0 +1,50 @@
+taskId: graphrag-responses-output-none-recovery
+runId: 20260527_r1
+status: open
+batchRunId: epub-batch-20260527-real-resume-1
+openedAt: 2026-05-27T14:42:30Z
+currentPhase: implementation_audit_passed
+designDecision: reports/design_decision.md
+designAuditResult: passed_with_required_implementation
+implementationStatus: fixes_applied
+implementationAuditResult: passed
+implementationAuditReports:
+  - dev-agent-a/implementation_audit.md
+  - dev-agent-b/implementation_audit.md
+  - dev-agent-c/implementation_audit.md
+  - dev-agent-c/implementation_reaudit_1.md
+verification:
+  pythonResponsesHarness: passed
+  focusedVitest: passed
+  typeCheck: passed
+  diffCheck: passed
+  nodeCheck: passed
+realStatusJsonProbe:
+  path: /tmp/qmd-epub-batch-20260527-real-resume-1/status-after-legacy-log-recovery.json
+  targetItemId: item-5d08f60ba01e-ca4bcb21
+  observedStatus: pending
+  observedFailureKind: transient
+  observedRecoveryDecision: retry_same_run_id
+  checkpointEditedManually: false
+scope:
+  - OpenAI Responses wrapper returns completed response with output=null
+  - GraphRAG extract_graph stage classifies the Python TypeError as unknown
+  - batch runner stops with stop_until_fixed instead of provider/transient recovery
+blockingFailure:
+  sourceName: Code that fits in your head - Heuristiken für die Softwareentwicklung Komplexität reduzieren Legacy Code beherrschen … (Mark Seeman).epub
+  itemId: item-5d08f60ba01e-ca4bcb21
+  bookId: book-5d08f60ba01e-1820c082
+  failedStage: resume-book-1
+  graphWorkflow: extract_graph
+  failureKind: unknown
+  retryable: false
+  recoveryDecision: stop_until_fixed
+  errorSummary: GraphRAG index workflow failed: extract_graph error "'NoneType' object is not iterable"
+evidence:
+  - graph_vault/catalog/batch-runs/epub-batch-20260527-real-resume-1/items/item-5d08f60ba01e-ca4bcb21.json
+  - /tmp/qmd-epub-batch-20260527-real-resume-1/graphrag-reports/book-5d08f60ba01e-1820c082/graph_extract/indexing-engine.log
+  - python/qmd_graphrag/graphrag_responses_completion.py
+requiredDecision:
+  - decide whether output=null is provider transient, SDK compatibility, stream recovery bug, or permanent data issue
+  - update docs if recovery taxonomy is incomplete
+  - implement classification/recovery without masking real GraphRAG integrity failures
