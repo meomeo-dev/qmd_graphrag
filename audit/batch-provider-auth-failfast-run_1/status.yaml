@@ -1,0 +1,94 @@
+schemaVersion: '1.0.0'
+case: batch-provider-auth-failfast
+run: 1
+status: development_audit_passed
+startedAt: '2026-05-27T02:05:00Z'
+updatedAt: '2026-05-27T03:05:00Z'
+criteriaFrozen: true
+criteriaPaths:
+  - agent-a/audit-criteria.md
+  - agent-b/audit-criteria.md
+  - agent-c/audit-criteria.md
+designAuditReports:
+  - agent-a/design-audit-report.md
+  - agent-b/design-audit-report.md
+  - agent-c/design-audit-report.md
+design: design.md
+developmentCriteriaFrozen: true
+developmentCriteriaPaths:
+  - agent-a/development-audit-criteria.md
+  - agent-b/development-audit-criteria.md
+  - agent-c/development-audit-criteria.md
+implementation:
+  files:
+    - scripts/graphrag/batch-epub-workflow.mjs
+    - test/cli.test.ts
+  summary:
+    - >-
+      Batch runner now treats unrecoverable provider auth failures as global
+      stop-until-fixed conditions.
+    - >-
+      401 and 403 provider status codes are detected from checkpoint-level and
+      failed command-check evidence.
+    - >-
+      invalid api key, invalid_api_key, unauthorized, forbidden, and
+      authentication text also trigger provider auth fail-fast without using a
+      broad auth substring.
+    - >-
+      Provider auth stop emits the generic
+      batch_stopped_after_non_transient_failure event with
+      metadata.stopReason=provider_auth and does not emit the data
+      compatibility compatibility event.
+    - >-
+      Existing data compatibility stop behavior and compatibility event are
+      preserved.
+    - >-
+      Regression tests cover both existing 401 failed checkpoint stop before
+      processing and runtime 401 failure stop within the same runner before the
+      next book starts.
+verification:
+  passed:
+    - npm run test:node -- test/cli.test.ts -t "provider"
+    - npm run test:node -- test/cli.test.ts -t "non-transient"
+    - npm run test:node -- test/cli.test.ts -t "data compatibility"
+    - npm run test:node -- test/cli.test.ts -t "fail-fast transient"
+    - npm run typecheck
+    - git diff --check
+  notes:
+    - >-
+      A broad status-json sweep also surfaced an unrelated stale GraphRAG
+      producer lineage expectation mismatch
+      (stage_artifact_missing vs producer_run_mismatch). It is outside this
+      provider auth fail-fast diff and was not counted as this case verification.
+developmentAuditReports:
+  - agent-a/development-audit-report.md
+  - agent-b/development-audit-report.md
+  - agent-c/development-audit-report.md
+developmentReauditReason:
+  - >-
+    Agent A required a runtime same-runner 401 test instead of only an existing
+    failed checkpoint stop-before-processing test.
+  - >-
+    Agent B required cleanup of .tmp-tests runtime artifacts before submission.
+developmentReauditReports:
+  - agent-a/development-reaudit-report.md
+  - agent-b/development-reaudit-report.md
+  - agent-c/development-reaudit-report.md
+finalReport: final-report.md
+trigger:
+  runId: epub-batch-20260527-after-bridge-projection-fix
+  itemId: item-356ff4920cdf-c7e96dce
+  bookId: book-356ff4920cdf-0bbd8bdb
+  failure:
+    providerStatusCode: 401
+    failureKind: permanent
+    retryable: false
+    recoveryDecision: stop_until_fixed
+    message: >-
+      Error code: 401 - {'code': 'INVALID_API_KEY', 'message': 'Invalid API key'}
+evidence:
+  summary:
+    - GraphRAG bridge projection error no longer appears for the item.
+    - The item reached graphBuildStatus query_ready before query check failure.
+    - Batch runner continued to the next item after permanent provider 401.
+    - Current shouldStopBatchAfterFailure only stops data_compatibility failures.

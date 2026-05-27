@@ -696,6 +696,18 @@ function checkpointHasProviderStatusCode(checkpoint) {
   );
 }
 
+function checkpointProviderStatusCodes(checkpoint) {
+  return [...new Set([
+    Number.isInteger(checkpoint?.providerStatusCode)
+      ? checkpoint.providerStatusCode
+      : null,
+    ...(checkpoint?.commandChecks ?? [])
+      .filter((check) => check.status === "failed")
+      .map((check) => check.providerStatusCode)
+      .filter(Number.isInteger),
+  ].filter(Number.isInteger))];
+}
+
 function checkpointClassifiedFailure(checkpoint) {
   const failure = classifyFailure(checkpointFailureText(checkpoint));
   if (failure.failureKind !== "unknown") return failure;
@@ -731,6 +743,22 @@ function canRepairLocalArtifactGate(checkpoint) {
 function checkpointHasDataCompatibilityFailure(checkpoint) {
   return checkpoint?.failureKind === "data_compatibility" ||
     checkpointClassifiedFailure(checkpoint).failureKind === "data_compatibility";
+}
+
+function checkpointHasUnrecoverableProviderAuthFailure(checkpoint) {
+  if (checkpointProviderStatusCodes(checkpoint).some((code) =>
+    code === 401 || code === 403
+  )) {
+    return true;
+  }
+  const failureText = checkpointFailureText(checkpoint).toLowerCase();
+  return [
+    "invalid api key",
+    "invalid_api_key",
+    "unauthorized",
+    "forbidden",
+    "authentication",
+  ].some((token) => failureText.includes(token));
 }
 
 function parseRepairMetadata(metadata) {
@@ -4304,7 +4332,10 @@ function shouldStopBatchAfterFailure(checkpoint) {
   return checkpoint?.status === "failed" &&
     checkpoint.retryable === false &&
     checkpoint.recoveryDecision === "stop_until_fixed" &&
-    checkpointHasDataCompatibilityFailure(checkpoint);
+    (
+      checkpointHasDataCompatibilityFailure(checkpoint) ||
+      checkpointHasUnrecoverableProviderAuthFailure(checkpoint)
+    );
 }
 
 function shouldStopBatchBeforeProcessing(checkpoint) {
@@ -4312,9 +4343,13 @@ function shouldStopBatchBeforeProcessing(checkpoint) {
 }
 
 function emitBatchStoppedAfterNonTransientFailure(checkpoint) {
-  const stoppedEvent = {
+  const stopReason = checkpointHasDataCompatibilityFailure(checkpoint)
+    ? "data_compatibility"
+    : checkpointHasUnrecoverableProviderAuthFailure(checkpoint)
+      ? "provider_auth"
+      : "non_transient";
+  const stoppedEventBase = {
     itemId: checkpoint.itemId,
-    event: "batch_stopped_after_data_compatibility_failure",
     status: "failed",
     failureKind: checkpoint.failureKind ?? "unknown",
     retryable: false,
@@ -4323,15 +4358,23 @@ function emitBatchStoppedAfterNonTransientFailure(checkpoint) {
     message: checkpoint.errorSummary,
     metadata: {
       policy: "stop_current_runner_until_fixed",
+      stopReason,
     },
   };
-  event(stoppedEvent);
+  if (stopReason === "data_compatibility") {
+    event({
+      ...stoppedEventBase,
+      event: "batch_stopped_after_data_compatibility_failure",
+    });
+  }
   event({
-    ...stoppedEvent,
+    ...stoppedEventBase,
     event: "batch_stopped_after_non_transient_failure",
     metadata: {
-      ...stoppedEvent.metadata,
-      compatibilityEvent: "batch_stopped_after_data_compatibility_failure",
+      ...stoppedEventBase.metadata,
+      ...(stopReason === "data_compatibility"
+        ? { compatibilityEvent: "batch_stopped_after_data_compatibility_failure" }
+        : {}),
     },
   });
 }
