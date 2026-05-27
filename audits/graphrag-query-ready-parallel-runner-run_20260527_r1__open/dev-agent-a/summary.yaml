@@ -1,0 +1,20 @@
+agent_id: dev-agent-a
+status: pass
+blocking_findings_count: 0
+nonblocking_findings_count: 2
+audited_scope:
+  - GraphRAG producer lineage recovery gate
+  - query_ready fail-closed
+  - local artifact gate repair observability
+  - parallel runner design deferral
+verification_mode: static_local_code_state_audit
+tests_run: []
+verified:
+  old_producer_success_does_not_override_current_non_success_checkpoint: true
+  query_ready_fail_closed: true
+  local_artifact_gate_status_json_recoverable: true
+  requires_real_rebuild_skips_provider_wait_and_runs_real_rebuild_once: true
+  parallel_runner_deferred_to_single_writer_design: true
+notes:
+  - 本次只读取本地代码、测试、文档和状态；未读取或输出 .env 密钥。
+  - 本次未修改源码。

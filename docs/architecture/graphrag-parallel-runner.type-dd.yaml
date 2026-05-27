@@ -1,0 +1,74 @@
+schemaVersion: "1.0.0"
+title: GraphRAG Parallel Runner Design
+status: proposed
+context:
+  problem: >
+    Sequential batch processing can leave OpenAI, Jina or local qmd resources
+    idle while another provider or stage waits. Parallel processing is useful
+    only after writer ownership and shared-resource contention are controlled.
+  currentBoundary: >
+    The production writer remains a single runner per batch run. Multiple
+    independent writer processes for the same runId are not supported.
+requiredControls:
+  itemLease:
+    capacity: 1
+    fields:
+      - itemId
+      - runId
+      - runnerSessionId
+      - fencingToken
+      - heartbeatAt
+      - expiresAt
+  bookLease:
+    capacity: 1
+    purpose: Prevent two items that resolve to the same bookId from writing the
+      same book-scoped output and checkpoints.
+  catalogWriterLane:
+    capacity: 1
+    protects:
+      - graph_vault/catalog/books.yaml
+      - graph_vault/catalog/runs.yaml
+      - graph_vault/catalog/document-identity-map.yaml
+      - graph_vault/catalog/graph-capabilities.yaml
+  qmdIndexWriterLane:
+    capacity: 1
+    protects:
+      - .qmd/index.sqlite
+      - qmd corpus registration
+      - qmd embedding writes
+  providerSemaphores:
+    openai:
+      purpose: Bound concurrent Responses or GraphRAG LLM calls.
+    jina:
+      purpose: Bound embeddings/rerank calls.
+    localCpu:
+      purpose: Bound EPUB normalization and parquet/LanceDB validation.
+  eventManifestAggregation:
+    requirement: >
+      Worker events must append atomically or flow through a coordinator.
+      manifest counters must be derived from item checkpoints, not from
+      unsynchronized in-memory counters.
+  fencing:
+    requirement: >
+      Every checkpoint/catalog write must prove the writer still owns the
+      current lease token. Stale writers must fail before writing.
+implementationStages:
+  - id: stage-1-single-process-worker-pool
+    status: recommended_first
+    description: >
+      Keep one coordinator process and add an internal worker pool with shared
+      semaphores and single writer lanes.
+  - id: stage-2-multiprocess-workers
+    status: later
+    description: >
+      Introduce durable lease files or SQLite-backed leases with fencing tokens
+      before allowing multiple OS processes.
+  - id: stage-3-distributed-runners
+    status: future
+    description: >
+      Requires host-aware leases, clock/TTL policy, and remote heartbeat
+      semantics.
+nonGoals:
+  - Enable multiple uncoordinated batch-epub-workflow writers for the same runId.
+  - Parallelize stages within the same book before producer lineage is stable.
+  - Share graph_vault/output as a cross-book GraphRAG output directory.

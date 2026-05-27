@@ -1,0 +1,36 @@
+agent_id: dev-agent-b
+status: pass
+blocking_findings_count: 0
+nonblocking_findings_count: 0
+audit_date: "2026-05-27"
+audit_scope:
+  - batch_checkpoint_hydration_classification
+  - resume_book_workspace_query_ready_repair_handling
+  - real_batch_state_recovery_safety
+  - test_coverage
+criteria_path: "audits/graphrag-query-ready-parallel-runner-run_20260527_r1__open/dev-agent-b/criteria.md"
+findings_path: "audits/graphrag-query-ready-parallel-runner-run_20260527_r1__open/dev-agent-b/findings.md"
+resolved_findings:
+  - id: F-001
+    severity: high
+    previous_blocking: true
+    current_blocking: false
+    title: "repair-only requiresRealRebuild 不再进入 provider recovery wait"
+    closure_basis:
+      - "requiresRealRebuild checkpoint 使用 continue_pending 且 retryable=false"
+      - "checkpoint 不设置 nextRetryAt 或 provider recovery wait metadata"
+      - "runner 随后进入普通 resume-book real rebuild"
+      - "focused regression test passed"
+verification:
+  - name: focused_cli_local_artifact_gate_and_real_rebuild
+    result: pass
+    tests_passed: 6
+  - name: book_job_state
+    result: pass
+    tests_passed: 51
+  - name: data_bus_contracts
+    result: pass
+    tests_passed: 24
+source_modifications: false
+external_upload: false
+env_secret_read_or_output: false

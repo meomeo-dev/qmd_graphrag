@@ -1,0 +1,51 @@
+taskId: graphrag-query-ready-parallel-runner
+runId: 20260527_r1
+status: implementation_passed
+batchRunId: epub-batch-20260527-real-resume-1
+openedAt: 2026-05-27T11:47:03Z
+updatedAt: 2026-05-27T23:20:00Z
+currentPhase: resume_real_batch
+designAudit:
+  status: passed_after_design_updates
+  decision: implement_producer_lineage_recovery_keep_parallel_runner_disabled
+  reports:
+    - agent-a/design_audit.md
+    - agent-b/design_audit.md
+    - agent-c/design_audit.md
+    - reports/design_decision.md
+implementationAudit:
+  status: passed
+  agents:
+    - id: dev-agent-a
+      status: pass
+      blockingFindings: 0
+      report: dev-agent-a/findings.md
+    - id: dev-agent-b
+      status: pass
+      blockingFindings: 0
+      report: dev-agent-b/findings.md
+    - id: dev-agent-c
+      status: pass
+      blockingFindings: 0
+      report: dev-agent-c/findings.md
+scope:
+  - query_ready producer stage gate failure after real batch runner exit
+  - multi-runner parallel processing design and resource contention
+blockingFailure:
+  sourceName: Code Complete, Second Edition (Steve McConnell [Steve McConnell]).epub
+  failedStage: resume-book-2
+  previousRecoveryDecision: stop_until_fixed
+  currentBatchRecoveryDecision: retry_same_run_id
+  errorSummary: query_ready requires completed graph_extract, community_report and embed stages
+resumeCommand:
+  clearProviderShellEnv: true
+  command: >
+    node scripts/graphrag/batch-epub-workflow.mjs --run-id
+    epub-batch-20260527-real-resume-1 --source-dir
+    inbox/软件工程与系统设计经典著作指南 --state-root graph_vault
+    --qmd-index-path .qmd/index.sqlite --config .qmd/index.yml
+    --project-dotenv .env --log-root
+    /tmp/qmd-epub-batch-20260527-real-resume-1
+closeCondition:
+  - real batch resumes past producer lineage repair or real rebuild gate
+  - no new blocking finding appears for this same issue

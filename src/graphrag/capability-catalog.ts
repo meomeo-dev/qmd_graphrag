@@ -156,6 +156,13 @@ function checkpointTimestamp(checkpoint: CheckpointCandidate): string {
   return checkpoint.finishedAt ?? checkpoint.startedAt ?? "";
 }
 
+function currentCheckpointBlocksRecoveredCandidate(
+  checkpoint: CheckpointCandidate | undefined,
+): boolean {
+  return checkpoint != null &&
+    checkpoint.status !== "succeeded";
+}
+
 function runRecordToCheckpointCandidate(
   record: BookJobRunRecord,
   book: BookJob,
@@ -217,6 +224,18 @@ async function loadCheckpointCandidates(
   ].sort((left, right) =>
     checkpointTimestamp(right).localeCompare(checkpointTimestamp(left)),
   );
+}
+
+async function loadCurrentCheckpointCandidates(
+  graphVault: string,
+  bookId: string,
+): Promise<CheckpointCandidate[] | null> {
+  const checkpointsRaw = await readYaml(
+    join(graphVault, "books", bookId, "checkpoints.yaml"),
+  );
+  const checkpointsResult = BookJobCheckpointListSchema.safeParse(checkpointsRaw);
+  if (!checkpointsResult.success) return null;
+  return checkpointsResult.data.items;
 }
 
 function checkpointMatchesBook(
@@ -399,8 +418,27 @@ export async function projectQueryReadyLineage(
   const artifactsResult = BookArtifactManifestListSchema.safeParse(artifactsRaw);
   if (!artifactsResult.success) return null;
   const artifacts = artifactsResult.data.items;
+  const currentCheckpoints = await loadCurrentCheckpointCandidates(graphVault, bookId);
+  if (currentCheckpoints == null) return null;
   const candidates = await loadCheckpointCandidates(graphVault, book);
   if (candidates == null) return null;
+  const currentByStage = new Map(
+    currentCheckpoints
+      .filter((checkpoint) =>
+        checkpoint.bookId === bookId &&
+        QUERY_READY_PRODUCER_STAGES.includes(
+          checkpoint.stage as QueryReadyProducerStage,
+        )
+      )
+      .map((checkpoint) => [checkpoint.stage, checkpoint]),
+  );
+  if (
+    QUERY_READY_PRODUCER_STAGES.some((stage) =>
+      currentCheckpointBlocksRecoveredCandidate(currentByStage.get(stage))
+    )
+  ) {
+    return null;
+  }
 
   const producerCheckpoints = await Promise.all(
     QUERY_READY_PRODUCER_STAGES.map(async (stage) => ({

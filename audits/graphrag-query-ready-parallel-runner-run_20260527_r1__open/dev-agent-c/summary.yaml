@@ -1,0 +1,29 @@
+agent_id: dev-agent-c
+status: pass
+blocking_findings_count: 0
+nonblocking_findings_count: 2
+scope:
+  - 文档/设计一致性
+  - parallel runner 资源竞争设计
+  - 状态管理/观测恢复机制
+  - 提交前风险
+decision_basis:
+  - 当前正式 runner 保持单 writer；多 runner 未被表述为可用能力。
+  - 未来 parallel runner 最小控制面已固定为 item lease、book lease、
+    provider semaphore、catalog writer lane、qmd index writer lane、
+    fencing token 和 event aggregation。
+  - query_ready producer gate 仍 fail-closed，且目标失败文本已进入
+    producer lineage/local artifact gate recovery 分类。
+  - requiresRealRebuild 现在进入真实 GraphRAG rebuild，不进入 provider wait。
+closed_findings:
+  - C-BLOCKER-001
+  - C-BLOCKER-002
+remaining_nonblocking_findings:
+  - future_provider_lane_resource_controls
+  - compacted_resume_index_improvement
+files_written:
+  - audits/graphrag-query-ready-parallel-runner-run_20260527_r1__open/dev-agent-c/criteria.md
+  - audits/graphrag-query-ready-parallel-runner-run_20260527_r1__open/dev-agent-c/findings.md
+  - audits/graphrag-query-ready-parallel-runner-run_20260527_r1__open/dev-agent-c/summary.yaml
+external_upload: false
+env_secret_read_or_output: false

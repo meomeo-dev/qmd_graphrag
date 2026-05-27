@@ -72,14 +72,16 @@ graph_vault/catalog/batch-runs/<runId>/
 6. `nextStage` 非空时只执行该 stage，不重跑已完成 stage。
 
 同一 runId 再次运行不会重跑已 completed item。`failed` item 只有在
-`retryable=true` 且 `recoveryDecision=retry_same_run_id` 时自动重试。`retryable=false`
-的 failed item 默认保持 failed，并继续处理其他 pending item。唯一例外是本地
-query-ready / graph-query readiness gate 已被当前代码分类为可低成本修复时，执行器
-可把 `stop_until_fixed` item 重新打开为 `pending`，写入
+`retryable=true` 且 `recoveryDecision=retry_same_run_id` 时自动重试。当前单
+runner 发现 `failed + retryable=false + recoveryDecision=stop_until_fixed` 时会停止
+调度后续图书，防止永久失败被新书进度掩盖。唯一例外是本地 query-ready、
+graph-query readiness gate 或 producer-lineage gate 已被当前代码分类为可低成本修复
+时，执行器必须先进入 repair path，可把 item 重新打开为 `pending`，写入
 `item_local_artifact_gate_repair` 或等价 recovery event，并设置
-`recoveryDecision=continue_pending`。该 reopen 不得写入 `completed`，也不得绕过
-后续 qmd 与 GraphRAG query command checks。更换 runId 会创建新的批量审计记录，
-但单书仍由 `BookResumePlan.nextStage` 防止重复高成本 stage。
+`recoveryDecision=continue_pending` 或 repair 要求的同 runId 续跑决策。该 reopen
+不得写入 `completed`，也不得绕过后续 qmd 与 GraphRAG query command checks。更换
+runId 会创建新的批量审计记录，但单书仍由 `BookResumePlan.nextStage` 防止重复
+高成本 stage。
 
 本地 projection gate reopen 后，`BatchItemCheckpoint.metadata` 必须保留审计字段
 （audit fields）：
@@ -298,6 +300,35 @@ GraphRAG 输出生产者 manifest 必须保存在每本书的 book-scoped output
 - `output/reports/indexing-engine.log` 只作为 stage health evidence 读取，不登记为
   query-ready graph artifact。
 - stage gate 只接受当前 stage 对应 producer run 的 artifact。
+- 历史失败文本
+  `query_ready requires completed graph_extract, community_report and embed stages`
+  表示 `query_ready` 门控发现 producer checkpoint 尚未调和。执行器应把它归入
+  producer-lineage/local-artifact-gate recovery：若旧 producer lineage 可验证，则
+  repair path 显式完成或调和 producer checkpoint；若不可验证，则返回
+  `requiresRealRebuild=true` 和具体 rebuild stage。该错误不得保持
+  `failureKind=unknown`。
+
+## 并行 Runner 边界
+
+当前正式批处理仍是单 writer runner。不要为了让 Jina 等待期间利用 OpenAI 或本地
+资源而启动多个 `batch-epub-workflow` 进程写同一个 `runId`。
+
+多 runner 并行启用前必须先实现以下资源控制：
+
+- item lease 和 fencing token，保证同一 item 只有一个 writer。
+- book lease，保证同一 `bookId` 的 checkpoint、artifact manifest 和 output 只有
+  一个 writer。
+- catalog writer lane，串行化 `graph_vault/catalog/*.yaml` 和 capability 发布。
+- qmd index writer lane，串行化 `.qmd/index.sqlite`、corpus registration 和 qmd
+  embedding 写入。
+- provider semaphore，分别限制 OpenAI、Jina、GraphRAG LLM stage 和本地 CPU 工作。
+- event/manifest aggregation，确保事件追加和 manifest 计数由 checkpoint 推导或由
+  单协调器写入。
+
+推荐的第一步不是多进程 runner，而是单进程 worker pool（single-process worker
+pool）：一个 coordinator 拥有 manifest 和 catalog 写入，内部多个 worker 在 lease
+和 semaphore 下处理不同书籍。该设计落地前，`status-json` 只用于观测，不能作为
+启动第二个 writer 的许可。
 
 恢复操作使用相同 runId 重新执行：
 

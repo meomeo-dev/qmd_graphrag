@@ -200,6 +200,8 @@ export function isGraphRagDataCompatibilityFailureText(text) {
 export function isLocalArtifactGateFailureText(text) {
   const message = String(text ?? "").toLowerCase();
   return (
+    message.includes("query_ready requires completed graph_extract") ||
+    message.includes("query_ready checkpoint requires completed graphrag producer stages") ||
     message.includes("missingartifactkinds") ||
     message.includes("missing artifact kinds") ||
     message.includes("missingartifactids") ||

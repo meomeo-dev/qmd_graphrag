@@ -259,6 +259,8 @@ async function queryReadyProducerArtifacts(runtimeApi, repo, sync) {
 function isLocalArtifactGateError(value) {
   const message = String(value ?? "").toLowerCase();
   return (
+    message.includes("query_ready requires completed graph_extract") ||
+    message.includes("query_ready checkpoint requires completed graphrag producer stages") ||
     message.includes("did not produce valid book-scoped artifacts") ||
     message.includes("missingartifactkinds") ||
     message.includes("missing artifact kinds") ||

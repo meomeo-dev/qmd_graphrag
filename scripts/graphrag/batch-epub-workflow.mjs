@@ -789,6 +789,9 @@ function canRepairLocalArtifactGate(checkpoint) {
   ) {
     return false;
   }
+  if (checkpoint.metadata?.localArtifactGateRepairRequiresRealRebuild === true) {
+    return false;
+  }
   if (!checkpointHasLocalArtifactGateFailure(checkpoint)) return false;
   const failure = checkpointClassifiedFailure(checkpoint);
   if (failure.providerStatusCode != null || checkpointHasProviderStatusCode(checkpoint)) {
@@ -4168,7 +4171,7 @@ function printStatusAndExit(manifest, checkpoints) {
 }
 
 function recoveryDecisionForBatch(checkpoints) {
-  if (checkpoints.some((item) => shouldStopBatchAfterFailure(item))) {
+  if (checkpoints.some((item) => shouldStopBatchBeforeProcessing(item))) {
     return "stop_until_fixed";
   }
   if (checkpoints.some((item) =>
@@ -4180,7 +4183,8 @@ function recoveryDecisionForBatch(checkpoints) {
   if (checkpoints.some((item) =>
     item.status === "pending" ||
     item.status === "running" ||
-    item.status === "skipped"
+    item.status === "skipped" ||
+    canRepairLocalArtifactGate(item)
   )) {
     return "continue_pending";
   }
@@ -4885,13 +4889,7 @@ function repairLocalArtifactGate(item, checkpoint) {
       : typeof repairResult.resume?.nextStage === "string"
         ? repairResult.resume.nextStage
         : undefined;
-    const recoveryFailureKind = requiresRealRebuild
-      ? "transient"
-      : checkpoint.failureKind ?? "permanent";
-    const recoveryRetryExhausted = requiresRealRebuild ? false : undefined;
-    const recoveryDecision = requiresRealRebuild
-      ? "retry_same_run_id"
-      : "continue_pending";
+    const recoveryFailureKind = checkpoint.failureKind ?? "permanent";
     const recoveryFailedStage = rebuildStage ?? checkpoint.failedStage ??
       "repair-local-artifact-gate";
     event({
@@ -4899,9 +4897,8 @@ function repairLocalArtifactGate(item, checkpoint) {
       event: "item_local_artifact_gate_repair_blocked",
       status: "pending",
       failureKind: recoveryFailureKind,
-      retryable: requiresRealRebuild,
-      attemptExhausted: recoveryRetryExhausted,
-      recoveryDecision,
+      retryable: false,
+      recoveryDecision: "continue_pending",
       failedStage: recoveryFailedStage,
       message: reason,
       metadata: {
@@ -4921,9 +4918,9 @@ function repairLocalArtifactGate(item, checkpoint) {
       failedAt: undefined,
       errorSummary: reason,
       failureKind: recoveryFailureKind,
-      retryable: requiresRealRebuild,
-      retryExhausted: recoveryRetryExhausted,
-      recoveryDecision,
+      retryable: false,
+      retryExhausted: undefined,
+      recoveryDecision: "continue_pending",
       failedStage: recoveryFailedStage,
       activeCommand: checkpoint.activeCommand ?? checkpoint.currentCommand ??
         checkpoint.failedStage,
@@ -5412,6 +5409,7 @@ function shouldStopBatchAfterFailure(checkpoint) {
 }
 
 function shouldStopBatchBeforeProcessing(checkpoint) {
+  if (canRepairLocalArtifactGate(checkpoint)) return false;
   return shouldStopBatchAfterFailure(checkpoint);
 }
 
@@ -5658,6 +5656,16 @@ function main() {
             manifest = updateManifest(manifest, Array.from(checkpoints.values()));
             if (repaired.metadata?.localArtifactGateRepairBlocked === true) {
               repairBlockedThisRun.add(item.itemId);
+              event({
+                itemId: item.itemId,
+                event: "item_local_artifact_gate_repair_blocked_skip",
+                status: "pending",
+                recoveryDecision: "continue_pending",
+                metadata: {
+                  reason: repaired.metadata?.localArtifactGateRepairBlockedReason ??
+                    "repair blocked earlier in this runner invocation",
+                },
+              });
             } else {
               processedInPass = true;
             }

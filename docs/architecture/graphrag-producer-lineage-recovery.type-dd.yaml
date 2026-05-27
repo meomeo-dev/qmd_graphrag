@@ -1,0 +1,77 @@
+schemaVersion: "1.0.0"
+title: GraphRAG Producer Lineage Recovery
+status: active
+context:
+  problem: >
+    A book can contain a current non-succeeded high-cost checkpoint while older
+    succeeded run records and artifacts still exist. Recovery planning must not
+    silently choose the older producer when query_ready validates current
+    producer checkpoints.
+  invariant: >
+    query_ready may only publish a graph capability after graph_extract,
+    community_report and embed are reconciled as current non-bootstrap
+    succeeded checkpoints with validated book-scoped artifacts.
+types:
+  highCostProducerStage:
+    values:
+      - graph_extract
+      - community_report
+      - embed
+  terminalReadinessStage:
+    values:
+      - query_ready
+  recoverableProducerLineageConflict:
+    currentCheckpoint:
+      status:
+        oneOf:
+          - pending
+          - running
+          - failed
+          - abandoned
+    candidateEvidence:
+      requires:
+        - succeeded run record
+        - artifact manifests with matching producerRunId
+        - book-scoped output files
+        - matching stageFingerprint
+        - matching providerFingerprint
+        - matching corpus content hash
+        - matching output producer manifest when present
+  rebuildRequired:
+    when:
+      - producer run id is missing
+      - required artifacts are missing
+      - artifact validation fails
+      - output belongs to another book
+      - content or fingerprint boundary does not match
+rules:
+  - id: effective-state-current-non-success-wins
+    statement: >
+      buildEffectiveResumeState must not replace a current non-succeeded
+      high-cost checkpoint with an older succeeded candidate.
+  - id: explicit-repair-required
+    statement: >
+      Reusing older producer lineage requires an explicit repair operation that
+      writes an auditable checkpoint transition.
+  - id: query-ready-current-producers-only
+    statement: >
+      query_ready validation reads reconciled current producer checkpoints and
+      fails closed if any producer is not a real succeeded checkpoint.
+  - id: no-completed-shortcut
+    statement: >
+      Repair may return a batch item to pending or continue_pending, but it must
+      not mark the item completed or synthesize passed command checks.
+observability:
+  failureText:
+    - query_ready requires completed graph_extract, community_report and embed stages
+    - query_ready checkpoint requires completed GraphRAG producer stages
+  expectedBatchClassification:
+    failureKind: permanent
+    retryable: false
+    recoveryDecision: continue_pending_or_retry_same_run_id_after_repair
+  metadata:
+    - repairReason
+    - reusedProducerRunIds
+    - localArtifactGateRepairRequiresRealRebuild
+    - localArtifactGateRepairRebuildStage
+    - repairedCheckpointStages

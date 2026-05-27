@@ -2439,6 +2439,12 @@ describe("GraphRAG EPUB batch runner", () => {
       retryable: false,
     });
     expect(classifyFailure(
+      "query_ready requires completed graph_extract, community_report and embed stages",
+    )).toMatchObject({
+      failureKind: "permanent",
+      retryable: false,
+    });
+    expect(classifyFailure(
       "graph_vault/settings.yaml is not the managed projection of .qmd/index.yml",
     )).toMatchObject({
       failureKind: "permanent",
@@ -2456,6 +2462,9 @@ describe("GraphRAG EPUB batch runner", () => {
     );
     expect(repairScript).toContain(
       "graph_vault/settings.yaml is not the managed projection of .qmd/index.yml",
+    );
+    expect(repairScript).toContain(
+      "query_ready requires completed graph_extract",
     );
   });
 
@@ -4320,7 +4329,7 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(recovered.errorSummary).toContain("\"code\": \"provider_unavailable\"");
   });
 
-  test("status-json keeps local GraphRAG artifact gate failures stop-until-fixed", async () => {
+  test("status-json marks local GraphRAG artifact gate failures resumable", async () => {
     const tmpRoot = await mkProjectTmpDir("qmd-batch-artifact-gap-local-gate-");
     const sourceDir = join(tmpRoot, "source");
     const stateRoot = join(tmpRoot, "graph_vault");
@@ -4387,10 +4396,10 @@ describe("GraphRAG EPUB batch runner", () => {
         bookId: batchBookId(sourceHash, sourceRelativePath),
         attempts: 4,
         failedAt: "2026-05-23T00:10:00.000Z",
-        failureKind: "transient",
-        retryable: true,
-        retryExhausted: false,
-        recoveryDecision: "retry_same_run_id",
+        failureKind: "permanent",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
         failedStage: "resume-book-1",
         errorSummary,
         commandChecks: [{
@@ -4402,10 +4411,10 @@ describe("GraphRAG EPUB batch runner", () => {
           stderrBytes: 12,
           startedAt: "2026-05-23T00:00:00.000Z",
           completedAt: "2026-05-23T00:01:00.000Z",
-          failureKind: "transient",
-          retryable: true,
+          failureKind: "permanent",
+          retryable: false,
           attemptExhausted: true,
-          recoveryDecision: "retry_same_run_id",
+          recoveryDecision: "stop_until_fixed",
           errorSummary,
         }],
       }),
@@ -4448,7 +4457,7 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toBe("");
     const summary = JSON.parse(result.stdout);
-    expect(summary.recoveryDecision).toBe("stop_until_fixed");
+    expect(summary.recoveryDecision).toBe("continue_pending");
     expect(summary.retryableItemCount).toBe(0);
     expect(summary.items[0]).toMatchObject({
       status: "failed",
@@ -4787,8 +4796,13 @@ describe("GraphRAG EPUB batch runner", () => {
     await mkdir(join(stateRoot, "input"), { recursive: true });
     const sourcePath = join(sourceDir, "Book.epub");
     await writeFile(sourcePath, sourceBytes);
+    const normalizedPath = join(
+      stateRoot,
+      "input",
+      `book-${sourceHash.slice(0, 10)}.md`,
+    );
     await writeFile(
-      join(stateRoot, "input", `book-${sourceHash.slice(0, 10)}.md`),
+      normalizedPath,
       "# Book\n\nAlready normalized.\n",
     );
     await writeFile(join(configDir, "index.yml"), "collections: {}\n");
@@ -4837,7 +4851,7 @@ describe("GraphRAG EPUB batch runner", () => {
         sourceRelativePath,
         sourceIdentityPath: sourceRelativePath,
         sourceHash,
-        normalizedPath: join(".tmp-tests", "graph_vault", "input", "book.md"),
+        normalizedPath: relative(projectRoot, normalizedPath),
         bookId,
         attempts: 1,
         failedAt: "2026-05-23T00:10:00.000Z",
@@ -4965,10 +4979,9 @@ describe("GraphRAG EPUB batch runner", () => {
     expect(blockedSkips).toHaveLength(0);
     expect(normalResumeStarts).toHaveLength(1);
     expect(repairBlockedEvent).toMatchObject({
-      failureKind: "transient",
-      retryable: true,
-      attemptExhausted: false,
-      recoveryDecision: "retry_same_run_id",
+      failureKind: "permanent",
+      retryable: false,
+      recoveryDecision: "continue_pending",
       failedStage: "graph_extract",
       metadata: {
         requiresRealRebuild: true,

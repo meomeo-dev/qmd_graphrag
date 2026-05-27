@@ -1638,6 +1638,86 @@ describe("Data bus contracts", () => {
     expect(hydrated.commandChecks[0]?.name).toBe("resume-book-24");
   });
 
+  test("hydrates query-ready producer gate failures as local repair candidates", () => {
+    const legacy = {
+      schemaVersion: SchemaVersion,
+      itemId: "item-query-ready-producer",
+      runId: "run-query-ready-producer",
+      status: "failed",
+      sourceName: "Producer.epub",
+      sourceRelativePath: "inbox/books/Producer.epub",
+      sourceIdentityPath: "inbox/books/Producer.epub",
+      sourceHash: "sha256:producer-source",
+      normalizedPath: "graph_vault/input/producer.md",
+      bookId: "book-producer",
+      attempts: 1,
+      failedAt: "2026-05-27T11:43:17.000Z",
+      failureKind: "unknown",
+      retryable: false,
+      retryExhausted: true,
+      recoveryDecision: "stop_until_fixed",
+      failedStage: "resume-book-2",
+      errorSummary:
+        "Error: query_ready requires completed graph_extract, " +
+        "community_report and embed stages",
+      commandChecks: [{
+        name: "resume-book-2",
+        status: "failed",
+        attempts: 1,
+        exitCode: 1,
+        stdoutBytes: 0,
+        stderrBytes: 128,
+        startedAt: "2026-05-27T11:43:00.000Z",
+        completedAt: "2026-05-27T11:43:17.000Z",
+        failureKind: "unknown",
+        retryable: false,
+        attemptExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        errorSummary:
+          "Error: query_ready requires completed graph_extract, " +
+          "community_report and embed stages",
+      }],
+    };
+
+    const hydrated = hydrateBatchCheckpoint({
+      item: {
+        sourceHash: "sha256:producer-source",
+        sourceIdentityPath: "inbox/books/Producer.epub",
+        sourceRelativePath: "inbox/books/Producer.epub",
+        bookId: "book-producer",
+      },
+      checkpoint: legacy,
+      expectedCommandCheckCount: 27,
+      maxCommandAttempts: 3,
+      maxTransientCommandAttempts: 5,
+      maxResumePasses: 24,
+      retryBaseDelaySeconds: 5,
+      retryMaxDelaySeconds: 300,
+      retryBudgetSeconds: 1800,
+      maxProviderRecoveryWaits: 3,
+      commandTimeoutSeconds: 600,
+      defaultBookId: "book-producer",
+    });
+
+    expect(hydrated).toMatchObject({
+      status: "failed",
+      failureKind: "permanent",
+      retryable: false,
+      retryExhausted: true,
+      recoveryDecision: "stop_until_fixed",
+      failedStage: "resume-book-2",
+      metadata: {
+        waitingForProviderRecovery: false,
+        reclassifiedByCurrentFailureClassifier: true,
+      },
+    });
+    expect(hydrated.commandChecks[0]).toMatchObject({
+      failureKind: "permanent",
+      retryable: false,
+      recoveryDecision: "stop_until_fixed",
+    });
+  });
+
   test("accepts batch execution bus envelopes with real schemas", () => {
     const manifestEnvelope = DataBusEnvelopeSchema.parse(
       batchRunManifestEnvelopeFixture(),

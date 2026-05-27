@@ -57,7 +57,7 @@ graph_vault/catalog/batch-runs/<runId>
 
 ## 审计收口状态
 
-`audit/` 顶层目录使用状态后缀：
+`audit/` 和 `audits/` 顶层目录使用状态后缀：
 
 - `__open`：当前仍需关注和收口的审计案例（audit case）。
 - `__closed`：历史审计案例，默认不再作为恢复入口。
@@ -65,17 +65,21 @@ graph_vault/catalog/batch-runs/<runId>
 当前唯一打开的审计案例：
 
 ```text
-audit/graphrag-query-provider-unavailable-recovery-run_20260527_r1__open
+audits/graphrag-query-ready-parallel-runner-run_20260527_r1__open
 ```
 
-该案例是 GraphRAG query provider unavailable 恢复审计。触发项是
-`Building Microservices (Sam Newman).epub` 在 GraphRAG build 成功后，于
-`qmd-query-graphrag-json` 阶段收到结构化 query error：
-`provider=graphrag`、`capability=graph_query`、
-`code=provider_unavailable`。该失败不得被永久化为
-`stop_until_fixed`；必须被重分类为 transient provider recovery，并暴露
-`waitingForProviderRecovery`、`nextRetryAt`、`retryDelaySeconds` 和
-`providerRecoveryReason`。
+该案例覆盖两个事实：
+
+- 当前真实阻塞是
+  `Code Complete, Second Edition (Steve McConnell [Steve McConnell]).epub`
+  在 `resume-book-2` 失败：
+  `query_ready requires completed graph_extract, community_report and embed stages`。
+  这是 producer-lineage / 当前 checkpoint 调和问题，不能继续保持
+  `unknown + stop_until_fixed`。
+- 用户提出并行 runner 设计问题：Jina 请求时 GraphRAG 不会请求 ChatGPT，资源可能
+  闲置。但当前系统尚不支持多个无协调 writer 同时处理同一 runId，多 runner 只能
+  在 item/book lease、catalog writer lane、qmd index lane、provider semaphore 和
+  fencing token 完成后启用。
 
 前序 GraphRAG qmd build gate 开发审计已关闭：
 
@@ -107,26 +111,19 @@ epub-batch-20260527-real-resume-1
 该 runId 是当前全量真实批次（full real batch）的恢复点。不要因为上下文丢失
 而新建 runId，除非显式要开启新的审计批次或重新定义任务边界。
 
-最近只读状态快照（2026-05-27T10:24:25Z）：
+最近只读状态快照（2026-05-27T11:47:03Z）：
 
 - 总数（total）：38 本。
-- completed：1 本。
-- pending：37 本。
+- completed：5 本。
+- pending：32 本。
 - running：0 本。
-- failed：0 本。
-- qmdBuildStatus：1 本 `succeeded`、37 本 `pending`。
-- commandCheckStatus：1 本 `succeeded`、2 本 `failed`、35 本 `pending`。
-- graphBuildStatus：5 本 `succeeded`、30 本 `failed`、1 本 `stale`、2 本
-  `running`。
-- graphQueryStatus：1 本 `succeeded`、1 本 `failed`、36 本 `pending`。
-- `Accelerate The Science of Lean Software and DevOps...` 已形成 completed 闭环。
-- retryable transient item：`A Philosophy of Software Design` 因
-  `community_report` partial-output failure 等待同 runId 恢复。
-- retryable query provider item：`Building Microservices (Sam Newman).epub`
-  因 `qmd-query-graphrag-json` 的结构化 `provider_unavailable` 等待同 runId
-  恢复。该项应显示 `status=pending`、`failureKind=transient`、
-  `retryable=true`、`recoveryDecision=retry_same_run_id`、
-  `waitingForProviderRecovery=true`、`providerRecoveryReason=legacy_retry_exhausted_transient`。
+- failed：1 本。
+- recoveryDecision：`stop_until_fixed`。
+- retryableItemCount：2。
+- failed item：`Code Complete, Second Edition (Steve McConnell [Steve McConnell]).epub`。
+- failedStage：`resume-book-2`。
+- errorSummary：
+  `query_ready requires completed graph_extract, community_report and embed stages`。
 - 未发现活跃的 `batch-epub-workflow` 或 `resume-book-workspace` 旧 runner。
 
 快照只用于定位。继续前必须重新执行只读状态命令，不得相信旧时间点状态。

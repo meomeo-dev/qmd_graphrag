@@ -1009,6 +1009,14 @@ function sortNewestCheckpoints(
   );
 }
 
+function currentCheckpointBlocksRecoveredCandidate(
+  checkpoint: BookJobStageCheckpoint | undefined,
+): boolean {
+  return checkpoint != null &&
+    HIGH_COST_STAGES.has(checkpoint.stage) &&
+    checkpoint.status !== "succeeded";
+}
+
 export class FileBookJobStateRepository {
   readonly rootDir: string;
 
@@ -2709,6 +2717,9 @@ export class FileBookJobStateRepository {
     const validity = new Map<BookStage, ArtifactStageValidity>();
 
     for (const stage of BookStageOrder.filter((item) => item !== "query_ready")) {
+      if (currentCheckpointBlocksRecoveredCandidate(effectiveByStage.get(stage))) {
+        continue;
+      }
       const usable = await this.selectUsableSucceededCheckpoint({
         bookId,
         stage,
@@ -2724,19 +2735,21 @@ export class FileBookJobStateRepository {
       validity.set(stage, usable.validity);
     }
 
-    const queryReadyUsable = await this.selectUsableSucceededCheckpoint({
-      bookId,
-      stage: "query_ready",
-      candidates,
-      fingerprints,
-      requirements,
-      artifacts,
-      job,
-      checkpointByStage: effectiveByStage,
-    });
-    if (queryReadyUsable != null) {
-      effectiveByStage.set("query_ready", queryReadyUsable.checkpoint);
-      validity.set("query_ready", queryReadyUsable.validity);
+    if (!currentCheckpointBlocksRecoveredCandidate(effectiveByStage.get("query_ready"))) {
+      const queryReadyUsable = await this.selectUsableSucceededCheckpoint({
+        bookId,
+        stage: "query_ready",
+        candidates,
+        fingerprints,
+        requirements,
+        artifacts,
+        job,
+        checkpointByStage: effectiveByStage,
+      });
+      if (queryReadyUsable != null) {
+        effectiveByStage.set("query_ready", queryReadyUsable.checkpoint);
+        validity.set("query_ready", queryReadyUsable.validity);
+      }
     }
 
     const checkpoints = [...effectiveByStage.values()].sort((left, right) =>
