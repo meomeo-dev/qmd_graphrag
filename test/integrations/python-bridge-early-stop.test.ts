@@ -1,4 +1,13 @@
-import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -33,6 +42,95 @@ async function writeFakeBridge(
 }
 
 describe("Python bridge GraphRAG stage early stop", () => {
+  test("registers batch subprocess records with provider slot fencing", async () => {
+    const workspace = await createWorkspace();
+    const registryDir = join(workspace, "subprocesses");
+    const previousEnv = {
+      QMD_GRAPHRAG_RUN_ID: process.env.QMD_GRAPHRAG_RUN_ID,
+      QMD_GRAPHRAG_ITEM_ID: process.env.QMD_GRAPHRAG_ITEM_ID,
+      QMD_GRAPHRAG_BOOK_ID: process.env.QMD_GRAPHRAG_BOOK_ID,
+      QMD_GRAPHRAG_WORKER_ID: process.env.QMD_GRAPHRAG_WORKER_ID,
+      QMD_GRAPHRAG_RUNNER_SESSION_ID:
+        process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID,
+      QMD_GRAPHRAG_RUNNER_HOST: process.env.QMD_GRAPHRAG_RUNNER_HOST,
+      QMD_GRAPHRAG_RUNNER_PID: process.env.QMD_GRAPHRAG_RUNNER_PID,
+      QMD_GRAPHRAG_SUBPROCESS_REGISTRY_DIR:
+        process.env.QMD_GRAPHRAG_SUBPROCESS_REGISTRY_DIR,
+      QMD_GRAPHRAG_PROVIDER_SLOT_ID: process.env.QMD_GRAPHRAG_PROVIDER_SLOT_ID,
+      QMD_GRAPHRAG_PROVIDER_SLOT_PROVIDER:
+        process.env.QMD_GRAPHRAG_PROVIDER_SLOT_PROVIDER,
+      QMD_GRAPHRAG_PROVIDER_SLOT_GENERATION:
+        process.env.QMD_GRAPHRAG_PROVIDER_SLOT_GENERATION,
+      QMD_GRAPHRAG_PROVIDER_SLOT_FENCING_TOKEN:
+        process.env.QMD_GRAPHRAG_PROVIDER_SLOT_FENCING_TOKEN,
+    };
+    try {
+      process.env.QMD_GRAPHRAG_RUN_ID = "bridge-registry-run";
+      process.env.QMD_GRAPHRAG_ITEM_ID = "item-bridge";
+      process.env.QMD_GRAPHRAG_BOOK_ID = "book-bridge";
+      process.env.QMD_GRAPHRAG_WORKER_ID = "worker-bridge";
+      process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID = "runner-session";
+      process.env.QMD_GRAPHRAG_RUNNER_HOST = "host-bridge";
+      process.env.QMD_GRAPHRAG_RUNNER_PID = String(process.pid);
+      process.env.QMD_GRAPHRAG_SUBPROCESS_REGISTRY_DIR = registryDir;
+      process.env.QMD_GRAPHRAG_PROVIDER_SLOT_ID = "openai-slot-1";
+      process.env.QMD_GRAPHRAG_PROVIDER_SLOT_PROVIDER = "openai";
+      process.env.QMD_GRAPHRAG_PROVIDER_SLOT_GENERATION = "7";
+      process.env.QMD_GRAPHRAG_PROVIDER_SLOT_FENCING_TOKEN = "slot-token-7";
+      const fakeBridge = await writeFakeBridge(
+        workspace,
+        [
+          "process.stdout.write(JSON.stringify({",
+          `  schemaVersion: ${JSON.stringify(SchemaVersion)},`,
+          "  method: 'standard',",
+          "  outputs: [{ workflow: 'extract_graph', hasError: false, stateKeys: [] }],",
+          "}));",
+        ].join("\n"),
+      );
+
+      await callPythonBridge({
+        command: "graphrag_index",
+        pythonBin: fakeBridge,
+        workingDirectory: workspace,
+        request: {},
+        responseSchema: GraphRagIndexResponseSchema,
+      });
+
+      const records = await Promise.all(
+        (await readdir(registryDir))
+          .filter((entry) => entry.endsWith(".json"))
+          .map(async (entry) =>
+            JSON.parse(await readFile(join(registryDir, entry), "utf8"))
+          ),
+      );
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({
+        schemaVersion: SchemaVersion,
+        runId: "bridge-registry-run",
+        command: "python-bridge:graphrag_index",
+        itemId: "item-bridge",
+        bookId: "book-bridge",
+        workerId: "worker-bridge",
+        runnerSessionId: "runner-session",
+        runnerHost: "host-bridge",
+        runnerPid: process.pid,
+        providerSlotId: "openai-slot-1",
+        providerSlotProvider: "openai",
+        providerSlotGeneration: 7,
+        providerSlotFencingToken: "slot-token-7",
+        status: "exited",
+        exitCode: 0,
+      });
+      expect(records[0].processGroup).toBe(process.platform !== "win32");
+    } finally {
+      for (const [key, value] of Object.entries(previousEnv)) {
+        if (value == null) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
   test("ignores old partial-output log history before the current offset", async () => {
     const workspace = await createWorkspace();
     const reportDir = join(workspace, "reports");

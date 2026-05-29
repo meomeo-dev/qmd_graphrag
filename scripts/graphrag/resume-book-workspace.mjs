@@ -44,6 +44,7 @@ async function importRuntime() {
     loadGraphQueryCapabilities: indexModule.loadGraphQueryCapabilities,
     syncGraphRagBookWorkspace: indexModule.syncGraphRagBookWorkspace,
     writeGraphRagOutputProducerManifest: indexModule.writeGraphRagOutputProducerManifest,
+    DurableStateError: indexModule.DurableStateError,
     loadConfig: collectionsModule.loadConfig,
     setConfigSource: collectionsModule.setConfigSource,
     sanitizeVaultText: metadataModule.sanitizeVaultText,
@@ -107,6 +108,77 @@ function errorText(error) {
 
 function safeText(runtimeApi, value) {
   return runtimeApi.sanitizeVaultText(String(value)) ?? "[redacted]";
+}
+
+function numberEnv(name) {
+  const value = process.env[name];
+  if (value == null || value === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function durableFailureEnvelope(runtimeApi, error) {
+  if (!runtimeApi?.DurableStateError || !(error instanceof runtimeApi.DurableStateError)) {
+    return null;
+  }
+  const evidence = error.evidence ?? {};
+  const output = {
+    marker: "QMD_GRAPHRAG_DURABLE_FAILURE",
+    schemaVersion: "1.0.0",
+    status: "failed",
+    failureKind: error.failureKind ?? "local_state_integrity",
+    localFailureClass: error.localFailureClass,
+    retryable: false,
+    recoveryDecision: error.recoveryDecision ?? "stop_until_fixed",
+    failedStage: process.env.QMD_GRAPHRAG_COMMAND_NAME ?? error.failedStage ??
+      "resume-book",
+    targetLocator: evidence.targetLocator,
+    redactedEvidenceLocator: evidence.redactedEvidenceLocator,
+    lane: evidence.lane,
+    targetMappingOwner: evidence.targetMappingOwner,
+    laneTimeoutMs: evidence.laneTimeoutMs,
+    releaseOn: evidence.releaseOn,
+    tempId: evidence.tempId,
+    operationId: evidence.operationId,
+    failedSyscall: evidence.failedSyscall,
+    errno: evidence.errno,
+    renameCause: evidence.renameCause,
+    lockOwnerEvidence: evidence.lockOwnerEvidence,
+    checksumRecoveryDecision: evidence.checksumRecoveryDecision,
+    cleanupReason: evidence.cleanupReason,
+    fsyncTarget: evidence.fsyncTarget,
+    fsyncErrno: evidence.fsyncErrno,
+    fsyncPlatform: evidence.fsyncPlatform,
+    durableMode: evidence.durableMode,
+    primaryTargetLocator: evidence.primaryTargetLocator,
+    sidecarTargetLocator: evidence.sidecarTargetLocator,
+    sidecarKind: evidence.sidecarKind,
+    checksumExpected: evidence.checksumExpected,
+    checksumActual: evidence.checksumActual,
+    repairAllowed: evidence.repairAllowed,
+    statusJsonDecision: evidence.statusJsonDecision,
+    diagnosticClass: evidence.diagnosticClass,
+    evidenceIncomplete: evidence.evidenceIncomplete,
+    evidenceIncompleteReason: evidence.evidenceIncompleteReason,
+    unavailableFieldSentinels: evidence.unavailableFieldSentinels,
+    completedPublishRule: evidence.completedPublishRule ?? "forbidden",
+    itemId: evidence.itemId ?? process.env.QMD_GRAPHRAG_ITEM_ID,
+    bookId: evidence.bookId ?? process.env.QMD_GRAPHRAG_BOOK_ID,
+    workerId: evidence.workerId ?? process.env.QMD_GRAPHRAG_WORKER_ID,
+    leaseGeneration: evidence.leaseGeneration ??
+      numberEnv("QMD_GRAPHRAG_BOOK_LEASE_GENERATION"),
+    bookLeaseGeneration: evidence.bookLeaseGeneration,
+    ownerPid: evidence.ownerPid,
+    ownerHost: evidence.ownerHost,
+    runnerSessionId: evidence.runnerSessionId,
+    createdAt: evidence.createdAt,
+    expiresAt: evidence.expiresAt,
+    targetGeneration: evidence.targetGeneration,
+    fencingTokenHash: evidence.fencingTokenHash,
+  };
+  return Object.fromEntries(
+    Object.entries(output).filter(([, value]) => value !== undefined),
+  );
 }
 
 function stageFailureKind(error) {
@@ -592,6 +664,7 @@ async function refreshOutputProducerManifestFromCheckpoints(
     if (checkpoint == null) continue;
     await runtimeApi.writeGraphRagOutputProducerManifest({
       outputDir: scopedOutputDir,
+      repo,
       bookId: sync.job.bookId,
       sourceHash: sync.job.sourceHash,
       documentId: sync.job.documentId,
@@ -627,6 +700,7 @@ async function restoreProducerManifestFromEvidence({
     if (typeof producerRunId !== "string") continue;
     await runtimeApi.writeGraphRagOutputProducerManifest({
       outputDir: scopedOutputDir,
+      repo,
       bookId: sync.job.bookId,
       sourceHash: sync.job.sourceHash,
       documentId: sync.job.documentId,
@@ -663,6 +737,7 @@ async function repairLocalArtifactGateFailureIfPossible({
 
   await runtimeApi.writeGraphRagOutputProducerManifest({
     outputDir: scopedOutputDir,
+    repo,
     bookId: sync.job.bookId,
     sourceHash: sync.job.sourceHash,
     documentId: sync.job.documentId,
@@ -1191,6 +1266,7 @@ async function run() {
     try {
       await runtimeApi.writeGraphRagOutputProducerManifest({
         outputDir: scopedOutputDir,
+        repo,
         bookId: sync.job.bookId,
         sourceHash: sync.job.sourceHash,
         documentId: sync.job.documentId,
@@ -1340,6 +1416,7 @@ async function run() {
 
     await runtimeApi.writeGraphRagOutputProducerManifest({
       outputDir: scopedOutputDir,
+      repo,
       bookId: sync.job.bookId,
       sourceHash: sync.job.sourceHash,
       documentId: sync.job.documentId,
@@ -1450,6 +1527,12 @@ async function run() {
 run().catch((error) => {
   importRuntime()
     .then((runtimeApi) => {
+      const envelope = durableFailureEnvelope(runtimeApi, error);
+      if (envelope != null) {
+        console.error(
+          `QMD_GRAPHRAG_DURABLE_FAILURE ${JSON.stringify(envelope)}`,
+        );
+      }
       console.error(safeText(runtimeApi, errorText(error)));
     })
     .catch(() => {

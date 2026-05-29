@@ -81,6 +81,7 @@ import {
   type ContextMap,
 } from "./collections.js";
 import { createQmdGraphRagRuntime, type QmdGraphRagRuntime } from "./runtime.js";
+import { DurableStateError } from "./job-state/durable-state-store.js";
 import type {
   BatchCommandCheck,
   BatchBuildStatus,
@@ -138,6 +139,8 @@ import type {
   QueryExpansionItem,
   QueryKind,
 } from "./contracts/common.js";
+
+export { DurableStateError };
 import type {
   DataBusEnvelope,
 } from "./contracts/bus.js";
@@ -688,6 +691,7 @@ export {
   graphRagBookOutputDir,
   assertGraphRagStageArtifactsReady,
   readGraphTextUnitIdentity,
+  registerQmdCorpusDocument,
   syncGraphRagBookWorkspace,
   writeGraphRagOutputProducerManifest,
 } from "./job-state/graphrag-book.js";

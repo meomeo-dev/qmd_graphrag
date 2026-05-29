@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +11,10 @@ import {
   runGraphRagIndex,
   runGraphRagQuery,
 } from "../../src/integrations/graphrag.js";
+import {
+  appendProviderCostAccounting,
+  buildProviderCostAccounting,
+} from "../../src/provider/cost-accounting.js";
 import { hashLanceDbDirectoryContents } from "../../src/job-state/artifact-validation.js";
 import { hashFile } from "../../src/job-state/fingerprint.js";
 
@@ -164,6 +168,19 @@ async function readCostLedger(root: string): Promise<Record<string, unknown>[]> 
     .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
+async function expectDurableRequestArtifact(
+  graphVault: string,
+  requestArtifactPath: string,
+): Promise<void> {
+  const artifactPath = join(graphVault, requestArtifactPath);
+  const checksumPath = `${artifactPath}.sha256`;
+  expect(existsSync(artifactPath)).toBe(true);
+  expect(existsSync(checksumPath)).toBe(true);
+  await expect(readFile(checksumPath, "utf8")).resolves.toBe(
+    `${await hashFile(artifactPath)}\n`,
+  );
+}
+
 describe("GraphRAG provider cost accounting", () => {
   test("records query artifactIds from GraphRAG evidence", async () => {
     const graphVault = await mkdtemp(join(tmpdir(), "qmd-graphrag-cost-query-"));
@@ -210,7 +227,7 @@ describe("GraphRAG provider cost accounting", () => {
     expect(artifactIds).toContain("artifact-from-evidence");
     expect(artifactIds).not.toContain("cap-1");
     expect(typeof requestArtifactPath).toBe("string");
-    expect(existsSync(join(graphVault, requestArtifactPath as string))).toBe(true);
+    await expectDurableRequestArtifact(graphVault, requestArtifactPath as string);
     expect(record?.tokenCountStatus).toBe("unknown");
     expect(record?.embeddingCountStatus).toBe("unknown");
   });
@@ -386,7 +403,7 @@ describe("GraphRAG provider cost accounting", () => {
     expect(artifactIds).not.toContain("workflow-not-artifact");
     expect(artifactIds).not.toContain("cap-1");
     expect(typeof requestArtifactPath).toBe("string");
-    expect(existsSync(join(graphVault, requestArtifactPath as string))).toBe(true);
+    await expectDurableRequestArtifact(graphVault, requestArtifactPath as string);
     expect(mockedBridge).toHaveBeenCalledWith(expect.objectContaining({
       command: "graphrag_index",
       request: expect.objectContaining({
@@ -405,6 +422,68 @@ describe("GraphRAG provider cost accounting", () => {
       }),
     }));
   });
+
+  test("recovers corrupt cost ledger tail before appending provider cost records",
+    async () => {
+      const graphVault = await mkdtemp(join(tmpdir(), "qmd-graphrag-cost-tail-"));
+      await mkdir(join(graphVault, "catalog"), { recursive: true });
+      const firstRecord = buildProviderCostAccounting({
+        sourceId: "source-1",
+        documentId: "doc-1",
+        bookId: "book-1",
+        contentHash: "content-1",
+        lineageMode: "graph_artifact",
+        stage: "graphrag_query",
+        provider: "graphrag",
+        model: "local",
+        requestCount: 1,
+        tokenCount: 0,
+        tokenCountStatus: "unknown",
+        embeddingCount: 0,
+        embeddingCountStatus: "unknown",
+        cacheHit: false,
+        runId: "run-existing",
+        requestArtifactId: "request-existing",
+        artifactIds: ["request-existing", "artifact-existing"],
+      });
+      const secondRecord = buildProviderCostAccounting({
+        sourceId: "source-2",
+        documentId: "doc-2",
+        bookId: "book-2",
+        contentHash: "content-2",
+        lineageMode: "graph_artifact",
+        stage: "graphrag_index",
+        provider: "graphrag",
+        model: "standard",
+        requestCount: 1,
+        tokenCount: 0,
+        tokenCountStatus: "unknown",
+        embeddingCount: 0,
+        embeddingCountStatus: "unknown",
+        cacheHit: false,
+        runId: "run-new",
+        requestArtifactId: "request-new",
+        artifactIds: ["request-new", "artifact-new"],
+      });
+
+      await writeFile(
+        join(graphVault, "catalog", "cost-accounting.jsonl"),
+        `${JSON.stringify(firstRecord)}\n{"schemaVersion":`,
+        "utf8",
+      );
+
+      await appendProviderCostAccounting(graphVault, secondRecord);
+
+      const records = await readCostLedger(graphVault);
+      const catalogEntries = await readdir(join(graphVault, "catalog"));
+      expect(records.map((record) => record.runId)).toEqual([
+        "run-existing",
+        "run-new",
+      ]);
+      expect(catalogEntries.some((entry) =>
+        entry.startsWith("cost-accounting.jsonl.corrupt-")
+      )).toBe(true);
+    });
 
   test("rejects GraphRAG index responses with workflow errors", async () => {
     const graphVault = await mkdtemp(join(tmpdir(), "qmd-graphrag-cost-index-"));

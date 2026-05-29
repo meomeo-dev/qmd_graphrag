@@ -1,10 +1,14 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { existsSync, mkdirSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
-import YAML from "yaml";
-
 import type { CollectionConfig } from "../collections.js";
+import {
+  readYamlUnknownDurable,
+  readYamlUnknownDurableSync,
+  writeYamlFileDurable,
+  writeYamlFileDurableSync,
+} from "../job-state/durable-state-store.js";
 import { createDeterministicHash } from "../job-state/fingerprint.js";
 import {
   DEFAULT_JINA_EMBEDDING_PROFILE,
@@ -34,6 +38,17 @@ export type ManagedGraphRagSettingsRepairResult = {
 
 const ManagedProjectionError =
   "graph_vault/settings.yaml is not the managed projection of .qmd/index.yml";
+
+function settingsMissingError(settingsPath: string): NodeJS.ErrnoException {
+  const error = new Error(
+    `ENOENT: no such file or directory, open '${settingsPath}'`,
+  ) as NodeJS.ErrnoException;
+  error.code = "ENOENT";
+  error.errno = -2;
+  error.path = settingsPath;
+  error.syscall = "open";
+  return error;
+}
 
 function envPlaceholder(envName: string | undefined, fallback: string): string {
   return `\${${envName || fallback}}`;
@@ -252,35 +267,27 @@ export function writeManagedGraphRagSettingsSync(input: {
   return settingsPath;
 }
 
-function managedSettingsTempPath(settingsPath: string): string {
-  return `${settingsPath}.tmp-${process.pid}-${Date.now()}`;
-}
-
 async function writeManagedSettingsFile(
   settingsPath: string,
   settings: Record<string, unknown>,
 ): Promise<void> {
-  const tmpPath = managedSettingsTempPath(settingsPath);
-  await writeFile(tmpPath, YAML.stringify(settings), "utf8");
-  await rename(tmpPath, settingsPath);
+  await writeYamlFileDurable(settingsPath, settings);
 }
 
 function writeManagedSettingsFileSync(
   settingsPath: string,
   settings: Record<string, unknown>,
 ): void {
-  const tmpPath = managedSettingsTempPath(settingsPath);
-  writeFileSync(tmpPath, YAML.stringify(settings), "utf8");
-  renameSync(tmpPath, settingsPath);
+  writeYamlFileDurableSync(settingsPath, settings);
 }
 
-function parseManagedSettings(raw: string): Record<string, unknown> & {
+function parseManagedSettings(input: unknown): Record<string, unknown> & {
   qmd_graphrag?: {
     managed_by?: unknown;
     source_fingerprint?: unknown;
   };
 } {
-  const parsed = (YAML.parse(raw) ?? {}) as Record<string, unknown> & {
+  const parsed = (input ?? {}) as Record<string, unknown> & {
     qmd_graphrag?: {
       managed_by?: unknown;
       source_fingerprint?: unknown;
@@ -290,6 +297,38 @@ function parseManagedSettings(raw: string): Record<string, unknown> & {
     throw new Error(ManagedProjectionError);
   }
   return parsed;
+}
+
+async function readManagedSettingsFile(
+  settingsPath: string,
+): Promise<Record<string, unknown> & {
+  qmd_graphrag?: {
+    managed_by?: unknown;
+    source_fingerprint?: unknown;
+  };
+}> {
+  if (!existsSync(settingsPath)) throw settingsMissingError(settingsPath);
+  const parsed = await readYamlUnknownDurable(settingsPath);
+  if (parsed == null && !existsSync(settingsPath)) {
+    throw settingsMissingError(settingsPath);
+  }
+  return parseManagedSettings(parsed);
+}
+
+function readManagedSettingsFileSync(
+  settingsPath: string,
+): Record<string, unknown> & {
+  qmd_graphrag?: {
+    managed_by?: unknown;
+    source_fingerprint?: unknown;
+  };
+} {
+  if (!existsSync(settingsPath)) throw settingsMissingError(settingsPath);
+  const parsed = readYamlUnknownDurableSync(settingsPath);
+  if (parsed == null && !existsSync(settingsPath)) {
+    throw settingsMissingError(settingsPath);
+  }
+  return parseManagedSettings(parsed);
 }
 
 function isValidManagedProjection(
@@ -325,9 +364,9 @@ export async function ensureManagedGraphRagSettings(input: {
 }): Promise<ManagedGraphRagSettingsRepairResult> {
   const projection = buildGraphRagRuntimeSettingsProjection(input.config);
   const settingsPath = resolve(input.settingsPath);
-  let raw: string;
+  let parsed: ReturnType<typeof parseManagedSettings>;
   try {
-    raw = await readFile(settingsPath, "utf8");
+    parsed = await readManagedSettingsFile(settingsPath);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     await mkdir(dirname(settingsPath), { recursive: true });
@@ -341,7 +380,6 @@ export async function ensureManagedGraphRagSettings(input: {
       reason: "managed_projection_created",
     };
   }
-  const parsed = parseManagedSettings(raw);
   if (isValidManagedProjection(parsed, projection)) {
     return {
       decision: "already_valid",
@@ -372,9 +410,9 @@ export function ensureManagedGraphRagSettingsSync(input: {
 }): ManagedGraphRagSettingsRepairResult {
   const projection = buildGraphRagRuntimeSettingsProjection(input.config);
   const settingsPath = resolve(input.settingsPath);
-  let raw: string;
+  let parsed: ReturnType<typeof parseManagedSettings>;
   try {
-    raw = readFileSync(settingsPath, "utf8");
+    parsed = readManagedSettingsFileSync(settingsPath);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     mkdirSync(dirname(settingsPath), { recursive: true });
@@ -388,7 +426,6 @@ export function ensureManagedGraphRagSettingsSync(input: {
       reason: "managed_projection_created",
     };
   }
-  const parsed = parseManagedSettings(raw);
   if (isValidManagedProjection(parsed, projection)) {
     return {
       decision: "already_valid",
@@ -417,8 +454,7 @@ export async function assertManagedGraphRagSettings(input: {
   config: CollectionConfig;
   settingsPath: string;
 }): Promise<void> {
-  const raw = await readFile(input.settingsPath, "utf8");
-  const parsed = parseManagedSettings(raw);
+  const parsed = await readManagedSettingsFile(input.settingsPath);
   const projection = buildGraphRagRuntimeSettingsProjection(input.config);
   if (!isValidManagedProjection(parsed, projection)) throw new Error(ManagedProjectionError);
 }

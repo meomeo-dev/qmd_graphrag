@@ -1,5 +1,15 @@
-import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -18,16 +28,61 @@ import {
   graphRagIndexLogOffset,
   graphRagBookOutputDir,
   loadGraphQueryCapabilities,
+  registerQmdCorpusDocument,
   SchemaVersion,
   syncGraphRagBookWorkspace,
   writeGraphRagOutputProducerManifest,
+  ensureManagedGraphRagSettings,
   writeManagedGraphRagSettings,
   writeManagedGraphRagSettingsSync,
 } from "../src/index.js";
 import type { CollectionConfig } from "../src/collections.js";
 import type { BookStage, BookJob } from "../src/contracts/book-job.js";
+import { writeYamlFileDurable } from "../src/job-state/durable-state-store.js";
 import type { StageFingerprintMap } from "../src/job-state/repository.js";
 import { createStore } from "../src/store.js";
+
+async function restoreEnv(
+  previousEnv: Record<string, string | undefined>,
+): Promise<void> {
+  for (const [key, value] of Object.entries(previousEnv)) {
+    if (value == null) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+async function installBatchBookLease(input: {
+  graphVault: string;
+  runId: string;
+  bookId: string;
+  sessionId: string;
+  generation: number;
+  token: string;
+}): Promise<void> {
+  const leaseDir = join(
+    input.graphVault,
+    "catalog",
+    "batch-runs",
+    input.runId,
+    "book-leases",
+  );
+  await mkdir(leaseDir, { recursive: true });
+  await writeFile(join(leaseDir, `${input.bookId}.json`), JSON.stringify({
+    schemaVersion: SchemaVersion,
+    runId: input.runId,
+    bookId: input.bookId,
+    itemId: "item-fenced",
+    workerId: "worker-1",
+    runnerSessionId: input.sessionId,
+    runnerHost: "localhost",
+    runnerPid: 1,
+    generation: input.generation,
+    fencingToken: input.token,
+    acquiredAt: "2026-05-23T00:00:00.000Z",
+    heartbeatAt: "2026-05-23T00:00:00.000Z",
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }), "utf8");
+}
 
 const TestPythonBin = existsSync(join(process.cwd(), ".venv-graphrag", "bin", "python"))
   ? join(process.cwd(), ".venv-graphrag", "bin", "python")
@@ -2635,6 +2690,42 @@ describe("syncGraphRagBookWorkspace", () => {
     }
   });
 
+  test("creates missing managed GraphRAG settings from project config", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      const settingsPath = join(graphVault, "settings.yaml");
+
+      const createdResult = await ensureManagedGraphRagSettings({
+        config: projectConfig,
+        settingsPath,
+      });
+      const createdRaw = await readFile(settingsPath, "utf8");
+      const created = YAML.parse(createdRaw) as {
+        qmd_graphrag?: { source_fingerprint?: string };
+      };
+      expect(createdResult).toMatchObject({
+        decision: "rewritten",
+        rewritten: true,
+        sourceFingerprint: created.qmd_graphrag?.source_fingerprint,
+        reason: "managed_projection_created",
+      });
+
+      const second = await ensureManagedGraphRagSettings({
+        config: projectConfig,
+        settingsPath,
+      });
+      expect(second).toMatchObject({
+        decision: "already_valid",
+        rewritten: false,
+        sourceFingerprint: createdResult.sourceFingerprint,
+      });
+      await expect(readFile(settingsPath, "utf8")).resolves.toBe(createdRaw);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("rewrites managed GraphRAG settings when projection body is mutated", async () => {
     const root = await createWorkspace();
     try {
@@ -2653,7 +2744,7 @@ describe("syncGraphRagBookWorkspace", () => {
       const raw = await readFile(join(graphVault, "settings.yaml"), "utf8");
       const parsed = YAML.parse(raw) as Record<string, unknown>;
       parsed.concurrent_requests = 99;
-      await writeFile(join(graphVault, "settings.yaml"), YAML.stringify(parsed), "utf8");
+      await writeYamlFileDurable(join(graphVault, "settings.yaml"), parsed);
 
       const synced = await syncGraphRagBookWorkspace({
         stateRootDir: graphVault,
@@ -2742,6 +2833,431 @@ describe("syncGraphRagBookWorkspace", () => {
       })).toThrow("managed projection");
       await expect(readFile(join(graphVault, "settings.yaml"), "utf8"))
         .resolves.toBe("vector_store: {}\n");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects stale book lease before qmd corpus index mutation", async () => {
+    const root = await createWorkspace();
+    const previousEnv = {
+      QMD_GRAPHRAG_RUN_ID: process.env.QMD_GRAPHRAG_RUN_ID,
+      QMD_GRAPHRAG_RUNNER_SESSION_ID: process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID,
+      QMD_GRAPHRAG_BOOK_LEASE_GENERATION:
+        process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION,
+      QMD_GRAPHRAG_BOOK_FENCING_TOKEN: process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN,
+      QMD_GRAPHRAG_GRAPH_VAULT: process.env.QMD_GRAPHRAG_GRAPH_VAULT,
+    };
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+      await mkdir(join(graphVault, "output"), { recursive: true });
+      await writeManagedGraphRagSettings({ config: projectConfig, graphVault });
+      await writeFile(join(graphVault, "prompts", "extract_graph.txt"), "prompt", "utf8");
+
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+
+      const initial = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        recordRecoveredStages: false,
+      });
+      const runId = "batch-qmd-corpus-stale-lease";
+      await installBatchBookLease({
+        graphVault,
+        runId,
+        bookId: initial.job.bookId,
+        sessionId: "active-session",
+        generation: 2,
+        token: "active-token",
+      });
+      process.env.QMD_GRAPHRAG_RUN_ID = runId;
+      process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID = "stale-session";
+      process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION = "1";
+      process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN = "stale-token";
+      process.env.QMD_GRAPHRAG_GRAPH_VAULT = graphVault;
+
+      await expect(registerQmdCorpusDocument({
+        repo: new FileBookJobStateRepository(graphVault),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        stateRootDir: graphVault,
+        job: initial.job,
+        normalizedPath,
+      })).rejects.toThrow(`book lease fencing rejected stage write: ${
+        initial.job.bookId
+      }`);
+
+      const store = createStore(join(root, ".qmd", "index.sqlite"));
+      try {
+        const documentCount = store.db.prepare(
+          "SELECT COUNT(*) AS count FROM documents",
+        ).get() as { count: number };
+        expect(documentCount.count).toBe(0);
+      } finally {
+        store.close();
+      }
+    } finally {
+      await restoreEnv(previousEnv);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("records qmd SQLite busy retry metrics when corpus registration recovers", async () => {
+    const root = await createWorkspace();
+    const previousEnv = {
+      QMD_GRAPHRAG_RUN_ID: process.env.QMD_GRAPHRAG_RUN_ID,
+      QMD_GRAPHRAG_RUNNER_SESSION_ID: process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID,
+      QMD_GRAPHRAG_BOOK_LEASE_GENERATION:
+        process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION,
+      QMD_GRAPHRAG_BOOK_FENCING_TOKEN: process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN,
+      QMD_GRAPHRAG_GRAPH_VAULT: process.env.QMD_GRAPHRAG_GRAPH_VAULT,
+    };
+    let lockStore: ReturnType<typeof createStore> | null = null;
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+      await mkdir(join(graphVault, "output"), { recursive: true });
+      await writeManagedGraphRagSettings({ config: projectConfig, graphVault });
+      await writeFile(join(graphVault, "prompts", "extract_graph.txt"), "prompt", "utf8");
+
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      const qmdIndexPath = join(root, ".qmd", "index.sqlite");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+      const initial = await syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        recordRecoveredStages: false,
+      });
+
+      const runId = "batch-qmd-sqlite-busy-retry";
+      await installBatchBookLease({
+        graphVault,
+        runId,
+        bookId: initial.job.bookId,
+        sessionId: "active-session",
+        generation: 2,
+        token: "active-token",
+      });
+      process.env.QMD_GRAPHRAG_RUN_ID = runId;
+      process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID = "active-session";
+      process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION = "2";
+      process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN = "active-token";
+      process.env.QMD_GRAPHRAG_GRAPH_VAULT = graphVault;
+
+      await mkdir(dirname(qmdIndexPath), { recursive: true });
+      lockStore = createStore(qmdIndexPath);
+      lockStore.db.exec("BEGIN EXCLUSIVE");
+      setTimeout(() => {
+        try {
+          lockStore?.db.exec("ROLLBACK");
+        } catch {}
+        lockStore?.close();
+        lockStore = null;
+      }, 5100).unref();
+
+      await registerQmdCorpusDocument({
+        repo: new FileBookJobStateRepository(graphVault),
+        qmdIndexPath,
+        stateRootDir: graphVault,
+        job: initial.job,
+        normalizedPath,
+      });
+
+      const metricPath = join(
+        graphVault,
+        "catalog",
+        "batch-runs",
+        runId,
+        "qmd-sqlite-retry-metrics.jsonl",
+      );
+      const metric = JSON.parse(readFileSync(metricPath, "utf8").trim());
+      expect(metric).toMatchObject({
+        operation: "qmd-corpus-registration",
+        bookId: initial.job.bookId,
+        retryCount: 1,
+        exhausted: false,
+      });
+      expect(["busy", "locked"]).toContain(metric.finalClassification);
+      expect(metric.waitMs).toBeGreaterThan(0);
+
+      const identityCatalog = YAML.parse(
+        await readFile(join(graphVault, "catalog", "document-identity-map.yaml"), "utf8"),
+      );
+      const identity = identityCatalog.items.find((item: { documentId: string }) =>
+        item.documentId === initial.job.documentId
+      );
+      expect(identity.metadata).toMatchObject({
+        qmdCorpusRegistered: true,
+        sqliteBusyRetryCount: 1,
+      });
+      expect(["busy", "locked"]).toContain(
+        identity.metadata.sqliteBusyFinalClassification,
+      );
+    } finally {
+      if (lockStore != null) {
+        try {
+          lockStore.db.exec("ROLLBACK");
+        } catch {}
+        lockStore.close();
+      }
+      await restoreEnv(previousEnv);
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  test("rejects stale book lease before producer manifest write", async () => {
+    const root = await createWorkspace();
+    const previousEnv = {
+      QMD_GRAPHRAG_RUN_ID: process.env.QMD_GRAPHRAG_RUN_ID,
+      QMD_GRAPHRAG_RUNNER_SESSION_ID: process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID,
+      QMD_GRAPHRAG_BOOK_LEASE_GENERATION:
+        process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION,
+      QMD_GRAPHRAG_BOOK_FENCING_TOKEN: process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN,
+    };
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "output"), { recursive: true });
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      const job = await repo.registerBookSource({
+        sourcePath,
+        sourceIdentityPath: "book.epub",
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+        normalizedContentHash: "content-1",
+        stageFingerprints: Object.fromEntries(BookStageOrder.map((stage) => [
+          stage,
+          `fp-${stage}`,
+        ])) as Record<BookStage, string>,
+        providerFingerprint: "provider-1",
+      });
+      const runId = "batch-producer-manifest-stale-lease";
+      await installBatchBookLease({
+        graphVault,
+        runId,
+        bookId: job.bookId,
+        sessionId: "active-session",
+        generation: 2,
+        token: "active-token",
+      });
+      process.env.QMD_GRAPHRAG_RUN_ID = runId;
+      process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID = "stale-session";
+      process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION = "1";
+      process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN = "stale-token";
+      const outputDir = graphRagBookOutputDir({
+        stateRootDir: graphVault,
+        bookId: job.bookId,
+      });
+
+      await expect(writeGraphRagOutputProducerManifest({
+        outputDir,
+        repo,
+        bookId: job.bookId,
+        sourceHash: job.sourceHash,
+        documentId: job.documentId,
+        contentHash: job.normalizedContentHash ?? job.sourceHash,
+        stageFingerprints: job.stageFingerprints as Record<BookStage, string>,
+        providerFingerprint: job.providerFingerprint!,
+        producerRunId: "stale-run",
+        stage: "graph_extract",
+      })).rejects.toThrow(`book lease fencing rejected stage write: ${job.bookId}`);
+
+      expect(existsSync(join(outputDir, "qmd_output_manifest.json"))).toBe(false);
+    } finally {
+      await restoreEnv(previousEnv);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("recovers producer manifest checksum and quarantines corrupt targets", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      const job = await repo.registerBookSource({
+        sourcePath,
+        sourceIdentityPath: "book.epub",
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+        normalizedContentHash: "content-1",
+        stageFingerprints: Object.fromEntries(BookStageOrder.map((stage) => [
+          stage,
+          `fp-${stage}`,
+        ])) as Record<BookStage, string>,
+        providerFingerprint: "provider-1",
+      });
+      const outputDir = graphRagBookOutputDir({
+        stateRootDir: graphVault,
+        bookId: job.bookId,
+      });
+      const manifestPath = join(outputDir, "qmd_output_manifest.json");
+      const checksumPath = `${manifestPath}.sha256`;
+
+      await writeGraphRagOutputProducerManifest({
+        outputDir,
+        bookId: job.bookId,
+        sourceHash: job.sourceHash,
+        documentId: job.documentId,
+        contentHash: job.normalizedContentHash ?? job.sourceHash,
+        stageFingerprints: job.stageFingerprints as Record<BookStage, string>,
+        providerFingerprint: job.providerFingerprint!,
+        producerRunId: "run-1",
+        stage: "graph_extract",
+      });
+      expect(existsSync(checksumPath)).toBe(true);
+
+      await rm(checksumPath, { force: true });
+      await writeGraphRagOutputProducerManifest({
+        outputDir,
+        bookId: job.bookId,
+        sourceHash: job.sourceHash,
+        documentId: job.documentId,
+        contentHash: job.normalizedContentHash ?? job.sourceHash,
+        stageFingerprints: job.stageFingerprints as Record<BookStage, string>,
+        providerFingerprint: job.providerFingerprint!,
+        producerRunId: "run-2",
+        stage: "community_report",
+      });
+      expect(existsSync(checksumPath)).toBe(true);
+      expect(readFileSync(checksumPath, "utf8").trim()).toMatch(/^[a-f0-9]{64}$/u);
+
+      await writeFile(checksumPath, "0".repeat(64) + "\n", "utf8");
+      await expect(writeGraphRagOutputProducerManifest({
+        outputDir,
+        bookId: job.bookId,
+        sourceHash: job.sourceHash,
+        documentId: job.documentId,
+        contentHash: job.normalizedContentHash ?? job.sourceHash,
+        stageFingerprints: job.stageFingerprints as Record<BookStage, string>,
+        providerFingerprint: job.providerFingerprint!,
+        producerRunId: "run-3",
+        stage: "embed",
+      })).resolves.toBeUndefined();
+      expect(existsSync(manifestPath)).toBe(true);
+      expect(readFileSync(checksumPath, "utf8").trim()).toMatch(/^[a-f0-9]{64}$/u);
+
+      await writeFile(checksumPath, "0".repeat(64) + "\n", "utf8");
+      await writeFile(
+        `${checksumPath}.meta.json`,
+        JSON.stringify({
+          checksum: "0".repeat(64),
+          commitState: "committed",
+          targetLocator: manifestPath,
+        }, null, 2) + "\n",
+        "utf8",
+      );
+      await expect(writeGraphRagOutputProducerManifest({
+        outputDir,
+        bookId: job.bookId,
+        sourceHash: job.sourceHash,
+        documentId: job.documentId,
+        contentHash: job.normalizedContentHash ?? job.sourceHash,
+        stageFingerprints: job.stageFingerprints as Record<BookStage, string>,
+        providerFingerprint: job.providerFingerprint!,
+        producerRunId: "run-4",
+        stage: "finalize",
+      })).rejects.toThrow("durable JSON checksum mismatch");
+      expect(existsSync(manifestPath)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("recovers GraphRAG identity sidecar checksums and quarantines invalid targets", async () => {
+    const root = await createWorkspace();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await mkdir(join(graphVault, "input"), { recursive: true });
+      await mkdir(join(graphVault, "prompts"), { recursive: true });
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await writeFile(sourcePath, "epub-bytes", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
+      const { initial, outputDir } = await prepareQueryReadyGraphFixture({
+        graphVault,
+        sourcePath,
+        normalizedPath,
+        projectConfig,
+        writeGraphOutput: writeUnmatchedMultiDocumentGraphOutput,
+      });
+      const sidecarPath = join(outputDir, "qmd_graph_text_unit_identity.json");
+      const checksumPath = `${sidecarPath}.sha256`;
+
+      await writeGraphTextUnitIdentitySidecar({
+        outputDir,
+        job: initial.job,
+        normalizedPath: initial.job.normalizedPath,
+        graphDocumentId: "graph-doc-1",
+        graphTextUnitIds: ["tu-1", "tu-2"],
+      });
+      await rm(checksumPath, { force: true });
+      await expect(syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig,
+        recordRecoveredStages: false,
+      })).rejects.toThrow("GraphRAG document identity sidecar evidence is invalid");
+      await expect(access(checksumPath)).resolves.toBeUndefined();
+
+      await writeFile(checksumPath, `${"0".repeat(64)}\n`, "utf8");
+      await expect(syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig,
+        recordRecoveredStages: false,
+      })).rejects.toThrow("durable JSON checksum mismatch");
+      await expect(access(sidecarPath)).rejects.toThrow();
+
+      await writeFile(sidecarPath, "{invalid-json", "utf8");
+      await unlink(checksumPath);
+      await expect(syncGraphRagBookWorkspace({
+        stateRootDir: graphVault,
+        sourcePath,
+        normalizedPath,
+        settingsPath: join(graphVault, "settings.yaml"),
+        promptsDir: join(graphVault, "prompts"),
+        outputDir: join(graphVault, "output"),
+        qmdIndexPath: join(root, ".qmd", "index.sqlite"),
+        projectConfig,
+        recordRecoveredStages: false,
+      })).rejects.toThrow("invalid durable JSON target");
+      await expect(access(sidecarPath)).rejects.toThrow();
+      const entries = await readdir(outputDir);
+      expect(
+        entries.some((entry) =>
+          entry.startsWith("qmd_graph_text_unit_identity.json.corrupt-")
+        ),
+      ).toBe(true);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

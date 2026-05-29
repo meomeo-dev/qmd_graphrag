@@ -65,11 +65,13 @@ import {
   BookJobRunRecordEnvelopeSchema,
 } from "../../src/contracts/book-job.js";
 import {
+  BatchCommandCheckSchema,
   BatchEventLogSchema,
   BatchItemCheckpointInputSchema,
   BatchItemCheckpointSchema,
   BatchRecoverySummarySchema,
   BatchRunManifestSchema,
+  DurableStateDiagnosticSchema,
   parseBatchItemCheckpoint,
 } from "../../src/contracts/batch-run.js";
 import {
@@ -278,6 +280,9 @@ export function batchEventLogEnvelopeFixture() {
     payload: {
       schemaVersion: SchemaVersion,
       runId: "run-fixture",
+      eventId: "evt-fixture",
+      sequence: 1,
+      runnerSessionId: "runner-fixture",
       itemId: "item-fixture",
       event: "command_failed",
       status: "failed",
@@ -361,6 +366,51 @@ export function batchRecoverySummaryEnvelopeFixture() {
         errorSummary: "Error code: 503 - Service temporarily unavailable",
       }],
     },
+  };
+}
+
+function durableEvidenceFixture(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    itemId: "item-fixture",
+    bookId: "book-fixture",
+    workerId: "worker-fixture",
+    activeCommand: "resume-book-1",
+    failureKind: "local_state_integrity",
+    retryable: false,
+    localFailureClass: "durable_temp_rename_enoent",
+    recoveryDecision: "stop_until_fixed",
+    failedStage: "resume-book-1",
+    targetLocator: "graph_vault/books/book-fixture/job.yaml",
+    redactedEvidenceLocator: "books/book-fixture/job.yaml",
+    lane: "checkpointWriterLane",
+    targetMappingOwner: "repository",
+    laneTimeoutMs: 120000,
+    releaseOn: ["close", "error"],
+    tempId: "tmp-fixture",
+    operationId: "op-fixture",
+    failedSyscall: "rename",
+    errno: "ENOENT",
+    renameCause: "primary_temp_missing",
+    completedPublishRule: "forbidden",
+    checksumRecoveryDecision: "sidecar_repaired",
+    durableMode: "strict",
+    primaryTargetLocator: "graph_vault/books/book-fixture/job.yaml",
+    sidecarTargetLocator: "graph_vault/books/book-fixture/job.yaml.sha256",
+    sidecarKind: "checksum",
+    checksumExpected: null,
+    checksumActual: "actual-checksum",
+    cleanupReason: "rename_enoent_cleanup",
+    repairAllowed: true,
+    statusJsonDecision: "metadata_missing_read_only",
+    diagnosticClass: "checksum_meta_missing",
+    evidenceIncomplete: true,
+    evidenceIncompleteReason: "subprocess_envelope_missing_fields",
+    unavailableFieldSentinels: ["targetLocator", "operationId"],
+    leaseGeneration: 2,
+    bookLeaseGeneration: 3,
+    ...overrides,
   };
 }
 
@@ -1757,6 +1807,93 @@ describe("Data bus contracts", () => {
       .toBe("settings-fp");
     expect(parsedRecoverySummary.retryPolicy.heartbeatIntervalSeconds)
       .toBeUndefined();
+  });
+
+  test("accepts durable schema closure payloads across batch contracts", () => {
+    const durableNull = durableEvidenceFixture();
+    const durableNonNull = durableEvidenceFixture({
+      checksumExpected: "expected-checksum",
+      checksumActual: "expected-checksum",
+      evidenceIncomplete: false,
+      evidenceIncompleteReason: undefined,
+      unavailableFieldSentinels: [],
+    });
+    const commandCheck = BatchCommandCheckSchema.parse({
+      name: "resume-book-1",
+      status: "failed",
+      attempts: 1,
+      exitCode: 1,
+      stdoutBytes: 0,
+      stderrBytes: 64,
+      startedAt: "2026-05-23T00:00:00.000Z",
+      completedAt: "2026-05-23T00:01:00.000Z",
+      attemptExhausted: true,
+      errorSummary: "durable rename ENOENT",
+      ...durableNull,
+    });
+    const checkpoint = BatchItemCheckpointSchema.parse({
+      ...batchItemCheckpointEnvelopeFixture().payload,
+      ...durableNull,
+      commandChecks: [commandCheck],
+    });
+    const event = BatchEventLogSchema.parse({
+      ...batchEventLogEnvelopeFixture().payload,
+      event: "command_failed",
+      command: "resume-book-1",
+      message: "durable rename ENOENT",
+      ...durableNull,
+    });
+    const manifest = BatchRunManifestSchema.parse({
+      ...batchRunManifestEnvelopeFixture().payload,
+      status: "failed",
+      runningItems: 0,
+      failedItems: 1,
+      durableFailureSummary: durableNull,
+    });
+    const recovery = BatchRecoverySummarySchema.parse({
+      ...batchRecoverySummaryEnvelopeFixture().payload,
+      recoveryDecision: "stop_until_fixed",
+      retryableItemCount: 0,
+      durableStateFailures: [
+        DurableStateDiagnosticSchema.parse(durableNull),
+      ],
+      durableTempDiagnostics: [
+        DurableStateDiagnosticSchema.parse(durableNonNull),
+      ],
+      durableLockDiagnostics: [
+        DurableStateDiagnosticSchema.parse(durableNull),
+      ],
+      items: [{
+        ...batchRecoverySummaryEnvelopeFixture().payload.items[0],
+        ...durableNull,
+      }],
+    });
+    const envelopes = [
+      { kind: "qmd.batch_run.manifest", payload: manifest },
+      { kind: "qmd.batch_run.item_checkpoint", payload: checkpoint },
+      { kind: "qmd.batch_run.event_log", payload: event },
+      { kind: "qmd.batch_run.recovery_summary", payload: recovery },
+    ].map((item) => DataBusEnvelopeSchema.parse({
+      schemaVersion: SchemaVersion,
+      ...item,
+    }));
+
+    expect(commandCheck.checksumExpected).toBeNull();
+    expect(checkpoint.commandChecks[0]?.checksumExpected).toBeNull();
+    expect(event.primaryTargetLocator).toBe(durableNull.primaryTargetLocator);
+    expect(manifest.durableFailureSummary?.repairAllowed).toBe(true);
+    expect(recovery.durableStateFailures?.[0]?.statusJsonDecision)
+      .toBe("metadata_missing_read_only");
+    expect(recovery.durableTempDiagnostics?.[0]?.checksumExpected)
+      .toBe("expected-checksum");
+    expect(recovery.items[0]?.unavailableFieldSentinels)
+      .toEqual(["targetLocator", "operationId"]);
+    expect(envelopes.map((item) => item.kind)).toEqual([
+      "qmd.batch_run.manifest",
+      "qmd.batch_run.item_checkpoint",
+      "qmd.batch_run.event_log",
+      "qmd.batch_run.recovery_summary",
+    ]);
   });
 
   test("rejects non-portable batch locators", () => {

@@ -1,10 +1,17 @@
 export function classifyFailure(text) {
   const message = String(text).toLowerCase();
-  const providerStatusCode = extractProviderStatusCode(message);
   const retryAfterMatch = message.match(/retry-after[:\s-]*(\d+)/iu);
   const retryAfterSeconds = retryAfterMatch
     ? Number.parseInt(retryAfterMatch[1], 10)
     : undefined;
+  const durableFailure = classifyLocalDurableStateFailure(message);
+  if (durableFailure != null) {
+    return {
+      ...durableFailure,
+      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+    };
+  }
+  const providerStatusCode = extractProviderStatusCode(message);
   if (
     providerStatusCode === 429 ||
     (providerStatusCode != null &&
@@ -44,6 +51,14 @@ export function classifyFailure(text) {
       ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
     };
   }
+  if (isSqliteBusyOrLockedFailureText(message)) {
+    return {
+      failureKind: "transient",
+      retryable: true,
+      localRetryClass: "sqlite_busy_or_locked",
+      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+    };
+  }
   if (isGraphRagDataCompatibilityFailureText(message)) {
     return {
       failureKind: "data_compatibility",
@@ -63,6 +78,126 @@ export function classifyFailure(text) {
     retryable: false,
     ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
   };
+}
+
+function classifyLocalDurableStateFailure(message) {
+  if (isLocalStateLockTimeoutFailureText(message)) {
+    return {
+      failureKind: "local_state_lock_timeout",
+      retryable: false,
+      localFailureClass: "durable_state_lock_timeout",
+      recoveryDecision: "stop_until_fixed",
+    };
+  }
+  const localFailureClass = localDurableFailureClass(message);
+  if (localFailureClass == null) return null;
+  return {
+    failureKind: "local_state_integrity",
+    retryable: false,
+    localFailureClass,
+    recoveryDecision: "stop_until_fixed",
+  };
+}
+
+function localDurableFailureClass(message) {
+  if (
+    message.includes("durable_temp_rename_enoent") ||
+    (
+      message.includes("enoent") &&
+      message.includes("rename") &&
+      (
+        message.includes(".tmp-") ||
+        message.includes("writeyamlfile") ||
+        message.includes("writejson") ||
+        message.includes("durable")
+      )
+    )
+  ) {
+    return "durable_temp_rename_enoent";
+  }
+  if (
+    message.includes("durable_temp_create_collision") ||
+    (
+      message.includes("eexist") &&
+      message.includes(".tmp-") &&
+      message.includes("durable")
+    )
+  ) {
+    return "durable_temp_create_collision";
+  }
+  if (
+    message.includes("durable_live_temp_deleted") ||
+    (
+      message.includes("live temp") &&
+      (message.includes("deleted") || message.includes("reconciled"))
+    )
+  ) {
+    return "durable_live_temp_deleted";
+  }
+  if (
+    message.includes("durable_directory_fsync_unsupported") ||
+    (
+      message.includes("directory fsync") &&
+      message.includes("unsupported")
+    )
+  ) {
+    return "durable_directory_fsync_unsupported";
+  }
+  if (
+    message.includes("durable_directory_fsync_uncertain") ||
+    message.includes("durable directory fsync failed") ||
+    (
+      message.includes("directory fsync") &&
+      (message.includes("failed") || message.includes("uncertain"))
+    )
+  ) {
+    return "durable_directory_fsync_uncertain";
+  }
+  if (
+    message.includes("durable_fsync_failed") ||
+    (
+      message.includes("fsync") &&
+      message.includes("failed") &&
+      message.includes("durable")
+    )
+  ) {
+    return "durable_fsync_failed";
+  }
+  if (
+    message.includes("target_new_checksum_old") ||
+    message.includes("target-new/checksum-old")
+  ) {
+    return "durable_checksum_window_recovered";
+  }
+  if (
+    message.includes("target_new_checksum_missing") ||
+    message.includes("target-new/checksum-missing")
+  ) {
+    return "durable_checksum_missing";
+  }
+  if (
+    message.includes("durable_checksum_mismatch") ||
+    message.includes("durable yaml checksum mismatch") ||
+    message.includes("durable json target checksum mismatch") ||
+    (
+      message.includes("checksum_mismatch") &&
+      message.includes("durable")
+    )
+  ) {
+    return "durable_checksum_mismatch";
+  }
+  if (
+    message.includes("durable_target_invalid") ||
+    message.includes("durable json target invalid") ||
+    message.includes("durable yaml target invalid") ||
+    message.includes("invalid durable json target") ||
+    message.includes("invalid durable yaml target")
+  ) {
+    return "durable_target_invalid";
+  }
+  return message.includes("local_state_integrity")
+    ? "durable_state_integrity"
+    : null;
 }
 
 function classifyTypedQueryFailure(text) {
@@ -112,6 +247,17 @@ function jsonObjectCandidates(raw) {
   const end = raw.lastIndexOf("}");
   if (start >= 0 && end > start) candidates.push(raw.slice(start, end + 1));
   return [...new Set(candidates)];
+}
+
+export function isSqliteBusyOrLockedFailureText(text) {
+  const message = String(text ?? "").toLowerCase();
+  return [
+    "sqlite_busy",
+    "sqlite_locked",
+    "database is locked",
+    "database table is locked",
+    "database is busy",
+  ].some((token) => message.includes(token));
 }
 
 export function isProviderTransientFailureText(text) {
@@ -196,6 +342,21 @@ export function isGraphRagDataCompatibilityFailureText(text) {
       message.includes("no resolvable text-unit rows")
     )
   );
+}
+
+export function isLocalStateLockTimeoutFailureText(text) {
+  const message = String(text ?? "").toLowerCase();
+  return (
+    message.includes("timed out waiting for durable yaml lock") ||
+    message.includes("timed out waiting for json file lock") ||
+    message.includes("timed out waiting for qmd index lock") ||
+    message.includes("local_state_lock_timeout")
+  );
+}
+
+export function isLocalStateIntegrityFailureText(text) {
+  const message = String(text ?? "").toLowerCase();
+  return localDurableFailureClass(message) != null;
 }
 
 export function isLocalArtifactGateFailureText(text) {

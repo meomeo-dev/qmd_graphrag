@@ -1,7 +1,5 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
-
-import YAML from "yaml";
 
 import {
   type BookArtifactKind,
@@ -30,6 +28,11 @@ import {
   QUERY_READY_ARTIFACT_KINDS,
   validateBookArtifactSet,
 } from "../job-state/artifact-validation.js";
+import {
+  readYamlUnknownDurable,
+  readYamlUnknownDurableUnlocked,
+  updateYamlUnknownDurable,
+} from "../job-state/durable-state-store.js";
 import { sanitizeVaultMetadata } from "../vault/metadata.js";
 
 const QUERY_READY_PRODUCER_REQUIRED_KINDS = {
@@ -337,13 +340,19 @@ export type ResolveGraphCapabilitiesInput = {
 };
 
 async function readYaml(path: string): Promise<unknown | null> {
-  try {
-    const raw = await readFile(path, "utf8");
-    return YAML.parse(raw);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw error;
-  }
+  return readYamlUnknownDurable(path);
+}
+
+async function readYamlUnlocked(path: string): Promise<unknown | null> {
+  return readYamlUnknownDurableUnlocked(path);
+}
+
+async function updateYamlFileDurable<T>(
+  path: string,
+  readCurrent: () => Promise<T>,
+  update: (current: T) => T | Promise<T>,
+): Promise<T> {
+  return updateYamlUnknownDurable(path, readCurrent, update);
 }
 
 function normalizeIdentitySet(
@@ -721,6 +730,10 @@ export async function loadGraphQueryCapabilities(
 export async function recordGraphCapability(
   graphVault: string,
   capability: GraphCapability,
+  options: {
+    beforeCommit?: () => void | Promise<void>;
+    afterCommit?: () => void | Promise<void>;
+  } = {},
 ): Promise<GraphCapability[]> {
   const root = resolve(graphVault);
   const catalogPath = join(root, "catalog", "graph-capabilities.yaml");
@@ -729,20 +742,38 @@ export async function recordGraphCapability(
     ...parsedCapability,
     metadata: sanitizeVaultMetadata(parsedCapability.metadata),
   });
-  const existing = await loadExplicitCapabilityCatalog(root);
-  const items = [
-    ...existing.filter((item) =>
-      item.capabilityId !== sanitizedCapability.capabilityId,
-    ),
-    sanitizedCapability,
-  ].sort((left, right) => left.capabilityId.localeCompare(right.capabilityId));
-  const catalog = GraphCapabilityCatalogSchema.parse({
-    schemaVersion: SchemaVersion,
-    items,
-  });
+  const catalog = await updateYamlFileDurable(
+    catalogPath,
+    async () => {
+      const parsed = await readYamlUnlocked(catalogPath);
+      if (parsed == null) {
+        return GraphCapabilityCatalogSchema.parse({
+          schemaVersion: SchemaVersion,
+          items: [],
+        });
+      }
+      return GraphCapabilityCatalogSchema.parse(parsed);
+    },
+    async (existingCatalog) => {
+      const items = [
+        ...existingCatalog.items.filter((item) =>
+          item.capabilityId !== sanitizedCapability.capabilityId
+        ),
+        sanitizedCapability,
+      ].sort((left, right) =>
+        left.capabilityId.localeCompare(right.capabilityId)
+      );
+      const nextCatalog = GraphCapabilityCatalogSchema.parse({
+        schemaVersion: SchemaVersion,
+        items,
+      });
 
-  await mkdir(join(root, "catalog"), { recursive: true });
-  await writeFile(catalogPath, YAML.stringify(catalog), "utf8");
+      await options.beforeCommit?.();
+      await mkdir(join(root, "catalog"), { recursive: true });
+      return nextCatalog;
+    },
+  );
+  await options.afterCommit?.();
   return catalog.items;
 }
 

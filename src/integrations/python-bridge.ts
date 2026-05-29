@@ -1,11 +1,14 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
+import { hostname } from "node:os";
 
 import type { ZodType } from "zod";
 
 import type { BookStage } from "../contracts/book-job.js";
+import { writeJsonFileDurableSync } from "../job-state/durable-state-store.js";
 import { resolveProjectPath } from "../utils/package-paths.js";
 import { sanitizeVaultText } from "../vault/metadata.js";
 
@@ -39,10 +42,137 @@ const GRAPH_RAG_EARLY_STOP_MAX_EVIDENCE = 20;
 const GRAPH_RAG_EARLY_STOP_MAX_LINE_LENGTH = 240;
 const GRAPH_RAG_PROVIDER_PAYLOAD_ASSIGNMENT_PATTERN =
   /\b(?:raw|payload|body|provider[_-]?request|provider[_-]?response|provider[_-]?request[_-]?body|provider[_-]?response[_-]?body|provider[_-]?request[_-]?payload|provider[_-]?response[_-]?payload|raw[_-]?request|raw[_-]?response|request[_-]?body|response[_-]?body|request[_-]?payload|response[_-]?payload)\b\s*[:=]\s*(?:"[^"]*"|'[^']*'|\{[^}]*\}|\[[^\]]*\]|[^,\s}]+)/giu;
+const PYTHON_BRIDGE_PROCESS_GROUP = process.platform !== "win32";
 
 type EarlyStopWatcher = {
   stop(): void;
 };
+
+type BridgeSubprocessRecord = {
+  schemaVersion: "1.0.0";
+  runId: string;
+  subprocessId: string;
+  runnerSessionId: string;
+  runnerHost: string;
+  runnerPid: number;
+  pid?: number;
+  command: string;
+  itemId?: string;
+  bookId?: string;
+  workerId?: string;
+  providerSlotId?: string;
+  providerSlotProvider?: "openai" | "jina" | "local_cpu" | "qmd_index_writer";
+  providerSlotGeneration?: number;
+  providerSlotFencingToken?: string;
+  processGroup: boolean;
+  startedAt: string;
+  heartbeatAt: string;
+  status: "running" | "exited" | "killed" | "quarantined" | "spawn_error";
+  exitCode?: number | null;
+  signal?: string | null;
+  completedAt?: string;
+};
+
+function parsePositiveInteger(value: string | undefined): number | undefined {
+  if (value == null || value === "") return undefined;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function optionalString(value: string | undefined): string | undefined {
+  return value == null || value === "" ? undefined : value;
+}
+
+function optionalProvider(
+  value: string | undefined,
+): BridgeSubprocessRecord["providerSlotProvider"] | undefined {
+  if (
+    value === "openai" ||
+    value === "jina" ||
+    value === "local_cpu" ||
+    value === "qmd_index_writer"
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
+function bridgeSubprocessRecordPath(subprocessId: string): string | null {
+  const root = optionalString(process.env.QMD_GRAPHRAG_SUBPROCESS_REGISTRY_DIR);
+  return root == null ? null : join(root, `${subprocessId}.json`);
+}
+
+function buildBridgeSubprocessRecord(input: {
+  subprocessId: string;
+  command: string;
+  startedAt: string;
+  pid?: number;
+  status: BridgeSubprocessRecord["status"];
+  completedAt?: string;
+  exitCode?: number | null;
+  signal?: string | null;
+}): BridgeSubprocessRecord | null {
+  const runId = optionalString(process.env.QMD_GRAPHRAG_RUN_ID);
+  const runnerSessionId = optionalString(process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID);
+  const runnerPid = parsePositiveInteger(process.env.QMD_GRAPHRAG_RUNNER_PID);
+  if (runId == null || runnerSessionId == null || runnerPid == null) return null;
+  return {
+    schemaVersion: "1.0.0",
+    runId,
+    subprocessId: input.subprocessId,
+    runnerSessionId,
+    runnerHost: optionalString(process.env.QMD_GRAPHRAG_RUNNER_HOST) ?? hostname(),
+    runnerPid,
+    pid: input.pid,
+    command: input.command,
+    itemId: optionalString(process.env.QMD_GRAPHRAG_ITEM_ID),
+    bookId: optionalString(process.env.QMD_GRAPHRAG_BOOK_ID),
+    workerId: optionalString(process.env.QMD_GRAPHRAG_WORKER_ID),
+    providerSlotId: optionalString(process.env.QMD_GRAPHRAG_PROVIDER_SLOT_ID),
+    providerSlotProvider: optionalProvider(
+      process.env.QMD_GRAPHRAG_PROVIDER_SLOT_PROVIDER,
+    ),
+    providerSlotGeneration: parsePositiveInteger(
+      process.env.QMD_GRAPHRAG_PROVIDER_SLOT_GENERATION,
+    ),
+    providerSlotFencingToken: optionalString(
+      process.env.QMD_GRAPHRAG_PROVIDER_SLOT_FENCING_TOKEN,
+    ),
+    processGroup: PYTHON_BRIDGE_PROCESS_GROUP,
+    startedAt: input.startedAt,
+    heartbeatAt: new Date().toISOString(),
+    status: input.status,
+    exitCode: input.exitCode,
+    signal: input.signal,
+    completedAt: input.completedAt,
+  };
+}
+
+function writeBridgeSubprocessRecord(record: BridgeSubprocessRecord | null): void {
+  if (record == null) return;
+  const path = bridgeSubprocessRecordPath(record.subprocessId);
+  if (path == null) return;
+  writeJsonFileDurableSync(path, `${JSON.stringify(record, null, 2)}\n`);
+}
+
+function terminatePythonBridgeChild(
+  child: ReturnType<typeof spawn>,
+  signal: NodeJS.Signals,
+): void {
+  try {
+    if (child.pid != null && PYTHON_BRIDGE_PROCESS_GROUP) {
+      process.kill(-child.pid, signal);
+      return;
+    }
+  } catch {
+    // Fall back to direct child termination below.
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // Process may have already exited.
+  }
+}
 
 function isActionableGraphRagPartialOutputLine(line: string): boolean {
   return GRAPH_RAG_ACTIONABLE_LOG_LEVEL_PATTERN.test(line) &&
@@ -191,10 +321,29 @@ export async function callPythonBridge<TRequest, TResponse>(
     "python3";
 
   return new Promise<TResponse>((resolve, reject) => {
+    const subprocessId = `python-bridge-${randomUUID()}`;
+    const startedAt = new Date().toISOString();
     const child = spawn(pythonBin, [scriptPath, options.command], {
       cwd: options.workingDirectory,
       stdio: ["pipe", "pipe", "pipe"],
+      detached: PYTHON_BRIDGE_PROCESS_GROUP,
     });
+    try {
+      writeBridgeSubprocessRecord(buildBridgeSubprocessRecord({
+        subprocessId,
+        command: `python-bridge:${options.command}`,
+        startedAt,
+        pid: child.pid,
+        status: "running",
+      }));
+    } catch (error) {
+      terminatePythonBridgeChild(child, "SIGTERM");
+      setTimeout(() => {
+        terminatePythonBridgeChild(child, "SIGKILL");
+      }, GRAPH_RAG_EARLY_STOP_KILL_GRACE_MS).unref?.();
+      reject(error);
+      return;
+    }
 
     let stdout = "";
     let stderr = "";
@@ -228,10 +377,10 @@ export async function callPythonBridge<TRequest, TResponse>(
 
     const terminateCurrentChild = () => {
       if (child.exitCode != null || child.signalCode != null) return;
-      child.kill("SIGTERM");
+      terminatePythonBridgeChild(child, "SIGTERM");
       killTimer = setTimeout(() => {
         if (child.exitCode == null && child.signalCode == null) {
-          child.kill("SIGKILL");
+          terminatePythonBridgeChild(child, "SIGKILL");
         }
       }, GRAPH_RAG_EARLY_STOP_KILL_GRACE_MS);
       killTimer.unref?.();
@@ -255,12 +404,30 @@ export async function callPythonBridge<TRequest, TResponse>(
 
     child.on("error", (error) => {
       if (earlyStopError != null) return;
+      writeBridgeSubprocessRecord(buildBridgeSubprocessRecord({
+        subprocessId,
+        command: `python-bridge:${options.command}`,
+        startedAt,
+        pid: child.pid,
+        status: "spawn_error",
+        completedAt: new Date().toISOString(),
+      }));
       rejectOnce(error);
     });
 
-    child.on("close", (code) => {
-      if (finished) return;
+    child.on("close", (code, signal) => {
       cleanup();
+      writeBridgeSubprocessRecord(buildBridgeSubprocessRecord({
+        subprocessId,
+        command: `python-bridge:${options.command}`,
+        startedAt,
+        pid: child.pid,
+        status: signal == null ? "exited" : "killed",
+        exitCode: code,
+        signal,
+        completedAt: new Date().toISOString(),
+      }));
+      if (finished) return;
       if (earlyStopError != null) {
         rejectOnce(earlyStopError);
         return;

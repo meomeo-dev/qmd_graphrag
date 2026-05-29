@@ -1,10 +1,18 @@
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  openSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import {
   copyFile,
   mkdir,
   readFile,
-  rename,
   rm,
   stat,
   writeFile,
@@ -56,11 +64,22 @@ import {
   type StageFingerprintMap,
 } from "./repository.js";
 import {
+  DurableStateError,
+  readJsonFileDurable,
+  writeJsonFileDurable,
+} from "./durable-json.js";
+import {
   ensureManagedGraphRagSettings,
   type ManagedGraphRagSettingsRepairResult,
 } from "../graphrag/settings-projection.js";
 
 const GRAPHRAG_NORMALIZATION_POLICY_VERSION = "graphrag-normalized-markdown-v1";
+const QMD_INDEX_LOCK_STALE_MS = 120000;
+const QMD_INDEX_LOCK_WAIT_MS = Math.max(QMD_INDEX_LOCK_STALE_MS * 2, 300000);
+const QMD_SQLITE_BUSY_RETRY_LIMIT = 8;
+const QMD_SQLITE_BUSY_RETRY_BASE_MS = 25;
+const QMD_SQLITE_BUSY_RETRY_MAX_MS = 500;
+const QMD_INDEX_RELEASE_ON = ["commit", "error", "cancellation", "lease_loss", "timeout"];
 
 const GRAPH_RAG_STAGE_ARTIFACT_REQUIREMENTS: StageArtifactRequirementMap = {
   ingest: ["source_epub"],
@@ -171,6 +190,8 @@ type GraphRagOutputProducerManifest = {
   outputDir: string;
   producerRunId: string;
   stageProducerRunIds: Partial<Record<BookStage, string>>;
+  bookLeaseGeneration?: number;
+  bookFencingToken?: string;
 };
 
 function stripKnownBookExtension(path: string): string {
@@ -891,13 +912,14 @@ async function readValidatedGraphTextUnitIdentity(
 async function readGraphTextUnitIdentitySidecar(
   input: GraphRagTextUnitIdentityInput,
 ): Promise<GraphRagTextUnitIdentity | null> {
-  let raw: string;
+  let parsed: unknown;
   try {
-    raw = await readFile(graphTextUnitIdentitySidecarPath(input.outputDir), "utf8");
-  } catch {
+    parsed = await readJsonFileDurable(graphTextUnitIdentitySidecarPath(input.outputDir));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     return null;
   }
-  const mapping = parseGraphTextUnitIdentitySidecar(raw, input);
+  const mapping = parseGraphTextUnitIdentitySidecar(JSON.stringify(parsed), input);
   if (mapping == null) {
     return null;
   }
@@ -948,10 +970,9 @@ async function recordGraphTextUnitIdentityIfAvailable(input: {
     );
   }
   await input.repo.recordGraphTextUnitIdentity(mapping);
-  await writeFile(
+  await writeJsonFileDurable(
     graphTextUnitIdentitySidecarPath(input.outputDir),
     JSON.stringify(mapping, null, 2),
-    "utf8",
   );
 }
 
@@ -985,7 +1006,7 @@ async function recordDocumentChunks(input: {
   });
 }
 
-async function registerQmdCorpusDocument(input: {
+export async function registerQmdCorpusDocument(input: {
   repo: FileBookJobStateRepository;
   qmdIndexPath: string;
   stateRootDir: string;
@@ -1004,37 +1025,362 @@ async function registerQmdCorpusDocument(input: {
   }
 
   await mkdir(dirname(input.qmdIndexPath), { recursive: true });
-  const store = createStore(input.qmdIndexPath);
-  try {
-    upsertStoreCollection(store.db, "books", {
-      path: join(resolve(input.stateRootDir), "input"),
-      pattern: "**/*.md",
-      context: {
-        "/": "Normalized books available to qmd and GraphRAG.",
+  await withQmdIndexFileLock(input.qmdIndexPath, async () => {
+    input.repo.assertCurrentBatchBookLease(input.job.bookId);
+    const result = await withSqliteBusyRetry(
+      "qmd-corpus-registration",
+      input.job.bookId,
+      async () => {
+        const store = createStore(input.qmdIndexPath);
+        try {
+          input.repo.assertCurrentBatchBookLease(input.job.bookId);
+          upsertStoreCollection(store.db, "books", {
+            path: join(resolve(input.stateRootDir), "input"),
+            pattern: "**/*.md",
+            context: {
+              "/": "Normalized books available to qmd and GraphRAG.",
+            },
+          });
+          const now = new Date().toISOString();
+          const normalizedRelativePath = input.job.normalizedPath?.startsWith("input/")
+            ? input.job.normalizedPath.slice("input/".length)
+            : input.job.normalizedPath ?? basename(input.normalizedPath);
+          insertContent(store.db, contentHash, content, now);
+          insertDocument(
+            store.db,
+            "books",
+            normalizedRelativePath,
+            extractTitle(content, normalizedRelativePath),
+            contentHash,
+            now,
+            now,
+          );
+          return normalizedRelativePath;
+        } finally {
+          store.close();
+        }
       },
-    });
-    const now = new Date().toISOString();
-    const normalizedRelativePath = input.job.normalizedPath?.startsWith("input/")
-      ? input.job.normalizedPath.slice("input/".length)
-      : input.job.normalizedPath ?? basename(input.normalizedPath);
-    insertContent(store.db, contentHash, content, now);
-    insertDocument(
-      store.db,
-      "books",
-      normalizedRelativePath,
-      extractTitle(content, normalizedRelativePath),
-      contentHash,
-      now,
-      now,
     );
+    input.repo.assertCurrentBatchBookLease(input.job.bookId);
     await input.repo.recordQmdCorpusRegistration({
       documentId: input.job.documentId,
       contentHash,
       collection: "books",
-      relativePath: normalizedRelativePath,
+      relativePath: result.value,
+      metadata: {
+        sqliteBusyRetryCount: result.retryCount,
+        sqliteBusyWaitMs: result.waitMs,
+        sqliteBusyFinalClassification: result.finalClassification,
+      },
     });
-  } finally {
-    store.close();
+  });
+}
+
+function classifySqliteBusyError(error: unknown): "busy" | "locked" | null {
+  const candidate = error as { code?: unknown; message?: unknown };
+  const code = typeof candidate?.code === "string"
+    ? candidate.code.toUpperCase()
+    : "";
+  const message = String(candidate?.message ?? "").toLowerCase();
+  if (code.includes("SQLITE_BUSY") || message.includes("database is busy")) {
+    return "busy";
+  }
+  if (
+    code.includes("SQLITE_LOCKED") ||
+    message.includes("database is locked") ||
+    message.includes("database table is locked")
+  ) {
+    return "locked";
+  }
+  return null;
+}
+
+async function withSqliteBusyRetry<T>(
+  operation: string,
+  bookId: string,
+  callback: () => Promise<T> | T,
+): Promise<{
+  value: T;
+  retryCount: number;
+  waitMs: number;
+  finalClassification: "none" | "busy" | "locked";
+}> {
+  let retryCount = 0;
+  let waitMs = 0;
+  let finalClassification: "none" | "busy" | "locked" = "none";
+  for (;;) {
+    try {
+      const value = await callback();
+      if (retryCount > 0) {
+        writeSqliteBusyRetryMetric({
+          operation,
+          bookId,
+          retryCount,
+          waitMs,
+          finalClassification,
+          exhausted: false,
+        });
+      }
+      return { value, retryCount, waitMs, finalClassification };
+    } catch (error) {
+      const classification = classifySqliteBusyError(error);
+      if (classification == null) throw error;
+      finalClassification = classification;
+      if (retryCount >= QMD_SQLITE_BUSY_RETRY_LIMIT) {
+        writeSqliteBusyRetryMetric({
+          operation,
+          bookId,
+          retryCount,
+          waitMs,
+          finalClassification,
+          exhausted: true,
+        });
+        throw error;
+      }
+      retryCount += 1;
+      const delayMs = Math.min(
+        QMD_SQLITE_BUSY_RETRY_MAX_MS,
+        QMD_SQLITE_BUSY_RETRY_BASE_MS * (2 ** (retryCount - 1)),
+      );
+      waitMs += delayMs;
+      await new Promise((resolveRetry) => setTimeout(resolveRetry, delayMs));
+    }
+  }
+}
+
+function writeSqliteBusyRetryMetric(input: {
+  operation: string;
+  bookId: string;
+  retryCount: number;
+  waitMs: number;
+  finalClassification: "busy" | "locked" | "none";
+  exhausted: boolean;
+}): void {
+  const root = process.env.QMD_GRAPHRAG_GRAPH_VAULT;
+  const runId = process.env.QMD_GRAPHRAG_RUN_ID;
+  if (root == null || runId == null || root.trim() === "" || runId.trim() === "") {
+    return;
+  }
+  const metricPath = join(
+    resolve(root),
+    "catalog",
+    "batch-runs",
+    runId,
+    "qmd-sqlite-retry-metrics.jsonl",
+  );
+  try {
+    const line = JSON.stringify({
+      schemaVersion: "1.0.0",
+      at: new Date().toISOString(),
+      ...input,
+    }) + "\n";
+    writeFileSync(metricPath, line, { encoding: "utf8", flag: "a" });
+  } catch {
+    // Metrics must not change qmd corpus commit semantics.
+  }
+}
+
+async function waitForQmdIndexLock() {
+  await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+}
+
+function processAlive(pid: number | undefined): boolean {
+  if (!Number.isInteger(pid) || pid == null || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readQmdIndexLockOwner(lockPath: string): {
+  pid?: number;
+  runnerSessionId?: string;
+  operationId?: string;
+  generation?: number;
+  fencingTokenHash?: string;
+} {
+  try {
+    const parsed = JSON.parse(readFileSync(lockPath, "utf8")) as {
+      pid?: number;
+      runnerSessionId?: string;
+      operationId?: string;
+      generation?: number;
+      fencingTokenHash?: string;
+    };
+    return parsed ?? {};
+  } catch {
+    return {};
+  }
+}
+
+function qmdIndexLockOwnerExpired(
+  owner: Record<string, unknown>,
+  mtimeMs: number,
+): boolean {
+  const expiresAt = typeof owner.expiresAt === "string"
+    ? Date.parse(owner.expiresAt)
+    : NaN;
+  return Number.isFinite(expiresAt)
+    ? Date.now() > expiresAt
+    : Date.now() - mtimeMs > QMD_INDEX_LOCK_STALE_MS;
+}
+
+function qmdIndexLockHasRecoveryFence(owner: Record<string, unknown>): boolean {
+  return Number.isInteger(owner.generation) &&
+    typeof owner.fencingTokenHash === "string" &&
+    owner.fencingTokenHash.length > 0 &&
+    typeof owner.runnerSessionId === "string" &&
+    owner.runnerSessionId.length > 0 &&
+    typeof owner.operationId === "string" &&
+    owner.operationId.length > 0;
+}
+
+function qmdIndexLockOwnedBy(
+  lockPath: string,
+  expected: Record<string, unknown>,
+): boolean {
+  const current = readQmdIndexLockOwner(lockPath);
+  return current.operationId === expected.operationId &&
+    current.runnerSessionId === expected.runnerSessionId &&
+    current.generation === expected.generation &&
+    current.fencingTokenHash === expected.fencingTokenHash;
+}
+
+function releaseQmdIndexLock(lockPath: string, owner: Record<string, unknown>): void {
+  if (!qmdIndexLockOwnedBy(lockPath, owner)) return;
+  unlinkSync(lockPath);
+  fsyncQmdIndexLockDirectory(dirname(lockPath), lockPath, owner);
+}
+
+function removeStaleQmdIndexLock(lockPath: string, mtimeMs: number): void {
+  const owner = readQmdIndexLockOwner(lockPath);
+  if (!qmdIndexLockOwnerExpired(owner, mtimeMs)) return;
+  if (!qmdIndexLockHasRecoveryFence(owner)) return;
+  if (processAlive(owner.pid)) return;
+  unlinkSync(lockPath);
+  fsyncQmdIndexLockDirectory(dirname(lockPath), lockPath, owner);
+}
+
+function qmdIndexLockTimeoutError(
+  qmdIndexPath: string,
+  lockPath: string,
+  lockOwnerEvidence: Record<string, unknown>,
+): DurableStateError {
+  return new DurableStateError(
+    `timed out waiting for qmd index lock: ${lockPath}`,
+    {
+      failureKind: "local_state_lock_timeout",
+      localFailureClass: "durable_state_lock_timeout",
+      evidence: {
+        targetLocator: qmdIndexPath,
+        redactedEvidenceLocator: basename(qmdIndexPath),
+        lockPath,
+        lane: "qmdIndexWriterLane",
+        targetMappingOwner: "qmd",
+        durableKind: "sqlite",
+        laneTimeoutMs: QMD_INDEX_LOCK_STALE_MS,
+        releaseOn: QMD_INDEX_RELEASE_ON,
+        lockOwnerEvidence,
+        durableMode: "strict",
+        completedPublishRule: "forbidden",
+      },
+    },
+  );
+}
+
+async function withQmdIndexFileLock<T>(
+  qmdIndexPath: string,
+  callback: () => Promise<T>,
+): Promise<T> {
+  const lockPath = `${qmdIndexPath}.lock`;
+  const startedAt = Date.now();
+  const runnerSessionId = process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID ??
+    `process-${process.pid}`;
+  const generation = Number.parseInt(
+    process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION ?? "",
+    10,
+  ) || 1;
+  const fencingToken = process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN ??
+    process.env.QMD_GRAPHRAG_ITEM_FENCING_TOKEN ??
+    "";
+  const fencingTokenHash = fencingToken.length > 0
+    ? hashText(fencingToken)
+    : hashText(["qmd-index-lock", runnerSessionId, qmdIndexPath, generation].join(":"));
+  for (;;) {
+    let fd: number | null = null;
+    const owner = {
+      pid: process.pid,
+      ownerPid: process.pid,
+      runnerSessionId,
+      runId: process.env.QMD_GRAPHRAG_RUN_ID,
+      runnerHost: process.env.QMD_GRAPHRAG_RUNNER_HOST,
+      ownerHost: process.env.QMD_GRAPHRAG_RUNNER_HOST,
+      targetLocator: qmdIndexPath,
+      lockPath,
+      lane: "qmdIndexWriterLane",
+      targetMappingOwner: "qmd",
+      durableKind: "sqlite",
+      laneTimeoutMs: QMD_INDEX_LOCK_STALE_MS,
+      releaseOn: QMD_INDEX_RELEASE_ON,
+      generation,
+      fencingTokenHash,
+      operationId: `qmd-index-lock-${randomUUID()}`,
+      itemId: process.env.QMD_GRAPHRAG_ITEM_ID,
+      bookId: process.env.QMD_GRAPHRAG_BOOK_ID,
+      workerId: process.env.QMD_GRAPHRAG_WORKER_ID,
+      acquiredAt: new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + QMD_INDEX_LOCK_STALE_MS).toISOString(),
+      durableMode: "strict",
+    };
+    try {
+      fd = openSync(lockPath, "wx");
+      writeFileSync(fd, `${JSON.stringify(owner)}\n`, "utf8");
+      fsyncSync(fd);
+      if (!qmdIndexLockOwnedBy(lockPath, owner)) {
+        throw qmdIndexLockTimeoutError(qmdIndexPath, lockPath, {
+          expected: owner,
+          current: readQmdIndexLockOwner(lockPath),
+        });
+      }
+      const result = await callback();
+      if (!qmdIndexLockOwnedBy(lockPath, owner)) {
+        throw qmdIndexLockTimeoutError(qmdIndexPath, lockPath, {
+          expected: owner,
+          current: readQmdIndexLockOwner(lockPath),
+        });
+      }
+      return result;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
+      try {
+        const entry = await stat(lockPath);
+        removeStaleQmdIndexLock(lockPath, entry.mtimeMs);
+      } catch (error) {
+        if (error instanceof DurableStateError) throw error;
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        // Missing or concurrently removed locks are expected under contention.
+      }
+      if (Date.now() - startedAt > QMD_INDEX_LOCK_WAIT_MS) {
+        throw qmdIndexLockTimeoutError(
+          qmdIndexPath,
+          lockPath,
+          readQmdIndexLockOwner(lockPath),
+        );
+      }
+      await waitForQmdIndexLock();
+    } finally {
+      if (fd != null) {
+        try {
+          closeSync(fd);
+        } catch {
+          // Best-effort cleanup only.
+        }
+        releaseQmdIndexLock(lockPath, owner);
+      }
+    }
   }
 }
 
@@ -1052,10 +1398,9 @@ async function writeLanceDbRowCountSidecars(root: string): Promise<void> {
     }
     const rowCount = await readLanceDbRowCount(tableDir);
     if (rowCount == null) continue;
-    await writeFile(
+    await writeJsonFileDurable(
       join(tableDir, "qmd_row_count.json"),
       JSON.stringify({ schemaVersion: "1.0.0", rowCount }, null, 2),
-      "utf8",
     );
   }
 }
@@ -1239,9 +1584,11 @@ async function collectWorkspaceArtifacts(
 async function readOutputProducerManifest(
   outputDir: string,
 ): Promise<GraphRagOutputProducerManifest | null> {
+  const manifestPath = join(outputDir, "qmd_output_manifest.json");
   try {
-    const raw = await readFile(join(outputDir, "qmd_output_manifest.json"), "utf8");
-    const parsed = JSON.parse(raw) as Partial<GraphRagOutputProducerManifest>;
+    const parsed = await readJsonFileDurable(
+      manifestPath,
+    ) as Partial<GraphRagOutputProducerManifest>;
     if (
       parsed.schemaVersion !== "1.0.0" ||
       typeof parsed.bookId !== "string" ||
@@ -1257,7 +1604,11 @@ async function readOutputProducerManifest(
       return null;
     }
     return parsed as GraphRagOutputProducerManifest;
-  } catch {
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    if (error instanceof DurableStateError) throw error;
     return null;
   }
 }
@@ -1288,6 +1639,7 @@ function outputProducerMatches(input: {
 
 export async function writeGraphRagOutputProducerManifest(input: {
   outputDir: string;
+  repo?: FileBookJobStateRepository;
   bookId: string;
   sourceHash: string;
   documentId: string;
@@ -1297,6 +1649,7 @@ export async function writeGraphRagOutputProducerManifest(input: {
   producerRunId: string;
   stage?: BookStage;
 }): Promise<void> {
+  input.repo?.assertCurrentBatchBookLease(input.bookId);
   const previous = await readOutputProducerManifest(input.outputDir);
   const previousMatches = outputProducerMatches({
     manifest: previous,
@@ -1323,13 +1676,102 @@ export async function writeGraphRagOutputProducerManifest(input: {
     outputDir: graphRagBookOutputLocator(input.bookId),
     producerRunId: input.producerRunId,
     stageProducerRunIds,
+    ...currentBatchBookLeaseFenceMetadata(),
   };
   await mkdir(input.outputDir, { recursive: true });
-  await writeFile(
+  input.repo?.assertCurrentBatchBookLease(input.bookId);
+  await writeJsonFileDurable(
     join(input.outputDir, "qmd_output_manifest.json"),
-    JSON.stringify(manifest, null, 2),
-    "utf8",
+    JSON.stringify(manifest, null, 2) + "\n",
   );
+}
+
+function currentBatchBookLeaseFenceMetadata(): {
+  bookLeaseGeneration?: number;
+  bookFencingToken?: string;
+} {
+  const generation = Number.parseInt(
+    process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION ?? "",
+    10,
+  );
+  const token = process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN;
+  if (
+    token == null ||
+    token === "" ||
+    !Number.isInteger(generation) ||
+    generation <= 0
+  ) {
+    return {};
+  }
+  return {
+    bookLeaseGeneration: generation,
+    bookFencingToken: token,
+  };
+}
+
+function fsyncQmdIndexLockDirectory(
+  path: string,
+  lockPath: string,
+  owner: Record<string, unknown>,
+): void {
+  let fd: number | null = null;
+  try {
+    maybeInjectQmdIndexDirectoryFsyncFailure(path, lockPath);
+    fd = openSync(path, "r");
+    fsyncSync(fd);
+  } catch (error) {
+    const fsyncErrno = (error as NodeJS.ErrnoException).code ?? "unknown";
+    throw new DurableStateError(`durable directory fsync failed: ${path}`, {
+      localFailureClass: "durable_directory_fsync_uncertain",
+      cause: error as Error,
+      evidence: {
+        targetLocator: owner.targetLocator,
+        lockPath,
+        directoryTargetLocator: path,
+        directoryDurableKind: "directory",
+        primaryTargetLocator: owner.targetLocator,
+        primaryDurableKind: "sqlite",
+        lane: "qmdIndexWriterLane",
+        targetMappingOwner: "qmd",
+        durableKind: "sqlite-lock",
+        laneTimeoutMs: QMD_INDEX_LOCK_STALE_MS,
+        releaseOn: QMD_INDEX_RELEASE_ON,
+        fsyncTarget: path,
+        fsyncErrno,
+        fsyncPlatform: process.platform,
+        unavailableFieldSentinels: fsyncErrnoSentinel(fsyncErrno)
+          ? ["fsyncErrno"]
+          : undefined,
+        lockOwnerEvidence: owner,
+        durableMode: "strict",
+        completedPublishRule: "forbidden",
+        redactedEvidenceLocator: basename(lockPath),
+      },
+    });
+  } finally {
+    if (fd != null) closeSync(fd);
+  }
+}
+
+function fsyncErrnoSentinel(errno: string): boolean {
+  return errno === "" ||
+    ["unknown", "unsupported", "unavailable", "platform_no_errno"]
+      .includes(errno);
+}
+
+function maybeInjectQmdIndexDirectoryFsyncFailure(
+  path: string,
+  lockPath: string,
+): void {
+  if (process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS !== "1") return;
+  const pattern = process.env
+    .QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_PATTERN ?? "";
+  if (pattern === "") return;
+  if (!path.includes(pattern) && !lockPath.includes(pattern)) return;
+  const error = new Error("injected qmd index directory fsync failure") as
+    Error & { code?: string };
+  error.code = "EIO";
+  throw error;
 }
 
 function groupArtifactsByStage(artifacts: BookArtifactManifest[]) {

@@ -2,15 +2,17 @@ import {
   access,
   mkdir,
   mkdtemp,
+  readdir,
   rename,
   readFile,
   rm,
   unlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { hostname, tmpdir } from "node:os";
+import { dirname, join, relative } from "node:path";
 
 import { describe, expect, test } from "vitest";
 import YAML from "yaml";
@@ -30,7 +32,21 @@ import {
   DocumentIdentityMapSchema,
   SourceDocumentSchema,
 } from "../src/contracts/corpus.js";
-import { hashLanceDbDirectoryContents } from "../src/job-state/artifact-validation.js";
+import { recordGraphCapability } from "../src/graphrag/capability-catalog.js";
+import {
+  hashLanceDbDirectoryContents,
+  validateLanceDbDirectory,
+} from "../src/job-state/artifact-validation.js";
+import {
+  DurableStateError,
+  durableChecksumMetaPath,
+  durableChecksumPath,
+  readJsonFileDurable,
+  writeJsonFileDurable,
+} from "../src/job-state/durable-state-store.js";
+import {
+  registerQmdCorpusDocument,
+} from "../src/job-state/graphrag-book.js";
 
 const MinimalParquetFixture = Buffer.from(
   "UEFSMRUEFRIVFkwVAhUAEgAACSAFAAAAcm93LTEVABUSFRYsFQIVEBUGFQYcNgAoBXJvdy0xGAVyb3ctMRERAAAACSACAAAAAgEBAgAVBBksNQAYBnNjaGVtYRUCABUMJQIYAmlkJQBMHAAAABYCGRwZHCYAHBUMGTUABhAZGAJpZBUCFgIWigEWkgEmOiYIHDYAKAVyb3ctMRgFcm93LTEREQAZLBUEFQAVAgAVABUQFQIAPBYKGQYZJgACAAAAFooBFgImCBaSAQAZHBgMQVJST1c6c2NoZW1hGKABLy8vLy8zQUFBQUFRQUFBQUFBQUtBQXdBQmdBRkFBZ0FDZ0FBQUFBQkJBQU1BQUFBQ0FBSUFBQUFCQUFJQUFBQUJBQUFBQUVBQUFBVUFBQUFFQUFVQUFnQUJnQUhBQXdBQUFBUUFCQUFBQUFBQUFFRkVBQUFBQmdBQUFBRUFBQUFBQUFBQUFJQUFBQnBaQUFBQkFBRUFBUUFBQUFBQUFBQQAYIHBhcnF1ZXQtY3BwLWFycm93IHZlcnNpb24gMjIuMC4wGRwcAAAAWgEAAFBBUjE=",
@@ -66,6 +82,10 @@ async function writeCompleteLanceDbFixture(root: string): Promise<void> {
 
 async function writeMinimalParquetFixture(path: string): Promise<void> {
   await writeFile(path, MinimalParquetFixture);
+}
+
+function stableTextHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 function bookScopedOutputDir(graphVault: string, bookId: string): string {
@@ -159,6 +179,123 @@ async function completeGraphQueryProducerStages(input: {
   });
 }
 
+async function installBatchBookLease(input: {
+  graphVault: string;
+  runId: string;
+  bookId: string;
+  sessionId: string;
+  generation: number;
+  token: string;
+}): Promise<void> {
+  const leaseDir = join(
+    input.graphVault,
+    "catalog",
+    "batch-runs",
+    input.runId,
+    "book-leases",
+  );
+  await mkdir(leaseDir, { recursive: true });
+  await writeFile(join(leaseDir, `${input.bookId}.json`), JSON.stringify({
+    schemaVersion: SchemaVersion,
+    runId: input.runId,
+    bookId: input.bookId,
+    itemId: "item-fenced",
+    workerId: "worker-1",
+    runnerSessionId: input.sessionId,
+    runnerHost: "localhost",
+    runnerPid: 1,
+    generation: input.generation,
+    fencingToken: input.token,
+    acquiredAt: "2026-05-23T00:00:00.000Z",
+    heartbeatAt: "2026-05-23T00:00:00.000Z",
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  }), "utf8");
+}
+
+async function prepareQueryReadyCapabilityFixture(root: string): Promise<{
+  graphVault: string;
+  repo: FileBookJobStateRepository;
+  job: Awaited<ReturnType<FileBookJobStateRepository["registerBookSource"]>>;
+  graphExtractArtifactIds: string[];
+  queryReadyArtifactIds: string[];
+}> {
+  const graphVault = join(root, "graph_vault");
+  const repo = new FileBookJobStateRepository(graphVault);
+  const sourcePath = join(root, "book.epub");
+  await writeFile(sourcePath, "fixture epub content", "utf8");
+
+  const job = await repo.registerBookSource({
+    sourcePath,
+    normalizedContentHash: "normalized-content-hash",
+    configFingerprint: "cfg-1",
+    promptFingerprint: "prompt-1",
+    modelFingerprint: "model-1",
+  });
+  const outputDir = bookScopedOutputDir(graphVault, job.bookId);
+  const reportsPath = join(outputDir, "community_reports.parquet");
+  const lancedbPath = join(outputDir, "lancedb");
+  await mkdir(outputDir, { recursive: true });
+  await writeCompleteLanceDbFixture(lancedbPath);
+  await writeMinimalParquetFixture(reportsPath);
+  const graphExtractArtifacts = await writeGraphExtractArtifacts(
+    repo,
+    job.bookId,
+    outputDir,
+  );
+  const artifacts = await repo.recordArtifacts(job.bookId, [
+    {
+      stage: "community_report",
+      kind: "graphrag_community_reports_parquet",
+      path: reportsPath,
+      contentHash: await hashFile(reportsPath),
+      producerRunId: "run-community-report-1",
+    },
+    {
+      stage: "embed",
+      kind: "lancedb_index",
+      path: lancedbPath,
+      contentHash: await hashLanceDbDirectoryContents(lancedbPath),
+      producerRunId: "run-embed-1",
+    },
+  ]);
+  await completeGraphQueryProducerStages({
+    repo,
+    bookId: job.bookId,
+    graphExtractArtifactIds: graphExtractArtifacts.map((artifact) =>
+      artifact.artifactId
+    ),
+    reportArtifactId: artifacts[0]!.artifactId,
+    lancedbArtifactId: artifacts[1]!.artifactId,
+  });
+  await repo.recordGraphTextUnitIdentity({
+    schemaVersion: SchemaVersion,
+    bookId: job.bookId,
+    sourceId: `sha256:${job.sourceHash}`,
+    sourceHash: job.sourceHash,
+    documentId: job.documentId,
+    contentHash: "normalized-content-hash",
+    normalizedPath: "input/book.md",
+    graphDocumentId: "graph-doc-1",
+    graphTextUnitIds: ["tu-1"],
+  });
+  await repo.recordQmdCorpusRegistration({
+    documentId: job.documentId,
+    contentHash: "normalized-content-hash",
+    collection: "books",
+    relativePath: "book.md",
+  });
+
+  return {
+    graphVault,
+    repo,
+    job,
+    graphExtractArtifactIds: graphExtractArtifacts.map((artifact) =>
+      artifact.artifactId
+    ),
+    queryReadyArtifactIds: artifacts.map((artifact) => artifact.artifactId),
+  };
+}
+
 describe("FileBookJobStateRepository", () => {
   test("registers a book and persists catalog entry", async () => {
     const root = await createFixtureDir();
@@ -225,6 +362,584 @@ describe("FileBookJobStateRepository", () => {
       expect(identities.items[0]?.contentHash).toBe(job.sourceHash);
       expect(identities.items[0]?.normalizationPolicyVersion).toBe(
         "graphrag-normalized-markdown-v1",
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("serializes concurrent shared catalog book registrations", async () => {
+    const root = await createFixtureDir();
+    try {
+      const graphVault = join(root, "graph_vault");
+      const jobs = await Promise.all([...Array(8).keys()].map(async (index) => {
+        const repo = new FileBookJobStateRepository(graphVault);
+        const sourcePath = join(root, `book-${index}.epub`);
+        await writeFile(sourcePath, `fixture epub content ${index}`, "utf8");
+        return repo.registerBookSource({
+          sourcePath,
+          sourceIdentityPath: `books/book-${index}.epub`,
+          configFingerprint: "cfg-1",
+          promptFingerprint: "prompt-1",
+          modelFingerprint: "model-1",
+        });
+      }));
+      const expectedBookIds = jobs.map((job) => job.bookId).sort();
+
+      for (const name of [
+        "books.yaml",
+        "sources.yaml",
+        "document-identity-map.yaml",
+      ]) {
+        const catalogPath = join(graphVault, "catalog", name);
+        await expect(readFile(`${catalogPath}.sha256`, "utf8")).resolves.toBe(
+          `${await hashFile(catalogPath)}\n`,
+        );
+      }
+
+      const bookCatalog = YAML.parse(
+        await readFile(join(graphVault, "catalog", "books.yaml"), "utf8"),
+      ) as { items: Array<{ bookId: string }> };
+      const sourceCatalog = YAML.parse(
+        await readFile(join(graphVault, "catalog", "sources.yaml"), "utf8"),
+      ) as { items: Array<{ metadata?: { bookId?: string } }> };
+      const identityCatalog = YAML.parse(
+        await readFile(
+          join(graphVault, "catalog", "document-identity-map.yaml"),
+          "utf8",
+        ),
+      ) as { items: Array<{ canonicalBookId: string }> };
+
+      expect(bookCatalog.items.map((item) => item.bookId).sort())
+        .toEqual(expectedBookIds);
+      expect(sourceCatalog.items.map((item) => item.metadata?.bookId).sort())
+        .toEqual(expectedBookIds);
+      expect(identityCatalog.items.map((item) => item.canonicalBookId).sort())
+        .toEqual(expectedBookIds);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("uses collision-resistant durable YAML temp paths for same-ms writes",
+    async () => {
+      const root = await createFixtureDir();
+      const originalNow = Date.now;
+      try {
+        Date.now = () => 1_779_897_600_000;
+        const graphVault = join(root, "graph_vault");
+        const jobs = await Promise.all([...Array(12).keys()].map(async (index) => {
+          const repo = new FileBookJobStateRepository(graphVault);
+          const sourcePath = join(root, `same-ms-book-${index}.epub`);
+          await writeFile(sourcePath, `same-ms fixture epub content ${index}`, "utf8");
+          return repo.registerBookSource({
+            sourcePath,
+            sourceIdentityPath: `books/same-ms-book-${index}.epub`,
+            configFingerprint: "cfg-1",
+            promptFingerprint: "prompt-1",
+            modelFingerprint: "model-1",
+          });
+        }));
+
+        const catalogPath = join(graphVault, "catalog", "books.yaml");
+        const catalog = YAML.parse(await readFile(catalogPath, "utf8")) as {
+          items: Array<{ bookId: string }>;
+        };
+        expect(catalog.items.map((item) => item.bookId).sort()).toEqual(
+          jobs.map((job) => job.bookId).sort(),
+        );
+        await expect(readFile(`${catalogPath}.sha256`, "utf8")).resolves.toBe(
+          `${await hashFile(catalogPath)}\n`,
+        );
+        const tempFiles = (await readdir(join(graphVault, "catalog")))
+          .filter((entry) => entry.includes(".tmp-"));
+        expect(tempFiles).toEqual([]);
+      } finally {
+        Date.now = originalNow;
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+  test("recovers and quarantines durable JSON checksum state", async () => {
+    const root = await createFixtureDir();
+    try {
+      const targetPath = join(root, "state", "checkpoint.json");
+      const originalText = `${JSON.stringify({ schemaVersion: SchemaVersion, value: 1 }, null, 2)}\n`;
+      await writeJsonFileDurable(targetPath, originalText);
+
+      const updatedText = `${JSON.stringify({ schemaVersion: SchemaVersion, value: 2 }, null, 2)}\n`;
+      await writeFile(targetPath, updatedText, "utf8");
+      await writeFile(
+        durableChecksumMetaPath(targetPath),
+        `${JSON.stringify({
+          checksum: stableTextHash(updatedText),
+          checksumRecoveryDecision: "completed_before_checksum_publish",
+        }, null, 2)}\n`,
+        "utf8",
+      );
+      await expect(readJsonFileDurable(targetPath)).rejects.toThrow(
+        "durable JSON checksum mismatch",
+      );
+      await writeJsonFileDurable(targetPath, originalText);
+
+      await writeJsonFileDurable(targetPath, updatedText);
+      const committedChecksum = stableTextHash(updatedText);
+      const committedMeta = JSON.parse(
+        await readFile(durableChecksumMetaPath(targetPath), "utf8"),
+      ) as Record<string, unknown>;
+      await writeFile(`${targetPath}.sha256`, `${committedChecksum}\n`, "utf8");
+      await writeFile(
+        durableChecksumMetaPath(targetPath),
+        `${JSON.stringify({
+          ...committedMeta,
+          checksum: committedChecksum,
+          checksumRecoveryDecision: "target_rename_pending",
+          commitState: "target_rename_pending",
+        }, null, 2)}\n`,
+        "utf8",
+      );
+      await expect(readJsonFileDurable(targetPath)).resolves.toMatchObject({
+        value: 2,
+      });
+      await expect(readFile(durableChecksumMetaPath(targetPath), "utf8"))
+        .resolves.toContain("pending_meta_committed");
+      const primaryCorruptBeforeMetaRepair = (
+        await readdir(dirname(targetPath))
+      ).filter((entry) => entry.startsWith("checkpoint.json.corrupt-")).sort();
+
+      const matchingTargetText = await readFile(targetPath, "utf8");
+      await writeFile(`${targetPath}.sha256`, `${stableTextHash(matchingTargetText)}\n`);
+      await writeFile(
+        durableChecksumMetaPath(targetPath),
+        `${JSON.stringify({ checksum: "stale" }, null, 2)}\n`,
+        "utf8",
+      );
+      await expect(readJsonFileDurable(targetPath)).resolves.toMatchObject({
+        value: 2,
+      });
+      await expect(access(targetPath)).resolves.toBeUndefined();
+      const staleMetaEntries = await readdir(dirname(targetPath));
+      expect(staleMetaEntries.filter((entry) =>
+        entry.startsWith("checkpoint.json.corrupt-")
+      ).sort()).toEqual(primaryCorruptBeforeMetaRepair);
+      expect(staleMetaEntries.some((entry) =>
+        entry.startsWith("checkpoint.json.sha256.meta.json.corrupt-")
+      )).toBe(true);
+
+      await writeJsonFileDurable(targetPath, updatedText);
+      const validTargetText = await readFile(targetPath, "utf8");
+      await writeFile(
+        `${targetPath}.sha256`,
+        `${stableTextHash(validTargetText)}\n`,
+        "utf8",
+      );
+      await writeFile(durableChecksumMetaPath(targetPath), "{invalid\n", "utf8");
+      await expect(readJsonFileDurable(targetPath)).resolves.toMatchObject({
+        value: 2,
+      });
+      const invalidMetaEntries = await readdir(dirname(targetPath));
+      expect(invalidMetaEntries.filter((entry) =>
+        entry.startsWith("checkpoint.json.corrupt-")
+      ).sort()).toEqual(primaryCorruptBeforeMetaRepair);
+      expect(invalidMetaEntries.some((entry) =>
+        entry.startsWith("checkpoint.json.sha256.meta.json.corrupt-")
+      )).toBe(true);
+
+      await writeJsonFileDurable(targetPath, updatedText);
+      await writeFile(`${targetPath}.sha256`, `${"0".repeat(64)}\n`, "utf8");
+      await writeFile(
+        durableChecksumMetaPath(targetPath),
+        `${JSON.stringify({ checksum: "stale" }, null, 2)}\n`,
+        "utf8",
+      );
+      await expect(readJsonFileDurable(targetPath)).rejects.toThrow(
+        "durable JSON checksum mismatch",
+      );
+      await expect(access(targetPath)).rejects.toThrow();
+      const entries = await readdir(dirname(targetPath));
+      expect(entries.some((entry) => entry.startsWith("checkpoint.json.corrupt-")))
+        .toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("classifies shared quarantine rename ENOENT with durable evidence", async () => {
+    const root = await createFixtureDir();
+    const previousHooks = process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS;
+    const previousPattern = process.env.QMD_GRAPHRAG_TEST_RENAME_ENOENT_ONCE_PATTERN;
+    try {
+      const targetPath = join(root, "state", "checkpoint.json");
+      await writeJsonFileDurable(
+        targetPath,
+        `${JSON.stringify({ schemaVersion: SchemaVersion, value: 1 }, null, 2)}\n`,
+      );
+      const matchingTargetText = await readFile(targetPath, "utf8");
+      await writeFile(
+        durableChecksumPath(targetPath),
+        `${stableTextHash(matchingTargetText)}\n`,
+        "utf8",
+      );
+      await writeFile(
+        durableChecksumMetaPath(targetPath),
+        `${JSON.stringify({ checksum: "stale" }, null, 2)}\n`,
+        "utf8",
+      );
+      process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS = "1";
+      process.env.QMD_GRAPHRAG_TEST_RENAME_ENOENT_ONCE_PATTERN =
+        "checkpoint.json.sha256.meta.json.corrupt-";
+
+      await expect(readJsonFileDurable(targetPath)).rejects.toMatchObject({
+        name: "DurableStateError",
+        localFailureClass: "durable_temp_rename_enoent",
+        evidence: expect.objectContaining({
+          failedSyscall: "rename",
+          errno: "ENOENT",
+          renameCause: "filesystem_or_external_mutation",
+          tempId: expect.any(String),
+          operationId: expect.any(String),
+          primaryTargetLocator: targetPath,
+          sidecarTargetLocator: durableChecksumMetaPath(targetPath),
+          sidecarKind: "checksum_meta",
+          checksumExpected: "stale",
+          checksumActual: stableTextHash(matchingTargetText),
+          checksumRecoveryDecision: "checksum_meta_sidecar_repaired",
+          repairAllowed: true,
+        }),
+      } satisfies Partial<DurableStateError>);
+      await expect(access(targetPath)).resolves.toBeUndefined();
+    } finally {
+      if (previousHooks == null) delete process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS;
+      else process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS = previousHooks;
+      if (previousPattern == null) {
+        delete process.env.QMD_GRAPHRAG_TEST_RENAME_ENOENT_ONCE_PATTERN;
+      } else {
+        process.env.QMD_GRAPHRAG_TEST_RENAME_ENOENT_ONCE_PATTERN = previousPattern;
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("shared durable publish reports checksum sidecar directory fsync evidence",
+    async () => {
+      const root = await createFixtureDir();
+      const previousHooks = process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS;
+      const previousPattern =
+        process.env.QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_PATTERN;
+      const previousAfterMatches =
+        process.env.QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_AFTER_MATCHES;
+      try {
+        const targetPath = join(root, "state", "checkpoint.json");
+        process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS = "1";
+        process.env.QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_PATTERN =
+          "checkpoint.json.sha256";
+        process.env.QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_AFTER_MATCHES =
+          "2";
+
+        await expect(writeJsonFileDurable(
+          targetPath,
+          `${JSON.stringify({ schemaVersion: SchemaVersion, value: 1 }, null, 2)}\n`,
+        )).rejects.toMatchObject({
+          name: "DurableStateError",
+          localFailureClass: "durable_directory_fsync_uncertain",
+          evidence: expect.objectContaining({
+            directoryTargetLocator: dirname(targetPath),
+            directoryDurableKind: "directory",
+            primaryTargetLocator: targetPath,
+            primaryDurableKind: "json",
+            sidecarTargetLocator: durableChecksumPath(targetPath),
+            sidecarKind: "checksum",
+            targetMappingOwner: "repository",
+            fsyncTarget: dirname(targetPath),
+            fsyncErrno: "EIO",
+            fsyncPlatform: expect.any(String),
+            completedPublishRule: "forbidden",
+          }),
+        } satisfies Partial<DurableStateError>);
+      } finally {
+        if (previousHooks == null) delete process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS;
+        else process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS = previousHooks;
+        if (previousPattern == null) {
+          delete process.env.QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_PATTERN;
+        } else {
+          process.env.QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_PATTERN =
+            previousPattern;
+        }
+        if (previousAfterMatches == null) {
+          delete process.env.QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_AFTER_MATCHES;
+        } else {
+          process.env.QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_AFTER_MATCHES =
+            previousAfterMatches;
+        }
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+  test("qmd index lock release reports directory fsync evidence", async () => {
+    const root = await createFixtureDir();
+    const previousHooks = process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS;
+    const previousPattern =
+      process.env.QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_PATTERN;
+    const previousAfterMatches =
+      process.env.QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_AFTER_MATCHES;
+    const previousRunId = process.env.QMD_GRAPHRAG_RUN_ID;
+    const previousSession = process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID;
+    const previousGeneration = process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION;
+    const previousToken = process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN;
+    try {
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      const normalizedPath = join(graphVault, "input", "book.md");
+      await mkdir(dirname(normalizedPath), { recursive: true });
+      await writeFile(sourcePath, "fixture epub content", "utf8");
+      await writeFile(normalizedPath, "# Book\n\nfixture epub content\n", "utf8");
+      const normalizedText = await readFile(normalizedPath, "utf8");
+      const job = await repo.registerBookSource({
+        sourcePath,
+        normalizedPath: relative(graphVault, normalizedPath),
+        normalizedContentHash: stableTextHash(JSON.stringify({
+          content: normalizedText,
+          normalizationPolicyVersion: "graphrag-normalized-markdown-v1",
+        })),
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+      });
+      process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS = "1";
+      process.env.QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_PATTERN =
+        "index.sqlite.lock";
+      process.env.QMD_GRAPHRAG_RUN_ID = "qmd-index-fsync-fixture";
+      process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID = "active-session";
+      process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION = "2";
+      process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN = "active-token";
+
+      const qmdIndexPath = join(root, "index.sqlite");
+      await expect(registerQmdCorpusDocument({
+        repo,
+        qmdIndexPath,
+        stateRootDir: graphVault,
+        job,
+        normalizedPath,
+      })).rejects.toMatchObject({
+        name: "DurableStateError",
+        localFailureClass: "durable_directory_fsync_uncertain",
+        evidence: expect.objectContaining({
+          targetLocator: qmdIndexPath,
+          lockPath: `${qmdIndexPath}.lock`,
+          directoryTargetLocator: dirname(qmdIndexPath),
+          directoryDurableKind: "directory",
+          primaryTargetLocator: qmdIndexPath,
+          primaryDurableKind: "sqlite",
+          lane: "qmdIndexWriterLane",
+          targetMappingOwner: "qmd",
+          fsyncTarget: dirname(qmdIndexPath),
+          fsyncErrno: "EIO",
+          fsyncPlatform: expect.any(String),
+          completedPublishRule: "forbidden",
+        }),
+      } satisfies Partial<DurableStateError>);
+    } finally {
+      if (previousHooks == null) delete process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS;
+      else process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS = previousHooks;
+      if (previousPattern == null) {
+        delete process.env.QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_PATTERN;
+      } else {
+        process.env.QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_PATTERN =
+          previousPattern;
+      }
+      if (previousAfterMatches == null) {
+        delete process.env.QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_AFTER_MATCHES;
+      } else {
+        process.env.QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_AFTER_MATCHES =
+          previousAfterMatches;
+      }
+      if (previousRunId == null) delete process.env.QMD_GRAPHRAG_RUN_ID;
+      else process.env.QMD_GRAPHRAG_RUN_ID = previousRunId;
+      if (previousSession == null) delete process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID;
+      else process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID = previousSession;
+      if (previousGeneration == null) {
+        delete process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION;
+      } else {
+        process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION = previousGeneration;
+      }
+      if (previousToken == null) delete process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN;
+      else process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN = previousToken;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects durable JSON auxiliary targets as primary state", async () => {
+    const root = await createFixtureDir();
+    try {
+      const targetPath = join(root, "state", "checkpoint.json");
+      await mkdir(dirname(targetPath), { recursive: true });
+      await writeFile(targetPath, "{}\n", "utf8");
+      const auxiliaryTargets = [
+        `${targetPath}.owner.json`,
+        `${targetPath}.sha256`,
+        durableChecksumMetaPath(targetPath),
+        `${targetPath}.tmp-live`,
+        `${targetPath}.corrupt-1`,
+        `${targetPath}.lock`,
+      ];
+      for (const auxiliaryPath of auxiliaryTargets) {
+        await expect(writeJsonFileDurable(auxiliaryPath, "{}\n"))
+          .rejects.toMatchObject({
+            name: "DurableStateError",
+            localFailureClass: "durable_auxiliary_target_rejected",
+          } satisfies Partial<DurableStateError>);
+        await expect(readJsonFileDurable(auxiliaryPath))
+          .rejects.toMatchObject({
+            name: "DurableStateError",
+            localFailureClass: "durable_auxiliary_target_rejected",
+          } satisfies Partial<DurableStateError>);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves stale durable temps without complete owner evidence", async () => {
+    const root = await createFixtureDir();
+    try {
+      const targetPath = join(root, "state", "checkpoint.json");
+      await writeJsonFileDurable(
+        targetPath,
+        `${JSON.stringify({ schemaVersion: SchemaVersion, value: 1 }, null, 2)}\n`,
+      );
+      const ownerlessTemp = `${targetPath}.tmp-ownerless`;
+      const missingCreatedAtTemp = `${targetPath}.tmp-missing-created-at`;
+      await writeFile(ownerlessTemp, "{}\n", "utf8");
+      await writeFile(missingCreatedAtTemp, "{}\n", "utf8");
+      await writeFile(
+        `${missingCreatedAtTemp}.owner.json`,
+        `${JSON.stringify({
+          tempId: "missing-created-at",
+          operationId: "missing-created-at-op",
+          targetLocator: targetPath,
+          ownerPid: 999999,
+          ownerHost: "missing-created-at-host",
+          durableMode: "strict",
+        }, null, 2)}\n`,
+        "utf8",
+      );
+      const remoteOwnerTemp = `${targetPath}.tmp-remote-owner`;
+      const expiredLeaseTemp = `${targetPath}.tmp-expired-lease`;
+      const targetChecksumBefore = await readFile(`${targetPath}.sha256`, "utf8");
+      await writeFile(remoteOwnerTemp, "{}\n", "utf8");
+      await writeFile(
+        `${remoteOwnerTemp}.owner.json`,
+        `${JSON.stringify({
+          tempId: "remote-owner",
+          operationId: "remote-owner-op",
+          targetLocator: targetPath,
+          ownerPid: 999999,
+          ownerHost: "remote-owner-host",
+          createdAt: "2026-05-23T00:00:00.000Z",
+          leaseGeneration: 1,
+          targetGeneration: 1,
+          targetChecksumBefore: targetChecksumBefore.trim(),
+          fencingTokenHash: "remote-owner-fence",
+          durableMode: "strict",
+        }, null, 2)}\n`,
+        "utf8",
+      );
+      await writeFile(expiredLeaseTemp, "{}\n", "utf8");
+      await writeFile(
+        `${expiredLeaseTemp}.owner.json`,
+        `${JSON.stringify({
+          tempId: "expired-lease",
+          operationId: "expired-lease-op",
+          targetLocator: targetPath,
+          ownerPid: 999999,
+          ownerHost: "expired-lease-host",
+          createdAt: "2026-05-23T00:00:00.000Z",
+          expiresAt: "2026-05-23T00:01:00.000Z",
+          leaseGeneration: 1,
+          targetGeneration: 1,
+          targetChecksumBefore: targetChecksumBefore.trim(),
+          fencingTokenHash: "expired-lease-fence",
+          durableMode: "strict",
+        }, null, 2)}\n`,
+        "utf8",
+      );
+      const oldDate = new Date(Date.now() - 25 * 60 * 60 * 1000);
+      await utimes(ownerlessTemp, oldDate, oldDate);
+      await utimes(missingCreatedAtTemp, oldDate, oldDate);
+      await utimes(`${missingCreatedAtTemp}.owner.json`, oldDate, oldDate);
+      await utimes(remoteOwnerTemp, oldDate, oldDate);
+      await utimes(`${remoteOwnerTemp}.owner.json`, oldDate, oldDate);
+      await utimes(expiredLeaseTemp, oldDate, oldDate);
+      await utimes(`${expiredLeaseTemp}.owner.json`, oldDate, oldDate);
+
+      await expect(readJsonFileDurable(targetPath)).resolves.toMatchObject({
+        value: 1,
+      });
+      await expect(access(ownerlessTemp)).resolves.toBeUndefined();
+      await expect(access(missingCreatedAtTemp)).resolves.toBeUndefined();
+      await expect(access(`${missingCreatedAtTemp}.owner.json`))
+        .resolves.toBeUndefined();
+      await expect(access(remoteOwnerTemp)).resolves.toBeUndefined();
+      await expect(access(`${remoteOwnerTemp}.owner.json`))
+        .resolves.toBeUndefined();
+      await expect(access(expiredLeaseTemp)).rejects.toThrow();
+      await expect(access(`${expiredLeaseTemp}.owner.json`)).rejects.toThrow();
+      const recoveryLog = await readFile(
+        join(dirname(targetPath), ".durable-recovery.jsonl"),
+        "utf8",
+      );
+      const recoveryRecords = recoveryLog.trim().split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(recoveryRecords).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            event: "durable_temp_recovered",
+            targetLocator: targetPath,
+            tempId: "expired-lease",
+            cleanupReason: "owner_lease_expired",
+            recoveryDecision: "stale_temp_removed",
+            staleAgeMs: expect.any(Number),
+          }),
+        ]),
+      );
+
+      const staleLockPath = `${targetPath}.lock`;
+      await writeFile(staleLockPath, `${JSON.stringify({
+        pid: 999999,
+        host: hostname(),
+        runnerSessionId: "stale-lock-session",
+        generation: 1,
+        fencingTokenHash: "stale-lock-fence",
+        targetLocator: targetPath,
+        operationId: "stale-lock-op",
+        expiresAt: "2026-05-23T00:01:00.000Z",
+      }, null, 2)}\n`, "utf8");
+      await utimes(staleLockPath, oldDate, oldDate);
+
+      await expect(readJsonFileDurable(targetPath)).resolves.toMatchObject({
+        value: 1,
+      });
+      await expect(access(staleLockPath)).rejects.toThrow();
+      const updatedRecoveryLog = await readFile(
+        join(dirname(targetPath), ".durable-recovery.jsonl"),
+        "utf8",
+      );
+      const updatedRecoveryRecords = updatedRecoveryLog.trim().split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(updatedRecoveryRecords).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            event: "durable_lock_recovered",
+            targetLocator: staleLockPath,
+            lockPath: staleLockPath,
+            recoveryDecision: "stale_lock_removed",
+            lockOwnerEvidence: expect.objectContaining({
+              runnerSessionId: "stale-lock-session",
+              operationId: "stale-lock-op",
+            }),
+          }),
+        ]),
       );
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -1056,6 +1771,207 @@ describe("FileBookJobStateRepository", () => {
     }
   });
 
+  test("rejects stage checkpoint writes with stale batch book lease fencing", async () => {
+    const root = await createFixtureDir();
+    const previousEnv = {
+      runId: process.env.QMD_GRAPHRAG_RUN_ID,
+      sessionId: process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID,
+      generation: process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION,
+      token: process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN,
+    };
+    try {
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "fixture epub content", "utf8");
+      const job = await repo.registerBookSource({
+        sourcePath,
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+      });
+      const runId = "batch-run-lease-fencing";
+      const leaseDir = join(
+        graphVault,
+        "catalog",
+        "batch-runs",
+        runId,
+        "book-leases",
+      );
+      await mkdir(leaseDir, { recursive: true });
+      await writeFile(
+        join(leaseDir, `${job.bookId}.json`),
+        JSON.stringify({
+          schemaVersion: SchemaVersion,
+          runId,
+          bookId: job.bookId,
+          itemId: "item-lease-fencing",
+          workerId: "worker-1",
+          runnerSessionId: "active-session",
+          runnerHost: "localhost",
+          runnerPid: 1,
+          generation: 2,
+          fencingToken: "active-token",
+          acquiredAt: "2026-05-23T00:00:00.000Z",
+          heartbeatAt: "2026-05-23T00:00:00.000Z",
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        }),
+      );
+      process.env.QMD_GRAPHRAG_RUN_ID = runId;
+      process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID = "stale-session";
+      process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION = "1";
+      process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN = "stale-token";
+
+      await expect(repo.startStage({
+        bookId: job.bookId,
+        stage: "ingest",
+        runId: "run-ingest-stale",
+        inputFingerprint: "fp-ingest",
+      })).rejects.toThrow(`book lease fencing rejected stage write: ${job.bookId}`);
+
+      process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID = "active-session";
+      process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION = "2";
+      process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN = "active-token";
+      await expect(repo.startStage({
+        bookId: job.bookId,
+        stage: "ingest",
+        runId: "run-ingest-active",
+        inputFingerprint: "fp-ingest",
+      })).resolves.toMatchObject({
+        bookId: job.bookId,
+        stage: "ingest",
+        status: "running",
+      });
+    } finally {
+      if (previousEnv.runId == null) delete process.env.QMD_GRAPHRAG_RUN_ID;
+      else process.env.QMD_GRAPHRAG_RUN_ID = previousEnv.runId;
+      if (previousEnv.sessionId == null) {
+        delete process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID;
+      } else {
+        process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID = previousEnv.sessionId;
+      }
+      if (previousEnv.generation == null) {
+        delete process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION;
+      } else {
+        process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION = previousEnv.generation;
+      }
+      if (previousEnv.token == null) {
+        delete process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN;
+      } else {
+        process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN = previousEnv.token;
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects artifact and run catalog writes with stale batch book lease fencing", async () => {
+    const root = await createFixtureDir();
+    const previousEnv = {
+      runId: process.env.QMD_GRAPHRAG_RUN_ID,
+      sessionId: process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID,
+      generation: process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION,
+      token: process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN,
+    };
+    try {
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "fixture epub content", "utf8");
+      const job = await repo.registerBookSource({
+        sourcePath,
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+      });
+      const runId = "batch-run-book-mutator-fencing";
+      const leaseDir = join(
+        graphVault,
+        "catalog",
+        "batch-runs",
+        runId,
+        "book-leases",
+      );
+      await mkdir(leaseDir, { recursive: true });
+      await writeFile(join(leaseDir, `${job.bookId}.json`), JSON.stringify({
+        schemaVersion: SchemaVersion,
+        runId,
+        bookId: job.bookId,
+        itemId: "item-mutator-fencing",
+        workerId: "worker-1",
+        runnerSessionId: "active-session",
+        runnerHost: "localhost",
+        runnerPid: 1,
+        generation: 2,
+        fencingToken: "active-token",
+        acquiredAt: "2026-05-23T00:00:00.000Z",
+        heartbeatAt: "2026-05-23T00:00:00.000Z",
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      }));
+      process.env.QMD_GRAPHRAG_RUN_ID = runId;
+      process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID = "stale-session";
+      process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION = "1";
+      process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN = "stale-token";
+
+      await expect(repo.recordArtifacts(job.bookId, [{
+        bookId: job.bookId,
+        stage: "ingest",
+        kind: "source_epub",
+        path: sourcePath,
+        contentHash: job.sourceHash,
+        producerRunId: "run-artifact-stale",
+      }])).rejects.toThrow(`book lease fencing rejected stage write: ${job.bookId}`);
+
+      await expect(repo.appendRunRecord({
+        schemaVersion: SchemaVersion,
+        runId: "run-record-stale",
+        bookId: job.bookId,
+        stage: "ingest",
+        status: "running",
+        attemptCount: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        inputFingerprint: "fp-ingest",
+        artifactIds: [],
+      })).rejects.toThrow(`book lease fencing rejected stage write: ${job.bookId}`);
+
+      process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID = "active-session";
+      process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION = "2";
+      process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN = "active-token";
+      await expect(repo.appendRunRecord({
+        schemaVersion: SchemaVersion,
+        runId: "run-record-active",
+        bookId: job.bookId,
+        stage: "ingest",
+        status: "running",
+        attemptCount: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        inputFingerprint: "fp-ingest",
+        artifactIds: [],
+      })).resolves.toMatchObject({
+        bookId: job.bookId,
+        runId: "run-record-active",
+      });
+    } finally {
+      if (previousEnv.runId == null) delete process.env.QMD_GRAPHRAG_RUN_ID;
+      else process.env.QMD_GRAPHRAG_RUN_ID = previousEnv.runId;
+      if (previousEnv.sessionId == null) {
+        delete process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID;
+      } else {
+        process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID = previousEnv.sessionId;
+      }
+      if (previousEnv.generation == null) {
+        delete process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION;
+      } else {
+        process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION = previousEnv.generation;
+      }
+      if (previousEnv.token == null) {
+        delete process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN;
+      } else {
+        process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN = previousEnv.token;
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("redacts absolute paths and secrets from checkpoint and run errors", async () => {
     const root = await createFixtureDir();
     try {
@@ -1103,6 +2019,91 @@ describe("FileBookJobStateRepository", () => {
       expect(runRaw).not.toContain("opaque-redaction-marker");
       expect(runRaw).toContain("[redacted-path]");
       expect(runRaw).toContain("[redacted-secret]");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("recovers book job YAML checksums and quarantines corrupt targets", async () => {
+    const root = await createFixtureDir();
+    try {
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
+      const sourcePath = join(root, "book.epub");
+      await writeFile(sourcePath, "fixture epub content", "utf8");
+      const job = await repo.registerBookSource({
+        sourcePath,
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+      });
+      const jobPath = join(graphVault, "books", job.bookId, "job.yaml");
+      const checksumPath = `${jobPath}.sha256`;
+
+      await unlink(checksumPath);
+      await expect(repo.getBookJob(job.bookId)).resolves.toMatchObject({
+        bookId: job.bookId,
+      });
+      await expect(access(checksumPath)).resolves.toBeUndefined();
+
+      await writeFile(checksumPath, `${"0".repeat(64)}\n`, "utf8");
+      await writeFile(
+        `${checksumPath}.meta.json`,
+        `${JSON.stringify({ checksum: "stale" }, null, 2)}\n`,
+        "utf8",
+      );
+      await expect(repo.getBookJob(job.bookId)).rejects.toThrow(
+        "durable YAML checksum mismatch",
+      );
+      await expect(access(jobPath)).rejects.toThrow();
+      const entries = await readdir(dirname(jobPath));
+      expect(entries.some((entry) => entry.startsWith("job.yaml.corrupt-")))
+        .toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("validates LanceDB row-count sidecars through durable checksums", async () => {
+    const root = await createFixtureDir();
+    try {
+      const lancedbPath = join(
+        root,
+        "graph_vault",
+        "books",
+        "book-1",
+        "output",
+        "lancedb",
+      );
+      await writeCompleteLanceDbFixture(lancedbPath);
+      const rowCountPath = join(
+        lancedbPath,
+        "entity_description.lance",
+        "qmd_row_count.json",
+      );
+      const checksumPath = `${rowCountPath}.sha256`;
+
+      await rm(checksumPath, { force: true });
+      await expect(validateLanceDbDirectory(lancedbPath)).resolves.toMatchObject({
+        valid: true,
+      });
+      await expect(access(checksumPath)).resolves.toBeUndefined();
+
+      await writeFile(checksumPath, `${"0".repeat(64)}\n`, "utf8");
+      await writeFile(
+        `${checksumPath}.meta.json`,
+        `${JSON.stringify({ checksum: "stale" }, null, 2)}\n`,
+        "utf8",
+      );
+      await expect(validateLanceDbDirectory(lancedbPath)).resolves.toMatchObject({
+        valid: false,
+        reason: "entity_description.lance:lancedb_table_missing_positive_row_count",
+      });
+      await expect(access(rowCountPath)).rejects.toThrow();
+      const entries = await readdir(dirname(rowCountPath));
+      expect(
+        entries.some((entry) => entry.startsWith("qmd_row_count.json.corrupt-")),
+      ).toBe(true);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -2585,82 +3586,23 @@ describe("FileBookJobStateRepository", () => {
   test("publishes graph capabilities after query-ready checkpoint validates", async () => {
     const root = await createFixtureDir();
     try {
-      const graphVault = join(root, "graph_vault");
-      const repo = new FileBookJobStateRepository(graphVault);
-      const sourcePath = join(root, "book.epub");
-      await writeFile(sourcePath, "fixture epub content", "utf8");
-
-      const job = await repo.registerBookSource({
-        sourcePath,
-        normalizedContentHash: "normalized-content-hash",
-        configFingerprint: "cfg-1",
-        promptFingerprint: "prompt-1",
-        modelFingerprint: "model-1",
-      });
-      const outputDir = bookScopedOutputDir(graphVault, job.bookId);
-      const reportsPath = join(outputDir, "community_reports.parquet");
-      const lancedbPath = join(outputDir, "lancedb");
-      await mkdir(outputDir, { recursive: true });
-      await writeCompleteLanceDbFixture(lancedbPath);
-      await writeMinimalParquetFixture(reportsPath);
-      const graphExtractArtifacts = await writeGraphExtractArtifacts(
+      const {
+        graphVault,
         repo,
-        job.bookId,
-        outputDir,
-      );
-      const reportHash = await hashFile(reportsPath);
-      const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
-      const artifacts = await repo.recordArtifacts(job.bookId, [
-        {
-          stage: "community_report",
-          kind: "graphrag_community_reports_parquet",
-          path: reportsPath,
-          contentHash: reportHash,
-          producerRunId: "run-community-report-1",
-        },
-        {
-          stage: "embed",
-          kind: "lancedb_index",
-          path: lancedbPath,
-          contentHash: lancedbHash,
-          producerRunId: "run-embed-1",
-        },
-      ]);
-      await completeGraphQueryProducerStages({
-        repo,
-        bookId: job.bookId,
-        graphExtractArtifactIds: graphExtractArtifacts.map((artifact) =>
-          artifact.artifactId
-        ),
-        reportArtifactId: artifacts[0]!.artifactId,
-        lancedbArtifactId: artifacts[1]!.artifactId,
-      });
-      await repo.recordGraphTextUnitIdentity({
-        schemaVersion: SchemaVersion,
-        bookId: job.bookId,
-        sourceId: `sha256:${job.sourceHash}`,
-        sourceHash: job.sourceHash,
-        documentId: job.documentId,
-        contentHash: "normalized-content-hash",
-        normalizedPath: "input/book.md",
-        graphDocumentId: "graph-doc-1",
-        graphTextUnitIds: ["tu-1"],
-      });
-      await repo.recordQmdCorpusRegistration({
-        documentId: job.documentId,
-        contentHash: "normalized-content-hash",
-        collection: "books",
-        relativePath: "book.md",
-      });
+        job,
+        graphExtractArtifactIds,
+        queryReadyArtifactIds,
+      } = await prepareQueryReadyCapabilityFixture(root);
 
       await repo.completeStage({
         bookId: job.bookId,
         stage: "query_ready",
         runId: "run-query-ready-1",
         inputFingerprint: "fp-query-ready",
-        artifactIds: artifacts.map((artifact) => artifact.artifactId),
+        artifactIds: queryReadyArtifactIds,
       });
 
+      const catalogPath = join(graphVault, "catalog", "graph-capabilities.yaml");
       const capabilities = await loadGraphQueryCapabilities({ graphVault });
 
       expect(capabilities).toHaveLength(1);
@@ -2668,14 +3610,264 @@ describe("FileBookJobStateRepository", () => {
       expect(capabilities[0]?.contentHash).toBe("normalized-content-hash");
       expect(capabilities[0]?.artifactIds).toEqual(
         expect.arrayContaining([
-          ...graphExtractArtifacts.map((artifact) => artifact.artifactId),
-          ...artifacts.map((artifact) => artifact.artifactId),
+          ...graphExtractArtifactIds,
+          ...queryReadyArtifactIds,
         ]),
+      );
+      await expect(access(`${catalogPath}.sha256`)).resolves.toBeUndefined();
+      await expect(readFile(`${catalogPath}.sha256`, "utf8")).resolves.toBe(
+        `${await hashFile(catalogPath)}\n`,
       );
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  test("recovers and quarantines graph capability catalog durable checksum state",
+    async () => {
+      const root = await createFixtureDir();
+      try {
+        const {
+          graphVault,
+          repo,
+          job,
+          queryReadyArtifactIds,
+        } = await prepareQueryReadyCapabilityFixture(root);
+
+        await repo.completeStage({
+          bookId: job.bookId,
+          stage: "query_ready",
+          runId: "run-query-ready-1",
+          inputFingerprint: "fp-query-ready",
+          artifactIds: queryReadyArtifactIds,
+        });
+
+        const catalogPath = join(graphVault, "catalog", "graph-capabilities.yaml");
+        const checksumPath = `${catalogPath}.sha256`;
+        await unlink(checksumPath);
+        await expect(loadGraphQueryCapabilities({ graphVault }))
+          .resolves.toHaveLength(1);
+        await expect(readFile(checksumPath, "utf8")).resolves.toBe(
+          `${await hashFile(catalogPath)}\n`,
+        );
+
+        await writeFile(checksumPath, `${"0".repeat(64)}\n`, "utf8");
+        await writeFile(
+          `${checksumPath}.meta.json`,
+          `${JSON.stringify({ checksum: "stale" }, null, 2)}\n`,
+          "utf8",
+        );
+        await expect(loadGraphQueryCapabilities({ graphVault }))
+          .rejects.toThrow("durable YAML checksum mismatch");
+        await expect(access(catalogPath)).rejects.toThrow();
+        const entries = await readdir(dirname(catalogPath));
+        expect(entries.some((entry) =>
+          entry.startsWith("graph-capabilities.yaml.corrupt-")
+        )).toBe(true);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+  test("rejects stale book lease before graph capability catalog commit",
+    async () => {
+      const root = await createFixtureDir();
+      const previousEnv = {
+        runId: process.env.QMD_GRAPHRAG_RUN_ID,
+        sessionId: process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID,
+        generation: process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION,
+        token: process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN,
+      };
+      try {
+        const {
+          graphVault,
+          repo,
+          job,
+          queryReadyArtifactIds,
+        } = await prepareQueryReadyCapabilityFixture(root);
+        const runId = "batch-graph-capability-fencing";
+        await installBatchBookLease({
+          graphVault,
+          runId,
+          bookId: job.bookId,
+          sessionId: "active-session",
+          generation: 2,
+          token: "active-token",
+        });
+        process.env.QMD_GRAPHRAG_RUN_ID = runId;
+        process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID = "stale-session";
+        process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION = "1";
+        process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN = "stale-token";
+
+        await expect(repo.completeStage({
+          bookId: job.bookId,
+          stage: "query_ready",
+          runId: "run-query-ready-1",
+          inputFingerprint: "fp-query-ready",
+          artifactIds: queryReadyArtifactIds,
+        })).rejects.toThrow(
+          `book lease fencing rejected stage write: ${job.bookId}`,
+        );
+        await expect(access(
+          join(graphVault, "catalog", "graph-capabilities.yaml"),
+        )).rejects.toThrow();
+
+        process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID = "active-session";
+        process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION = "2";
+        process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN = "active-token";
+        await expect(repo.completeStage({
+          bookId: job.bookId,
+          stage: "query_ready",
+          runId: "run-query-ready-1",
+          inputFingerprint: "fp-query-ready",
+          artifactIds: queryReadyArtifactIds,
+        })).resolves.toMatchObject({
+          bookId: job.bookId,
+          stage: "query_ready",
+          status: "succeeded",
+        });
+        await expect(access(
+          join(graphVault, "catalog", "graph-capabilities.yaml.sha256"),
+        )).resolves.toBeUndefined();
+      } finally {
+        if (previousEnv.runId == null) delete process.env.QMD_GRAPHRAG_RUN_ID;
+        else process.env.QMD_GRAPHRAG_RUN_ID = previousEnv.runId;
+        if (previousEnv.sessionId == null) {
+          delete process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID;
+        } else {
+          process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID = previousEnv.sessionId;
+        }
+        if (previousEnv.generation == null) {
+          delete process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION;
+        } else {
+          process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION = previousEnv.generation;
+        }
+        if (previousEnv.token == null) {
+          delete process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN;
+        } else {
+          process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN = previousEnv.token;
+        }
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+  test("fences durable graph capability catalog commits with commit hooks",
+    async () => {
+      const root = await createFixtureDir();
+      try {
+        const graphVault = join(root, "graph_vault");
+        const capability = {
+          schemaVersion: SchemaVersion,
+          capabilityId: "book-1:graph_query",
+          kind: "graph_query" as const,
+          bookId: "book-1",
+          sourceId: "source-1",
+          documentId: "doc-1",
+          contentHash: "content-1",
+          ready: true,
+          readinessSource: "validated_checkpoint_plus_validated_manifest" as const,
+          artifactIds: ["artifact-1"],
+          createdAt: "2026-05-23T00:00:00.000Z",
+        };
+        const catalogPath = join(graphVault, "catalog", "graph-capabilities.yaml");
+
+        await expect(recordGraphCapability(graphVault, capability, {
+          beforeCommit: () => {
+            throw new Error("lease rejected before commit");
+          },
+        })).rejects.toThrow("lease rejected before commit");
+        await expect(access(catalogPath)).rejects.toThrow();
+
+        await expect(recordGraphCapability(graphVault, capability, {
+          afterCommit: () => {
+            throw new Error("lease rejected after commit");
+          },
+        })).rejects.toThrow("lease rejected after commit");
+        await expect(access(catalogPath)).resolves.toBeUndefined();
+        await expect(access(`${catalogPath}.sha256`)).resolves.toBeUndefined();
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+  test("serializes concurrent graph capability catalog commits", async () => {
+    const root = await createFixtureDir();
+    try {
+      const graphVault = join(root, "graph_vault");
+      await Promise.all([...Array(8).keys()].map((index) =>
+        recordGraphCapability(graphVault, {
+          schemaVersion: SchemaVersion,
+          capabilityId: `book-${index}:graph_query`,
+          kind: "graph_query",
+          bookId: `book-${index}`,
+          sourceId: `source-${index}`,
+          documentId: `doc-${index}`,
+          contentHash: `content-${index}`,
+          ready: true,
+          readinessSource: "validated_checkpoint_plus_validated_manifest",
+          artifactIds: [`artifact-${index}`],
+          createdAt: "2026-05-23T00:00:00.000Z",
+        })
+      ));
+      const catalogPath = join(graphVault, "catalog", "graph-capabilities.yaml");
+      const catalog = YAML.parse(await readFile(catalogPath, "utf8")) as {
+        items: Array<{ capabilityId: string }>;
+      };
+
+      expect(catalog.items.map((item) => item.capabilityId).sort()).toEqual(
+        [...Array(8).keys()].map((index) => `book-${index}:graph_query`),
+      );
+      await expect(readFile(`${catalogPath}.sha256`, "utf8")).resolves.toBe(
+        `${await hashFile(catalogPath)}\n`,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("uses collision-resistant graph capability temp paths for same-ms commits",
+    async () => {
+      const root = await createFixtureDir();
+      const originalNow = Date.now;
+      try {
+        Date.now = () => 1_779_897_600_000;
+        const graphVault = join(root, "graph_vault");
+        await Promise.all([...Array(12).keys()].map((index) =>
+          recordGraphCapability(graphVault, {
+            schemaVersion: SchemaVersion,
+            capabilityId: `same-ms-book-${index}:graph_query`,
+            kind: "graph_query",
+            bookId: `same-ms-book-${index}`,
+            sourceId: `source-${index}`,
+            documentId: `doc-${index}`,
+            contentHash: `content-${index}`,
+            ready: true,
+            readinessSource: "validated_checkpoint_plus_validated_manifest",
+            artifactIds: [`artifact-${index}`],
+            createdAt: "2026-05-23T00:00:00.000Z",
+          })
+        ));
+        const catalogPath = join(graphVault, "catalog", "graph-capabilities.yaml");
+        const catalog = YAML.parse(await readFile(catalogPath, "utf8")) as {
+          items: Array<{ capabilityId: string }>;
+        };
+
+        expect(catalog.items.map((item) => item.capabilityId).sort()).toEqual(
+          [...Array(12).keys()].map((index) =>
+            `same-ms-book-${index}:graph_query`
+          ).sort(),
+        );
+        await expect(readFile(`${catalogPath}.sha256`, "utf8")).resolves.toBe(
+          `${await hashFile(catalogPath)}\n`,
+        );
+        const tempFiles = (await readdir(join(graphVault, "catalog")))
+          .filter((entry) => entry.includes(".tmp-"));
+        expect(tempFiles).toEqual([]);
+      } finally {
+        Date.now = originalNow;
+        await rm(root, { recursive: true, force: true });
+      }
+    });
 
   test("rejects query-ready success checkpoint with only bootstrap producers", async () => {
     const root = await createFixtureDir();

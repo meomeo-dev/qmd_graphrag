@@ -7,6 +7,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
 import {
   basename,
   dirname,
@@ -66,6 +67,15 @@ import {
   normalizeBookSlug,
   toIsoTimestamp,
 } from "./fingerprint.js";
+import {
+  readYamlFileDurable,
+  readYamlFileDurableUnlocked,
+  readYamlUnknownDurableUnlocked,
+  updateYamlFileDurable,
+  updateYamlUnknownDurable,
+  writeYamlFileDurable,
+  writeYamlFileDurableUnlocked,
+} from "./durable-state-store.js";
 import {
   GraphEnhancementRequestSchema,
   GraphEnhancementStateSchema,
@@ -234,6 +244,7 @@ export type RecordQmdCorpusRegistrationInput = {
   contentHash: string;
   collection: string;
   relativePath: string;
+  metadata?: Record<string, JsonValue>;
 };
 
 export type StartStageInput = {
@@ -300,6 +311,17 @@ type WriteStageCheckpointInput = {
   metadata?: Record<string, JsonValue>;
 };
 
+type BatchBookLease = {
+  runId: string;
+  bookId: string;
+  generation: number;
+  fencingToken: string;
+  runnerSessionId: string;
+  runnerHost: string;
+  runnerPid: number;
+  expiresAt: string;
+};
+
 function stageIndex(stage: BookStage): number {
   return BookStageOrder.indexOf(stage);
 }
@@ -313,16 +335,15 @@ async function readYamlFile<T>(
   schema: { parse(input: unknown): T },
   fallback: T,
 ): Promise<T> {
-  try {
-    const raw = await readFile(path, "utf8");
-    const parsed = YAML.parse(raw);
-    return schema.parse(parsed);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return fallback;
-    }
-    throw error;
-  }
+  return readYamlFileDurable(path, schema, fallback);
+}
+
+async function readYamlFileUnlocked<T>(
+  path: string,
+  schema: { parse(input: unknown): T },
+  fallback: T,
+): Promise<T> {
+  return readYamlFileDurableUnlocked(path, schema, fallback);
 }
 
 function migrateLegacyBookJob(value: unknown): BookJob {
@@ -356,31 +377,55 @@ function migrateLegacyBookJob(value: unknown): BookJob {
 }
 
 async function readBookJobCatalogFile(path: string): Promise<BookJobCatalog> {
-  try {
-    const raw = await readFile(path, "utf8");
-    const parsed = YAML.parse(raw) as { items?: unknown[] } | null;
-    const items = (parsed?.items ?? []).map((item) => migrateLegacyBookJob(item));
-    return BookJobCatalogSchema.parse({
-      schemaVersion: SchemaVersion,
-      items,
-    });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return EMPTY_BOOK_CATALOG;
-    }
-    throw error;
-  }
+  return updateYamlUnknownDurable(
+    path,
+    () => readBookJobCatalogFileUnlocked(path),
+    (current) => current,
+  );
+}
+
+async function readBookJobCatalogFileUnlocked(
+  path: string,
+): Promise<BookJobCatalog> {
+  const parsed = await readYamlUnknownDurableUnlocked(path) as {
+    items?: unknown[];
+  } | null;
+  const items = (parsed?.items ?? []).map((item) => migrateLegacyBookJob(item));
+  return BookJobCatalogSchema.parse({
+    schemaVersion: SchemaVersion,
+    items,
+  });
 }
 
 async function writeYamlFile(path: string, value: unknown): Promise<void> {
-  await ensureDir(dirname(path));
-  const tempPath = `${path}.tmp-${process.pid}-${Date.now()}`;
-  const yaml = YAML.stringify(value, {
-    indent: 2,
-    lineWidth: 88,
-  });
-  await writeFile(tempPath, yaml, "utf8");
-  await rename(tempPath, path);
+  await writeYamlFileDurable(path, value);
+}
+
+async function writeYamlFileUnlocked(
+  path: string,
+  value: unknown,
+): Promise<void> {
+  await writeYamlFileDurableUnlocked(path, value);
+}
+
+async function updateYamlFile<T>(
+  path: string,
+  schema: { parse(input: unknown): T },
+  fallback: T,
+  update: (current: T) => T | Promise<T>,
+): Promise<T> {
+  return updateYamlFileDurable(path, schema, fallback, update);
+}
+
+async function updateBookJobCatalogFile(
+  path: string,
+  update: (current: BookJobCatalog) => BookJobCatalog | Promise<BookJobCatalog>,
+): Promise<BookJobCatalog> {
+  return updateYamlUnknownDurable(
+    path,
+    () => readBookJobCatalogFileUnlocked(path),
+    update,
+  );
 }
 
 function dedupeArtifacts(
@@ -718,6 +763,34 @@ function upsertCheckpoint(
   );
 }
 
+function parsePositiveInt(value: string | undefined): number | null {
+  if (value == null || value.trim() === "") return null;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function readBatchBookLease(path: string): BatchBookLease | null {
+  if (!existsSync(path)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as BatchBookLease;
+    if (
+      typeof parsed.runId === "string" &&
+      typeof parsed.bookId === "string" &&
+      typeof parsed.fencingToken === "string" &&
+      typeof parsed.runnerSessionId === "string" &&
+      typeof parsed.runnerHost === "string" &&
+      Number.isInteger(parsed.runnerPid) &&
+      Number.isInteger(parsed.generation) &&
+      typeof parsed.expiresAt === "string"
+    ) {
+      return parsed;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 function checkpointRank(checkpoint: BookJobStageCheckpoint): number {
   if (checkpoint.status === "succeeded") return 4;
   if (checkpoint.status === "running") return 3;
@@ -1038,6 +1111,82 @@ export class FileBookJobStateRepository {
     await ensureDir(join(this.catalogDir, "runs"));
   }
 
+  private assertBatchBookLease(bookId: string): void {
+    const runId = process.env.QMD_GRAPHRAG_RUN_ID;
+    const sessionId = process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID;
+    const expectedGeneration = parsePositiveInt(
+      process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION,
+    );
+    const expectedToken = process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN;
+    if (
+      runId == null ||
+      sessionId == null ||
+      expectedGeneration == null ||
+      expectedToken == null ||
+      expectedToken === ""
+    ) {
+      return;
+    }
+    const leasePath = join(
+      this.rootDir,
+      "catalog",
+      "batch-runs",
+      runId,
+      "book-leases",
+      `${bookId}.json`,
+    );
+    const lease = readBatchBookLease(leasePath);
+    if (
+      lease == null ||
+      lease.runId !== runId ||
+      lease.bookId !== bookId ||
+      lease.runnerSessionId !== sessionId ||
+      lease.generation !== expectedGeneration ||
+      lease.fencingToken !== expectedToken ||
+      Date.parse(lease.expiresAt) <= Date.now()
+    ) {
+      throw new Error(`book lease fencing rejected stage write: ${bookId}`);
+    }
+  }
+
+  assertCurrentBatchBookLease(bookId: string): void {
+    this.assertBatchBookLease(bookId);
+  }
+
+  private async assertBatchBookLeaseForDocument(
+    documentId: string,
+    contentHash?: string,
+  ): Promise<void> {
+    const runId = process.env.QMD_GRAPHRAG_RUN_ID;
+    const sessionId = process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID;
+    const expectedGeneration = parsePositiveInt(
+      process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION,
+    );
+    const expectedToken = process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN;
+    if (
+      runId == null ||
+      sessionId == null ||
+      expectedGeneration == null ||
+      expectedToken == null ||
+      expectedToken === ""
+    ) {
+      return;
+    }
+    const catalog = await readYamlFile(
+      this.documentIdentityCatalogPath(),
+      DocumentIdentityCatalogSchema,
+      EMPTY_DOCUMENT_IDENTITY_CATALOG,
+    );
+    const identity = catalog.items.find((item) =>
+      item.documentId === documentId &&
+      (contentHash == null || item.contentHash === contentHash)
+    );
+    if (identity == null || identity.canonicalBookId == null) {
+      throw new Error(`document identity not found for fenced write: ${documentId}`);
+    }
+    this.assertBatchBookLease(identity.canonicalBookId);
+  }
+
   async registerBookSource(input: RegisterBookSourceInput): Promise<BookJob> {
     await this.ensureLayout();
     const sourcePath = resolve(input.sourcePath);
@@ -1045,6 +1194,7 @@ export class FileBookJobStateRepository {
     const sourceHash = await hashFile(sourcePath);
     const now = toIsoTimestamp();
     const bookId = buildBookIdFromSourceHash(sourceIdentityPath, sourceHash);
+    this.assertBatchBookLease(bookId);
     await this.migrateLegacyBookId(
       sourcePath,
       sourceIdentityPath,
@@ -1215,98 +1365,97 @@ export class FileBookJobStateRepository {
       }),
     });
 
-    const catalog = await readYamlFile(
+    await updateYamlFile(
       this.sourceDocumentCatalogPath(),
       SourceDocumentCatalogSchema,
       EMPTY_SOURCE_DOCUMENT_CATALOG,
+      (catalog) => {
+        const items = catalog.items.filter((item) =>
+          item.metadata?.bookId !== job.bookId
+        );
+        items.push(source);
+        items.sort((left, right) => left.sourceId.localeCompare(right.sourceId));
+        return { schemaVersion: SchemaVersion, items };
+      },
     );
-    const items = catalog.items.filter((item) =>
-      item.metadata?.bookId !== job.bookId
-    );
-    items.push(source);
-    items.sort((left, right) => left.sourceId.localeCompare(right.sourceId));
-    await writeYamlFile(this.sourceDocumentCatalogPath(), {
-      schemaVersion: SchemaVersion,
-      items,
-    });
   }
 
   private async upsertDocumentIdentityMap(job: BookJob): Promise<void> {
     const sourceId = `sha256:${job.sourceHash}`;
     const normalizedPath = job.normalizedPath;
     const contentHash = job.normalizedContentHash ?? job.sourceHash;
-    const catalog = await readYamlFile(
+    await updateYamlFile(
       this.documentIdentityCatalogPath(),
       DocumentIdentityCatalogSchema,
       EMPTY_DOCUMENT_IDENTITY_CATALOG,
-    );
-    const existingIdentity = catalog.items.find((item) =>
-      item.canonicalBookId === job.bookId &&
-      item.documentId === job.documentId
-    );
-    const preservesContentIdentity =
-      existingIdentity?.sourceId === sourceId &&
-      existingIdentity.sourceHash === job.sourceHash &&
-      existingIdentity.contentHash === contentHash;
-    const aliases = [
-      ...(existingIdentity?.aliases ?? []),
-      existingIdentity?.normalizedPath ?? null,
-      job.sourceIdentityPath,
-      metadataString(job.metadata, "sourceIdentityPath") ?? null,
-      metadataString(job.metadata, "sourceName") ?? null,
-      normalizedPath,
-    ].filter((value): value is string => !!value);
-    const metadata = mergeJobMetadata(
-      preservesContentIdentity ? existingIdentity.metadata : undefined,
-      {
-        ...job.metadata,
-        bookId: job.bookId,
-        sourceIdentityPath: job.sourceIdentityPath,
-        normalizedPath: normalizedPath ?? null,
+      (catalog) => {
+        const existingIdentity = catalog.items.find((item) =>
+          item.canonicalBookId === job.bookId &&
+          item.documentId === job.documentId
+        );
+        const preservesContentIdentity =
+          existingIdentity?.sourceId === sourceId &&
+          existingIdentity.sourceHash === job.sourceHash &&
+          existingIdentity.contentHash === contentHash;
+        const aliases = [
+          ...(existingIdentity?.aliases ?? []),
+          existingIdentity?.normalizedPath ?? null,
+          job.sourceIdentityPath,
+          metadataString(job.metadata, "sourceIdentityPath") ?? null,
+          metadataString(job.metadata, "sourceName") ?? null,
+          normalizedPath,
+        ].filter((value): value is string => !!value);
+        const metadata = mergeJobMetadata(
+          preservesContentIdentity ? existingIdentity.metadata : undefined,
+          {
+            ...job.metadata,
+            bookId: job.bookId,
+            sourceIdentityPath: job.sourceIdentityPath,
+            normalizedPath: normalizedPath ?? null,
+          },
+        );
+        const preservedProjectionMetadata = preserveMetadataKeys(
+          metadata,
+          preservesContentIdentity ? existingIdentity.metadata : undefined,
+          [
+            "qmdCorpusRegistered",
+            "qmdCollection",
+            "qmdRelativePath",
+            "qmdChunkCount",
+            "graphDocumentId",
+            "graphTextUnitCount",
+          ],
+        );
+        const identity = DocumentIdentityMapSchema.parse({
+          schemaVersion: SchemaVersion,
+          sourceId,
+          sourceHash: job.sourceHash,
+          canonicalBookId: job.bookId,
+          documentId: job.documentId,
+          contentHash,
+          normalizationPolicyVersion:
+            job.normalizationPolicyVersion ?? NormalizationPolicyVersion,
+          normalizedPath,
+          chunkIds: preservesContentIdentity ? existingIdentity.chunkIds : [],
+          ...(preservesContentIdentity && existingIdentity.graphDocumentId
+            ? { graphDocumentId: existingIdentity.graphDocumentId }
+            : {}),
+          ...(preservesContentIdentity && existingIdentity.graphTextUnitIds
+            ? { graphTextUnitIds: existingIdentity.graphTextUnitIds }
+            : {}),
+          aliases: [...new Set(aliases)],
+          metadata: preservedProjectionMetadata,
+        });
+        const items = catalog.items.filter((item) =>
+          item.canonicalBookId !== job.bookId
+        );
+        items.push(identity);
+        items.sort((left, right) =>
+          left.documentId.localeCompare(right.documentId)
+        );
+        return { schemaVersion: SchemaVersion, items };
       },
     );
-    const preservedProjectionMetadata = preserveMetadataKeys(
-      metadata,
-      preservesContentIdentity ? existingIdentity.metadata : undefined,
-      [
-        "qmdCorpusRegistered",
-        "qmdCollection",
-        "qmdRelativePath",
-        "qmdChunkCount",
-        "graphDocumentId",
-        "graphTextUnitCount",
-      ],
-    );
-    const identity = DocumentIdentityMapSchema.parse({
-      schemaVersion: SchemaVersion,
-      sourceId,
-      sourceHash: job.sourceHash,
-      canonicalBookId: job.bookId,
-      documentId: job.documentId,
-      contentHash,
-      normalizationPolicyVersion:
-        job.normalizationPolicyVersion ?? NormalizationPolicyVersion,
-      normalizedPath,
-      chunkIds: preservesContentIdentity ? existingIdentity.chunkIds : [],
-      ...(preservesContentIdentity && existingIdentity.graphDocumentId
-        ? { graphDocumentId: existingIdentity.graphDocumentId }
-        : {}),
-      ...(preservesContentIdentity && existingIdentity.graphTextUnitIds
-        ? { graphTextUnitIds: existingIdentity.graphTextUnitIds }
-        : {}),
-      aliases: [...new Set(aliases)],
-      metadata: preservedProjectionMetadata,
-    });
-
-    const items = catalog.items.filter((item) =>
-      item.canonicalBookId !== job.bookId
-    );
-    items.push(identity);
-    items.sort((left, right) => left.documentId.localeCompare(right.documentId));
-    await writeYamlFile(this.documentIdentityCatalogPath(), {
-      schemaVersion: SchemaVersion,
-      items,
-    });
   }
 
   async recordGraphTextUnitIdentity(
@@ -1314,52 +1463,55 @@ export class FileBookJobStateRepository {
   ): Promise<void> {
     await this.ensureLayout();
     const parsed = GraphTextUnitIdentityMapSchema.parse(input);
-    const catalog = await readYamlFile(
+    this.assertBatchBookLease(parsed.bookId);
+    await updateYamlFile(
       this.documentIdentityCatalogPath(),
       DocumentIdentityCatalogSchema,
       EMPTY_DOCUMENT_IDENTITY_CATALOG,
+      (catalog) => {
+        const items = catalog.items.map((item) => {
+          const matchesIdentity =
+            item.canonicalBookId === parsed.bookId &&
+            item.sourceId === parsed.sourceId &&
+            item.sourceHash === parsed.sourceHash &&
+            item.documentId === parsed.documentId &&
+            item.contentHash === parsed.contentHash;
+          if (!matchesIdentity) return item;
+          return DocumentIdentityMapSchema.parse({
+            ...item,
+            normalizedPath: parsed.normalizedPath,
+            graphDocumentId: parsed.graphDocumentId,
+            graphTextUnitIds: parsed.graphTextUnitIds,
+            metadata: mergeJobMetadata(item.metadata, {
+              graphDocumentId: parsed.graphDocumentId,
+              graphTextUnitCount: parsed.graphTextUnitIds.length,
+            }),
+          });
+        });
+        const matched = items.some((item) =>
+          item.canonicalBookId === parsed.bookId &&
+          item.sourceId === parsed.sourceId &&
+          item.sourceHash === parsed.sourceHash &&
+          item.documentId === parsed.documentId &&
+          item.contentHash === parsed.contentHash &&
+          item.graphDocumentId === parsed.graphDocumentId
+        );
+        if (!matched) {
+          throw new Error(
+            `document identity not found for graph text units: ${
+              parsed.documentId
+            }`,
+          );
+        }
+        return { schemaVersion: SchemaVersion, items };
+      },
     );
-    const items = catalog.items.map((item) => {
-      const matchesIdentity =
-        item.canonicalBookId === parsed.bookId &&
-        item.sourceId === parsed.sourceId &&
-        item.sourceHash === parsed.sourceHash &&
-        item.documentId === parsed.documentId &&
-        item.contentHash === parsed.contentHash;
-      if (!matchesIdentity) return item;
-      return DocumentIdentityMapSchema.parse({
-        ...item,
-        normalizedPath: parsed.normalizedPath,
-        graphDocumentId: parsed.graphDocumentId,
-        graphTextUnitIds: parsed.graphTextUnitIds,
-        metadata: mergeJobMetadata(item.metadata, {
-          graphDocumentId: parsed.graphDocumentId,
-          graphTextUnitCount: parsed.graphTextUnitIds.length,
-        }),
-      });
-    });
-    const matched = items.some((item) =>
-      item.canonicalBookId === parsed.bookId &&
-      item.sourceId === parsed.sourceId &&
-      item.sourceHash === parsed.sourceHash &&
-      item.documentId === parsed.documentId &&
-      item.contentHash === parsed.contentHash &&
-      item.graphDocumentId === parsed.graphDocumentId
-    );
-    if (!matched) {
-      throw new Error(
-        `document identity not found for graph text units: ${parsed.documentId}`,
-      );
-    }
-    await writeYamlFile(this.documentIdentityCatalogPath(), {
-      schemaVersion: SchemaVersion,
-      items,
-    });
   }
 
   async remapBookIdentity(oldBookId: string, newBookId: string): Promise<void> {
     await this.ensureLayout();
     if (oldBookId === newBookId) return;
+    this.assertBatchBookLease(newBookId);
 
     const oldDir = this.bookDir(oldBookId);
     const newDir = this.bookDir(newBookId);
@@ -1550,75 +1702,78 @@ export class FileBookJobStateRepository {
 
   async recordDocumentChunks(input: RecordDocumentChunksInput): Promise<void> {
     await this.ensureLayout();
+    await this.assertBatchBookLeaseForDocument(input.documentId, input.contentHash);
     if (input.chunkIds.length === 0) {
       throw new Error(`document chunks cannot be empty: ${input.documentId}`);
     }
-    const catalog = await readYamlFile(
+    await updateYamlFile(
       this.documentIdentityCatalogPath(),
       DocumentIdentityCatalogSchema,
       EMPTY_DOCUMENT_IDENTITY_CATALOG,
+      (catalog) => {
+        let matched = false;
+        const items = catalog.items.map((item) => {
+          const matchesIdentity =
+            item.documentId === input.documentId &&
+            item.contentHash === input.contentHash;
+          if (!matchesIdentity) return item;
+          matched = true;
+          return DocumentIdentityMapSchema.parse({
+            ...item,
+            chunkIds: input.chunkIds,
+            metadata: mergeJobMetadata(item.metadata, {
+              qmdChunkCount: input.chunkIds.length,
+            }),
+          });
+        });
+        if (!matched) {
+          throw new Error(
+            `document identity not found for chunks: ${input.documentId}`,
+          );
+        }
+        return { schemaVersion: SchemaVersion, items };
+      },
     );
-    let matched = false;
-    const items = catalog.items.map((item) => {
-      const matchesIdentity =
-        item.documentId === input.documentId &&
-        item.contentHash === input.contentHash;
-      if (!matchesIdentity) return item;
-      matched = true;
-      return DocumentIdentityMapSchema.parse({
-        ...item,
-        chunkIds: input.chunkIds,
-        metadata: mergeJobMetadata(item.metadata, {
-          qmdChunkCount: input.chunkIds.length,
-        }),
-      });
-    });
-    if (!matched) {
-      throw new Error(`document identity not found for chunks: ${input.documentId}`);
-    }
-    await writeYamlFile(this.documentIdentityCatalogPath(), {
-      schemaVersion: SchemaVersion,
-      items,
-    });
   }
 
   async recordQmdCorpusRegistration(
     input: RecordQmdCorpusRegistrationInput,
   ): Promise<void> {
     await this.ensureLayout();
+    await this.assertBatchBookLeaseForDocument(input.documentId, input.contentHash);
     const relativePath = normalizePortableVaultRelativePath(input.relativePath);
-    const catalog = await readYamlFile(
+    await updateYamlFile(
       this.documentIdentityCatalogPath(),
       DocumentIdentityCatalogSchema,
       EMPTY_DOCUMENT_IDENTITY_CATALOG,
+      (catalog) => {
+        let matched = false;
+        const items = catalog.items.map((item) => {
+          const matchesIdentity =
+            item.documentId === input.documentId &&
+            item.contentHash === input.contentHash;
+          if (!matchesIdentity) return item;
+          matched = true;
+          return DocumentIdentityMapSchema.parse({
+            ...item,
+            metadata: mergeJobMetadata(item.metadata, {
+              qmdCorpusRegistered: true,
+              qmdCollection: input.collection,
+              qmdRelativePath: relativePath,
+              ...(input.metadata ?? {}),
+            }),
+          });
+        });
+        if (!matched) {
+          throw new Error(
+            `document identity not found for qmd corpus registration: ${
+              input.documentId
+            }`,
+          );
+        }
+        return { schemaVersion: SchemaVersion, items };
+      },
     );
-    let matched = false;
-    const items = catalog.items.map((item) => {
-      const matchesIdentity =
-        item.documentId === input.documentId &&
-        item.contentHash === input.contentHash;
-      if (!matchesIdentity) return item;
-      matched = true;
-      return DocumentIdentityMapSchema.parse({
-        ...item,
-        metadata: mergeJobMetadata(item.metadata, {
-          qmdCorpusRegistered: true,
-          qmdCollection: input.collection,
-          qmdRelativePath: relativePath,
-        }),
-      });
-    });
-    if (!matched) {
-      throw new Error(
-        `document identity not found for qmd corpus registration: ${
-          input.documentId
-        }`,
-      );
-    }
-    await writeYamlFile(this.documentIdentityCatalogPath(), {
-      schemaVersion: SchemaVersion,
-      items,
-    });
   }
 
   async upsertBookJob(job: BookJob): Promise<BookJob> {
@@ -1632,28 +1787,23 @@ export class FileBookJobStateRepository {
         : normalizePortableVaultRelativePath(job.normalizedPath),
       metadata: sanitizeVaultMetadata(job.metadata),
     });
+    this.assertBatchBookLease(parsed.bookId);
     await writeYamlFile(this.bookJobPath(parsed.bookId), parsed);
 
-    const catalog = await readBookJobCatalogFile(this.bookCatalogPath());
-    const items = catalog.items.filter((item) => item.bookId !== parsed.bookId);
-    items.push(parsed);
-    items.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-    await writeYamlFile(this.bookCatalogPath(), {
-      schemaVersion: SchemaVersion,
-      items,
+    await updateBookJobCatalogFile(this.bookCatalogPath(), (catalog) => {
+      const items = catalog.items.filter((item) => item.bookId !== parsed.bookId);
+      items.push(parsed);
+      items.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+      return { schemaVersion: SchemaVersion, items };
     });
 
     return parsed;
   }
 
   async getBookJob(bookId: string): Promise<BookJob | null> {
-    try {
-      const raw = await readFile(this.bookJobPath(bookId), "utf8");
-      return migrateLegacyBookJob(YAML.parse(raw));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-      throw error;
-    }
+    return readYamlFile(this.bookJobPath(bookId), {
+      parse: migrateLegacyBookJob,
+    }, null);
   }
 
   async buildGraphEnhancementRequest(
@@ -1990,6 +2140,7 @@ export class FileBookJobStateRepository {
     inputs: RecordArtifactInput[],
   ): Promise<BookArtifactManifest[]> {
     await this.ensureLayout();
+    this.assertBatchBookLease(bookId);
     const existing = await this.listArtifacts(bookId);
     const job = await this.getBookJob(bookId);
     const now = toIsoTimestamp();
@@ -2082,29 +2233,33 @@ export class FileBookJobStateRepository {
       errorSummary: sanitizeVaultText(record.errorSummary),
       metadata: sanitizeVaultMetadata(record.metadata),
     });
+    this.assertBatchBookLease(parsed.bookId);
     await writeYamlFile(this.runRecordPath(parsed.bookId, parsed.runId), parsed);
 
-    const catalog = await readYamlFile(
+    await updateYamlFile(
       this.runCatalogPath(),
       BookJobRunCatalogSchema,
       EMPTY_RUN_CATALOG,
+      (catalog) => {
+        const item = BookJobRunCatalogEntrySchema.parse({
+          schemaVersion: SchemaVersion,
+          runId: parsed.runId,
+          bookId: parsed.bookId,
+          stage: parsed.stage,
+          status: parsed.status,
+          startedAt: parsed.startedAt,
+          finishedAt: parsed.finishedAt,
+        });
+        const items = catalog.items.filter((entry) =>
+          entry.runId !== parsed.runId
+        );
+        items.push(item);
+        items.sort((left, right) =>
+          right.startedAt.localeCompare(left.startedAt)
+        );
+        return { schemaVersion: SchemaVersion, items };
+      },
     );
-    const item = BookJobRunCatalogEntrySchema.parse({
-      schemaVersion: SchemaVersion,
-      runId: parsed.runId,
-      bookId: parsed.bookId,
-      stage: parsed.stage,
-      status: parsed.status,
-      startedAt: parsed.startedAt,
-      finishedAt: parsed.finishedAt,
-    });
-    const items = catalog.items.filter((entry) => entry.runId !== parsed.runId);
-    items.push(item);
-    items.sort((left, right) => right.startedAt.localeCompare(left.startedAt));
-    await writeYamlFile(this.runCatalogPath(), {
-      schemaVersion: SchemaVersion,
-      items,
-    });
     return parsed;
   }
 
@@ -2255,61 +2410,72 @@ export class FileBookJobStateRepository {
     await this.rewriteLegacyRunRecords(bookId, artifactIdMap);
     await this.removeLegacyBookCatalogEntries(oldBookId, bookId);
 
-    const catalog = await readYamlFile(
+    await updateYamlFile(
       this.runCatalogPath(),
       BookJobRunCatalogSchema,
       EMPTY_RUN_CATALOG,
+      (catalog) => {
+        if (!catalog.items.some((item) => item.bookId === oldBookId)) {
+          return catalog;
+        }
+        return {
+          schemaVersion: SchemaVersion,
+          items: catalog.items.map((item) =>
+            item.bookId === oldBookId ? { ...item, bookId } : item
+          ),
+        };
+      },
     );
-    if (catalog.items.some((item) => item.bookId === oldBookId)) {
-      await writeYamlFile(this.runCatalogPath(), {
-        schemaVersion: SchemaVersion,
-        items: catalog.items.map((item) =>
-          item.bookId === oldBookId ? { ...item, bookId } : item,
-        ),
-      });
-    }
   }
 
   private async rewriteLegacyCatalogReferences(
     oldBookId: string,
     newBookId: string,
   ): Promise<void> {
-    const sources = await readYamlFile(
+    await updateYamlFile(
       this.sourceDocumentCatalogPath(),
       SourceDocumentCatalogSchema,
       EMPTY_SOURCE_DOCUMENT_CATALOG,
+      (sources) => {
+        if (!sources.items.some((item) => item.metadata?.bookId === oldBookId)) {
+          return sources;
+        }
+        return {
+          schemaVersion: SchemaVersion,
+          items: sources.items.map((item) => ({
+            ...item,
+            metadata: mergeJobMetadata(item.metadata, { bookId: newBookId }),
+          })),
+        };
+      },
     );
-    if (sources.items.some((item) => item.metadata?.bookId === oldBookId)) {
-      await writeYamlFile(this.sourceDocumentCatalogPath(), {
-        schemaVersion: SchemaVersion,
-        items: sources.items.map((item) => ({
-          ...item,
-          metadata: mergeJobMetadata(item.metadata, { bookId: newBookId }),
-        })),
-      });
-    }
 
-    const identities = await readYamlFile(
+    await updateYamlFile(
       this.documentIdentityCatalogPath(),
       DocumentIdentityCatalogSchema,
       EMPTY_DOCUMENT_IDENTITY_CATALOG,
-    );
-    if (identities.items.some((item) => item.canonicalBookId === oldBookId)) {
-      await writeYamlFile(this.documentIdentityCatalogPath(), {
-        schemaVersion: SchemaVersion,
-        items: dedupeDocumentIdentityMaps(
-          identities.items.map((item) =>
-            item.canonicalBookId === oldBookId
-              ? DocumentIdentityMapSchema.parse({
-                  ...item,
-                  canonicalBookId: newBookId,
-                  metadata: mergeJobMetadata(item.metadata, { bookId: newBookId }),
-                })
-              : item,
+      (identities) => {
+        if (!identities.items.some((item) => item.canonicalBookId === oldBookId)) {
+          return identities;
+        }
+        return {
+          schemaVersion: SchemaVersion,
+          items: dedupeDocumentIdentityMaps(
+            identities.items.map((item) =>
+              item.canonicalBookId === oldBookId
+                ? DocumentIdentityMapSchema.parse({
+                    ...item,
+                    canonicalBookId: newBookId,
+                    metadata: mergeJobMetadata(item.metadata, {
+                      bookId: newBookId,
+                    }),
+                  })
+                : item
+            ),
           ),
-        ),
-      });
-    }
+        };
+      },
+    );
 
     await this.rewriteRunCatalogBookId(oldBookId, newBookId);
   }
@@ -2350,35 +2516,33 @@ export class FileBookJobStateRepository {
     oldBookId: string,
     newBookId: string,
   ): Promise<void> {
-    const catalog = await readYamlFile(
+    await updateYamlFile(
       this.runCatalogPath(),
       BookJobRunCatalogSchema,
       EMPTY_RUN_CATALOG,
+      (catalog) => {
+        if (!catalog.items.some((item) => item.bookId === oldBookId)) {
+          return catalog;
+        }
+        return {
+          schemaVersion: SchemaVersion,
+          items: catalog.items.map((item) =>
+            item.bookId === oldBookId ? { ...item, bookId: newBookId } : item
+          ),
+        };
+      },
     );
-    if (!catalog.items.some((item) => item.bookId === oldBookId)) {
-      return;
-    }
-
-    await writeYamlFile(this.runCatalogPath(), {
-      schemaVersion: SchemaVersion,
-      items: catalog.items.map((item) =>
-        item.bookId === oldBookId ? { ...item, bookId: newBookId } : item,
-      ),
-    });
   }
 
   private async removeLegacyBookCatalogEntries(
     oldBookId: string,
     newBookId: string,
   ): Promise<void> {
-    const catalog = await readBookJobCatalogFile(this.bookCatalogPath());
-    const items = catalog.items.filter((item) => item.bookId !== oldBookId);
-    if (items.length !== catalog.items.length) {
-      await writeYamlFile(this.bookCatalogPath(), {
-        schemaVersion: SchemaVersion,
-        items,
-      });
-    }
+    await updateBookJobCatalogFile(this.bookCatalogPath(), (catalog) => {
+      const items = catalog.items.filter((item) => item.bookId !== oldBookId);
+      if (items.length === catalog.items.length) return catalog;
+      return { schemaVersion: SchemaVersion, items };
+    });
   }
 
   private async buildArtifactValidity(
@@ -2814,6 +2978,7 @@ export class FileBookJobStateRepository {
     input: WriteStageCheckpointInput,
   ): Promise<BookJobStageCheckpoint> {
     await this.ensureLayout();
+    this.assertBatchBookLease(input.bookId);
     const existing = await this.getStageCheckpoint(input.bookId, input.stage);
     const now = toIsoTimestamp();
     const job = await this.getBookJob(input.bookId);
@@ -3036,7 +3201,12 @@ export class FileBookJobStateRepository {
         kind: "community_reports" as const,
       },
     ]) {
-      await recordGraphCapability(this.rootDir, capability);
+      this.assertCurrentBatchBookLease(job.bookId);
+      await recordGraphCapability(this.rootDir, capability, {
+        beforeCommit: () => this.assertCurrentBatchBookLease(job.bookId),
+        afterCommit: () => this.assertCurrentBatchBookLease(job.bookId),
+      });
+      this.assertCurrentBatchBookLease(job.bookId);
     }
   }
 

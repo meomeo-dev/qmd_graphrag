@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -12,8 +12,10 @@ import {
   rmSync,
   renameSync,
   statSync,
+  fsyncSync,
   closeSync,
   readSync,
+  writeSync,
   writeFileSync,
   unlinkSync,
 } from "node:fs";
@@ -70,6 +72,10 @@ const { values } = parseArgs({
     "command-timeout-seconds": { type: "string", default: "21600" },
     "completed-manifest": { type: "string" },
     "heartbeat-interval-seconds": { type: "string", default: "30" },
+    "book-concurrency": { type: "string", default: "2" },
+    "openai-provider-concurrency": { type: "string", default: "1" },
+    "jina-provider-concurrency": { type: "string", default: "2" },
+    "local-cpu-concurrency": { type: "string", default: "2" },
     "migrate-only": { type: "boolean", default: false },
     "status-json": { type: "boolean", default: false },
     "skip-dotenv": { type: "boolean", default: false },
@@ -128,16 +134,434 @@ const heartbeatIntervalSeconds = Math.max(
   1,
   Number.parseInt(String(values["heartbeat-interval-seconds"]), 10) || 30,
 );
+const bookConcurrency = Math.max(
+  1,
+  Number.parseInt(String(values["book-concurrency"]), 10) || 2,
+);
+const openaiProviderConcurrency = Math.max(
+  1,
+  Number.parseInt(String(values["openai-provider-concurrency"]), 10) || 1,
+);
+const jinaProviderConcurrency = Math.max(
+  1,
+  Number.parseInt(String(values["jina-provider-concurrency"]), 10) || 2,
+);
+const localCpuConcurrency = Math.max(
+  1,
+  Number.parseInt(String(values["local-cpu-concurrency"]), 10) || 2,
+);
 const runnerHost = hostname();
 const runnerPid = process.pid;
 const runnerSessionId = randomUUID();
 const runnerHeartbeatTtlSeconds = Math.max(commandTimeoutSeconds * 2, 3600);
 const jsonFileLockStaleMs = 120000;
+const configuredJsonFileLockWaitMs = Number.parseInt(
+  process.env.QMD_GRAPHRAG_TEST_JSON_FILE_LOCK_WAIT_MS ?? "",
+  10,
+);
+const configuredDurableTempStaleMs = Number.parseInt(
+  process.env.QMD_GRAPHRAG_TEST_DURABLE_TEMP_STALE_MS ?? "",
+  10,
+);
+const testHooksEnabled = process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS === "1";
+const testRenameEnoentOncePattern = testHooksEnabled
+  ? process.env.QMD_GRAPHRAG_TEST_RENAME_ENOENT_ONCE_PATTERN ?? ""
+  : "";
+const testSkipRunnerStartPreflight = testHooksEnabled &&
+  process.env.QMD_GRAPHRAG_TEST_SKIP_RUNNER_START_PREFLIGHT === "1";
+const testTempIdOncePattern = testHooksEnabled
+  ? process.env.QMD_GRAPHRAG_TEST_TEMP_ID_ONCE_PATTERN ?? ""
+  : "";
+const testTempIdOnceValue = testHooksEnabled
+  ? process.env.QMD_GRAPHRAG_TEST_TEMP_ID_ONCE_VALUE ?? ""
+  : "";
+const testDirectoryFsyncFailurePattern = testHooksEnabled
+  ? process.env.QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_PATTERN ?? ""
+  : "";
+const testDirectoryFsyncFailureAfterMatches = testHooksEnabled
+  ? Math.max(
+      0,
+      Number.parseInt(
+        process.env.QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_AFTER_MATCHES ??
+          "0",
+        10,
+      ) || 0,
+    )
+  : 0;
+const testRenameEnoentAfterMatches = testHooksEnabled
+  ? Math.max(
+      0,
+      Number.parseInt(
+        process.env.QMD_GRAPHRAG_TEST_RENAME_ENOENT_AFTER_MATCHES ?? "0",
+        10,
+      ) || 0,
+    )
+  : 0;
+let testRenameEnoentInjected = false;
+let testRenameEnoentMatchCount = 0;
+let testTempIdInjected = false;
+let testDirectoryFsyncFailureInjected = false;
+let testDirectoryFsyncFailureMatchCount = 0;
+const jsonFileLockWaitMs = testHooksEnabled &&
+  Number.isInteger(configuredJsonFileLockWaitMs) &&
+  configuredJsonFileLockWaitMs > 0
+  ? configuredJsonFileLockWaitMs
+  : Math.max(jsonFileLockStaleMs * 2, 300000);
+const durableReleaseOn = ["commit", "error", "cancellation", "lease_loss", "timeout"];
+const durableDefaultLaneTimeoutMs = 120000;
+const durableTempStaleMs = testHooksEnabled &&
+  Number.isInteger(configuredDurableTempStaleMs) &&
+  configuredDurableTempStaleMs >= 0
+  ? configuredDurableTempStaleMs
+  : 24 * 60 * 60 * 1000;
+const durableAdapterContract = Object.freeze({
+  schemaVersion: "1.0.0",
+  boundary: "runner-equivalent-durable-state-store",
+  sharedModule: "src/job-state/durable-state-store.ts",
+  guarantees: [
+    "targetMapping",
+    "exclusiveTempCreate",
+    "ownerEvidence",
+    "checksumCommitMeta",
+    "targetGenerationFence",
+    "guardedLockRelease",
+    "preflightReconcile",
+    "localStateFailureProjection",
+  ],
+});
+const statusJsonDurableDiagnostics = [];
+const providerRequestStartupScanLimit = 200;
+const providerRequestStartupSampleLimit = 10;
+const providerSlotAcquireWaitMs = Math.max(jsonFileLockWaitMs, 300000);
+const qmdIndexFileLockStaleMs = 120000;
+const qmdIndexFileLockWaitMs = Math.max(qmdIndexFileLockStaleMs * 2, 300000);
 const failFast = Boolean(values["fail-fast"]);
 const migrateOnly = Boolean(values["migrate-only"]);
 const statusJson = Boolean(values["status-json"]);
 const initialEnvNames = new Set(Object.keys(process.env));
 const extraExactRedactions = new Map();
+let coordinatorLease = null;
+let coordinatorHeartbeatTimer = null;
+let eventSequence = 0;
+let batchStopRequested = false;
+let batchStopReason = null;
+let terminationSignalHandling = false;
+const activeChildProcesses = new Map();
+let durableOperationContext = null;
+const heldJsonFileLocks = new Map();
+
+const durableTargetMappingTable = [
+  {
+    pattern: /^graph_vault\/catalog\/books\.yaml$/,
+    lane: "catalogWriterLane",
+    durableKind: "yaml",
+    targetMappingOwner: "repository",
+    preflightScopes: [{ path: "graph_vault/catalog" }],
+  },
+  {
+    pattern: /^graph_vault\/catalog\/runs\.yaml$/,
+    lane: "catalogWriterLane",
+    durableKind: "yaml",
+    targetMappingOwner: "repository",
+    preflightScopes: [{ path: "graph_vault/catalog" }],
+  },
+  {
+    pattern: /^graph_vault\/catalog\/sources\.yaml$/,
+    lane: "catalogWriterLane",
+    durableKind: "yaml",
+    targetMappingOwner: "repository",
+    preflightScopes: [{ path: "graph_vault/catalog" }],
+  },
+  {
+    pattern: /^graph_vault\/catalog\/document-identity-map\.yaml$/,
+    lane: "catalogWriterLane",
+    durableKind: "yaml",
+    targetMappingOwner: "repository",
+    preflightScopes: [{ path: "graph_vault/catalog" }],
+  },
+  {
+    pattern: /^graph_vault\/catalog\/graph-capabilities\.yaml$/,
+    lane: "catalogWriterLane",
+    durableKind: "yaml",
+    targetMappingOwner: "capabilityCatalog",
+    preflightScopes: [{ path: "graph_vault/catalog" }],
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/(?:job|artifacts|checkpoints)\.yaml$/,
+    lane: "checkpointWriterLane",
+    durableKind: "yaml",
+    targetMappingOwner: "repository",
+    preflightScopes: [{ path: "graph_vault/books/{bookId}" }],
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/runs\/[^/]+\.yaml$/,
+    lane: "checkpointWriterLane",
+    durableKind: "yaml",
+    targetMappingOwner: "repository",
+    preflightScopes: [{ path: "graph_vault/books/{bookId}/runs" }],
+  },
+  {
+    pattern: /^graph_vault\/settings\.yaml$/,
+    lane: "catalogWriterLane",
+    durableKind: "yaml",
+    targetMappingOwner: "settingsProjection",
+    preflightScopes: [{ path: "graph_vault" }],
+  },
+  {
+    pattern: /^graph_vault\/catalog\/batch-runs\/[^/]+\/items\/[^/]+\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "batchCoordinator",
+    preflightScopes: [{ path: "graph_vault/catalog/batch-runs/{runId}/items" }],
+  },
+  {
+    pattern: /^graph_vault\/catalog\/batch-runs\/[^/]+\/manifest\.json$/,
+    lane: "manifestWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "batchCoordinator",
+    preflightScopes: [{ path: "graph_vault/catalog/batch-runs/{runId}" }],
+  },
+  {
+    pattern: /^graph_vault\/catalog\/batch-runs\/[^/]+\/events\.jsonl$/,
+    lane: "eventWriterLane",
+    durableKind: "jsonl",
+    targetMappingOwner: "batchCoordinator",
+    preflightScopes: [{ path: "graph_vault/catalog/batch-runs/{runId}" }],
+  },
+  {
+    pattern: /^graph_vault\/catalog\/batch-runs\/[^/]+\/status\.json$/,
+    lane: "manifestWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "batchCoordinator",
+    preflightScopes: [{ path: "graph_vault/catalog/batch-runs/{runId}" }],
+  },
+  {
+    pattern: /^graph_vault\/catalog\/batch-runs\/[^/]+\/recovery-summary\.json$/,
+    lane: "manifestWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "batchCoordinator",
+    preflightScopes: [{ path: "graph_vault/catalog/batch-runs/{runId}" }],
+  },
+  {
+    pattern: /^graph_vault\/catalog\/batch-runs\/[^/]+\/coordinator-lock\.json$/,
+    lane: "manifestWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "batchCoordinator",
+    preflightScopes: [{ path: "graph_vault/catalog/batch-runs/{runId}" }],
+  },
+  {
+    pattern: /^graph_vault\/catalog\/batch-runs\/[^/]+\/provider-slots\/[^/]+\.json$/,
+    lane: "manifestWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "batchCoordinator",
+    preflightScopes: [
+      { path: "graph_vault/catalog/batch-runs/{runId}/provider-slots" },
+    ],
+  },
+  {
+    pattern: /^graph_vault\/catalog\/batch-runs\/[^/]+\/subprocesses\/[^/]+\.json$/,
+    lane: "manifestWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "batchCoordinator",
+    preflightScopes: [
+      { path: "graph_vault/catalog/batch-runs/{runId}/subprocesses" },
+    ],
+  },
+  {
+    pattern: /^graph_vault\/catalog\/batch-runs\/[^/]+\/book-leases\/[^/]+\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "batchCoordinator",
+    preflightScopes: [
+      { path: "graph_vault/catalog/batch-runs/{runId}/book-leases" },
+    ],
+  },
+  {
+    pattern: /^graph_vault\/catalog\/provider-requests\/[^/]+\.json$/,
+    lane: "catalogWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "providerRequestFingerprint",
+    targetFamily: "provider_request_fingerprint",
+    startupCriticality: "historical_observation",
+    runnerStartPreflightMode: "read_only_capped_diagnostic",
+    normalRunnerPrimaryQuarantine: false,
+    preflightScopes: [{ path: "graph_vault/catalog/provider-requests" }],
+  },
+  {
+    pattern: /^graph_vault\/catalog\/cost-accounting\.jsonl$/,
+    lane: "eventWriterLane",
+    durableKind: "jsonl",
+    targetMappingOwner: "providerCostAccounting",
+    preflightScopes: [{ path: "graph_vault/catalog" }],
+  },
+  {
+    pattern: /^graph_vault\/dspy\/.+\.yaml$/,
+    lane: "catalogWriterLane",
+    durableKind: "yaml",
+    targetMappingOwner: "dspyPolicyStore",
+    preflightScopes: [{ path: "graph_vault/dspy", recursive: true }],
+  },
+  {
+    pattern: /^graph_vault\/dspy\/.+\.json$/,
+    lane: "catalogWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "dspyPolicyStore",
+    preflightScopes: [{ path: "graph_vault/dspy", recursive: true }],
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/qmd\/qmd_build_manifest\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "qmd",
+    preflightScopes: [{ path: "graph_vault/books/{bookId}/qmd" }],
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/output\/qmd_output_manifest\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "graphOutputProducer",
+    preflightScopes: [
+      { path: "graph_vault/books/{bookId}/output", recursive: true },
+    ],
+  },
+  {
+    pattern:
+      /^graph_vault\/books\/[^/]+\/output\/qmd_graph_text_unit_identity\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "graphOutputProducer",
+    preflightScopes: [
+      { path: "graph_vault/books/{bookId}/output", recursive: true },
+    ],
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/output\/context\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "graphOutputProducer",
+    preflightScopes: [
+      { path: "graph_vault/books/{bookId}/output", recursive: true },
+    ],
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/output\/stats\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "graphOutputProducer",
+    preflightScopes: [
+      { path: "graph_vault/books/{bookId}/output", recursive: true },
+    ],
+  },
+  {
+    pattern:
+      /^graph_vault\/books\/[^/]+\/output\/lancedb\/[^/]+\.lance\/qmd_row_count\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "artifactValidation",
+    preflightScopes: [
+      { path: "graph_vault/books/{bookId}/output", recursive: true },
+    ],
+  },
+  {
+    pattern: /^graph_vault\/output\/lancedb\/[^/]+\.lance\/qmd_row_count\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "artifactValidation",
+    preflightScopes: [{ path: "graph_vault/output", recursive: true }],
+  },
+  {
+    pattern: /(?:^|\/)\.qmd\/index\.sqlite$/,
+    lane: "qmdIndexWriterLane",
+    durableKind: "sqlite",
+    targetMappingOwner: "qmd",
+    preflightScopes: [],
+  },
+  {
+    pattern: /(?:^|\/)index\.sqlite$/,
+    lane: "qmdIndexWriterLane",
+    durableKind: "sqlite",
+    targetMappingOwner: "qmd",
+    preflightScopes: [],
+  },
+];
+
+const durableDirectoryFsyncScopeTable = [
+  {
+    pattern: /^graph_vault$/,
+    lane: "catalogWriterLane",
+    targetMappingOwner: "settingsProjection",
+  },
+  {
+    pattern: /^graph_vault\/catalog$/,
+    lane: "catalogWriterLane",
+    targetMappingOwner: "repository",
+  },
+  {
+    pattern: /^graph_vault\/catalog\/provider-requests$/,
+    lane: "catalogWriterLane",
+    targetMappingOwner: "providerRequestFingerprint",
+  },
+  {
+    pattern: /^graph_vault\/catalog\/batch-runs\/[^/]+$/,
+    lane: "manifestWriterLane",
+    targetMappingOwner: "batchCoordinator",
+  },
+  {
+    pattern: /^graph_vault\/catalog\/batch-runs\/[^/]+\/items$/,
+    lane: "checkpointWriterLane",
+    targetMappingOwner: "batchCoordinator",
+  },
+  {
+    pattern: /^graph_vault\/catalog\/batch-runs\/[^/]+\/provider-slots$/,
+    lane: "manifestWriterLane",
+    targetMappingOwner: "batchCoordinator",
+  },
+  {
+    pattern: /^graph_vault\/catalog\/batch-runs\/[^/]+\/subprocesses$/,
+    lane: "manifestWriterLane",
+    targetMappingOwner: "batchCoordinator",
+  },
+  {
+    pattern: /^graph_vault\/catalog\/batch-runs\/[^/]+\/book-leases$/,
+    lane: "checkpointWriterLane",
+    targetMappingOwner: "batchCoordinator",
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+$/,
+    lane: "checkpointWriterLane",
+    targetMappingOwner: "repository",
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/runs$/,
+    lane: "checkpointWriterLane",
+    targetMappingOwner: "repository",
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/qmd$/,
+    lane: "checkpointWriterLane",
+    targetMappingOwner: "qmd",
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/output(?:\/.*)?$/,
+    lane: "checkpointWriterLane",
+    targetMappingOwner: "graphOutputProducer",
+  },
+  {
+    pattern: /^graph_vault\/output\/lancedb\/[^/]+\.lance$/,
+    lane: "checkpointWriterLane",
+    targetMappingOwner: "artifactValidation",
+  },
+  {
+    pattern: /^graph_vault\/dspy(?:\/.*)?$/,
+    lane: "catalogWriterLane",
+    targetMappingOwner: "dspyPolicyStore",
+  },
+  {
+    pattern: /^\.qmd$/,
+    lane: "qmdIndexWriterLane",
+    targetMappingOwner: "qmd",
+  },
+];
 
 const RepairReasonSchema = z.enum([
   "graph_identity_projection_missing",
@@ -183,7 +607,12 @@ const itemRoot = join(batchRoot, "items");
 const eventsPath = join(batchRoot, "events.jsonl");
 const manifestPath = join(batchRoot, "manifest.json");
 const recoverySummaryPath = join(batchRoot, "recovery-summary.json");
-const requiredCommandCheckNames = [
+const batchStatusPath = join(batchRoot, "status.json");
+const coordinatorLockPath = join(batchRoot, "coordinator-lock.json");
+const providerSlotRoot = join(batchRoot, "provider-slots");
+const subprocessRoot = join(batchRoot, "subprocesses");
+const bookLeaseRoot = join(batchRoot, "book-leases");
+const defaultRequiredCommandCheckNames = [
   "qmd-version",
   "qmd-status",
   "qmd-doctor-json",
@@ -216,9 +645,39 @@ const graphQueryCommandCheckNames = [
   "qmd-query-auto-json",
   "qmd-query-graphrag-json",
 ];
+function requiredCommandCheckNamesForRuntime() {
+  if (process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS !== "1") {
+    return defaultRequiredCommandCheckNames;
+  }
+  const raw = process.env.QMD_GRAPHRAG_TEST_COMMAND_CHECK_NAMES;
+  if (raw == null || raw.trim() === "") return defaultRequiredCommandCheckNames;
+  const names = raw.split(",").map((name) => name.trim()).filter(Boolean);
+  const uniqueNames = [...new Set(names)];
+  const defaultNameSet = new Set(defaultRequiredCommandCheckNames);
+  const unknown = uniqueNames.filter((name) => !defaultNameSet.has(name));
+  const missingGraphQueries = graphQueryCommandCheckNames.filter((name) =>
+    !uniqueNames.includes(name)
+  );
+  if (
+    uniqueNames.length === 0 ||
+    uniqueNames.length !== names.length ||
+    unknown.length > 0 ||
+    missingGraphQueries.length > 0
+  ) {
+    throw new Error(
+      "invalid QMD_GRAPHRAG_TEST_COMMAND_CHECK_NAMES: " +
+        `unknown=${unknown.join(",") || "none"} ` +
+        `missingGraphQueries=${missingGraphQueries.join(",") || "none"} ` +
+        `duplicates=${uniqueNames.length === names.length ? "none" : "present"}`,
+    );
+  }
+  return uniqueNames;
+}
+const requiredCommandCheckNames = requiredCommandCheckNamesForRuntime();
 const qmdNativeCommandCheckNames = requiredCommandCheckNames.filter(
   (name) => !graphQueryCommandCheckNames.includes(name),
 );
+const qmdIndexLockedCommandNames = new Set(requiredCommandCheckNames);
 const expectedCommandCheckCount = requiredCommandCheckNames.length;
 const expectedQmdNativeCommandCheckCount = qmdNativeCommandCheckNames.length;
 const requiredLanceDbTables = [
@@ -252,6 +711,8 @@ const BatchFailureKindSchema = z.enum([
   "transient",
   "permanent",
   "data_compatibility",
+  "local_state_integrity",
+  "local_state_lock_timeout",
   "unknown",
 ]);
 const BatchRecoveryDecisionSchema = z.enum([
@@ -260,6 +721,67 @@ const BatchRecoveryDecisionSchema = z.enum([
   "continue_pending",
   "stop_until_fixed",
 ]);
+const StatusJsonDiagnosticRecoveryDecisionSchema = z.union([
+  BatchRecoveryDecisionSchema,
+  z.literal("metadata_missing_read_only"),
+  z.literal("continue_with_diagnostic_unless_catalog_blocked"),
+]);
+const DurableStateDiagnosticSchema = z.object({
+  itemId: z.string().min(1).optional(),
+  bookId: z.string().min(1).optional(),
+  workerId: z.string().min(1).optional(),
+  activeCommand: z.string().min(1).optional(),
+  failureKind: BatchFailureKindSchema.optional(),
+  retryable: z.boolean().optional(),
+  localFailureClass: z.string().min(1).optional(),
+  recoveryDecision: StatusJsonDiagnosticRecoveryDecisionSchema.optional(),
+  failedStage: z.string().min(1).optional(),
+  targetLocator: z.string().min(1).optional(),
+  redactedEvidenceLocator: z.string().min(1).optional(),
+  lane: z.string().min(1).optional(),
+  targetMappingOwner: z.string().min(1).optional(),
+  laneTimeoutMs: z.number().int().positive().optional(),
+  releaseOn: z.array(z.string().min(1)).optional(),
+  tempId: z.string().min(1).optional(),
+  operationId: z.string().min(1).optional(),
+  failedSyscall: z.string().min(1).optional(),
+  errno: z.string().min(1).optional(),
+  renameCause: z.string().min(1).optional(),
+  completedPublishRule: z.string().min(1).optional(),
+  lockOwnerEvidence: JsonValueSchema.optional(),
+  checksumRecoveryDecision: z.string().min(1).optional(),
+  fsyncTarget: z.string().min(1).optional(),
+  fsyncErrno: z.string().min(1).optional(),
+  fsyncPlatform: z.string().min(1).optional(),
+  directoryTargetLocator: z.string().min(1).optional(),
+  directoryDurableKind: z.string().min(1).optional(),
+  primaryDurableKind: z.string().min(1).optional(),
+  durableMode: z.string().min(1).optional(),
+  primaryTargetLocator: z.string().min(1).optional(),
+  sidecarTargetLocator: z.string().min(1).optional(),
+  sidecarKind: z.string().min(1).optional(),
+  checksumExpected: z.string().min(1).nullable().optional(),
+  checksumActual: z.string().min(1).optional(),
+  cleanupReason: z.string().min(1).optional(),
+  repairAllowed: z.boolean().optional(),
+  statusJsonDecision: z.string().min(1).optional(),
+  diagnosticClass: z.string().min(1).optional(),
+  normalRunnerAction: z.string().min(1).optional(),
+  scannedTargetCount: z.number().int().nonnegative().optional(),
+  degradedTargetCount: z.number().int().nonnegative().optional(),
+  sampleTargetLocators: z.array(z.string().min(1)).optional(),
+  scanTruncated: z.boolean().optional(),
+  maxRunnerStartScannedTargets: z.number().int().positive().optional(),
+  maxRunnerStartReportedSamples: z.number().int().positive().optional(),
+  maxRunnerStartMutationCount: z.number().int().nonnegative().optional(),
+  evidenceIncomplete: z.boolean().optional(),
+  evidenceIncompleteReason: z.string().min(1).optional(),
+  unavailableFieldSentinels: z.array(z.string().min(1)).optional(),
+  leaseGeneration: z.number().int().positive().optional(),
+  bookLeaseGeneration: z.number().int().positive().optional(),
+});
+const BatchStopInterruptErrorName = "BatchStopInterruptError";
+const DurableFailureEnvelopeMarker = "QMD_GRAPHRAG_DURABLE_FAILURE";
 const BatchProjectRelativeLocatorSchema = z.string().min(1).refine(
   (value) => {
     if (value.includes("\0")) return false;
@@ -270,6 +792,72 @@ const BatchProjectRelativeLocatorSchema = z.string().min(1).refine(
   },
   "path must be project-relative and portable",
 );
+const LeaseSchema = z.object({
+  runnerSessionId: z.string().min(1),
+  runnerHost: z.string().min(1),
+  runnerPid: z.number().int().positive(),
+  generation: z.number().int().positive(),
+  fencingToken: z.string().min(1),
+  acquiredAt: z.string().datetime(),
+  heartbeatAt: z.string().datetime(),
+  expiresAt: z.string().datetime(),
+});
+const CoordinatorLockSchema = LeaseSchema.extend({
+  schemaVersion: z.literal(SchemaVersion),
+  runId: z.string().min(1),
+  bookConcurrency: z.number().int().positive(),
+  openaiProviderConcurrency: z.number().int().positive(),
+  jinaProviderConcurrency: z.number().int().positive(),
+  localCpuConcurrency: z.number().int().positive(),
+});
+const ProviderSlotLeaseSchema = LeaseSchema.extend({
+  schemaVersion: z.literal(SchemaVersion),
+  runId: z.string().min(1),
+  provider: z.enum(["openai", "jina", "local_cpu", "qmd_index_writer"]),
+  slotId: z.string().min(1),
+  itemId: z.string().min(1).optional(),
+  bookId: z.string().min(1).optional(),
+  workerId: z.string().min(1).optional(),
+  command: z.string().min(1).optional(),
+  limit: z.number().int().positive(),
+  waitMs: z.number().int().nonnegative().optional(),
+});
+const BookLeaseSchema = LeaseSchema.extend({
+  schemaVersion: z.literal(SchemaVersion),
+  runId: z.string().min(1),
+  bookId: z.string().min(1),
+  itemId: z.string().min(1),
+  workerId: z.string().min(1).optional(),
+});
+const SubprocessRecordSchema = z.object({
+  schemaVersion: z.literal(SchemaVersion),
+  runId: z.string().min(1),
+  subprocessId: z.string().min(1),
+  runnerSessionId: z.string().min(1),
+  runnerHost: z.string().min(1),
+  runnerPid: z.number().int().positive(),
+  pid: z.number().int().positive().optional(),
+  command: z.string().min(1),
+  itemId: z.string().min(1).optional(),
+  bookId: z.string().min(1).optional(),
+  workerId: z.string().min(1).optional(),
+  providerSlotId: z.string().min(1).optional(),
+  providerSlotProvider: z.enum([
+    "openai",
+    "jina",
+    "local_cpu",
+    "qmd_index_writer",
+  ]).optional(),
+  providerSlotGeneration: z.number().int().positive().optional(),
+  providerSlotFencingToken: z.string().min(1).optional(),
+  processGroup: z.boolean(),
+  startedAt: z.string().datetime(),
+  heartbeatAt: z.string().datetime(),
+  status: z.enum(["running", "exited", "killed", "quarantined", "spawn_error"]),
+  exitCode: z.number().int().nullable().optional(),
+  signal: z.string().min(1).nullable().optional(),
+  completedAt: z.string().datetime().optional(),
+});
 const BatchCommandCheckSchema = z.object({
   name: z.string().min(1),
   status: z.enum(["passed", "failed"]),
@@ -287,6 +875,53 @@ const BatchCommandCheckSchema = z.object({
   attemptExhausted: z.boolean().optional(),
   providerStatusCode: z.number().int().positive().optional(),
   recoveryDecision: BatchRecoveryDecisionSchema.optional(),
+  localFailureClass: z.string().min(1).optional(),
+  targetLocator: z.string().min(1).optional(),
+  redactedEvidenceLocator: z.string().min(1).optional(),
+  lane: z.string().min(1).optional(),
+  targetMappingOwner: z.string().min(1).optional(),
+  laneTimeoutMs: z.number().int().positive().optional(),
+  releaseOn: z.array(z.string().min(1)).optional(),
+  tempId: z.string().min(1).optional(),
+  operationId: z.string().min(1).optional(),
+  failedSyscall: z.string().min(1).optional(),
+  errno: z.string().min(1).optional(),
+  renameCause: z.string().min(1).optional(),
+  completedPublishRule: z.string().min(1).optional(),
+  lockOwnerEvidence: JsonValueSchema.optional(),
+  checksumRecoveryDecision: z.string().min(1).optional(),
+  fsyncTarget: z.string().min(1).optional(),
+  fsyncErrno: z.string().min(1).optional(),
+  fsyncPlatform: z.string().min(1).optional(),
+  directoryTargetLocator: z.string().min(1).optional(),
+  directoryDurableKind: z.string().min(1).optional(),
+  primaryDurableKind: z.string().min(1).optional(),
+  durableMode: z.string().min(1).optional(),
+  primaryTargetLocator: z.string().min(1).optional(),
+  sidecarTargetLocator: z.string().min(1).optional(),
+  sidecarKind: z.string().min(1).optional(),
+  checksumExpected: z.string().min(1).nullable().optional(),
+  checksumActual: z.string().min(1).optional(),
+  cleanupReason: z.string().min(1).optional(),
+  repairAllowed: z.boolean().optional(),
+  evidenceIncomplete: z.boolean().optional(),
+  evidenceIncompleteReason: z.string().min(1).optional(),
+  unavailableFieldSentinels: z.array(z.string().min(1)).optional(),
+  runnerSessionId: z.string().min(1).optional(),
+  runnerHost: z.string().min(1).optional(),
+  runnerPid: z.number().int().positive().optional(),
+  workerId: z.string().min(1).optional(),
+  itemId: z.string().min(1).optional(),
+  bookId: z.string().min(1).optional(),
+  ownerPid: z.number().int().positive().optional(),
+  ownerHost: z.string().min(1).optional(),
+  createdAt: z.string().datetime().optional(),
+  expiresAt: z.string().datetime().optional(),
+  leaseGeneration: z.number().int().positive().optional(),
+  bookLeaseGeneration: z.number().int().positive().optional(),
+  targetGeneration: z.number().int().positive().optional(),
+  fencingTokenHash: z.string().min(1).optional(),
+  failedStage: z.string().min(1).optional(),
   errorSummary: z.string().max(1000).optional(),
 });
 const BatchBuildStatusSchema = z.object({
@@ -442,6 +1077,16 @@ const BatchItemCheckpointBaseSchema = z.object({
   runnerHost: z.string().min(1).optional(),
   runnerPid: z.number().int().positive().optional(),
   runnerHeartbeatAt: z.string().datetime().optional(),
+  leaseGeneration: z.number().int().positive().optional(),
+  fencingToken: z.string().min(1).optional(),
+  leaseExpiresAt: z.string().datetime().optional(),
+  bookLeaseGeneration: z.number().int().positive().optional(),
+  bookFencingToken: z.string().min(1).optional(),
+  activeProviderSlots: z.number().int().nonnegative().optional(),
+  providerWaitMs: z.number().int().nonnegative().optional(),
+  providerSlotGeneration: z.number().int().positive().optional(),
+  workerId: z.string().min(1).optional(),
+  activeSubprocesses: z.number().int().nonnegative().optional(),
   orphanedRunnerDetectedAt: z.string().datetime().optional(),
   currentCommand: z.string().min(1).optional(),
   activeCommand: z.string().min(1).optional(),
@@ -452,6 +1097,44 @@ const BatchItemCheckpointBaseSchema = z.object({
   retryable: z.boolean().optional(),
   retryExhausted: z.boolean().optional(),
   recoveryDecision: BatchRecoveryDecisionSchema.optional(),
+  localFailureClass: z.string().min(1).optional(),
+  targetLocator: z.string().min(1).optional(),
+  redactedEvidenceLocator: z.string().min(1).optional(),
+  lane: z.string().min(1).optional(),
+  targetMappingOwner: z.string().min(1).optional(),
+  laneTimeoutMs: z.number().int().positive().optional(),
+  releaseOn: z.array(z.string().min(1)).optional(),
+  tempId: z.string().min(1).optional(),
+  operationId: z.string().min(1).optional(),
+  failedSyscall: z.string().min(1).optional(),
+  errno: z.string().min(1).optional(),
+  renameCause: z.string().min(1).optional(),
+  completedPublishRule: z.string().min(1).optional(),
+  lockOwnerEvidence: JsonValueSchema.optional(),
+  checksumRecoveryDecision: z.string().min(1).optional(),
+  fsyncTarget: z.string().min(1).optional(),
+  fsyncErrno: z.string().min(1).optional(),
+  fsyncPlatform: z.string().min(1).optional(),
+  directoryTargetLocator: z.string().min(1).optional(),
+  directoryDurableKind: z.string().min(1).optional(),
+  primaryDurableKind: z.string().min(1).optional(),
+  durableMode: z.string().min(1).optional(),
+  primaryTargetLocator: z.string().min(1).optional(),
+  sidecarTargetLocator: z.string().min(1).optional(),
+  sidecarKind: z.string().min(1).optional(),
+  checksumExpected: z.string().min(1).nullable().optional(),
+  checksumActual: z.string().min(1).optional(),
+  cleanupReason: z.string().min(1).optional(),
+  repairAllowed: z.boolean().optional(),
+  evidenceIncomplete: z.boolean().optional(),
+  evidenceIncompleteReason: z.string().min(1).optional(),
+  unavailableFieldSentinels: z.array(z.string().min(1)).optional(),
+  ownerPid: z.number().int().positive().optional(),
+  ownerHost: z.string().min(1).optional(),
+  createdAt: z.string().datetime().optional(),
+  expiresAt: z.string().datetime().optional(),
+  targetGeneration: z.number().int().positive().optional(),
+  fencingTokenHash: z.string().min(1).optional(),
   failedStage: z.string().min(1).optional(),
   qmdBuildStatus: BatchBuildStatusSchema.optional(),
   graphBuildStatus: BatchBuildStatusSchema.optional(),
@@ -475,6 +1158,11 @@ const BatchItemCheckpointSchema = BatchItemCheckpointBaseSchema.extend({
       "runnerHost",
       "runnerPid",
       "runnerHeartbeatAt",
+      "leaseGeneration",
+      "fencingToken",
+      "leaseExpiresAt",
+      "bookLeaseGeneration",
+      "bookFencingToken",
     ]) {
       if (value[field] == null) {
         ctx.addIssue({
@@ -485,14 +1173,14 @@ const BatchItemCheckpointSchema = BatchItemCheckpointBaseSchema.extend({
       }
     }
   }
-  if (value.retryExhausted === true && value.failureKind !== "transient" && (
+  if (value.retryExhausted === true && (
     value.retryable !== false ||
     value.recoveryDecision !== "stop_until_fixed"
   )) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message:
-        "non-transient retryExhausted checkpoint requires retryable=false " +
+        "retryExhausted checkpoint requires retryable=false " +
         "and recoveryDecision=stop_until_fixed",
       path: ["retryExhausted"],
     });
@@ -523,16 +1211,60 @@ const BatchRunManifestSchema = z.object({
   maxProviderRecoveryWaits: z.number().int().positive().optional(),
   commandTimeoutSeconds: z.number().int().positive().optional(),
   heartbeatIntervalSeconds: z.number().int().positive().optional(),
+  activeProviderSlots: z.number().int().nonnegative().optional(),
+  activeSubprocesses: z.number().int().nonnegative().optional(),
+  activeBookLeases: z.number().int().nonnegative().optional(),
   startedAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
   completedAt: z.string().datetime().optional(),
   failedAt: z.string().datetime().optional(),
   itemIds: z.array(z.string().min(1)),
+  durableFailureSummary: z.object({
+    failureKind: BatchFailureKindSchema.optional(),
+    localFailureClass: z.string().min(1).optional(),
+    recoveryDecision: BatchRecoveryDecisionSchema.optional(),
+    failedStage: z.string().min(1).optional(),
+    targetLocator: z.string().min(1).optional(),
+    redactedEvidenceLocator: z.string().min(1).optional(),
+    lane: z.string().min(1).optional(),
+    targetMappingOwner: z.string().min(1).optional(),
+    laneTimeoutMs: z.number().int().positive().optional(),
+    releaseOn: z.array(z.string().min(1)).optional(),
+    tempId: z.string().min(1).optional(),
+    operationId: z.string().min(1).optional(),
+    failedSyscall: z.string().min(1).optional(),
+    errno: z.string().min(1).optional(),
+    renameCause: z.string().min(1).optional(),
+    completedPublishRule: z.string().min(1).optional(),
+    lockOwnerEvidence: JsonValueSchema.optional(),
+    checksumRecoveryDecision: z.string().min(1).optional(),
+    fsyncTarget: z.string().min(1).optional(),
+    fsyncErrno: z.string().min(1).optional(),
+    fsyncPlatform: z.string().min(1).optional(),
+    directoryTargetLocator: z.string().min(1).optional(),
+    directoryDurableKind: z.string().min(1).optional(),
+    primaryDurableKind: z.string().min(1).optional(),
+    durableMode: z.string().min(1).optional(),
+    primaryTargetLocator: z.string().min(1).optional(),
+    sidecarTargetLocator: z.string().min(1).optional(),
+    sidecarKind: z.string().min(1).optional(),
+    checksumExpected: z.string().min(1).nullable().optional(),
+    checksumActual: z.string().min(1).optional(),
+    cleanupReason: z.string().min(1).optional(),
+    repairAllowed: z.boolean().optional(),
+    evidenceIncomplete: z.boolean().optional(),
+    evidenceIncompleteReason: z.string().min(1).optional(),
+    unavailableFieldSentinels: z.array(z.string().min(1)).optional(),
+  }).optional(),
   metadata: z.record(z.string(), JsonValueSchema).optional(),
 });
 const BatchEventLogSchema = z.object({
   schemaVersion: z.literal(SchemaVersion),
   runId: z.string().min(1),
+  eventId: z.string().min(1),
+  sequence: z.number().int().positive(),
+  runnerSessionId: z.string().min(1),
+  coordinatorGeneration: z.number().int().positive().optional(),
   itemId: z.string().min(1).optional(),
   event: z.string().min(1),
   status: BatchItemStatusSchema.optional(),
@@ -543,10 +1275,58 @@ const BatchEventLogSchema = z.object({
   attemptExhausted: z.boolean().optional(),
   providerStatusCode: z.number().int().positive().optional(),
   recoveryDecision: BatchRecoveryDecisionSchema.optional(),
+  localFailureClass: z.string().min(1).optional(),
+  targetLocator: z.string().min(1).optional(),
+  redactedEvidenceLocator: z.string().min(1).optional(),
+  lane: z.string().min(1).optional(),
+  targetMappingOwner: z.string().min(1).optional(),
+  laneTimeoutMs: z.number().int().positive().optional(),
+  releaseOn: z.array(z.string().min(1)).optional(),
+  tempId: z.string().min(1).optional(),
+  operationId: z.string().min(1).optional(),
+  failedSyscall: z.string().min(1).optional(),
+  errno: z.string().min(1).optional(),
+  renameCause: z.string().min(1).optional(),
+  completedPublishRule: z.string().min(1).optional(),
+  lockOwnerEvidence: JsonValueSchema.optional(),
+  checksumRecoveryDecision: z.string().min(1).optional(),
+  fsyncTarget: z.string().min(1).optional(),
+  fsyncErrno: z.string().min(1).optional(),
+  fsyncPlatform: z.string().min(1).optional(),
+  directoryTargetLocator: z.string().min(1).optional(),
+  directoryDurableKind: z.string().min(1).optional(),
+  primaryDurableKind: z.string().min(1).optional(),
+  durableMode: z.string().min(1).optional(),
+  primaryTargetLocator: z.string().min(1).optional(),
+  sidecarTargetLocator: z.string().min(1).optional(),
+  sidecarKind: z.string().min(1).optional(),
+  checksumExpected: z.string().min(1).nullable().optional(),
+  checksumActual: z.string().min(1).optional(),
+  cleanupReason: z.string().min(1).optional(),
+  repairAllowed: z.boolean().optional(),
+  evidenceIncomplete: z.boolean().optional(),
+  evidenceIncompleteReason: z.string().min(1).optional(),
+  unavailableFieldSentinels: z.array(z.string().min(1)).optional(),
+  workerId: z.string().min(1).optional(),
+  bookId: z.string().min(1).optional(),
+  ownerPid: z.number().int().positive().optional(),
+  ownerHost: z.string().min(1).optional(),
+  createdAt: z.string().datetime().optional(),
+  expiresAt: z.string().datetime().optional(),
+  leaseGeneration: z.number().int().positive().optional(),
+  bookLeaseGeneration: z.number().int().positive().optional(),
+  targetGeneration: z.number().int().positive().optional(),
+  fencingTokenHash: z.string().min(1).optional(),
   failedStage: z.string().min(1).optional(),
   at: z.string().datetime(),
   message: z.string().max(1000).optional(),
   metadata: z.record(z.string(), JsonValueSchema).optional(),
+});
+const LegacyBatchEventLogSchema = BatchEventLogSchema.partial({
+  eventId: true,
+  sequence: true,
+  runnerSessionId: true,
+  coordinatorGeneration: true,
 });
 const BatchRecoverySummaryItemSchema = z.object({
   itemId: z.string().min(1),
@@ -562,7 +1342,45 @@ const BatchRecoverySummaryItemSchema = z.object({
   retryable: z.boolean().optional(),
   retryExhausted: z.boolean().optional(),
   recoveryDecision: BatchRecoveryDecisionSchema.optional(),
+  localFailureClass: z.string().min(1).optional(),
+  targetLocator: z.string().min(1).optional(),
+  redactedEvidenceLocator: z.string().min(1).optional(),
+  lane: z.string().min(1).optional(),
+  targetMappingOwner: z.string().min(1).optional(),
+  laneTimeoutMs: z.number().int().positive().optional(),
+  releaseOn: z.array(z.string().min(1)).optional(),
+  tempId: z.string().min(1).optional(),
+  operationId: z.string().min(1).optional(),
+  failedSyscall: z.string().min(1).optional(),
+  errno: z.string().min(1).optional(),
+  renameCause: z.string().min(1).optional(),
+  completedPublishRule: z.string().min(1).optional(),
+  lockOwnerEvidence: JsonValueSchema.optional(),
+  checksumRecoveryDecision: z.string().min(1).optional(),
+  fsyncTarget: z.string().min(1).optional(),
+  fsyncErrno: z.string().min(1).optional(),
+  fsyncPlatform: z.string().min(1).optional(),
+  directoryTargetLocator: z.string().min(1).optional(),
+  directoryDurableKind: z.string().min(1).optional(),
+  primaryDurableKind: z.string().min(1).optional(),
+  durableMode: z.string().min(1).optional(),
+  primaryTargetLocator: z.string().min(1).optional(),
+  sidecarTargetLocator: z.string().min(1).optional(),
+  sidecarKind: z.string().min(1).optional(),
+  checksumExpected: z.string().min(1).nullable().optional(),
+  checksumActual: z.string().min(1).optional(),
+  cleanupReason: z.string().min(1).optional(),
+  repairAllowed: z.boolean().optional(),
+  evidenceIncomplete: z.boolean().optional(),
+  evidenceIncompleteReason: z.string().min(1).optional(),
+  unavailableFieldSentinels: z.array(z.string().min(1)).optional(),
   failedStage: z.string().min(1).optional(),
+  ownerPid: z.number().int().positive().optional(),
+  ownerHost: z.string().min(1).optional(),
+  createdAt: z.string().datetime().optional(),
+  expiresAt: z.string().datetime().optional(),
+  targetGeneration: z.number().int().positive().optional(),
+  fencingTokenHash: z.string().min(1).optional(),
   providerStatusCode: z.number().int().positive().optional(),
   retryAfterSeconds: z.number().int().nonnegative().optional(),
   nextRetryAt: z.string().datetime().optional(),
@@ -575,6 +1393,16 @@ const BatchRecoverySummaryItemSchema = z.object({
   runnerHost: z.string().min(1).optional(),
   runnerPid: z.number().int().positive().optional(),
   runnerHeartbeatAt: z.string().datetime().optional(),
+  workerId: z.string().min(1).optional(),
+  leaseGeneration: z.number().int().positive().optional(),
+  fencingToken: z.string().min(1).optional(),
+  leaseExpiresAt: z.string().datetime().optional(),
+  bookLeaseGeneration: z.number().int().positive().optional(),
+  bookFencingToken: z.string().min(1).optional(),
+  activeProviderSlots: z.number().int().nonnegative().optional(),
+  providerWaitMs: z.number().int().nonnegative().optional(),
+  providerSlotGeneration: z.number().int().positive().optional(),
+  activeSubprocesses: z.number().int().nonnegative().optional(),
   orphanedRunnerDetectedAt: z.string().datetime().optional(),
   currentCommand: z.string().min(1).optional(),
   activeCommand: z.string().min(1).optional(),
@@ -644,6 +1472,9 @@ const BatchRecoverySummarySchema = z.object({
     completedItems: z.number().int().nonnegative(),
     skippedItems: z.number().int().nonnegative(),
     failedItems: z.number().int().nonnegative(),
+    activeProviderSlots: z.number().int().nonnegative().optional(),
+    activeSubprocesses: z.number().int().nonnegative().optional(),
+    activeBookLeases: z.number().int().nonnegative().optional(),
     updatedAt: z.string().datetime(),
     completedAt: z.string().datetime().optional(),
     failedAt: z.string().datetime().optional(),
@@ -663,6 +1494,9 @@ const BatchRecoverySummarySchema = z.object({
   recoveryDecision: BatchRecoveryDecisionSchema,
   retryableItemCount: z.number().int().nonnegative(),
   nextRetryAt: z.string().datetime().optional(),
+  durableStateFailures: z.array(DurableStateDiagnosticSchema).optional(),
+  durableTempDiagnostics: z.array(DurableStateDiagnosticSchema).optional(),
+  durableLockDiagnostics: z.array(DurableStateDiagnosticSchema).optional(),
   items: z.array(BatchRecoverySummaryItemSchema),
 });
 
@@ -1700,6 +2534,9 @@ function runningCheckpointIsOrphaned(checkpoint) {
   if (heartbeatAt === 0) return true;
   const heartbeatAgeMs = Date.now() - heartbeatAt;
   if (heartbeatAgeMs > runnerHeartbeatTtlSeconds * 1000) return true;
+  if (checkpoint.leaseExpiresAt != null && epochMs(checkpoint.leaseExpiresAt) <= Date.now()) {
+    return true;
+  }
   if (checkpoint.runnerHost === runnerHost) {
     if (checkpoint.runnerSessionId === runnerSessionId) return false;
     return !processAlive(checkpoint.runnerPid);
@@ -1826,6 +2663,1764 @@ function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+function delay(ms) {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
+function randomToken(prefix) {
+  return `${prefix}-${randomUUID()}`;
+}
+
+function temporaryPathFor(path) {
+  return `${path}.tmp-${process.pid}-${Date.now()}-${randomUUID()}`;
+}
+
+function durableChecksumMetaPath(path) {
+  return `${durableChecksumPath(path)}.meta.json`;
+}
+
+function durableLocator(path) {
+  const normalized = resolve(path);
+  const stateRelative = relative(stateRoot, normalized).split(sep).join("/");
+  if (
+    stateRelative !== "" &&
+    stateRelative !== ".." &&
+    !stateRelative.startsWith("../")
+  ) {
+    return `graph_vault/${stateRelative}`;
+  }
+  if (stateRelative === "") return "graph_vault";
+  const qmdRoot = dirname(qmdIndexPath);
+  const qmdRelative = relative(qmdRoot, normalized).split(sep).join("/");
+  if (
+    qmdRelative !== "" &&
+    qmdRelative !== ".." &&
+    !qmdRelative.startsWith("../")
+  ) {
+    return `.qmd/${qmdRelative}`;
+  }
+  if (qmdRelative === "") return ".qmd";
+  return relative(root, normalized).split(sep).join("/");
+}
+
+function readDurableChecksum(path) {
+  try {
+    return readFileSync(durableChecksumPath(path), "utf8").trim();
+  } catch {
+    return undefined;
+  }
+}
+
+function durableOperationEvidence(path, kind, extra = {}) {
+  const operationId = randomUUID();
+  const tempId = testTempIdFor(path) ?? `${process.pid}-${Date.now()}-${operationId}`;
+  const mapping = durableTargetMapping(path, kind);
+  const context = durableOperationContext ?? {};
+  const leaseGeneration =
+    context.leaseGeneration ??
+    context.bookLeaseGeneration ??
+    coordinatorLease?.generation ??
+    undefined;
+  const fencingToken =
+    context.fencingToken ??
+    context.bookFencingToken ??
+    coordinatorLease?.fencingToken;
+  const fencingTokenHash = fencingToken == null
+    ? context.fencingTokenHash ?? sha256Text([
+        "runner-durable-fence",
+        runnerSessionId,
+        runId,
+        relative(root, path),
+        String(leaseGeneration ?? "no-lease"),
+      ].join(":"))
+    : sha256Text(fencingToken);
+  return withoutUndefined({
+    tempId,
+    operationId,
+    targetLocator: relative(root, path),
+    absoluteTargetLocator: path,
+    kind,
+    ...mapping,
+    runnerSessionId,
+    runnerHost,
+    runnerPid,
+    runId,
+    workerId: context.workerId ?? process.env.QMD_GRAPHRAG_WORKER_ID,
+    itemId: context.itemId ?? process.env.QMD_GRAPHRAG_ITEM_ID,
+    bookId: context.bookId ?? process.env.QMD_GRAPHRAG_BOOK_ID,
+    ownerPid: runnerPid,
+    ownerHost: runnerHost,
+    createdAt: now(),
+    expiresAt: context.expiresAt ?? leaseExpiresAt(),
+    leaseGeneration,
+    bookLeaseGeneration: context.bookLeaseGeneration,
+    targetGeneration: context.targetGeneration ?? leaseGeneration,
+    targetChecksumBefore: readDurableChecksum(path) ?? null,
+    fencingTokenHash,
+    durableMode: "strict",
+    durableAdapterContract,
+    ...extra,
+  });
+}
+
+function testTempIdFor(path) {
+  if (
+    testTempIdInjected ||
+    testTempIdOncePattern === "" ||
+    testTempIdOnceValue === ""
+  ) {
+    return undefined;
+  }
+  const target = relative(root, path);
+  if (!target.includes(testTempIdOncePattern)) return undefined;
+  testTempIdInjected = true;
+  return testTempIdOnceValue;
+}
+
+function withDurableOperationContext(context, callback) {
+  const previous = durableOperationContext;
+  durableOperationContext = withoutUndefined({
+    ...(previous ?? {}),
+    ...(context ?? {}),
+  });
+  try {
+    return callback();
+  } finally {
+    durableOperationContext = previous;
+  }
+}
+
+function durableContextFromValue(value) {
+  if (value == null || typeof value !== "object") return {};
+  const fencingToken =
+    value.fencingToken ??
+    value.bookFencingToken ??
+    value.providerSlotFencingToken ??
+    value.metadata?.itemFencingToken ??
+    value.metadata?.bookFencingToken;
+  return withoutUndefined({
+    itemId: value.itemId,
+    bookId: value.bookId,
+    workerId: value.workerId ?? value.metadata?.workerId,
+    leaseGeneration:
+      value.leaseGeneration ??
+      value.generation ??
+      value.metadata?.leaseGeneration,
+    bookLeaseGeneration:
+      value.bookLeaseGeneration ??
+      value.metadata?.bookLeaseGeneration,
+    targetGeneration:
+      value.leaseGeneration ??
+      value.generation ??
+      value.bookLeaseGeneration ??
+      value.providerSlotGeneration,
+    fencingToken,
+    expiresAt: value.leaseExpiresAt ?? value.expiresAt,
+  });
+}
+
+function durableTargetMapping(path, kind) {
+  const relativePath = durableLocator(path);
+  if (kind === "directory-fsync") {
+    return durableDirectoryFsyncMapping(relativePath, path);
+  }
+  const mappingPath = primaryTargetRelativePathForMapping(relativePath);
+  const mapped = durableTargetMappingTable.find(({ pattern }) =>
+    pattern.test(mappingPath)
+  );
+  if (mapped == null && isProductionDurableTarget(mappingPath, kind)) {
+    throw new DurableStateError(
+      `durable target mapping missing: ${relativePath}`,
+      {
+        localFailureClass: "durable_target_mapping_missing",
+        evidence: {
+          targetLocator: relativePath,
+          durableKind: kind,
+          durableMode: "strict",
+          completedPublishRule: "forbidden",
+          redactedEvidenceLocator: basename(path),
+        },
+      },
+    );
+  }
+  const durableKind = kind === "lock"
+    ? "json-lock"
+    : kind === "sqlite-lock"
+      ? "sqlite"
+      : mapped?.durableKind ?? kind;
+  return withoutUndefined({
+    targetMappingRule: mapped == null ? "nonProductionDefault" : "explicit",
+    targetMappingPattern: mapped?.pattern.source,
+    lane: mapped?.lane ?? inferDurableLane(relativePath),
+    targetMappingOwner:
+      mapped?.targetMappingOwner ?? inferDurableOwner(relativePath),
+    durableKind,
+    targetFamily: mapped?.targetFamily,
+    startupCriticality: mapped?.startupCriticality,
+    runnerStartPreflightMode: mapped?.runnerStartPreflightMode,
+    normalRunnerPrimaryQuarantine: mapped?.normalRunnerPrimaryQuarantine,
+    laneTimeoutMs: durableDefaultLaneTimeoutMs,
+    releaseOn: durableReleaseOn,
+  });
+}
+
+function durableDirectoryFsyncMapping(relativePath, path) {
+  const mapped = durableDirectoryFsyncScopeTable.find(({ pattern }) =>
+    pattern.test(relativePath)
+  );
+  if (mapped == null && isProductionDurableTarget(relativePath, "directory-fsync")) {
+    throw new DurableStateError(
+      `durable directory target mapping missing: ${relativePath}`,
+      {
+        localFailureClass: "durable_target_mapping_missing",
+        evidence: {
+          directoryTargetLocator: relativePath,
+          fsyncTarget: relativePath,
+          directoryDurableKind: "directory",
+          durableMode: "strict",
+          completedPublishRule: "forbidden",
+          redactedEvidenceLocator: basename(path),
+        },
+      },
+    );
+  }
+  return withoutUndefined({
+    targetMappingRule: mapped == null ? "nonProductionDefault" : "directoryScope",
+    targetMappingPattern: mapped?.pattern.source,
+    lane: mapped?.lane ?? inferDurableLane(relativePath),
+    targetMappingOwner:
+      mapped?.targetMappingOwner ?? inferDurableOwner(relativePath),
+    durableKind: "directory",
+    directoryDurableKind: "directory",
+    laneTimeoutMs: durableDefaultLaneTimeoutMs,
+    releaseOn: durableReleaseOn,
+  });
+}
+
+function isProductionDurableTarget(relativePath, kind) {
+  if (relativePath.startsWith("graph_vault/")) return true;
+  if (relativePath.startsWith(".qmd/") || relativePath.includes("/.qmd/")) {
+    return true;
+  }
+  return kind === "sqlite-lock" ||
+    relativePath.endsWith("index.sqlite") ||
+    relativePath.endsWith("index.sqlite.lock");
+}
+
+function primaryTargetRelativePathForMapping(relativePath) {
+  if (relativePath.endsWith(".sha256.meta.json")) {
+    return relativePath.slice(0, -".sha256.meta.json".length);
+  }
+  if (relativePath.endsWith(".sha256")) {
+    return relativePath.slice(0, -".sha256".length);
+  }
+  return relativePath;
+}
+
+function inferDurableLane(relativePath) {
+  if (relativePath.includes("/batch-runs/") && relativePath.includes("/items/")) {
+    return "checkpointWriterLane";
+  }
+  if (
+    relativePath.includes("/batch-runs/") &&
+    relativePath.includes("/book-leases/")
+  ) {
+    return "checkpointWriterLane";
+  }
+  if (relativePath.includes("/books/")) return "checkpointWriterLane";
+  if (relativePath.endsWith("/settings.yaml")) return "catalogWriterLane";
+  if (relativePath.includes("/catalog/batch-runs/")) return "manifestWriterLane";
+  if (relativePath.includes("/catalog/")) return "catalogWriterLane";
+  if (relativePath.endsWith(".qmd/index.sqlite") ||
+    relativePath.endsWith("index.sqlite")) {
+    return "qmdIndexWriterLane";
+  }
+  return "durableStateStoreLane";
+}
+
+function inferDurableOwner(relativePath) {
+  if (relativePath.endsWith("/settings.yaml")) return "settingsProjection";
+  if (relativePath.includes("/graph-capabilities.yaml")) return "capabilityCatalog";
+  if (relativePath.endsWith(".qmd/index.sqlite") ||
+    relativePath.endsWith("index.sqlite")) {
+    return "qmd";
+  }
+  if (relativePath.includes("/batch-runs/")) return "batchCoordinator";
+  if (relativePath.includes("/dspy/")) return "dspyPolicyStore";
+  return "repository";
+}
+
+function localDurableEvidence(input) {
+  return withoutUndefined({
+    failureKind: input.failureKind ?? "local_state_integrity",
+    retryable: input.retryable,
+    localFailureClass: input.localFailureClass,
+    recoveryDecision: input.recoveryDecision,
+    activeCommand: input.activeCommand,
+    targetLocator: input.targetLocator,
+    redactedEvidenceLocator: input.redactedEvidenceLocator,
+    lane: input.lane,
+    targetMappingOwner: input.targetMappingOwner,
+    laneTimeoutMs: input.laneTimeoutMs,
+    releaseOn: input.releaseOn,
+    tempId: input.tempId,
+    operationId: input.operationId,
+    failedStage: input.failedStage,
+    failedSyscall: input.failedSyscall,
+    errno: input.errno,
+    renameCause: input.renameCause,
+    completedPublishRule: input.completedPublishRule,
+    lockOwnerEvidence: input.lockOwnerEvidence,
+    checksumRecoveryDecision: input.checksumRecoveryDecision,
+    fsyncTarget: input.fsyncTarget,
+    fsyncErrno: input.fsyncErrno,
+    fsyncPlatform: input.fsyncPlatform,
+    directoryTargetLocator: input.directoryTargetLocator,
+    directoryDurableKind: input.directoryDurableKind,
+    primaryDurableKind: input.primaryDurableKind,
+    durableMode: input.durableMode,
+    primaryTargetLocator: input.primaryTargetLocator,
+    sidecarTargetLocator: input.sidecarTargetLocator,
+    sidecarKind: input.sidecarKind,
+    checksumExpected: input.checksumExpected,
+    checksumActual: input.checksumActual,
+    cleanupReason: input.cleanupReason,
+    repairAllowed: input.repairAllowed,
+    statusJsonDecision: input.statusJsonDecision,
+    diagnosticClass: input.diagnosticClass,
+    normalRunnerAction: input.normalRunnerAction,
+    scannedTargetCount: input.scannedTargetCount,
+    degradedTargetCount: input.degradedTargetCount,
+    sampleTargetLocators: input.sampleTargetLocators,
+    scanTruncated: input.scanTruncated,
+    maxRunnerStartScannedTargets: input.maxRunnerStartScannedTargets,
+    maxRunnerStartReportedSamples: input.maxRunnerStartReportedSamples,
+    maxRunnerStartMutationCount: input.maxRunnerStartMutationCount,
+    evidenceIncomplete: input.evidenceIncomplete,
+    evidenceIncompleteReason: input.evidenceIncompleteReason,
+    unavailableFieldSentinels: input.unavailableFieldSentinels,
+    runnerSessionId: input.runnerSessionId,
+    runnerHost: input.runnerHost,
+    runnerPid: input.runnerPid,
+    workerId: input.workerId,
+    itemId: input.itemId,
+    bookId: input.bookId,
+    ownerPid: input.ownerPid,
+    ownerHost: input.ownerHost,
+    createdAt: input.createdAt,
+    expiresAt: input.expiresAt,
+    leaseGeneration: input.leaseGeneration,
+    bookLeaseGeneration: input.bookLeaseGeneration,
+    targetGeneration: input.targetGeneration,
+    fencingTokenHash: input.fencingTokenHash,
+  });
+}
+
+class DurableStateError extends Error {
+  constructor(message, input) {
+    super(message);
+    this.name = "DurableStateError";
+    this.failureKind = input.failureKind ?? "local_state_integrity";
+    this.localFailureClass = input.localFailureClass;
+    this.retryable = false;
+    this.recoveryDecision = "stop_until_fixed";
+    this.failedStage = input.failedStage ?? "durable_state";
+    this.evidence = localDurableEvidence({
+      failureKind: this.failureKind,
+      localFailureClass: this.localFailureClass,
+      ...(input.evidence ?? {}),
+    });
+    if (input.cause != null) this.cause = input.cause;
+  }
+}
+
+function durableEvidenceFromError(error) {
+  if (error instanceof DurableStateError) return error.evidence;
+  if (
+    error != null &&
+    typeof error === "object" &&
+    "localFailureClass" in error
+  ) {
+    return localDurableEvidence({
+      failureKind: error.failureKind,
+      localFailureClass: error.localFailureClass,
+      ...(error.evidence ?? {}),
+    });
+  }
+  return {};
+}
+
+function durableProjection(source) {
+  if (source == null || typeof source !== "object") return {};
+  const metadata = source.metadata != null && typeof source.metadata === "object"
+    ? source.metadata
+    : {};
+  const field = (name) =>
+    Object.hasOwn(source, name) && source[name] !== undefined
+      ? source[name]
+      : metadata[name];
+  return localDurableEvidence({
+    failureKind: field("failureKind"),
+    retryable: field("retryable"),
+    localFailureClass: field("localFailureClass"),
+    recoveryDecision: field("recoveryDecision"),
+    activeCommand: field("activeCommand"),
+    targetLocator: field("targetLocator"),
+    redactedEvidenceLocator:
+      field("redactedEvidenceLocator"),
+    lane: field("lane"),
+    targetMappingOwner: field("targetMappingOwner"),
+    laneTimeoutMs: field("laneTimeoutMs"),
+    releaseOn: field("releaseOn"),
+    tempId: field("tempId"),
+    operationId: field("operationId"),
+    failedStage: field("failedStage"),
+    failedSyscall: field("failedSyscall"),
+    errno: field("errno"),
+    renameCause: field("renameCause"),
+    completedPublishRule:
+      field("completedPublishRule"),
+    lockOwnerEvidence: field("lockOwnerEvidence"),
+    checksumRecoveryDecision:
+      field("checksumRecoveryDecision"),
+    fsyncTarget: field("fsyncTarget"),
+    fsyncErrno: field("fsyncErrno"),
+    fsyncPlatform: field("fsyncPlatform"),
+    directoryTargetLocator:
+      field("directoryTargetLocator"),
+    directoryDurableKind:
+      field("directoryDurableKind"),
+    primaryDurableKind:
+      field("primaryDurableKind"),
+    durableMode: field("durableMode"),
+    primaryTargetLocator:
+      field("primaryTargetLocator"),
+    sidecarTargetLocator:
+      field("sidecarTargetLocator"),
+    sidecarKind: field("sidecarKind"),
+    checksumExpected: field("checksumExpected"),
+    checksumActual: field("checksumActual"),
+    cleanupReason: field("cleanupReason"),
+    repairAllowed: field("repairAllowed"),
+    statusJsonDecision: field("statusJsonDecision"),
+    diagnosticClass: field("diagnosticClass"),
+    normalRunnerAction: field("normalRunnerAction"),
+    scannedTargetCount: field("scannedTargetCount"),
+    degradedTargetCount: field("degradedTargetCount"),
+    sampleTargetLocators: field("sampleTargetLocators"),
+    scanTruncated: field("scanTruncated"),
+    maxRunnerStartScannedTargets: field("maxRunnerStartScannedTargets"),
+    maxRunnerStartReportedSamples: field("maxRunnerStartReportedSamples"),
+    maxRunnerStartMutationCount: field("maxRunnerStartMutationCount"),
+    evidenceIncomplete:
+      field("evidenceIncomplete"),
+    evidenceIncompleteReason:
+      field("evidenceIncompleteReason"),
+    unavailableFieldSentinels:
+      field("unavailableFieldSentinels"),
+    runnerSessionId: field("runnerSessionId"),
+    runnerHost: field("runnerHost"),
+    runnerPid: field("runnerPid"),
+    workerId: field("workerId"),
+    itemId: field("itemId"),
+    bookId: field("bookId"),
+    ownerPid: field("ownerPid"),
+    ownerHost: field("ownerHost"),
+    createdAt: field("createdAt"),
+    expiresAt: field("expiresAt"),
+    leaseGeneration: field("leaseGeneration"),
+    bookLeaseGeneration:
+      field("bookLeaseGeneration"),
+    targetGeneration: field("targetGeneration"),
+    fencingTokenHash: field("fencingTokenHash"),
+  });
+}
+
+function durableFailureForError(error, fallbackTarget) {
+  if (error instanceof DurableStateError) {
+    return {
+      failureKind: error.failureKind,
+      retryable: false,
+      localFailureClass: error.localFailureClass,
+      recoveryDecision: error.recoveryDecision,
+      failedStage: error.failedStage,
+      ...durableEvidenceFromError(error),
+    };
+  }
+  const classified = classifyFailure(error instanceof Error ? error.message : String(error));
+  if (
+    classified.failureKind === "local_state_integrity" ||
+    classified.failureKind === "local_state_lock_timeout"
+  ) {
+    return {
+      ...classified,
+      retryable: false,
+      recoveryDecision: "stop_until_fixed",
+      failedStage: "durable_state",
+      targetLocator: fallbackTarget == null ? undefined : relative(root, fallbackTarget),
+      redactedEvidenceLocator: fallbackTarget == null
+        ? undefined
+        : basename(fallbackTarget),
+    };
+  }
+  return {};
+}
+
+function parseDurableFailureEnvelope(text, commandName, item) {
+  const lines = String(text ?? "").split(/\r?\n/u);
+  for (const line of lines) {
+    if (!line.includes(DurableFailureEnvelopeMarker)) continue;
+    const jsonStart = line.indexOf("{");
+    if (jsonStart < 0) {
+      return incompleteSubprocessDurableFailure(commandName, item, [
+        "json_object",
+      ]);
+    }
+    try {
+      const payload = JSON.parse(line.slice(jsonStart));
+      return normalizeDurableFailureEnvelope(payload, commandName, item);
+    } catch {
+      return incompleteSubprocessDurableFailure(commandName, item, [
+        "parseable_json",
+      ]);
+    }
+  }
+  return null;
+}
+
+function isDurableSubprocessCommand(commandName) {
+  return String(commandName).startsWith("resume-book-") ||
+    String(commandName).startsWith("repair-local-artifact-gate-");
+}
+
+function confirmedLocalDurableFailure(failure) {
+  return failure?.failureKind === "local_state_integrity" ||
+    failure?.failureKind === "local_state_lock_timeout";
+}
+
+function missingDurableSubprocessEnvelopeFailure(commandName, item, failure) {
+  if (!isDurableSubprocessCommand(commandName)) return null;
+  if (!confirmedLocalDurableFailure(failure)) return null;
+  return incompleteSubprocessDurableFailure(commandName, item, ["envelope"]);
+}
+
+function normalizeDurableFailureEnvelope(payload, commandName, item) {
+  if (payload == null || typeof payload !== "object") {
+    return incompleteSubprocessDurableFailure(commandName, item, ["payload"]);
+  }
+  const evidence = payload.evidence != null && typeof payload.evidence === "object"
+    ? payload.evidence
+    : {};
+  const source = { ...evidence, ...payload };
+  const missing = durableEnvelopeMissingFields(source);
+  const normalized = localDurableEvidence({
+    failureKind: source.failureKind ?? "local_state_integrity",
+    retryable: source.retryable,
+    localFailureClass: source.localFailureClass,
+    recoveryDecision: source.recoveryDecision ?? "stop_until_fixed",
+    activeCommand: commandName,
+    failedStage: commandName,
+    targetLocator: source.targetLocator,
+    redactedEvidenceLocator: source.redactedEvidenceLocator,
+    lane: source.lane,
+    targetMappingOwner: source.targetMappingOwner,
+    laneTimeoutMs: source.laneTimeoutMs,
+    releaseOn: source.releaseOn,
+    tempId: source.tempId,
+    operationId: source.operationId,
+    failedSyscall: source.failedSyscall,
+    errno: source.errno,
+    renameCause: source.renameCause,
+    completedPublishRule: source.completedPublishRule ?? "forbidden",
+    lockOwnerEvidence: source.lockOwnerEvidence,
+    checksumRecoveryDecision: source.checksumRecoveryDecision,
+    cleanupReason: source.cleanupReason,
+    fsyncTarget: source.fsyncTarget,
+    fsyncErrno: source.fsyncErrno,
+    fsyncPlatform: source.fsyncPlatform,
+    directoryTargetLocator: source.directoryTargetLocator,
+    directoryDurableKind: source.directoryDurableKind,
+    primaryDurableKind: source.primaryDurableKind,
+    durableMode: source.durableMode,
+    primaryTargetLocator: source.primaryTargetLocator,
+    sidecarTargetLocator: source.sidecarTargetLocator,
+    sidecarKind: source.sidecarKind,
+    checksumExpected: source.checksumExpected,
+    checksumActual: source.checksumActual,
+    evidenceIncomplete: source.evidenceIncomplete,
+    evidenceIncompleteReason: source.evidenceIncompleteReason,
+    unavailableFieldSentinels: source.unavailableFieldSentinels,
+    repairAllowed: source.repairAllowed,
+    runnerSessionId: source.runnerSessionId,
+    runnerHost: source.runnerHost,
+    runnerPid: source.runnerPid,
+    workerId: source.workerId ?? item.workerId,
+    itemId: source.itemId ?? item.itemId,
+    bookId: source.bookId ?? item.bookId,
+    ownerPid: source.ownerPid,
+    ownerHost: source.ownerHost,
+    createdAt: source.createdAt,
+    expiresAt: source.expiresAt,
+    leaseGeneration: source.leaseGeneration ?? item.bookLeaseGeneration,
+    bookLeaseGeneration: source.bookLeaseGeneration ?? item.bookLeaseGeneration,
+    targetGeneration: source.targetGeneration,
+    fencingTokenHash: source.fencingTokenHash,
+  });
+  if (missing.length === 0) {
+    return {
+      ...normalized,
+      failureKind: normalized.failureKind ?? "local_state_integrity",
+      localFailureClass: normalized.localFailureClass ??
+        "durable_subprocess_evidence_incomplete",
+      retryable: false,
+      recoveryDecision: "stop_until_fixed",
+      failedStage: commandName,
+      completedPublishRule: normalized.completedPublishRule ?? "forbidden",
+    };
+  }
+  return {
+    ...incompleteSubprocessDurableFailure(commandName, item, missing),
+    ...withoutUndefined(normalized),
+    retryable: false,
+    recoveryDecision: "stop_until_fixed",
+    failedStage: commandName,
+    localFailureClass: "durable_subprocess_evidence_incomplete",
+    completedPublishRule: "forbidden",
+    evidenceIncomplete: true,
+    evidenceIncompleteReason: `missing:${missing.join(",")}`,
+    unavailableFieldSentinels: missing,
+  };
+}
+
+function durableEnvelopeMissingFields(source) {
+  const required = [
+    "schemaVersion",
+    "marker",
+    "status",
+    "failureKind",
+    "localFailureClass",
+    "retryable",
+    "recoveryDecision",
+    "failedStage",
+    "tempId",
+    "operationId",
+    "failedSyscall",
+    "errno",
+    "renameCause",
+    "lane",
+    "targetMappingOwner",
+    "itemId",
+    "bookId",
+    "workerId",
+    "leaseGeneration",
+    "completedPublishRule",
+  ];
+  const missing = required.filter((field) =>
+    source[field] == null || source[field] === ""
+  );
+  if (
+    (source.targetLocator == null || source.targetLocator === "") &&
+    (
+      source.redactedEvidenceLocator == null ||
+      source.redactedEvidenceLocator === ""
+    )
+  ) {
+    missing.push("targetLocator_or_redactedEvidenceLocator");
+  }
+  if (source.marker !== DurableFailureEnvelopeMarker) missing.push("marker");
+  if (source.status !== "failed") missing.push("status");
+  if (source.schemaVersion !== SchemaVersion) missing.push("schemaVersion");
+  if (source.retryable !== false) missing.push("retryable");
+  if (source.recoveryDecision !== "stop_until_fixed") {
+    missing.push("recoveryDecision");
+  }
+  return [...new Set(missing)];
+}
+
+function incompleteSubprocessDurableFailure(commandName, item, missing) {
+  const unavailable = [...new Set(missing)];
+  return {
+    failureKind: "local_state_integrity",
+    localFailureClass: "durable_subprocess_evidence_incomplete",
+    retryable: false,
+    recoveryDecision: "stop_until_fixed",
+    failedStage: commandName,
+    activeCommand: commandName,
+    targetLocator: "unavailable",
+    redactedEvidenceLocator: `${item.itemId}-${commandName}.err`,
+    tempId: "unavailable",
+    operationId: "unavailable",
+    failedSyscall: "unavailable",
+    errno: "unavailable",
+    renameCause: "unavailable",
+    completedPublishRule: "forbidden",
+    itemId: item.itemId,
+    bookId: item.bookId,
+    workerId: item.workerId,
+    leaseGeneration: item.bookLeaseGeneration,
+    evidenceIncomplete: true,
+    evidenceIncompleteReason: `missing:${unavailable.join(",")}`,
+    unavailableFieldSentinels: unavailable,
+  };
+}
+
+function emitDurableFailureEvent(eventName, error, metadata = {}) {
+  if (statusJson) return null;
+  const failure = durableFailureForError(error, metadata.absoluteTargetLocator);
+  const payload = {
+    event: eventName,
+    status: "failed",
+    failureKind: failure.failureKind ?? "local_state_integrity",
+    retryable: false,
+    recoveryDecision: "stop_until_fixed",
+    failedStage: "durable_state",
+    message: error instanceof Error ? error.message : String(error),
+    ...durableProjection(failure),
+    metadata: {
+      ...durableProjection(failure),
+      ...metadata,
+    },
+  };
+  try {
+    return event(payload);
+  } catch {
+    return null;
+  }
+}
+
+function isDurableTempEntry(path, entry) {
+  if (entry.endsWith(".owner.json")) return false;
+  return entry.startsWith(`${basename(path)}.tmp-`) ||
+    (entry.startsWith(`${basename(path)}.`) && entry.endsWith(".tmp"));
+}
+
+function isDurableAuxiliaryJsonEntry(entry) {
+  return isDurableAuxiliaryPath(entry) && entry.endsWith(".json");
+}
+
+function isDurableAuxiliaryPath(path) {
+  const name = basename(path);
+  return name.endsWith(".owner.json") ||
+    name.endsWith(".sha256") ||
+    name.endsWith(".sha256.meta.json") ||
+    name.endsWith(".lock") ||
+    name.includes(".tmp-") ||
+    name.includes(".corrupt-");
+}
+
+function isDurablePrimaryJsonEntry(entry) {
+  return entry.endsWith(".json") && !isDurableAuxiliaryJsonEntry(entry);
+}
+
+function isDurablePrimaryYamlEntry(entry) {
+  return entry.endsWith(".yaml") && !isDurableAuxiliaryPath(entry);
+}
+
+function stableRecoveredToken(prefix, parts) {
+  return `${prefix}-${sha256Text(JSON.stringify(parts)).slice(0, 24)}`;
+}
+
+function durableChecksumPath(path) {
+  return `${path}.sha256`;
+}
+
+function leaseExpiresAt() {
+  return isoAfterSeconds(runnerHeartbeatTtlSeconds);
+}
+
+function fileExists(path) {
+  try {
+    return existsSync(path);
+  } catch {
+    return false;
+  }
+}
+
+function countJsonFiles(path) {
+  try {
+    return readdirSync(path).filter(isDurablePrimaryJsonEntry).length;
+  } catch {
+    return 0;
+  }
+}
+
+function directoryFsyncEvidence(path, operation = undefined) {
+  const directoryTargetLocator = durableLocator(path);
+  if (operation == null) {
+    return durableOperationEvidence(path, "directory-fsync", {
+      directoryTargetLocator,
+      fsyncTarget: directoryTargetLocator,
+    });
+  }
+  const directoryMapping = durableTargetMapping(path, "directory-fsync");
+  const primaryTargetLocator =
+    operation.primaryTargetLocator ?? operation.targetLocator;
+  const primaryDurableKind =
+    operation.primaryDurableKind ?? operation.durableKind ?? operation.kind;
+  return withoutUndefined({
+    ...operation,
+    lane: operation.lane ?? directoryMapping.lane,
+    targetMappingOwner:
+      operation.targetMappingOwner ?? directoryMapping.targetMappingOwner,
+    targetMappingPattern:
+      operation.targetMappingPattern ?? directoryMapping.targetMappingPattern,
+    directoryTargetLocator,
+    directoryDurableKind: "directory",
+    primaryTargetLocator,
+    primaryDurableKind,
+    fsyncTarget: directoryTargetLocator,
+    targetMappingRule:
+      operation.targetMappingRule === "nonProductionDefault"
+        ? operation.targetMappingRule
+        : "derivedDirectoryFsync",
+  });
+}
+
+function fsyncErrnoSentinel(errno) {
+  return errno == null || errno === "" ||
+    ["unknown", "unsupported", "unavailable", "platform_no_errno"]
+      .includes(String(errno));
+}
+
+function fsyncDirectory(path, operation = undefined) {
+  if (statusJson) return;
+  let fd = null;
+  const fsyncOperation = directoryFsyncEvidence(path, operation);
+  try {
+    maybeInjectDirectoryFsyncFailure(path, fsyncOperation);
+    fd = openSync(path, "r");
+    fsyncSync(fd);
+  } catch (error) {
+    const fsyncErrno = error?.code ?? "unknown";
+    throw new DurableStateError(`durable directory fsync failed: ${durableLocator(path)}`, {
+      localFailureClass: "durable_directory_fsync_uncertain",
+      cause: error,
+      evidence: {
+        ...fsyncOperation,
+        fsyncTarget: fsyncOperation.fsyncTarget,
+        fsyncErrno,
+        fsyncPlatform: process.platform,
+        unavailableFieldSentinels:
+          fsyncErrnoSentinel(fsyncErrno) ? ["fsyncErrno"] : undefined,
+        durableMode: "strict",
+        completedPublishRule: "forbidden",
+        redactedEvidenceLocator: basename(path),
+      },
+    });
+  } finally {
+    if (fd != null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Best-effort only.
+      }
+    }
+  }
+}
+
+function maybeInjectDirectoryFsyncFailure(path, operation = undefined) {
+  if (
+    testDirectoryFsyncFailureInjected ||
+    testDirectoryFsyncFailurePattern === ""
+  ) {
+    return;
+  }
+  const candidates = [
+    durableLocator(path),
+    operation?.directoryTargetLocator,
+    operation?.targetLocator,
+    operation?.primaryTargetLocator,
+    operation?.sidecarTargetLocator,
+    operation?.fsyncTarget,
+  ].filter((value) => typeof value === "string" && value.length > 0);
+  if (!candidates.some((target) =>
+    target.includes(testDirectoryFsyncFailurePattern)
+  )) {
+    return;
+  }
+  testDirectoryFsyncFailureMatchCount += 1;
+  if (
+    testDirectoryFsyncFailureMatchCount <=
+      testDirectoryFsyncFailureAfterMatches
+  ) {
+    return;
+  }
+  testDirectoryFsyncFailureInjected = true;
+  const error = new Error("injected directory fsync failure");
+  error.code = "EIO";
+  throw error;
+}
+
+function durableFileFsyncError(path, error, operation) {
+  return new DurableStateError(`durable file fsync failed: ${durableLocator(path)}`, {
+    localFailureClass: "durable_fsync_failed",
+    cause: error,
+    evidence: {
+      ...operation,
+      fsyncTarget: durableLocator(path),
+      fsyncErrno: error?.code ?? "unknown",
+      fsyncPlatform: process.platform,
+      durableMode: "strict",
+      completedPublishRule: "forbidden",
+      redactedEvidenceLocator: basename(path),
+    },
+  });
+}
+
+function writeFileDurable(path, text, options = {}) {
+  if (statusJson) return;
+  const operation = options.operation ?? durableOperationEvidence(path, "file");
+  mkdirSync(dirname(path), { recursive: true });
+  let fd = null;
+  try {
+    fd = openSync(path, options.flag ?? "w");
+    writeSync(fd, text);
+    fsyncSync(fd);
+  } catch (error) {
+    if (error?.code === "EEXIST") throw error;
+    throw durableFileFsyncError(path, error, operation);
+  } finally {
+    if (fd != null) closeSync(fd);
+  }
+  if (options.fsyncParent !== false) fsyncDirectory(dirname(path), operation);
+}
+
+class AsyncSemaphore {
+  constructor(limit, name) {
+    this.limit = Math.max(1, limit);
+    this.name = name;
+    this.active = 0;
+    this.queue = [];
+  }
+
+  async acquire(metadata = {}) {
+    const requestedAt = Date.now();
+    if (this.active < this.limit && this.queue.length === 0) {
+      this.active += 1;
+    } else {
+      await new Promise((resolveAcquire) => {
+        this.queue.push(resolveAcquire);
+      });
+    }
+    let released = false;
+    const waitMs = Date.now() - requestedAt;
+    if (waitMs > 0 || metadata.eventOnImmediate === true) {
+      event({
+        itemId: metadata.itemId,
+        event: `${this.name}_slot_acquired`,
+        status: metadata.status,
+        command: metadata.command,
+        metadata: withoutUndefined({
+          provider: metadata.provider ?? this.name,
+          workerId: metadata.workerId,
+          bookId: metadata.bookId,
+          command: metadata.command,
+          waitMs,
+          activeSlots: this.active,
+          queuedSlots: this.queue.length,
+          limit: this.limit,
+        }),
+      });
+    }
+    return {
+      waitMs,
+      release: () => {
+        if (released) return;
+        released = true;
+        const activeAfterRelease = Math.max(0, this.active - 1);
+        event({
+          itemId: metadata.itemId,
+          event: `${this.name}_slot_released`,
+          status: metadata.status,
+          command: metadata.command,
+          metadata: withoutUndefined({
+            provider: metadata.provider ?? this.name,
+            workerId: metadata.workerId,
+            bookId: metadata.bookId,
+            command: metadata.command,
+            activeSlots: activeAfterRelease,
+            queuedSlots: this.queue.length,
+            limit: this.limit,
+          }),
+        });
+        this.active = activeAfterRelease;
+        this.drain();
+      },
+    };
+  }
+
+  drain() {
+    while (this.active < this.limit && this.queue.length > 0) {
+      const next = this.queue.shift();
+      this.active += 1;
+      next();
+    }
+  }
+}
+
+function providerSlotProviderName(name) {
+  if (name === "openai_provider") return "openai";
+  if (name === "jina_provider") return "jina";
+  if (name === "local_cpu") return "local_cpu";
+  if (name === "qmd_index_writer") return "qmd_index_writer";
+  return name;
+}
+
+function providerSlotPath(slotId) {
+  return join(providerSlotRoot, `${slotId}.json`);
+}
+
+function readProviderSlotLeases() {
+  try {
+    return readdirSync(providerSlotRoot)
+      .filter(isDurablePrimaryJsonEntry)
+      .filter((name) => !name.endsWith(".registry.json"))
+      .map((name) => readTypedJsonIfExists(
+        join(providerSlotRoot, name),
+        ProviderSlotLeaseSchema,
+      ))
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function providerSlotLeaseLive(lease) {
+  if (lease == null) return false;
+  if (epochMs(lease.expiresAt) <= Date.now()) return false;
+  if (lease.runnerHost === runnerHost) return processAlive(lease.runnerPid);
+  return true;
+}
+
+function activeProviderSlotLeases() {
+  return readProviderSlotLeases().filter((lease) => providerSlotLeaseLive(lease));
+}
+
+function recoverProviderSlotLeaseUnderRegistryLock(lease, reason) {
+  const path = providerSlotPath(lease.slotId);
+  const current = readTypedJsonIfExists(path, ProviderSlotLeaseSchema);
+  if (
+    current == null ||
+    current.runnerSessionId !== lease.runnerSessionId ||
+    current.generation !== lease.generation ||
+    current.fencingToken !== lease.fencingToken
+  ) {
+    return false;
+  }
+  rmSync(path, { force: true });
+  fsyncDirectory(providerSlotRoot);
+  event({
+    event: "provider_slot_lease_recovered",
+    status: "pending",
+    command: lease.command,
+    metadata: {
+      itemId: lease.itemId,
+      bookId: lease.bookId,
+      workerId: lease.workerId,
+      provider: lease.provider,
+      slotId: lease.slotId,
+      generation: lease.generation,
+      previousRunnerSessionId: lease.runnerSessionId,
+      reason,
+    },
+  });
+  return true;
+}
+
+function recoverStaleProviderSlotLeases(provider) {
+  for (const lease of readProviderSlotLeases().filter((item) =>
+    item.provider === provider
+  )) {
+    const expired = epochMs(lease.expiresAt) <= Date.now();
+    const deadSameHost = lease.runnerHost === runnerHost &&
+      !processAlive(lease.runnerPid);
+    if (!expired && !deadSameHost) continue;
+    recoverProviderSlotLeaseUnderRegistryLock(
+      lease,
+      expired ? "expired" : "dead_same_host_runner",
+    );
+  }
+}
+
+function activeSubprocessRecords() {
+  try {
+    return readdirSync(subprocessRoot)
+      .filter(isDurablePrimaryJsonEntry)
+      .map((name) => readTypedJsonIfExists(
+        join(subprocessRoot, name),
+        SubprocessRecordSchema,
+      ))
+      .filter(Boolean)
+      .filter((record) => record.status === "running");
+  } catch {
+    return [];
+  }
+}
+
+function bookLeasePath(bookId) {
+  return join(bookLeaseRoot, `${bookId}.json`);
+}
+
+function bookLeaseLive(lease) {
+  if (lease == null) return false;
+  if (epochMs(lease.expiresAt) <= Date.now()) return false;
+  if (lease.runnerHost === runnerHost) return processAlive(lease.runnerPid);
+  return true;
+}
+
+function readBookLeases() {
+  try {
+    return readdirSync(bookLeaseRoot)
+      .filter(isDurablePrimaryJsonEntry)
+      .map((name) => readTypedJsonIfExists(join(bookLeaseRoot, name), BookLeaseSchema))
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function activeBookLeases() {
+  return readBookLeases().filter((lease) => bookLeaseLive(lease));
+}
+
+function acquireBookLease(item, workerId) {
+  if (statusJson) return null;
+  assertCoordinatorLease();
+  const path = bookLeasePath(item.bookId);
+  return withJsonFileLock(path, () => {
+    const current = readTypedJsonIfExistsUnlocked(path, BookLeaseSchema);
+    if (bookLeaseLive(current) && current.runnerSessionId !== runnerSessionId) {
+      throw new Error(
+        `book ${item.bookId} already has a live worker lease: ` +
+          `session=${current.runnerSessionId} item=${current.itemId}`,
+      );
+    }
+    const acquiredAt = now();
+    const lease = BookLeaseSchema.parse({
+      schemaVersion: SchemaVersion,
+      runId,
+      bookId: item.bookId,
+      itemId: item.itemId,
+      workerId,
+      runnerSessionId,
+      runnerHost,
+      runnerPid,
+      generation: (current?.generation ?? 0) + 1,
+      fencingToken: randomToken("book-fence"),
+      acquiredAt,
+      heartbeatAt: acquiredAt,
+      expiresAt: leaseExpiresAt(),
+    });
+    writeJsonAtomicWithValue(path, lease);
+    event({
+      itemId: item.itemId,
+      event: "book_lease_acquired",
+      status: "running",
+      metadata: {
+        bookId: item.bookId,
+        workerId,
+        generation: lease.generation,
+        fencingToken: lease.fencingToken,
+        expiresAt: lease.expiresAt,
+      },
+    });
+    return lease;
+  });
+}
+
+function refreshBookLease(lease) {
+  if (statusJson || lease == null) return lease;
+  const path = bookLeasePath(lease.bookId);
+  return withJsonFileLock(path, () => {
+    const current = readTypedJsonIfExistsUnlocked(path, BookLeaseSchema);
+    if (
+      current?.runnerSessionId !== lease.runnerSessionId ||
+      current?.generation !== lease.generation ||
+      current?.fencingToken !== lease.fencingToken
+    ) {
+      throw new Error(`book lease lost for ${lease.bookId}`);
+    }
+    const updated = BookLeaseSchema.parse({
+      ...current,
+      heartbeatAt: now(),
+      expiresAt: leaseExpiresAt(),
+    });
+    writeJsonAtomicWithValue(path, updated);
+    return updated;
+  });
+}
+
+function releaseBookLease(lease, status = "running") {
+  if (statusJson || lease == null) return;
+  const path = bookLeasePath(lease.bookId);
+  withJsonFileLock(path, () => {
+    const current = readTypedJsonIfExistsUnlocked(path, BookLeaseSchema);
+    if (
+      current?.runnerSessionId === lease.runnerSessionId &&
+      current?.generation === lease.generation &&
+      current?.fencingToken === lease.fencingToken
+    ) {
+      rmSync(path, { force: true });
+      fsyncDirectory(dirname(path));
+      event({
+        itemId: lease.itemId,
+        event: "book_lease_released",
+        status,
+        metadata: {
+          bookId: lease.bookId,
+          workerId: lease.workerId,
+          generation: lease.generation,
+          fencingToken: lease.fencingToken,
+        },
+      });
+    }
+  });
+}
+
+function subprocessRecordPath(subprocessId) {
+  return join(subprocessRoot, `${subprocessId}.json`);
+}
+
+function writeSubprocessRecord(record) {
+  if (statusJson) return record;
+  return writeTypedJson(
+    subprocessRecordPath(record.subprocessId),
+    SubprocessRecordSchema,
+    record,
+  );
+}
+
+function updateSubprocessRecord(subprocessId, callback) {
+  if (statusJson) return null;
+  const path = subprocessRecordPath(subprocessId);
+  return lockedReadWriteTypedJson(path, SubprocessRecordSchema, (current) =>
+    callback(current)
+  );
+}
+
+function qmdIndexFileLockPath() {
+  return `${qmdIndexPath}.lock`;
+}
+
+function readQmdIndexFileLockOwner(lockPath) {
+  try {
+    return JSON.parse(readFileSync(lockPath, "utf8")) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+function qmdIndexLockOwnerExpired(owner, entry) {
+  const expiryMs = epochMs(owner?.expiresAt);
+  return expiryMs > 0
+    ? Date.now() > expiryMs
+    : Date.now() - entry.mtimeMs > qmdIndexFileLockStaleMs;
+}
+
+function qmdIndexLockHasRecoveryFence(owner) {
+  return Number.isInteger(owner?.generation) &&
+    typeof owner?.fencingTokenHash === "string" &&
+    owner.fencingTokenHash.length > 0 &&
+    typeof owner?.runnerSessionId === "string" &&
+    owner.runnerSessionId.length > 0 &&
+    typeof owner?.operationId === "string" &&
+    owner.operationId.length > 0;
+}
+
+function removeStaleQmdIndexFileLock(lockPath) {
+  try {
+    const entry = statSync(lockPath);
+    if (Date.now() - entry.mtimeMs <= qmdIndexFileLockStaleMs) return false;
+    const owner = readQmdIndexFileLockOwner(lockPath);
+    if (!qmdIndexLockOwnerExpired(owner, entry)) return false;
+    if (!qmdIndexLockHasRecoveryFence(owner)) return false;
+    if (processAlive(owner.pid)) return false;
+    unlinkSync(lockPath);
+    fsyncDirectory(dirname(lockPath), owner);
+    event({
+      event: "qmd_index_file_lock_recovered",
+      status: "pending",
+      metadata: {
+        lockPath: relative(root, lockPath),
+        previousPid: owner.pid,
+        previousRunnerSessionId: owner.runnerSessionId,
+        lockOwnerEvidence: redactJsonValue(owner),
+        recoveryDecision: "stale_lock_removed",
+      },
+    });
+    return true;
+  } catch (error) {
+    if (error instanceof DurableStateError) throw error;
+    return false;
+  }
+}
+
+function qmdIndexLockOwnedBy(lockPath, expected) {
+  const current = readQmdIndexFileLockOwner(lockPath);
+  return current.operationId === expected.operationId &&
+    current.runnerSessionId === expected.runnerSessionId &&
+    current.generation === expected.generation &&
+    current.fencingTokenHash === expected.fencingTokenHash;
+}
+
+function releaseQmdIndexFileLock(lockPath, owner) {
+  if (!qmdIndexLockOwnedBy(lockPath, owner)) return false;
+  unlinkSync(lockPath);
+  fsyncDirectory(dirname(lockPath), owner);
+  return true;
+}
+
+async function withQmdIndexFileLock(callback, metadata = {}) {
+  if (statusJson) return await callback();
+  const lockPath = qmdIndexFileLockPath();
+  const startedAt = Date.now();
+  for (;;) {
+    let fd = null;
+    try {
+      mkdirSync(dirname(qmdIndexPath), { recursive: true });
+      fd = openSync(lockPath, "wx");
+      const mapping = durableTargetMapping(qmdIndexPath, "sqlite-lock");
+      const generation = coordinatorLease?.generation ?? 1;
+      const fencingTokenHash = coordinatorLease?.fencingToken == null
+        ? sha256Text([
+            "qmd-index",
+            runnerSessionId,
+            runId,
+            String(generation),
+          ].join(":"))
+        : sha256Text(coordinatorLease.fencingToken);
+      const owner = {
+        pid: runnerPid,
+        ownerPid: runnerPid,
+        runnerSessionId,
+        runId,
+        runnerHost,
+        ownerHost: runnerHost,
+        targetLocator: relative(root, qmdIndexPath),
+        lockPath: relative(root, lockPath),
+        ...mapping,
+        generation,
+        fencingTokenHash,
+        operationId: randomToken("qmd-index-lock"),
+        command: metadata.command,
+        itemId: metadata.itemId,
+        bookId: metadata.bookId,
+        workerId: metadata.workerId,
+        acquiredAt: now(),
+        heartbeatAt: now(),
+        expiresAt: new Date(Date.now() + qmdIndexFileLockStaleMs).toISOString(),
+        durableMode: "strict",
+        durableAdapterContract,
+      };
+      writeSync(fd, JSON.stringify(owner) + "\n");
+      fsyncSync(fd);
+      event({
+        itemId: metadata.itemId,
+        event: "qmd_index_file_lock_acquired",
+        status: metadata.status,
+        command: metadata.command,
+        metadata: {
+          bookId: metadata.bookId,
+          workerId: metadata.workerId,
+          waitMs: Date.now() - startedAt,
+          generation: owner.generation,
+          fencingTokenHash: owner.fencingTokenHash,
+          operationId: owner.operationId,
+          lane: owner.lane,
+          targetMappingOwner: owner.targetMappingOwner,
+          durableKind: owner.durableKind,
+          laneTimeoutMs: owner.laneTimeoutMs,
+          releaseOn: owner.releaseOn,
+          ...durableProjection(owner),
+        },
+      });
+      try {
+        return await callback();
+      } finally {
+        try {
+          closeSync(fd);
+        } catch {
+          // Best-effort cleanup only.
+        }
+        fd = null;
+        const released = releaseQmdIndexFileLock(lockPath, owner);
+        event({
+          itemId: metadata.itemId,
+          event: "qmd_index_file_lock_released",
+          status: metadata.status,
+          command: metadata.command,
+          metadata: {
+            bookId: metadata.bookId,
+            workerId: metadata.workerId,
+            released,
+            generation: owner.generation,
+            fencingTokenHash: owner.fencingTokenHash,
+            operationId: owner.operationId,
+            lane: owner.lane,
+            targetMappingOwner: owner.targetMappingOwner,
+            durableKind: owner.durableKind,
+            laneTimeoutMs: owner.laneTimeoutMs,
+            releaseOn: owner.releaseOn,
+            ...durableProjection(owner),
+          },
+        });
+      }
+    } catch (error) {
+      if (fd != null) {
+        try {
+          closeSync(fd);
+        } catch {
+          // Best-effort cleanup only.
+        }
+      }
+      if (error?.code !== "EEXIST") throw error;
+      removeStaleQmdIndexFileLock(lockPath);
+      if (Date.now() - startedAt > qmdIndexFileLockWaitMs) {
+        const lockOwnerEvidence = readQmdIndexFileLockOwner(lockPath);
+        const mapping = durableTargetMapping(qmdIndexPath, "sqlite-lock");
+        const durableError = new DurableStateError(
+          `timed out waiting for qmd index file lock: ${relative(root, lockPath)}`,
+          {
+            failureKind: "local_state_lock_timeout",
+            localFailureClass: "durable_state_lock_timeout",
+            evidence: {
+              targetLocator: relative(root, qmdIndexPath),
+              redactedEvidenceLocator: basename(qmdIndexPath),
+              lockPath: relative(root, lockPath),
+              ...mapping,
+              lockOwnerEvidence: redactJsonValue(lockOwnerEvidence),
+              durableMode: "strict",
+              completedPublishRule: "forbidden",
+            },
+          },
+        );
+        emitDurableFailureEvent("durable_lock_timeout", durableError, {
+          targetLocator: relative(root, qmdIndexPath),
+        });
+        throw durableError;
+      }
+      await delay(25);
+    }
+  }
+}
+
+function terminateProcessTree(child, signal) {
+  try {
+    if (child.pid && process.platform !== "win32") {
+      process.kill(-child.pid, signal);
+      return;
+    }
+  } catch {
+    // Fall back to direct child termination below.
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // Process may have already exited.
+  }
+}
+
+function terminatePid(pid, processGroup, signal) {
+  try {
+    if (pid && processGroup && process.platform !== "win32") {
+      process.kill(-pid, signal);
+      return;
+    }
+  } catch {
+    // Fall back to direct pid termination below.
+  }
+  try {
+    process.kill(pid, signal);
+  } catch {
+    // Process may have already exited.
+  }
+}
+
+function requestBatchStop(reason) {
+  if (batchStopRequested) return;
+  batchStopRequested = true;
+  batchStopReason = batchStopReason ?? reason;
+  event({
+    event: "batch_stop_requested",
+    status: "failed",
+    recoveryDecision: "stop_until_fixed",
+    metadata: {
+      reason,
+      activeSubprocesses: activeChildProcesses.size,
+    },
+  });
+}
+
+function terminateActiveSubprocesses(reason, signal = "SIGTERM") {
+  if (activeChildProcesses.size === 0) return;
+  event({
+    event: "batch_active_subprocesses_terminating",
+    status: "failed",
+    recoveryDecision: "stop_until_fixed",
+    metadata: {
+      reason,
+      signal,
+      activeSubprocesses: activeChildProcesses.size,
+    },
+  });
+  for (const child of activeChildProcesses.values()) {
+    terminateProcessTree(child, signal);
+  }
+}
+
+function handleTerminationSignal(signal) {
+  if (terminationSignalHandling) return;
+  terminationSignalHandling = true;
+  const reason = `runner_signal_${signal}`;
+  process.exitCode = 1;
+  try {
+    requestBatchStop(reason);
+  } catch (error) {
+    console.error(redactLog(
+      error instanceof Error ? error.stack ?? error.message : String(error),
+    ));
+  }
+  try {
+    terminateActiveSubprocesses(reason, "SIGTERM");
+  } catch (error) {
+    console.error(redactLog(
+      error instanceof Error ? error.stack ?? error.message : String(error),
+    ));
+  }
+  setTimeout(() => {
+    try {
+      terminateActiveSubprocesses(`${reason}_kill_timeout`, "SIGKILL");
+    } catch (error) {
+      console.error(redactLog(
+        error instanceof Error ? error.stack ?? error.message : String(error),
+      ));
+    }
+  }, 750).unref();
+  setTimeout(() => {
+    try {
+      releaseCoordinatorLock();
+    } catch (error) {
+      console.error(redactLog(
+        error instanceof Error ? error.stack ?? error.message : String(error),
+      ));
+    }
+    process.exit(1);
+  }, 1500).unref();
+}
+
+function installTerminationSignalHandlers() {
+  for (const signal of ["SIGTERM", "SIGINT"]) {
+    process.once(signal, () => handleTerminationSignal(signal));
+  }
+}
+
+function batchStopInterruptError(command) {
+  const error = new Error(
+    `batch stop requested before command: ${batchStopReason ?? "unknown"}`,
+  );
+  error.name = BatchStopInterruptErrorName;
+  error.batchStopInterrupt = true;
+  error.commandCheck = {
+    name: command,
+    status: "failed",
+    attempts: 1,
+    exitCode: null,
+    stdoutBytes: 0,
+    stderrBytes: 0,
+    startedAt: now(),
+    completedAt: now(),
+    failureKind: "transient",
+    retryable: true,
+    attemptExhausted: false,
+    recoveryDecision: "continue_pending",
+    errorSummary: "batch stop requested by coordinator",
+  };
+  return error;
+}
+
+function isBatchStopInterrupt(error) {
+  return error != null &&
+    typeof error === "object" &&
+    error.batchStopInterrupt === true;
+}
+
+function buildProviderSlotLease(semaphore, metadata, waitMs) {
+  if (statusJson) return null;
+  const provider = providerSlotProviderName(metadata.provider ?? semaphore.name);
+  const slotId = randomToken(`${provider}-slot`);
+  const issuedAt = now();
+  return ProviderSlotLeaseSchema.parse({
+    schemaVersion: SchemaVersion,
+    runId,
+    provider,
+    slotId,
+    itemId: metadata.itemId,
+    bookId: metadata.bookId,
+    workerId: metadata.workerId,
+    command: metadata.command,
+    limit: semaphore.limit,
+    waitMs,
+    runnerSessionId,
+    runnerHost,
+    runnerPid,
+    generation: coordinatorLease?.generation ?? 1,
+    fencingToken: randomToken("provider-fence"),
+    acquiredAt: issuedAt,
+    heartbeatAt: issuedAt,
+    expiresAt: leaseExpiresAt(),
+  });
+}
+
+async function acquireProviderSlotLease(semaphore, metadata, waitMs) {
+  if (statusJson) return null;
+  const provider = providerSlotProviderName(metadata.provider ?? semaphore.name);
+  const startedAt = Date.now();
+  for (;;) {
+    const acquired = await withJsonFileLockAsync(
+      providerSlotRegistryLockPath(provider),
+      async () => {
+        recoverStaleProviderSlotLeases(provider);
+        const active = activeProviderSlotLeases().filter((lease) =>
+          lease.provider === provider
+        );
+        if (active.length >= semaphore.limit) return null;
+        const lease = buildProviderSlotLease(
+          semaphore,
+          metadata,
+          Date.now() - startedAt + waitMs,
+        );
+        writeJsonAtomicWithValue(providerSlotPath(lease.slotId), lease);
+        return lease;
+      },
+    );
+    if (acquired != null) {
+      event({
+        itemId: metadata.itemId,
+        event: "provider_slot_lease_acquired",
+        status: metadata.status,
+        command: metadata.command,
+        metadata: {
+          slotId: acquired.slotId,
+          provider,
+          workerId: metadata.workerId,
+          bookId: metadata.bookId,
+          limit: semaphore.limit,
+          waitMs: acquired.waitMs,
+          fencingToken: acquired.fencingToken,
+          generation: acquired.generation,
+          durableCapacityGate: true,
+        },
+      });
+      return acquired;
+    }
+    if (Date.now() - startedAt > providerSlotAcquireWaitMs) {
+      throw new Error(
+        `timed out waiting for durable provider slot: ${provider}`,
+      );
+    }
+    await delay(100);
+  }
+}
+
+function releaseProviderSlotLease(lease, metadata = {}) {
+  if (lease == null || statusJson) return;
+  withJsonFileLock(providerSlotRegistryLockPath(lease.provider), () => {
+    const path = providerSlotPath(lease.slotId);
+    const current = readTypedJsonIfExists(path, ProviderSlotLeaseSchema);
+    if (
+      current == null ||
+      current.runnerSessionId !== lease.runnerSessionId ||
+      current.generation !== lease.generation ||
+      current.fencingToken !== lease.fencingToken
+    ) {
+      event({
+        itemId: metadata.itemId ?? lease.itemId,
+        event: "provider_slot_lease_release_rejected",
+        status: metadata.status,
+        command: metadata.command ?? lease.command,
+        metadata: {
+          slotId: lease.slotId,
+          provider: lease.provider,
+          workerId: lease.workerId,
+          bookId: lease.bookId,
+          generation: lease.generation,
+          fencingToken: lease.fencingToken,
+        },
+      });
+      return;
+    }
+    rmSync(path, { force: true });
+    fsyncDirectory(providerSlotRoot);
+    event({
+      itemId: metadata.itemId ?? lease.itemId,
+      event: "provider_slot_lease_released",
+      status: metadata.status,
+      command: metadata.command ?? lease.command,
+      metadata: {
+        slotId: lease.slotId,
+        provider: lease.provider,
+        workerId: lease.workerId,
+        bookId: lease.bookId,
+        generation: lease.generation,
+        fencingToken: lease.fencingToken,
+      },
+    });
+  });
+}
+
+const localCpuSlots = new AsyncSemaphore(localCpuConcurrency, "local_cpu");
+const openaiProviderSlots = new AsyncSemaphore(
+  openaiProviderConcurrency,
+  "openai_provider",
+);
+const jinaProviderSlots = new AsyncSemaphore(jinaProviderConcurrency, "jina_provider");
+const qmdIndexWriterLane = new AsyncSemaphore(1, "qmd_index_writer");
+
+async function withSemaphore(semaphore, metadata, callback) {
+  const lease = await semaphore.acquire(metadata);
+  const providerSlotLease = await acquireProviderSlotLease(
+    semaphore,
+    metadata,
+    lease.waitMs,
+  );
+  try {
+    return await callback({ ...lease, providerSlotLease });
+  } finally {
+    releaseProviderSlotLease(providerSlotLease, metadata);
+    lease.release();
+  }
+}
+
+function providerSemaphoreForCommand(name) {
+  if (name === "qmd-query-json" || name === "qmd-query-auto-json") {
+    return { semaphore: openaiProviderSlots, provider: "openai" };
+  }
+  if (name === "qmd-query-graphrag-json") {
+    return { semaphore: openaiProviderSlots, provider: "openai" };
+  }
+  if (name === "qmd-vsearch-json" || name === "qmd-embed") {
+    return { semaphore: jinaProviderSlots, provider: "jina" };
+  }
+  return null;
+}
+
+function providerSemaphoreForResumeStage(checkpoint) {
+  const stage = checkpoint?.graphBuildStatus?.stage ?? checkpoint?.failedStage;
+  if (stage === "embed") return { semaphore: jinaProviderSlots, provider: "jina" };
+  if (stage === "graph_extract" || stage === "community_report") {
+    return { semaphore: openaiProviderSlots, provider: "openai" };
+  }
+  return { semaphore: openaiProviderSlots, provider: "openai" };
+}
+
+function providerSemaphoreForResumeNextStage(nextStage) {
+  if (nextStage === "embed") return { semaphore: jinaProviderSlots, provider: "jina" };
+  if (nextStage === "graph_extract" || nextStage === "community_report") {
+    return { semaphore: openaiProviderSlots, provider: "openai" };
+  }
+  return { semaphore: openaiProviderSlots, provider: "openai" };
+}
+
 function ensureDirs() {
   if (statusJson) {
     requirePath(stateRoot, "state root");
@@ -1947,6 +4542,10 @@ function loadDotenv() {
 }
 
 function event(payload) {
+  if (payload?.itemId != null && payload?.status !== "running") {
+    assertEventItemFence(payload);
+  }
+  eventSequence += 1;
   const sanitizedPayload = {
     ...payload,
     message: payload?.message ? redacted(payload.message) : undefined,
@@ -1957,13 +4556,21 @@ function event(payload) {
   const item = BatchEventLogSchema.parse({
     schemaVersion: SchemaVersion,
     runId,
+    eventId: randomToken("evt"),
+    sequence: eventSequence,
+    runnerSessionId,
+    coordinatorGeneration: coordinatorLease?.generation,
     at: now(),
     ...withoutUndefined(sanitizedPayload),
   });
   if (statusJson) return item;
-  writeFileSync(eventsPath, JSON.stringify(item) + "\n", {
-    flag: "a",
-    encoding: "utf8",
+  withJsonFileLock(eventsPath, () => {
+    withDurableOperationContext(durableContextFromValue(item), () => {
+      writeFileDurable(eventsPath, JSON.stringify(item) + "\n", {
+        flag: "a",
+        fsyncParent: false,
+      });
+    });
   });
   if (values.verbose && !statusJson) {
     const parts = [item.event, item.itemId, item.command, item.status]
@@ -1973,19 +4580,1805 @@ function event(payload) {
   }
 }
 
+function assertEventItemFence(payload) {
+  if (statusJson) return;
+  const current = readTypedJsonIfExists(
+    join(itemRoot, `${payload.itemId}.json`),
+    BatchItemCheckpointSchema,
+  );
+  if (payload?.event === "item_running_recovered") {
+    if (current?.status === "running" && runningCheckpointIsOrphaned(current)) return;
+  }
+  if (current?.status !== "running") {
+    assertTerminalEventFinalizationFence(current, payload);
+    return;
+  }
+  if (current.runnerSessionId !== runnerSessionId) {
+    throw new Error(
+      `item event fencing rejected stale event for ${payload.itemId}`,
+    );
+  }
+  if (current.leaseExpiresAt != null && epochMs(current.leaseExpiresAt) <= Date.now()) {
+    throw new Error(`item event lease expired before event: ${payload.itemId}`);
+  }
+  const currentLease = readTypedJsonIfExists(
+    bookLeasePath(current.bookId),
+    BookLeaseSchema,
+  );
+  if (
+    currentLease == null ||
+    currentLease.runnerSessionId !== runnerSessionId ||
+    currentLease.generation !== current.bookLeaseGeneration ||
+    currentLease.fencingToken !== current.bookFencingToken
+  ) {
+    throw new Error(
+      `item event book fencing rejected stale event for ${payload.itemId}`,
+    );
+  }
+}
+
+function terminalFinalizationFenceFromCheckpoint(checkpoint) {
+  const fence = checkpoint?.metadata?.terminalFinalization;
+  if (fence == null || typeof fence !== "object" || Array.isArray(fence)) return null;
+  const required = [
+    "token",
+    "runnerSessionId",
+    "bookId",
+    "bookLeaseGeneration",
+    "bookFencingToken",
+    "itemFencingToken",
+    "completedFromStatus",
+    "providerSlotFence",
+  ];
+  for (const field of required) {
+    if (typeof fence[field] !== "string" && field !== "bookLeaseGeneration") {
+      return null;
+    }
+  }
+  if (!Number.isInteger(fence.bookLeaseGeneration)) return null;
+  if (
+    fence.activeProviderSlotsAtFinalization != null &&
+    !Number.isInteger(fence.activeProviderSlotsAtFinalization)
+  ) {
+    return null;
+  }
+  return fence;
+}
+
+function assertTerminalEventFinalizationFence(current, payload) {
+  if (payload?.event !== "item_completed" && payload?.event !== "item_worker_completed") {
+    return;
+  }
+  const fence = terminalFinalizationFenceFromCheckpoint(current);
+  if (fence == null) {
+    throw new Error(`missing terminal finalization fence for event: ${payload.itemId}`);
+  }
+  const payloadFence = payload.metadata?.terminalFinalization;
+  if (
+    payloadFence == null ||
+    payloadFence.token !== fence.token ||
+    payloadFence.runnerSessionId !== runnerSessionId ||
+    payloadFence.bookId !== fence.bookId ||
+    payloadFence.bookLeaseGeneration !== fence.bookLeaseGeneration ||
+    payloadFence.bookFencingToken !== fence.bookFencingToken ||
+    payloadFence.itemFencingToken !== fence.itemFencingToken
+  ) {
+    throw new Error(`terminal event fencing rejected stale event for ${payload.itemId}`);
+  }
+}
+
+function activeProviderSlotLeasesForItem(itemId) {
+  return activeProviderSlotLeases().filter((lease) =>
+    lease.itemId === itemId &&
+    lease.runnerSessionId === runnerSessionId
+  );
+}
+
+function assertNoActiveProviderSlotLeasesForTerminal(checkpoint) {
+  const active = activeProviderSlotLeasesForItem(checkpoint.itemId);
+  if (active.length > 0) {
+    throw new Error(
+      `terminal completion blocked by active provider slot: ${checkpoint.itemId}`,
+    );
+  }
+}
+
+function buildTerminalFinalizationFence(checkpoint) {
+  assertNoActiveProviderSlotLeasesForTerminal(checkpoint);
+  if (
+    checkpoint.runnerSessionId !== runnerSessionId ||
+    checkpoint.bookLeaseGeneration == null ||
+    checkpoint.bookFencingToken == null ||
+    checkpoint.fencingToken == null
+  ) {
+    throw new Error(
+      `terminal completion missing item/book fencing: ${checkpoint.itemId}`,
+    );
+  }
+  return {
+    token: randomToken("item-finalize"),
+    runnerSessionId,
+    bookId: checkpoint.bookId,
+    bookLeaseGeneration: checkpoint.bookLeaseGeneration,
+    bookFencingToken: checkpoint.bookFencingToken,
+    itemFencingToken: checkpoint.fencingToken,
+    completedFromStatus: checkpoint.status,
+    providerSlotFence: "no_active_provider_slot",
+    activeProviderSlotsAtFinalization: 0,
+    finalizedAt: now(),
+  };
+}
+
 function readJson(path) {
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
+function writeJsonSidecar(path, value, operation = durableOperationEvidence(path, "json-sidecar")) {
+  writeFileDurable(path, `${JSON.stringify(value, null, 2)}\n`, {
+    flag: "wx",
+    fsyncParent: false,
+    operation,
+  });
+}
+
+function primaryDurableKindForPath(path) {
+  if (path.endsWith(".yaml") || path.endsWith(".yml")) return "yaml";
+  if (path.endsWith(".jsonl")) return "jsonl";
+  if (path.endsWith(".json")) return "json";
+  if (path.endsWith(".sqlite")) return "sqlite";
+  return "file";
+}
+
+function checksumSidecarWriteEvidence(primaryPath, checksumPath, value = {}) {
+  return {
+    primaryTargetLocator: relative(root, primaryPath),
+    primaryDurableKind: primaryDurableKindForPath(primaryPath),
+    sidecarTargetLocator: relative(root, checksumPath),
+    sidecarKind: "checksum",
+    checksum: value?.checksum,
+    checksumExpected: value?.checksumExpected ?? value?.checksum,
+    checksumActual: value?.checksumActual ?? value?.checksum,
+    checksumRecoveryDecision: value?.checksumRecoveryDecision,
+    repairAllowed: value?.repairAllowed ?? true,
+  };
+}
+
+function checksumMetaWriteEvidence(path, value) {
+  const primaryPath = path.endsWith(".sha256.meta.json")
+    ? path.slice(0, -".sha256.meta.json".length)
+    : undefined;
+  if (primaryPath == null) return {};
+  const hasExpected = Object.hasOwn(value ?? {}, "checksumExpected");
+  return {
+    primaryTargetLocator: relative(root, primaryPath),
+    primaryDurableKind: primaryDurableKindForPath(primaryPath),
+    sidecarTargetLocator: relative(root, path),
+    sidecarKind: "checksum_meta",
+    checksum: value?.checksum,
+    checksumExpected: hasExpected ? value.checksumExpected : value?.checksum ?? null,
+    checksumActual: value?.checksumActual ?? value?.checksum,
+    checksumRecoveryDecision: value?.checksumRecoveryDecision,
+    repairAllowed: value?.repairAllowed ?? true,
+  };
+}
+
+function writeJsonAtomicSidecar(path, value, extra = {}) {
+  const operation = durableOperationEvidence(path, "json-sidecar", {
+    ...checksumMetaWriteEvidence(path, value),
+    ...extra,
+  });
+  const temporaryPath = `${path}.tmp-${operation.tempId}`;
+  const ownerPath = `${temporaryPath}.owner.json`;
+  try {
+    writeJsonSidecar(ownerPath, operation, operation);
+    writeFileDurable(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, {
+      flag: "wx",
+      fsyncParent: false,
+      operation,
+    });
+    renameWithDurableEvidence(temporaryPath, path, operation);
+    rmSync(ownerPath, { force: true });
+    fsyncDirectory(dirname(path), operation);
+  } catch (error) {
+    rmSync(temporaryPath, { force: true });
+    rmSync(ownerPath, { force: true });
+    throw classifyDurableWriteError(error, operation);
+  }
+}
+
+function readChecksumMeta(path) {
+  try {
+    return JSON.parse(readFileSync(durableChecksumMetaPath(path), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function readChecksumMetaState(path) {
+  const metaPath = durableChecksumMetaPath(path);
+  if (!existsSync(metaPath)) return { status: "missing", meta: null };
+  try {
+    return { status: "present", meta: JSON.parse(readFileSync(metaPath, "utf8")) };
+  } catch (error) {
+    return { status: "invalid", meta: null, error };
+  }
+}
+
+function recordStatusJsonDurableDiagnostic(input) {
+  if (!statusJson) return null;
+  const diagnostic = DurableStateDiagnosticSchema.parse(withoutUndefined({
+    failureKind: input.failureKind ?? "local_state_integrity",
+    localFailureClass: input.localFailureClass,
+    recoveryDecision: input.recoveryDecision,
+    failedStage: input.failedStage ?? "status-json",
+    ...durableProjection(input),
+  }));
+  const key = JSON.stringify([
+    diagnostic.targetLocator,
+    diagnostic.sidecarTargetLocator,
+    diagnostic.localFailureClass,
+    diagnostic.checksumRecoveryDecision,
+    diagnostic.statusJsonDecision,
+  ]);
+  if (!statusJsonDurableDiagnostics.some((item) => item.key === key)) {
+    statusJsonDurableDiagnostics.push({ key, diagnostic });
+  }
+  return diagnostic;
+}
+
+function statusJsonDurableDiagnosticList() {
+  return statusJsonDurableDiagnostics.map((item) => item.diagnostic);
+}
+
+function durableDiagnosticKey(diagnostic) {
+  return JSON.stringify([
+    diagnostic.itemId,
+    diagnostic.bookId,
+    diagnostic.activeCommand,
+    diagnostic.targetLocator,
+    diagnostic.sidecarTargetLocator,
+    diagnostic.localFailureClass,
+    diagnostic.checksumRecoveryDecision,
+    diagnostic.statusJsonDecision,
+  ]);
+}
+
+function durableStateFailureDiagnosticsForItems(items) {
+  return items
+    .filter((item) =>
+      item.localFailureClass != null ||
+      item.failureKind === "local_state_integrity" ||
+      item.failureKind === "local_state_lock_timeout" ||
+      item.commandChecks?.some((check) =>
+        check.localFailureClass != null ||
+        check.failureKind === "local_state_integrity" ||
+        check.failureKind === "local_state_lock_timeout"
+      )
+    )
+    .map((item) => {
+      const failedCommand = (item.commandChecks ?? [])
+        .filter((check) => check.status === "failed")
+        .at(-1);
+      const durable = durableProjection(failedCommand ?? item);
+      return DurableStateDiagnosticSchema.parse(withoutUndefined({
+        ...durable,
+        itemId: item.itemId,
+        bookId: item.bookId,
+        activeCommand: failedCommand?.name ?? item.activeCommand ??
+          item.currentCommand ?? item.failedStage,
+        failureKind: failedCommand?.failureKind ?? item.failureKind ??
+          durable.failureKind,
+        retryable: failedCommand?.retryable ?? item.retryable ??
+          durable.retryable,
+        localFailureClass: failedCommand?.localFailureClass ??
+          item.localFailureClass ?? durable.localFailureClass,
+        recoveryDecision: failedCommand?.recoveryDecision ??
+          item.recoveryDecision ?? durable.recoveryDecision,
+        failedStage: failedCommand?.failedStage ?? item.failedStage ??
+          durable.failedStage,
+      }));
+    });
+}
+
+function mergedDurableStateFailures(items) {
+  const merged = new Map();
+  for (const diagnostic of [
+    ...statusJsonDurableDiagnosticList(),
+    ...durableStateFailureDiagnosticsForItems(items),
+  ]) {
+    const key = durableDiagnosticKey(diagnostic);
+    if (!merged.has(key)) merged.set(key, diagnostic);
+  }
+  return Array.from(merged.values());
+}
+
+function inspectDurableSerializedTargetReadOnly(path, text, kind) {
+  const checksumPath = durableChecksumPath(path);
+  const expected = existsSync(checksumPath)
+    ? readFileSync(checksumPath, "utf8").trim()
+    : null;
+  const actual = sha256Text(text);
+  const mapping = durableTargetMapping(path, kind);
+  const primaryTargetLocator = relative(root, path);
+  const checksumMetaLocator = relative(root, durableChecksumMetaPath(path));
+  const directoryTargetLocator = relative(root, dirname(path)).split(sep).join("/");
+  const directoryMapping = durableTargetMapping(dirname(path), "directory-fsync");
+  const baseDiagnostic = {
+    ...mapping,
+    lane: mapping.lane ?? directoryMapping.lane,
+    targetMappingOwner:
+      mapping.targetMappingOwner ?? directoryMapping.targetMappingOwner,
+    targetLocator: primaryTargetLocator,
+    directoryTargetLocator,
+    directoryDurableKind: "directory",
+    primaryDurableKind: mapping.durableKind,
+    primaryTargetLocator,
+    sidecarTargetLocator: checksumMetaLocator,
+    sidecarKind: "checksum_meta",
+    checksumExpected: expected,
+    checksumActual: actual,
+    repairAllowed: false,
+    completedPublishRule: "forbidden",
+    fsyncTarget: directoryTargetLocator,
+    fsyncPlatform: process.platform,
+    fsyncErrno: "not_attempted_read_only",
+    unavailableFieldSentinels: ["fsyncErrno"],
+    durableMode: "read_only_observer",
+  };
+  if (expected == null) {
+    recordStatusJsonDurableDiagnostic({
+      ...baseDiagnostic,
+      sidecarTargetLocator: relative(root, checksumPath),
+      sidecarKind: "checksum",
+      localFailureClass: "durable_checksum_missing",
+      recoveryDecision: "stop_until_fixed",
+      statusJsonDecision: "fail_closed_projection",
+      diagnosticClass: "checksum_missing",
+      checksumRecoveryDecision: "target_new_checksum_missing",
+    });
+    return;
+  }
+  if (expected !== actual) {
+    recordStatusJsonDurableDiagnostic({
+      ...baseDiagnostic,
+      localFailureClass: "durable_checksum_mismatch",
+      recoveryDecision: "stop_until_fixed",
+      statusJsonDecision: "fail_closed_projection",
+      diagnosticClass: "checksum_mismatch",
+      checksumRecoveryDecision: "stop_until_fixed",
+    });
+    return;
+  }
+  const metaPath = durableChecksumMetaPath(path);
+  if (!existsSync(metaPath)) {
+    recordStatusJsonDurableDiagnostic({
+      ...baseDiagnostic,
+      localFailureClass: "durable_checksum_meta_missing",
+      recoveryDecision: "metadata_missing_read_only",
+      statusJsonDecision: "read_only_degraded",
+      diagnosticClass: "checksum_meta_missing",
+      checksumRecoveryDecision: "metadata_missing_read_only",
+    });
+    return;
+  }
+  let meta;
+  try {
+    meta = JSON.parse(readFileSync(metaPath, "utf8"));
+  } catch {
+    recordStatusJsonDurableDiagnostic({
+      ...baseDiagnostic,
+      localFailureClass: "durable_checksum_meta_invalid",
+      recoveryDecision: "stop_until_fixed",
+      statusJsonDecision: "fail_closed_projection",
+      diagnosticClass: "checksum_meta_invalid",
+      checksumRecoveryDecision: "stop_until_fixed",
+    });
+    return;
+  }
+  if (checksumMetaIsInvalid(path, actual, meta)) {
+    recordStatusJsonDurableDiagnostic({
+      ...baseDiagnostic,
+      localFailureClass: "durable_checksum_meta_conflict",
+      recoveryDecision: "stop_until_fixed",
+      statusJsonDecision: "fail_closed_projection",
+      diagnosticClass: "checksum_meta_conflict",
+      checksumRecoveryDecision: "stop_until_fixed",
+    });
+  }
+}
+
+function readDurableYamlReadOnly(path) {
+  const text = readFileSync(path, "utf8");
+  const parsed = YAML.parse(text) ?? null;
+  inspectDurableSerializedTargetReadOnly(path, text, "yaml");
+  return parsed;
+}
+
+function readDurableJsonReadOnly(path) {
+  const text = readFileSync(path, "utf8");
+  const parsed = JSON.parse(text);
+  inspectDurableSerializedTargetReadOnly(path, text, "json");
+  return parsed;
+}
+
+function checksumCommitEvidenceMatches(path, checksum, meta) {
+  if (meta == null || meta.checksum !== checksum) return false;
+  if (meta.operationId == null || meta.runnerSessionId == null) return false;
+  if (meta.fencingTokenHash == null || meta.targetGeneration == null) return false;
+  if (
+    meta.commitState !== "target_rename_pending" &&
+    meta.checksumRecoveryDecision !== "target_rename_pending"
+  ) {
+    return false;
+  }
+  return meta.absoluteTargetLocator === path ||
+    meta.targetLocator === relative(root, path) ||
+    basename(String(meta.targetLocator ?? "")) === basename(path);
+}
+
+function checksumMetaIsInvalid(path, checksum, meta) {
+  return meta != null && meta.checksum !== checksum;
+}
+
+function checksumMetaSidecarEvidence(path, checksum, decision, extra = {}) {
+  const hasExpected = Object.hasOwn(extra, "checksumExpected");
+  return durableOperationEvidence(durableChecksumMetaPath(path), "json-sidecar", {
+    ...extra,
+    primaryTargetLocator: relative(root, path),
+    sidecarTargetLocator: relative(root, durableChecksumMetaPath(path)),
+    sidecarKind: "checksum_meta",
+    checksum,
+    checksumExpected: hasExpected ? extra.checksumExpected : checksum,
+    checksumActual: extra.checksumActual ?? checksum,
+    checksumRecoveryDecision: extra.checksumRecoveryDecision ?? decision,
+    repairAllowed: extra.repairAllowed ?? true,
+  });
+}
+
+function eventDurableChecksumMetaBackfilled(path, checksum, decision) {
+  const evidence = checksumMetaSidecarEvidence(path, checksum, decision);
+  event({
+    event: "durable_checksum_meta_backfilled",
+    status: "pending",
+    checksumRecoveryDecision: decision,
+    ...durableProjection(evidence),
+    metadata: {
+      ...durableProjection(evidence),
+      locator: relative(root, path),
+      checksum,
+      checksumRecoveryDecision: decision,
+    },
+  });
+}
+
+function writeCommittedChecksumMeta(path, checksum, decision) {
+  writeJsonAtomicSidecar(
+    durableChecksumMetaPath(path),
+    {
+      ...committedChecksumMeta(path, checksum, decision),
+      checksumExpected: checksum,
+      checksumActual: checksum,
+      repairAllowed: true,
+    },
+  );
+  eventDurableChecksumMetaBackfilled(path, checksum, decision);
+}
+
+function quarantineChecksumMetaSidecar(path, checksum, meta, decision, reason) {
+  const metaPath = durableChecksumMetaPath(path);
+  if (!existsSync(metaPath)) return;
+  const operation = checksumMetaSidecarEvidence(path, checksum, decision, {
+    localFailureClass: reason === "invalid"
+      ? "durable_checksum_meta_invalid"
+      : "durable_checksum_meta_conflict",
+    checksumExpected: reason === "invalid" ? null : meta?.checksum,
+    completedPublishRule: "forbidden",
+  });
+  const quarantinePath = `${metaPath}.corrupt-${Date.now()}`;
+  try {
+    renameWithDurableEvidence(metaPath, quarantinePath, operation);
+    fsyncDirectory(dirname(metaPath), operation);
+  } catch (error) {
+    const durableError = classifyDurableWriteError(error, operation);
+    emitDurableFailureEvent("durable_replace_failed", durableError, {
+      targetLocator: relative(root, metaPath),
+    });
+    throw durableError;
+  }
+  event({
+    event: "durable_checksum_meta_sidecar_quarantined",
+    status: "failed",
+    failureKind: "local_state_integrity",
+    retryable: false,
+    recoveryDecision: "stop_until_fixed",
+    checksumRecoveryDecision: decision,
+    ...durableProjection(operation),
+    metadata: {
+      ...durableProjection(operation),
+      locator: relative(root, path),
+      quarantineLocator: relative(root, quarantinePath),
+      checksum,
+      previousChecksum: meta?.checksum,
+      reason,
+    },
+  });
+}
+
+function repairChecksumMetaSidecar(path, checksum, meta, decision, reason) {
+  quarantineChecksumMetaSidecar(path, checksum, meta, decision, reason);
+  writeCommittedChecksumMeta(path, checksum, decision);
+}
+
+function checksumMetaIsPending(meta) {
+  return meta?.commitState === "target_rename_pending" ||
+    meta?.checksumRecoveryDecision === "target_rename_pending";
+}
+
+function committedChecksumMeta(path, checksum, decision) {
+  return durableOperationEvidence(path, "checksum", {
+    checksum,
+    checksumPath: relative(root, durableChecksumPath(path)),
+    checksumRecoveryDecision: decision,
+    commitState: "committed",
+    committedAt: now(),
+  });
+}
+
+function renameWithDurableEvidence(from, to, operation) {
+  try {
+    if (shouldInjectRenameEnoent(to, operation)) {
+      unlinkSync(from);
+    }
+    renameSync(from, to);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new DurableStateError(
+        `local_state_integrity durable_temp_rename_enoent: ${relative(root, to)}`,
+        {
+          localFailureClass: "durable_temp_rename_enoent",
+          cause: error,
+          evidence: {
+            ...operation,
+            targetLocator: relative(root, to),
+            failedSyscall: "rename",
+            errno: "ENOENT",
+            renameCause: inferRenameEnoentCause(from, to, operation),
+            completedPublishRule: "forbidden",
+            redactedEvidenceLocator: basename(to),
+          },
+        },
+      );
+    }
+    throw error;
+  }
+}
+
+function inferRenameEnoentCause(from, to, operation) {
+  const tempExists = existsSync(from);
+  const targetExists = existsSync(to);
+  const currentChecksum = readDurableChecksum(to);
+  if (
+    currentChecksum != null &&
+    operation?.targetChecksumBefore != null &&
+    currentChecksum !== operation.targetChecksumBefore
+  ) {
+    return "generation_advanced";
+  }
+  if (operation?.tempCreateCollision === true) return "temp_collision";
+  if (
+    operation?.cleanupReason === "live_temp_deleted" ||
+    operation?.cleanupReason === "owner_alive"
+  ) {
+    return "reconciler_mistaken_deletion";
+  }
+  if (
+    operation?.fencingTokenMismatch === true ||
+    operation?.staleWriter === true ||
+    operation?.leaseGenerationChanged === true
+  ) {
+    return "concurrent_takeover";
+  }
+  if (!tempExists && targetExists) return "generation_advanced";
+  return "filesystem_or_external_mutation";
+}
+
+function shouldInjectRenameEnoent(to, operation) {
+  if (testRenameEnoentInjected || testRenameEnoentOncePattern === "") return false;
+  const target = relative(root, to);
+  if (!target.includes(testRenameEnoentOncePattern)) return false;
+  const sidecarPattern = testRenameEnoentOncePattern.includes(".sha256.meta.json");
+  if (operation?.kind === "json-sidecar" && !sidecarPattern) return false;
+  if (operation?.kind !== "json" && operation?.kind !== "json-sidecar") return false;
+  if (!target.endsWith(".json")) return false;
+  testRenameEnoentMatchCount += 1;
+  if (testRenameEnoentMatchCount <= testRenameEnoentAfterMatches) {
+    return false;
+  }
+  testRenameEnoentInjected = true;
+  return true;
+}
+
+function classifyDurableWriteError(error, operation) {
+  if (error instanceof DurableStateError) return error;
+  if (error?.code === "EEXIST") {
+    return new DurableStateError(
+      `local_state_integrity durable_temp_create_collision: ${operation.targetLocator}`,
+      {
+        localFailureClass: "durable_temp_create_collision",
+        cause: error,
+        evidence: {
+          ...operation,
+          errno: "EEXIST",
+          completedPublishRule: "forbidden",
+          redactedEvidenceLocator: basename(String(operation.absoluteTargetLocator ?? "")),
+        },
+      },
+    );
+  }
+  return error;
+}
+
 function writeJsonAtomic(path, text) {
   mkdirSync(dirname(path), { recursive: true });
-  const temporaryPath = `${path}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(temporaryPath, text, "utf8");
-  renameSync(temporaryPath, path);
+  JSON.parse(text);
+  const checksum = sha256Text(text);
+  const operation = durableOperationEvidence(path, "json");
+  const commitEvidence = { ...operation, checksum };
+  const temporaryPath = `${path}.tmp-${operation.tempId}`;
+  const ownerPath = `${temporaryPath}.owner.json`;
+  const checksumPath = durableChecksumPath(path);
+  const checksumOperation = durableOperationEvidence(checksumPath, "checksum", {
+    ...checksumSidecarWriteEvidence(path, checksumPath, {
+      checksum,
+      checksumRecoveryDecision: "committed",
+    }),
+    checksum,
+    checksumRecoveryDecision: "committed",
+    tempId: `${operation.tempId}-checksum`,
+  });
+  const checksumTemporaryPath = `${checksumPath}.tmp-${checksumOperation.tempId}`;
+  const checksumOwnerPath = `${checksumTemporaryPath}.owner.json`;
+  let tempCreated = false;
+  let checksumTempCreated = false;
+  try {
+    writeJsonSidecar(ownerPath, commitEvidence, operation);
+    writeFileDurable(temporaryPath, text, {
+      flag: "wx",
+      fsyncParent: false,
+      operation,
+    });
+    tempCreated = true;
+    writeJsonAtomicSidecar(durableChecksumMetaPath(path), {
+      ...commitEvidence,
+      checksumRecoveryDecision: "target_rename_pending",
+      commitState: "target_rename_pending",
+    });
+    renameWithDurableEvidence(temporaryPath, path, operation);
+    const checksumMeta = {
+      ...commitEvidence,
+      checksum,
+      checksumPath: relative(root, checksumPath),
+      checksumRecoveryDecision: "committed",
+      commitState: "committed",
+      committedAt: now(),
+    };
+    writeJsonSidecar(checksumOwnerPath, checksumOperation, checksumOperation);
+    writeFileDurable(checksumTemporaryPath, `${checksum}\n`, {
+      flag: "wx",
+      fsyncParent: false,
+      operation: checksumOperation,
+    });
+    checksumTempCreated = true;
+    renameWithDurableEvidence(checksumTemporaryPath, checksumPath, checksumOperation);
+    writeJsonAtomicSidecar(durableChecksumMetaPath(path), checksumMeta);
+    rmSync(ownerPath, { force: true });
+    rmSync(checksumOwnerPath, { force: true });
+    fsyncDirectory(dirname(path), checksumOperation);
+  } catch (error) {
+    if (tempCreated) rmSync(temporaryPath, { force: true });
+    rmSync(ownerPath, { force: true });
+    if (checksumTempCreated) rmSync(checksumTemporaryPath, { force: true });
+    rmSync(checksumOwnerPath, { force: true });
+    const durableError = classifyDurableWriteError(error, operation);
+    emitDurableFailureEvent("durable_replace_failed", durableError, {
+      targetLocator: relative(root, path),
+    });
+    throw durableError;
+  }
+}
+
+function writeJsonlAtomic(path, lines) {
+  mkdirSync(dirname(path), { recursive: true });
+  const text = lines.join("\n") + "\n";
+  for (const line of lines) JSON.parse(line);
+  const operation = durableOperationEvidence(path, "jsonl");
+  const temporaryPath = `${path}.tmp-${operation.tempId}`;
+  const ownerPath = `${temporaryPath}.owner.json`;
+  try {
+    writeJsonSidecar(ownerPath, operation, operation);
+    writeFileDurable(temporaryPath, text, {
+      flag: "wx",
+      fsyncParent: false,
+      operation,
+    });
+    renameWithDurableEvidence(temporaryPath, path, operation);
+    rmSync(ownerPath, { force: true });
+    fsyncDirectory(dirname(path), operation);
+  } catch (error) {
+    rmSync(temporaryPath, { force: true });
+    rmSync(ownerPath, { force: true });
+    const durableError = classifyDurableWriteError(error, operation);
+    emitDurableFailureEvent("durable_replace_failed", durableError, {
+      targetLocator: relative(root, path),
+    });
+    throw durableError;
+  }
+}
+
+function readJsonSidecar(path) {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function durableTempOwnerEvidence(owner) {
+  if (owner == null || typeof owner !== "object") return undefined;
+  return redactJsonValue({
+    ...localDurableEvidence({
+      localFailureClass: owner.localFailureClass,
+      targetLocator: owner.targetLocator,
+      redactedEvidenceLocator: owner.redactedEvidenceLocator,
+      lane: owner.lane,
+      targetMappingOwner: owner.targetMappingOwner,
+      laneTimeoutMs: owner.laneTimeoutMs,
+      releaseOn: owner.releaseOn,
+      tempId: owner.tempId,
+      operationId: owner.operationId,
+      failedSyscall: owner.failedSyscall,
+      errno: owner.errno,
+      renameCause: owner.renameCause,
+      completedPublishRule: owner.completedPublishRule,
+      checksumRecoveryDecision: owner.checksumRecoveryDecision,
+      fsyncTarget: owner.fsyncTarget,
+      fsyncErrno: owner.fsyncErrno,
+      fsyncPlatform: owner.fsyncPlatform,
+      durableMode: owner.durableMode,
+    }),
+    runnerSessionId: owner.runnerSessionId,
+    runId: owner.runId,
+    workerId: owner.workerId,
+    itemId: owner.itemId,
+    bookId: owner.bookId,
+    leaseGeneration: owner.leaseGeneration,
+    ownerPid: owner.ownerPid ?? owner.pid,
+    ownerHost: owner.ownerHost ?? owner.host,
+    createdAt: owner.createdAt,
+    expiresAt: owner.expiresAt,
+    fencingTokenHash: owner.fencingTokenHash,
+    targetGeneration: owner.targetGeneration,
+    targetChecksumBefore: owner.targetChecksumBefore,
+  });
+}
+
+function durableTempCleanupDecision(temporaryPath, temporaryStat) {
+  const owner = readJsonSidecar(`${temporaryPath}.owner.json`);
+  const ownerTarget = String(owner?.absoluteTargetLocator ?? "");
+  const ownerRelativeTarget = String(owner?.targetLocator ?? "");
+  const tempTarget = durableTempTargetPath(temporaryPath);
+  const targetMatches =
+    tempTarget != null &&
+    (
+      ownerTarget === tempTarget ||
+      ownerRelativeTarget === relative(root, tempTarget)
+    );
+  const ownerPid = Number.parseInt(String(owner?.ownerPid ?? owner?.pid ?? ""), 10);
+  const ownerHost = String(owner?.ownerHost ?? owner?.host ?? "");
+  const staleAgeMs = Math.max(0, Date.now() - temporaryStat.mtimeMs);
+  const ownerCreatedAtMs = epochMs(owner?.createdAt);
+  const ownerLocal = ownerHost === "" || ownerHost === runnerHost;
+  const ownerAlive = ownerLocal && processAlive(ownerPid);
+  const ownerExpiryMs = epochMs(owner?.expiresAt);
+  const leaseExpired = ownerExpiryMs > 0 && Date.now() > ownerExpiryMs;
+  if (staleAgeMs <= durableTempStaleMs) {
+    return {
+      remove: false,
+      reason: "fresh_temp_below_stale_ttl",
+      staleAgeMs,
+      lockOwnerEvidence: durableTempOwnerEvidence(owner),
+    };
+  }
+  if (owner == null || ownerCreatedAtMs <= 0) {
+    return {
+      remove: false,
+      reason: "owner_evidence_missing_or_invalid",
+      staleAgeMs,
+      lockOwnerEvidence: durableTempOwnerEvidence(owner),
+    };
+  }
+  if (!targetMatches) {
+    return {
+      remove: false,
+      reason: "owner_target_mismatch",
+      staleAgeMs,
+      lockOwnerEvidence: durableTempOwnerEvidence(owner),
+    };
+  }
+  if (
+    !Number.isInteger(owner?.leaseGeneration) ||
+    !Number.isInteger(owner?.targetGeneration) ||
+    typeof owner?.fencingTokenHash !== "string" ||
+    owner.fencingTokenHash.length === 0 ||
+    typeof owner?.targetChecksumBefore !== "string"
+  ) {
+    return {
+      remove: false,
+      reason: "owner_generation_or_fencing_missing",
+      staleAgeMs,
+      lockOwnerEvidence: durableTempOwnerEvidence(owner),
+    };
+  }
+  const currentTargetChecksum = tempTarget == null
+    ? undefined
+    : readDurableChecksum(tempTarget);
+  if (currentTargetChecksum !== owner.targetChecksumBefore) {
+    return {
+      remove: false,
+      reason: "target_generation_advanced",
+      staleAgeMs,
+      lockOwnerEvidence: durableTempOwnerEvidence(owner),
+    };
+  }
+  if (ownerAlive && !leaseExpired) {
+    return {
+      remove: false,
+      reason: "owner_alive",
+      staleAgeMs,
+      lockOwnerEvidence: durableTempOwnerEvidence(owner),
+    };
+  }
+  if (!ownerLocal && !leaseExpired) {
+    return {
+      remove: false,
+      reason: "remote_owner_unproven",
+      staleAgeMs,
+      lockOwnerEvidence: durableTempOwnerEvidence(owner),
+    };
+  }
+  return {
+    remove: true,
+    reason: owner == null
+      ? "orphan_temp_without_owner"
+      : leaseExpired
+        ? "owner_lease_expired"
+        : "owner_dead_stale_temp",
+    staleAgeMs,
+    lockOwnerEvidence: durableTempOwnerEvidence(owner),
+  };
+}
+
+function durableTempTargetPath(temporaryPath) {
+  const checksumMarker = ".sha256.tmp-";
+  const checksumIndex = temporaryPath.lastIndexOf(checksumMarker);
+  if (checksumIndex >= 0) {
+    return temporaryPath.slice(0, checksumIndex + ".sha256".length);
+  }
+  const marker = ".tmp-";
+  const index = temporaryPath.lastIndexOf(marker);
+  return index >= 0 ? temporaryPath.slice(0, index) : null;
+}
+
+function tempOwnerEvidence(temporaryPath) {
+  const owner = readJsonSidecar(`${temporaryPath}.owner.json`);
+  return durableTempOwnerEvidence(owner);
+}
+
+function tempOwnerProjection(temporaryPath) {
+  const owner = readJsonSidecar(`${temporaryPath}.owner.json`);
+  if (owner == null) return {};
+  return localDurableEvidence({
+    localFailureClass: owner.localFailureClass,
+    targetLocator: owner.targetLocator,
+    redactedEvidenceLocator: owner.redactedEvidenceLocator,
+    lane: owner.lane,
+    targetMappingOwner: owner.targetMappingOwner,
+    laneTimeoutMs: owner.laneTimeoutMs,
+    releaseOn: owner.releaseOn,
+    tempId: owner.tempId,
+    operationId: owner.operationId,
+    failedStage: owner.failedStage,
+    failedSyscall: owner.failedSyscall,
+    errno: owner.errno,
+    renameCause: owner.renameCause,
+    completedPublishRule: owner.completedPublishRule,
+    checksumRecoveryDecision: owner.checksumRecoveryDecision,
+    fsyncTarget: owner.fsyncTarget,
+    fsyncErrno: owner.fsyncErrno,
+    fsyncPlatform: owner.fsyncPlatform,
+    durableMode: owner.durableMode,
+  });
+}
+
+function durablePreflightDecisionForTemp(temporaryPath) {
+  let temporaryStat;
+  try {
+    temporaryStat = statSync(temporaryPath);
+  } catch {
+    return null;
+  }
+  const decision = durableTempCleanupDecision(temporaryPath, temporaryStat);
+  if (decision.remove) return null;
+  const ownerProjection = tempOwnerProjection(temporaryPath);
+  return {
+    localFailureClass: "durable_preflight_unresolved_temp",
+    reason: decision.reason,
+    targetLocator: relative(root, temporaryPath),
+    redactedEvidenceLocator: basename(temporaryPath),
+    ...ownerProjection,
+    lockOwnerEvidence: decision.lockOwnerEvidence,
+    cleanupReason: decision.reason,
+  };
+}
+
+function durablePreflightDecisionForLock(lockPath) {
+  try {
+    const entry = statSync(lockPath);
+    const owner = readJsonLockOwner(lockPath);
+    const expiredAndDead = jsonLockOwnerExpired(owner, entry) &&
+      !processAlive(owner.pid);
+    if (expiredAndDead && jsonLockOwnerHasRecoveryFence(owner)) return null;
+    return {
+      localFailureClass: "durable_preflight_live_lock",
+      reason: expiredAndDead
+        ? "stale_lock_recovery_fence_missing"
+        : "lock_owner_live_or_unexpired",
+      targetLocator: owner.targetLocator ?? relative(root, lockPath),
+      redactedEvidenceLocator: basename(lockPath),
+      lane: owner.lane,
+      targetMappingOwner: owner.targetMappingOwner,
+      laneTimeoutMs: owner.laneTimeoutMs,
+      releaseOn: owner.releaseOn,
+      operationId: owner.operationId,
+      lockOwnerEvidence: redactJsonValue(owner),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function durablePreflightDecisionForPrimaryJson(path) {
+  try {
+    reconcileDurableJsonTarget(path);
+    return null;
+  } catch (error) {
+    if (error instanceof DurableStateError) {
+      return {
+        localFailureClass:
+          error.localFailureClass ?? "durable_preflight_checksum_blocked",
+        reason: "durable_json_reconcile_failed",
+        ...durableProjection(error.evidence),
+        targetLocator: error.evidence?.targetLocator ?? relative(root, path),
+        redactedEvidenceLocator: error.evidence?.redactedEvidenceLocator ??
+          basename(path),
+      };
+    }
+    return {
+      localFailureClass: "durable_preflight_checksum_blocked",
+      reason: "durable_json_reconcile_failed",
+      targetLocator: relative(root, path),
+      redactedEvidenceLocator: basename(path),
+      checksumRecoveryDecision: "stop_until_fixed",
+    };
+  }
+}
+
+function durablePreflightDecisionForPrimaryYaml(path) {
+  try {
+    reconcileDurableYamlTarget(path);
+    return null;
+  } catch (error) {
+    if (error instanceof DurableStateError) {
+      return {
+        localFailureClass:
+          error.localFailureClass ?? "durable_preflight_checksum_blocked",
+        reason: "durable_yaml_reconcile_failed",
+        ...durableProjection(error.evidence),
+        targetLocator: error.evidence?.targetLocator ?? relative(root, path),
+        redactedEvidenceLocator: error.evidence?.redactedEvidenceLocator ??
+          basename(path),
+      };
+    }
+    return {
+      localFailureClass: "durable_preflight_checksum_blocked",
+      reason: "durable_yaml_reconcile_failed",
+      targetLocator: relative(root, path),
+      redactedEvidenceLocator: basename(path),
+      checksumRecoveryDecision: "stop_until_fixed",
+    };
+  }
+}
+
+function providerRequestDiagnosticBase(path) {
+  const mapping = durableTargetMapping(path, "json");
+  const primaryTargetLocator = relative(root, path);
+  const directoryTargetLocator = relative(root, dirname(path)).split(sep).join("/");
+  return {
+    ...mapping,
+    targetLocator: primaryTargetLocator,
+    primaryTargetLocator,
+    redactedEvidenceLocator: basename(path),
+    directoryTargetLocator,
+    directoryDurableKind: "directory",
+    primaryDurableKind: "json",
+    failedStage: "runner_start",
+    failureKind: "local_state_integrity",
+    retryable: false,
+    recoveryDecision: "continue_with_diagnostic_unless_catalog_blocked",
+    statusJsonDecision: "read_only_capped_diagnostic",
+    diagnosticClass: "provider_request_durable_degraded",
+    checksumRecoveryDecision: "read_only_capped_diagnostic",
+    normalRunnerAction: "no_primary_quarantine",
+    repairAllowed: false,
+    completedPublishRule: "allowed_with_diagnostic",
+    durableMode: "read_only_capped_diagnostic",
+  };
+}
+
+function providerRequestReadOnlyDiagnostic(path) {
+  try {
+    const text = readFileSync(path, "utf8");
+    JSON.parse(text);
+    const expected = existsSync(durableChecksumPath(path))
+      ? readFileSync(durableChecksumPath(path), "utf8").trim()
+      : null;
+    const actual = sha256Text(text);
+    const base = providerRequestDiagnosticBase(path);
+    if (expected == null) {
+      return {
+        ...base,
+        localFailureClass: "durable_checksum_missing",
+        checksumExpected: null,
+        checksumActual: actual,
+      };
+    }
+    if (expected !== actual) {
+      return {
+        ...base,
+        localFailureClass: "durable_checksum_mismatch",
+        checksumExpected: expected,
+        checksumActual: actual,
+      };
+    }
+    const metaState = readChecksumMetaState(path);
+    if (metaState.status === "missing") {
+      return {
+        ...base,
+        localFailureClass: "durable_checksum_meta_missing",
+        checksumExpected: expected,
+        checksumActual: actual,
+      };
+    }
+    if (metaState.status === "invalid") {
+      return {
+        ...base,
+        localFailureClass: "durable_checksum_meta_invalid",
+        checksumExpected: expected,
+        checksumActual: actual,
+      };
+    }
+    if (checksumMetaIsInvalid(path, actual, metaState.meta)) {
+      return {
+        ...base,
+        localFailureClass: "durable_checksum_meta_conflict",
+        checksumExpected: metaState.meta?.checksum ?? expected,
+        checksumActual: actual,
+      };
+    }
+  } catch (error) {
+    return {
+      ...providerRequestDiagnosticBase(path),
+      localFailureClass: "durable_target_invalid",
+      checksumExpected: null,
+      checksumActual: undefined,
+      evidenceIncomplete: true,
+      evidenceIncompleteReason: error instanceof SyntaxError
+        ? "invalid_json"
+        : "read_only_inspection_failed",
+    };
+  }
+  return null;
+}
+
+function providerRequestSummaryDiagnostic(diagnostics, scanned, truncated) {
+  if (diagnostics.length === 0) return null;
+  const first = diagnostics[0];
+  return {
+    ...first,
+    scannedTargetCount: scanned,
+    degradedTargetCount: diagnostics.length,
+    sampleTargetLocators: diagnostics
+      .slice(0, providerRequestStartupSampleLimit)
+      .map((item) => item.targetLocator),
+    scanTruncated: truncated,
+    maxRunnerStartScannedTargets: providerRequestStartupScanLimit,
+    maxRunnerStartReportedSamples: providerRequestStartupSampleLimit,
+    maxRunnerStartMutationCount: 0,
+  };
+}
+
+function scanProviderRequestDiagnostics(directory) {
+  let entries = [];
+  try {
+    entries = readdirSync(directory, { withFileTypes: true });
+  } catch {
+    return { diagnostics: [], scanned: 0, truncated: false };
+  }
+  const primaryJsonEntries = entries
+    .filter((entry) => entry.isFile() && isDurablePrimaryJsonEntry(entry.name))
+    .sort((left, right) => left.name.localeCompare(right.name));
+  const targets = primaryJsonEntries.slice(0, providerRequestStartupScanLimit);
+  const diagnostics = [];
+  for (const entry of targets) {
+    const diagnostic = providerRequestReadOnlyDiagnostic(join(directory, entry.name));
+    if (diagnostic != null) diagnostics.push(diagnostic);
+  }
+  return {
+    diagnostics,
+    scanned: targets.length,
+    truncated: primaryJsonEntries.length > targets.length,
+  };
+}
+
+function durablePreflightDecisionForQmdIndexLock() {
+  const lockPath = qmdIndexFileLockPath();
+  try {
+    const entry = statSync(lockPath);
+    const owner = readQmdIndexFileLockOwner(lockPath);
+    const expiredAndDead = qmdIndexLockOwnerExpired(owner, entry) &&
+      !processAlive(owner.pid);
+    if (expiredAndDead && qmdIndexLockHasRecoveryFence(owner)) return null;
+    return {
+      localFailureClass: "durable_preflight_live_lock",
+      reason: expiredAndDead
+        ? "stale_lock_recovery_fence_missing"
+        : "lock_owner_live_or_unexpired",
+      targetLocator: owner.targetLocator ?? relative(root, qmdIndexPath),
+      redactedEvidenceLocator: basename(lockPath),
+      lane: owner.lane,
+      targetMappingOwner: owner.targetMappingOwner,
+      laneTimeoutMs: owner.laneTimeoutMs,
+      releaseOn: owner.releaseOn,
+      operationId: owner.operationId,
+      lockOwnerEvidence: redactJsonValue(owner),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function durablePreflightScanDirectory(directory, options = {}, depth = 0) {
+  const blockers = [];
+  if (options.providerRequestReadOnly === true) {
+    const scan = scanProviderRequestDiagnostics(directory);
+    const summary = providerRequestSummaryDiagnostic(
+      scan.diagnostics,
+      scan.scanned,
+      scan.truncated,
+    );
+    if (summary != null) {
+      options.providerRequestDiagnostics?.push(summary);
+    }
+    return blockers;
+  }
+  const includeTemps = options.includeTemps !== false;
+  const recursive = options.recursive === true;
+  const maxDepth = Number.isInteger(options.maxDepth) ? options.maxDepth : 8;
+  let entries = [];
+  try {
+    entries = readdirSync(directory, { withFileTypes: true });
+  } catch {
+    return blockers;
+  }
+  for (const entry of entries.filter((entry) => entry.name.endsWith(".lock"))) {
+    const path = join(directory, entry.name);
+    const blocker = durablePreflightDecisionForLock(path);
+    if (blocker != null) blockers.push(blocker);
+  }
+  for (const entry of entries) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      if (recursive && depth < maxDepth && !entry.name.includes(".corrupt-")) {
+        blockers.push(...durablePreflightScanDirectory(path, options, depth + 1));
+      }
+      continue;
+    }
+    if (entry.name.endsWith(".owner.json") || entry.name.endsWith(".lock")) continue;
+    if (includeTemps && entry.name.includes(".tmp-")) {
+      const blocker = durablePreflightDecisionForTemp(path);
+      if (blocker != null) blockers.push(blocker);
+      continue;
+    }
+    if (isDurablePrimaryJsonEntry(entry.name)) {
+      const blocker = durablePreflightDecisionForPrimaryJson(path);
+      if (blocker != null) blockers.push(blocker);
+      continue;
+    }
+    if (isDurablePrimaryYamlEntry(entry.name)) {
+      const blocker = durablePreflightDecisionForPrimaryYaml(path);
+      if (blocker != null) blockers.push(blocker);
+    }
+  }
+  return blockers;
+}
+
+function isProviderRequestPreflightMapping(mapping) {
+  return mapping.targetFamily === "provider_request_fingerprint" ||
+    mapping.targetMappingOwner === "providerRequestFingerprint";
+}
+
+function durablePreflightTargets(item = undefined) {
+  const targets = [];
+  for (const mapping of durableTargetMappingTable) {
+    if (!Array.isArray(mapping.preflightScopes)) {
+      throw new DurableStateError(
+        `durable target preflight scope missing: ${mapping.pattern.source}`,
+        {
+          localFailureClass: "durable_target_mapping_missing",
+          evidence: {
+            targetMappingPattern: mapping.pattern.source,
+            targetMappingOwner: mapping.targetMappingOwner,
+            lane: mapping.lane,
+            durableKind: mapping.durableKind,
+            durableMode: "strict",
+            completedPublishRule: "forbidden",
+          },
+        },
+      );
+    }
+    for (const scope of mapping.preflightScopes) {
+      const entry = durablePreflightTargetFromScope(scope, item);
+      if (entry != null && isProviderRequestPreflightMapping(mapping)) {
+        entry.providerRequestReadOnly = true;
+      }
+      if (entry != null) targets.push(entry);
+    }
+  }
+  return uniqueDurablePreflightTargets(targets);
+}
+
+function durablePreflightTargetsForItems(items) {
+  const targets = [...durablePreflightTargets(undefined)];
+  for (const item of items) {
+    targets.push(...durablePreflightTargets(item));
+  }
+  return uniqueDurablePreflightTargets(targets);
+}
+
+function uniqueDurablePreflightTargets(targets) {
+  const unique = new Map();
+  for (const target of targets) {
+    const entry = typeof target === "string" ? { directory: target } : target;
+    const current = unique.get(entry.directory);
+    unique.set(entry.directory, {
+      ...current,
+      ...entry,
+      recursive: Boolean(current?.recursive || entry.recursive),
+    });
+  }
+  return Array.from(unique.values());
+}
+
+function durablePreflightTargetFromScope(scope, item = undefined) {
+  const scopePath = typeof scope === "string" ? scope : scope?.path;
+  if (typeof scopePath !== "string" || scopePath.length === 0) return null;
+  const replacements = {
+    runId,
+    bookId: item?.bookId,
+    itemId: item?.itemId,
+  };
+  let resolved = scopePath;
+  for (const [key, value] of Object.entries(replacements)) {
+    if (resolved.includes(`{${key}}`)) {
+      if (value == null || value === "") return null;
+      resolved = resolved.split(`{${key}}`).join(value);
+    }
+  }
+  return {
+    directory: durablePreflightScopeDirectory(resolved),
+    recursive: Boolean(scope?.recursive),
+    maxDepth: scope?.maxDepth,
+  };
+}
+
+function durablePreflightScopeDirectory(scopePath) {
+  if (scopePath === "graph_vault") return stateRoot;
+  if (scopePath.startsWith("graph_vault/")) {
+    return join(stateRoot, scopePath.slice("graph_vault/".length));
+  }
+  return join(root, scopePath);
+}
+
+function durablePreflight(stage, item = undefined, options = {}) {
+  if (statusJson) return;
+  const blockers = [];
+  const targets = Array.isArray(options.targets)
+    ? options.targets
+    : durablePreflightTargets(item);
+  for (const target of targets) {
+    blockers.push(...durablePreflightScanDirectory(target.directory, {
+      ...options,
+      recursive: Boolean(options.recursive || target.recursive),
+      providerRequestReadOnly: Boolean(
+        options.providerRequestReadOnly || target.providerRequestReadOnly
+      ),
+      providerRequestDiagnostics: options.providerRequestDiagnostics,
+    }));
+  }
+  const qmdIndexLockBlocker = durablePreflightDecisionForQmdIndexLock();
+  if (qmdIndexLockBlocker != null) blockers.push(qmdIndexLockBlocker);
+  if (blockers.length === 0) return;
+  const first = blockers[0];
+  const durableError = new DurableStateError(
+    `durable preflight blocked ${stage}: ${first.targetLocator}`,
+    {
+      localFailureClass: first.localFailureClass,
+      evidence: {
+        ...first,
+        failedStage: stage,
+        durableMode: "strict",
+        completedPublishRule: "forbidden",
+      },
+    },
+  );
+  event({
+    itemId: item?.itemId,
+    event: "durable_preflight_blocked",
+    status: "failed",
+    failureKind: "local_state_integrity",
+    retryable: false,
+    recoveryDecision: "stop_until_fixed",
+    failedStage: stage,
+    message: durableError.message,
+    ...durableProjection(durableError.evidence),
+    metadata: {
+      ...durableProjection(durableError.evidence),
+      blockerCount: blockers.length,
+      firstBlockerReason: first.reason,
+      cleanupReason: first.cleanupReason,
+    },
+  });
+  throw durableError;
+}
+
+function backfillDurableChecksum(path, checksum, decision, eventName) {
+  const checksumPath = durableChecksumPath(path);
+  const operation = durableOperationEvidence(checksumPath, "checksum", {
+    ...checksumSidecarWriteEvidence(path, checksumPath, {
+      checksum,
+      checksumRecoveryDecision: decision,
+    }),
+    checksum,
+    checksumRecoveryDecision: decision,
+  });
+  const temporaryPath = `${checksumPath}.tmp-${operation.tempId}`;
+  const ownerPath = `${temporaryPath}.owner.json`;
+  let tempCreated = false;
+  try {
+    writeJsonSidecar(ownerPath, operation, operation);
+    writeFileDurable(temporaryPath, `${checksum}\n`, {
+      flag: "wx",
+      fsyncParent: false,
+      operation,
+    });
+    tempCreated = true;
+    renameWithDurableEvidence(temporaryPath, checksumPath, operation);
+    writeJsonAtomicSidecar(durableChecksumMetaPath(path), operation);
+    rmSync(ownerPath, { force: true });
+    fsyncDirectory(dirname(path), operation);
+    event({
+      event: eventName,
+      status: "pending",
+      ...durableProjection(operation),
+      metadata: {
+        ...durableProjection(operation),
+        locator: relative(root, path),
+        checksum,
+        checksumRecoveryDecision: decision,
+      },
+    });
+  } catch (error) {
+    if (tempCreated) rmSync(temporaryPath, { force: true });
+    rmSync(ownerPath, { force: true });
+    const durableError = classifyDurableWriteError(error, operation);
+    emitDurableFailureEvent("durable_replace_failed", durableError, {
+      targetLocator: relative(root, checksumPath),
+    });
+    throw durableError;
+  }
+}
+
+function quarantineDurableTarget(path, kind, reason, cause, extra = {}) {
+  const operation = durableOperationEvidence(path, `${kind}-quarantine`, {
+    localFailureClass: reason === "checksum_mismatch"
+      ? "durable_checksum_mismatch"
+      : "durable_target_invalid",
+    checksumRecoveryDecision: "stop_until_fixed",
+    ...extra,
+  });
+  const quarantinePath = `${path}.corrupt-${Date.now()}`;
+  try {
+    renameWithDurableEvidence(path, quarantinePath, operation);
+    fsyncDirectory(dirname(path), operation);
+  } catch (error) {
+    const durableError = classifyDurableWriteError(error, operation);
+    emitDurableFailureEvent("durable_replace_failed", durableError, {
+      targetLocator: relative(root, path),
+    });
+    throw durableError;
+  }
+  const targetLabel = kind === "json" ? "JSON" : "YAML";
+  const reasonLabel = reason === "checksum_mismatch"
+    ? "checksum mismatch"
+    : reason;
+  const durableError = new DurableStateError(`invalid durable ${targetLabel} target: ${
+    relative(root, path)
+  } (${reasonLabel})`, {
+    localFailureClass: operation.localFailureClass,
+    cause,
+    evidence: {
+      ...operation,
+      quarantineLocator: relative(root, quarantinePath),
+      redactedEvidenceLocator: basename(path),
+    },
+  });
+  event({
+    event: `durable_${kind}_target_quarantined`,
+    status: "failed",
+    failureKind: "local_state_integrity",
+    retryable: false,
+    recoveryDecision: "stop_until_fixed",
+    failedStage: "durable_state",
+    message: durableError.message,
+    ...durableProjection(durableError.evidence),
+    metadata: {
+      ...durableProjection(durableError.evidence),
+      locator: relative(root, path),
+      quarantineLocator: relative(root, quarantinePath),
+      reason,
+    },
+  });
+  throw durableError;
+}
+
+function reconcileDurableJsonTarget(path) {
+  if (statusJson) return;
+  if (isDurableAuxiliaryPath(path)) return;
+  withJsonFileLock(path, () => reconcileDurableJsonTargetUnlocked(path));
+}
+
+function reconcileDurableJsonTargetUnlocked(path) {
+  const directory = dirname(path);
+  try {
+    for (const entry of readdirSync(directory)) {
+      if (
+        isDurableTempEntry(path, entry) ||
+        isDurableTempEntry(durableChecksumPath(path), entry)
+      ) {
+        const temporaryPath = join(directory, entry);
+        const temporaryStat = statSync(temporaryPath);
+        const decision = durableTempCleanupDecision(temporaryPath, temporaryStat);
+        if (!decision.remove) continue;
+        const ownerProjection = tempOwnerProjection(temporaryPath);
+        rmSync(temporaryPath, { force: true });
+        rmSync(`${temporaryPath}.owner.json`, { force: true });
+        fsyncDirectory(directory);
+        event({
+          event: "durable_json_temp_reconciled",
+          status: "pending",
+          localFailureClass: "durable_stale_temp_reconciled",
+          targetLocator: relative(root, temporaryPath),
+          ...ownerProjection,
+          metadata: {
+            locator: relative(root, temporaryPath),
+            lockOwnerEvidence: decision.lockOwnerEvidence,
+            recoveryDecision: "stale_temp_removed",
+            cleanupReason: decision.reason,
+            staleAgeMs: Math.floor(decision.staleAgeMs),
+          },
+        });
+      }
+    }
+  } catch {
+    return;
+  }
+  if (!existsSync(path)) return;
+  try {
+    const text = readFileSync(path, "utf8");
+    JSON.parse(text);
+    const expected = existsSync(durableChecksumPath(path))
+      ? readFileSync(durableChecksumPath(path), "utf8").trim()
+      : null;
+    const actual = sha256Text(text);
+    const metaState = readChecksumMetaState(path);
+    const meta = metaState.meta;
+    if (expected != null && expected !== actual) {
+      if (checksumCommitEvidenceMatches(path, actual, meta)) {
+        backfillDurableChecksum(
+          path,
+          actual,
+          "target_new_checksum_old",
+          "durable_json_checksum_backfilled",
+        );
+        return;
+      }
+      throw Object.assign(new Error("checksum_mismatch"), {
+        checksumExpected: expected,
+        checksumActual: actual,
+      });
+    }
+    if (expected == null) {
+      if (!checksumCommitEvidenceMatches(path, actual, meta)) {
+        throw Object.assign(new Error("checksum_mismatch"), {
+          checksumExpected: null,
+          checksumActual: actual,
+        });
+      }
+      backfillDurableChecksum(
+        path,
+        actual,
+        "target_new_checksum_missing",
+        "durable_json_checksum_backfilled",
+      );
+    } else if (checksumMetaIsPending(meta)) {
+      if (!checksumCommitEvidenceMatches(path, actual, meta)) {
+        throw Object.assign(new Error("checksum_mismatch"), {
+          checksumExpected: meta?.checksum,
+          checksumActual: actual,
+        });
+      }
+      if (meta?.checksum !== actual) {
+        backfillDurableChecksum(
+          path,
+          actual,
+          "abandoned_pending_commit_recovered",
+          "durable_json_checksum_backfilled",
+        );
+      } else {
+        writeJsonAtomicSidecar(
+          durableChecksumMetaPath(path),
+          committedChecksumMeta(path, actual, "pending_meta_committed"),
+        );
+        event({
+          event: "durable_json_checksum_meta_committed",
+          status: "pending",
+          checksumRecoveryDecision: "pending_meta_committed",
+          metadata: {
+            locator: relative(root, path),
+            checksum: actual,
+            checksumRecoveryDecision: "pending_meta_committed",
+          },
+        });
+      }
+    } else if (metaState.status === "invalid") {
+      repairChecksumMetaSidecar(
+        path,
+        actual,
+        meta,
+        "checksum_meta_sidecar_repaired",
+        "invalid",
+      );
+    } else if (checksumMetaIsInvalid(path, actual, meta)) {
+      repairChecksumMetaSidecar(
+        path,
+        actual,
+        meta,
+        "checksum_meta_sidecar_repaired",
+        "conflict",
+      );
+    } else if (metaState.status === "missing") {
+      writeCommittedChecksumMeta(path, actual, "metadata_backfilled");
+    }
+  } catch (error) {
+    if (error instanceof DurableStateError) throw error;
+    quarantineDurableTarget(path, "json", error?.message ?? "invalid", error, {
+      checksumExpected: error?.checksumExpected,
+      checksumActual: error?.checksumActual,
+      checksumRecoveryDecision: error?.message === "checksum_mismatch"
+        ? "stop_until_fixed"
+        : undefined,
+    });
+  }
+}
+
+function reconcileDurableYamlTarget(path) {
+  if (statusJson) return;
+  if (isDurableAuxiliaryPath(path)) return;
+  withJsonFileLock(path, () => reconcileDurableYamlTargetUnlocked(path));
+}
+
+function reconcileDurableYamlTargetUnlocked(path) {
+  const directory = dirname(path);
+  try {
+    for (const entry of readdirSync(directory)) {
+      if (
+        isDurableTempEntry(path, entry) ||
+        isDurableTempEntry(durableChecksumPath(path), entry)
+      ) {
+        const temporaryPath = join(directory, entry);
+        const temporaryStat = statSync(temporaryPath);
+        const decision = durableTempCleanupDecision(temporaryPath, temporaryStat);
+        if (!decision.remove) continue;
+        const ownerProjection = tempOwnerProjection(temporaryPath);
+        rmSync(temporaryPath, { force: true });
+        rmSync(`${temporaryPath}.owner.json`, { force: true });
+        fsyncDirectory(directory);
+        event({
+          event: "durable_yaml_temp_reconciled",
+          status: "pending",
+          localFailureClass: "durable_stale_temp_reconciled",
+          targetLocator: relative(root, temporaryPath),
+          ...ownerProjection,
+          metadata: {
+            locator: relative(root, temporaryPath),
+            lockOwnerEvidence: decision.lockOwnerEvidence,
+            recoveryDecision: "stale_temp_removed",
+            cleanupReason: decision.reason,
+            staleAgeMs: Math.floor(decision.staleAgeMs),
+          },
+        });
+      }
+    }
+  } catch {
+    return;
+  }
+  if (!existsSync(path)) return;
+  try {
+    const text = readFileSync(path, "utf8");
+    YAML.parse(text);
+    const expected = existsSync(durableChecksumPath(path))
+      ? readFileSync(durableChecksumPath(path), "utf8").trim()
+      : null;
+    const actual = sha256Text(text);
+    const metaState = readChecksumMetaState(path);
+    const meta = metaState.meta;
+    if (expected != null && expected !== actual) {
+      if (checksumCommitEvidenceMatches(path, actual, meta)) {
+        backfillDurableChecksum(
+          path,
+          actual,
+          "target_new_checksum_old",
+          "durable_yaml_checksum_backfilled",
+        );
+        return;
+      }
+      throw Object.assign(new Error("checksum_mismatch"), {
+        checksumExpected: expected,
+        checksumActual: actual,
+      });
+    }
+    if (expected == null) {
+      if (!checksumCommitEvidenceMatches(path, actual, meta)) {
+        throw Object.assign(new Error("checksum_mismatch"), {
+          checksumExpected: null,
+          checksumActual: actual,
+        });
+      }
+      backfillDurableChecksum(
+        path,
+        actual,
+        "target_new_checksum_missing",
+        "durable_yaml_checksum_backfilled",
+      );
+    } else if (checksumMetaIsPending(meta)) {
+      if (!checksumCommitEvidenceMatches(path, actual, meta)) {
+        throw Object.assign(new Error("checksum_mismatch"), {
+          checksumExpected: meta?.checksum,
+          checksumActual: actual,
+        });
+      }
+      if (meta?.checksum !== actual) {
+        backfillDurableChecksum(
+          path,
+          actual,
+          "abandoned_pending_commit_recovered",
+          "durable_yaml_checksum_backfilled",
+        );
+      } else {
+        writeJsonAtomicSidecar(
+          durableChecksumMetaPath(path),
+          committedChecksumMeta(path, actual, "pending_meta_committed"),
+        );
+        event({
+          event: "durable_yaml_checksum_meta_committed",
+          status: "pending",
+          checksumRecoveryDecision: "pending_meta_committed",
+          metadata: {
+            locator: relative(root, path),
+            checksum: actual,
+            checksumRecoveryDecision: "pending_meta_committed",
+          },
+        });
+      }
+    } else if (metaState.status === "invalid") {
+      repairChecksumMetaSidecar(
+        path,
+        actual,
+        meta,
+        "checksum_meta_sidecar_repaired",
+        "invalid",
+      );
+    } else if (checksumMetaIsInvalid(path, actual, meta)) {
+      repairChecksumMetaSidecar(
+        path,
+        actual,
+        meta,
+        "checksum_meta_sidecar_repaired",
+        "conflict",
+      );
+    } else if (metaState.status === "missing") {
+      writeCommittedChecksumMeta(path, actual, "metadata_backfilled");
+    }
+  } catch (error) {
+    if (error instanceof DurableStateError) throw error;
+    quarantineDurableTarget(path, "yaml", error?.message ?? "invalid", error, {
+      checksumExpected: error?.checksumExpected,
+      checksumActual: error?.checksumActual,
+      checksumRecoveryDecision: error?.message === "checksum_mismatch"
+        ? "stop_until_fixed"
+        : undefined,
+    });
+  }
+}
+
+function reconcileDurableRunFiles() {
+  if (statusJson) return;
+  reconcileDurableJsonTarget(manifestPath);
+  reconcileDurableJsonTarget(recoverySummaryPath);
+  reconcileDurableJsonTarget(coordinatorLockPath);
+  for (const directory of [itemRoot, providerSlotRoot, subprocessRoot, bookLeaseRoot]) {
+    try {
+      for (const entry of readdirSync(directory)) {
+        if (!isDurablePrimaryJsonEntry(entry)) continue;
+        reconcileDurableJsonTarget(join(directory, entry));
+      }
+    } catch {
+      // A missing directory is expected before the first run creates it.
+    }
+  }
 }
 
 function lockPathFor(path) {
   return `${path}.lock`;
+}
+
+function providerSlotRegistryLockPath(provider) {
+  return join(providerSlotRoot, `${provider}.registry.json`);
+}
+
+function readJsonLockOwner(lockPath) {
+  try {
+    return JSON.parse(readFileSync(lockPath, "utf8")) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+function jsonLockOwnerExpired(owner, entry) {
+  const expiryMs = epochMs(owner?.expiresAt);
+  return expiryMs > 0
+    ? Date.now() > expiryMs
+    : Date.now() - entry.mtimeMs > jsonFileLockStaleMs;
+}
+
+function jsonLockOwnerHasRecoveryFence(owner) {
+  return Number.isInteger(owner?.generation) &&
+    typeof owner?.fencingTokenHash === "string" &&
+    owner.fencingTokenHash.length > 0 &&
+    typeof owner?.runnerSessionId === "string" &&
+    owner.runnerSessionId.length > 0 &&
+    typeof owner?.operationId === "string" &&
+    owner.operationId.length > 0;
 }
 
 function removeStaleJsonLock(path) {
@@ -1993,24 +6386,212 @@ function removeStaleJsonLock(path) {
     const lockPath = path;
     const entry = statSync(lockPath);
     if (Date.now() - entry.mtimeMs > jsonFileLockStaleMs) {
+      const owner = readJsonLockOwner(lockPath);
+      if (!jsonLockOwnerExpired(owner, entry)) return;
+      if (!jsonLockOwnerHasRecoveryFence(owner)) return;
+      if (processAlive(owner.pid)) return;
       unlinkSync(lockPath);
+      fsyncDirectory(dirname(lockPath));
+      event({
+        event: "durable_lock_recovered",
+        status: "pending",
+        localFailureClass: "durable_stale_lock_recovered",
+        targetLocator: owner.targetLocator ?? relative(root, lockPath),
+        lane: owner.lane,
+        targetMappingOwner: owner.targetMappingOwner,
+        laneTimeoutMs: owner.laneTimeoutMs,
+        releaseOn: owner.releaseOn,
+        operationId: owner.operationId,
+        lockOwnerEvidence: redactJsonValue(owner),
+        durableMode: "strict",
+        metadata: {
+          lockPath: relative(root, lockPath),
+          lockOwnerEvidence: redactJsonValue(owner),
+          recoveryDecision: "stale_lock_removed",
+        },
+      });
     }
   } catch {
     // Missing or concurrently removed locks are expected under contention.
   }
 }
 
+function staleJsonLockWithoutRecoveryFenceError(path, lockPath, mapping) {
+  let entry;
+  try {
+    entry = statSync(lockPath);
+  } catch {
+    return null;
+  }
+  const lockOwnerEvidence = readJsonLockOwner(lockPath);
+  const expiredAndDead = jsonLockOwnerExpired(lockOwnerEvidence, entry) &&
+    !processAlive(lockOwnerEvidence.pid);
+  if (!expiredAndDead || jsonLockOwnerHasRecoveryFence(lockOwnerEvidence)) {
+    return null;
+  }
+  return new DurableStateError(
+    `durable preflight blocked stale lock without recovery fence: ${
+      relative(root, lockPath)
+    }`,
+    {
+      failureKind: "local_state_integrity",
+      localFailureClass: "durable_preflight_live_lock",
+      failedStage: "runner_start",
+      evidence: {
+        targetLocator: lockOwnerEvidence.targetLocator ?? relative(root, path),
+        redactedEvidenceLocator: basename(lockPath),
+        ...mapping,
+        operationId: lockOwnerEvidence.operationId,
+        lockOwnerEvidence: redactJsonValue(lockOwnerEvidence),
+        durableMode: "strict",
+        completedPublishRule: "forbidden",
+      },
+    },
+  );
+}
+
+function assertJsonLockStillOwned(lockPath, expected) {
+  const current = readJsonLockOwner(lockPath);
+  if (
+    current.operationId === expected.operationId &&
+    current.runnerSessionId === expected.runnerSessionId &&
+    current.generation === expected.generation &&
+    current.fencingTokenHash === expected.fencingTokenHash
+  ) {
+    return;
+  }
+  throw new DurableStateError(
+    `durable lock fencing rejected: ${relative(root, lockPath)}`,
+    {
+      localFailureClass: "stale_writer_commit_rejected",
+      evidence: {
+        targetLocator: expected.targetLocator,
+        redactedEvidenceLocator: basename(lockPath),
+        lane: expected.lane,
+        targetMappingOwner: expected.targetMappingOwner,
+        laneTimeoutMs: expected.laneTimeoutMs,
+        releaseOn: expected.releaseOn,
+        operationId: expected.operationId,
+        lockOwnerEvidence: {
+          expected,
+          current,
+        },
+        durableMode: "strict",
+        completedPublishRule: "forbidden",
+      },
+    },
+  );
+}
+
+function jsonLockOwnedBy(lockPath, expected) {
+  const current = readJsonLockOwner(lockPath);
+  return current.operationId === expected.operationId &&
+    current.runnerSessionId === expected.runnerSessionId &&
+    current.generation === expected.generation &&
+    current.fencingTokenHash === expected.fencingTokenHash;
+}
+
+function releaseJsonFileLock(lockPath, owner) {
+  try {
+    if (!jsonLockOwnedBy(lockPath, owner)) return;
+    unlinkSync(lockPath);
+    fsyncDirectory(dirname(lockPath));
+  } catch {
+    // Missing or concurrently removed locks are handled by stale lock recovery.
+  }
+}
+
+function enterHeldJsonFileLock(path) {
+  const count = heldJsonFileLocks.get(path) ?? 0;
+  heldJsonFileLocks.set(path, count + 1);
+}
+
+function exitHeldJsonFileLock(path) {
+  const count = heldJsonFileLocks.get(path) ?? 0;
+  if (count <= 1) {
+    heldJsonFileLocks.delete(path);
+  } else {
+    heldJsonFileLocks.set(path, count - 1);
+  }
+}
+
+function jsonFileLockHeldByCurrentStack(path) {
+  return (heldJsonFileLocks.get(path) ?? 0) > 0;
+}
+
 function withJsonFileLock(path, callback) {
   const lockPath = lockPathFor(path);
+  const startedAt = Date.now();
   for (;;) {
     let fd = null;
+    const mapping = durableTargetMapping(path, "lock");
+    const owner = {
+      pid: runnerPid,
+      runnerSessionId,
+      runnerHost,
+      runId,
+      targetLocator: relative(root, path),
+      lockPath: relative(root, lockPath),
+      ...mapping,
+      generation: coordinatorLease?.generation ?? 1,
+      fencingTokenHash: coordinatorLease?.fencingToken == null
+        ? sha256Text([
+            "json-lock",
+            runnerSessionId,
+            runId,
+            relative(root, path),
+            String(coordinatorLease?.generation ?? 1),
+          ].join(":"))
+        : sha256Text(coordinatorLease.fencingToken),
+      operationId: randomToken("json-lock"),
+      acquiredAt: now(),
+      heartbeatAt: now(),
+      expiresAt: new Date(Date.now() + jsonFileLockStaleMs).toISOString(),
+    };
     try {
       mkdirSync(dirname(path), { recursive: true });
       fd = openSync(lockPath, "wx");
-      return callback();
+      writeSync(fd, JSON.stringify(owner) + "\n");
+      fsyncSync(fd);
+      assertJsonLockStillOwned(lockPath, owner);
+      enterHeldJsonFileLock(path);
+      try {
+        const result = callback();
+        assertJsonLockStillOwned(lockPath, owner);
+        return result;
+      } finally {
+        exitHeldJsonFileLock(path);
+      }
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
       removeStaleJsonLock(lockPath);
+      const staleLockError = staleJsonLockWithoutRecoveryFenceError(
+        path,
+        lockPath,
+        mapping,
+      );
+      if (staleLockError != null) throw staleLockError;
+      if (Date.now() - startedAt > jsonFileLockWaitMs) {
+        const lockOwnerEvidence = readJsonLockOwner(lockPath);
+        const durableError = new DurableStateError(
+          `timed out waiting for json file lock: ${relative(root, lockPath)}`,
+          {
+            failureKind: "local_state_lock_timeout",
+            localFailureClass: "durable_state_lock_timeout",
+            evidence: {
+              targetLocator: relative(root, path),
+              redactedEvidenceLocator: basename(path),
+              ...mapping,
+              lockOwnerEvidence,
+              durableMode: "strict",
+            },
+          },
+        );
+        emitDurableFailureEvent("durable_lock_timeout", durableError, {
+          targetLocator: relative(root, path),
+        });
+        throw durableError;
+      }
       sleep(25);
     } finally {
       if (fd != null) {
@@ -2019,11 +6600,94 @@ function withJsonFileLock(path, callback) {
         } catch {
           // Best-effort cleanup only; the stale lock sweeper handles leftovers.
         }
+        releaseJsonFileLock(lockPath, owner);
+      }
+    }
+  }
+}
+
+async function withJsonFileLockAsync(path, callback) {
+  const lockPath = lockPathFor(path);
+  const startedAt = Date.now();
+  for (;;) {
+    let fd = null;
+    const mapping = durableTargetMapping(path, "lock");
+    const owner = {
+      pid: runnerPid,
+      runnerSessionId,
+      runnerHost,
+      runId,
+      targetLocator: relative(root, path),
+      lockPath: relative(root, lockPath),
+      ...mapping,
+      generation: coordinatorLease?.generation ?? 1,
+      fencingTokenHash: coordinatorLease?.fencingToken == null
+        ? sha256Text([
+            "json-lock",
+            runnerSessionId,
+            runId,
+            relative(root, path),
+            String(coordinatorLease?.generation ?? 1),
+          ].join(":"))
+        : sha256Text(coordinatorLease.fencingToken),
+      operationId: randomToken("json-lock"),
+      acquiredAt: now(),
+      heartbeatAt: now(),
+      expiresAt: new Date(Date.now() + jsonFileLockStaleMs).toISOString(),
+    };
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      fd = openSync(lockPath, "wx");
+      writeSync(fd, JSON.stringify(owner) + "\n");
+      fsyncSync(fd);
+      assertJsonLockStillOwned(lockPath, owner);
+      enterHeldJsonFileLock(path);
+      try {
+        const result = await callback();
+        assertJsonLockStillOwned(lockPath, owner);
+        return result;
+      } finally {
+        exitHeldJsonFileLock(path);
+      }
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      removeStaleJsonLock(lockPath);
+      const staleLockError = staleJsonLockWithoutRecoveryFenceError(
+        path,
+        lockPath,
+        mapping,
+      );
+      if (staleLockError != null) throw staleLockError;
+      if (Date.now() - startedAt > jsonFileLockWaitMs) {
+        const lockOwnerEvidence = readJsonLockOwner(lockPath);
+        const durableError = new DurableStateError(
+          `timed out waiting for json file lock: ${relative(root, lockPath)}`,
+          {
+            failureKind: "local_state_lock_timeout",
+            localFailureClass: "durable_state_lock_timeout",
+            evidence: {
+              targetLocator: relative(root, path),
+              redactedEvidenceLocator: basename(path),
+              ...mapping,
+              lockOwnerEvidence,
+              durableMode: "strict",
+            },
+          },
+        );
+        emitDurableFailureEvent("durable_lock_timeout", durableError, {
+          targetLocator: relative(root, path),
+        });
+        throw durableError;
+      }
+      await delay(25);
+    } finally {
+      if (fd != null) {
         try {
-          unlinkSync(lockPath);
+          closeSync(fd);
         } catch {
-          // Another process may have already removed a stale lock.
+          // Best-effort cleanup only; the stale lock sweeper handles leftovers.
         }
+        releaseJsonFileLock(lockPath, owner);
       }
     }
   }
@@ -2034,7 +6698,7 @@ function lockedReadWriteTypedJson(path, schema, callback) {
   return withJsonFileLock(path, () => {
     const current = existsSync(path) ? schema.parse(readJson(path)) : undefined;
     const next = schema.parse(withoutUndefined(callback(current)));
-    writeJsonAtomic(path, JSON.stringify(next, null, 2) + "\n");
+    writeJsonAtomicWithValue(path, next);
     return next;
   });
 }
@@ -2043,9 +6707,386 @@ function writeTypedJson(path, schema, value) {
   const parsed = schema.parse(withoutUndefined(value));
   if (statusJson) return parsed;
   withJsonFileLock(path, () => {
-    writeJsonAtomic(path, JSON.stringify(parsed, null, 2) + "\n");
+    writeJsonAtomicWithValue(path, parsed);
   });
   return parsed;
+}
+
+function writeJsonAtomicWithValue(path, value) {
+  const parsed = withoutUndefined(value);
+  withDurableOperationContext(durableContextFromValue(parsed), () => {
+    writeJsonAtomic(path, JSON.stringify(parsed, null, 2) + "\n");
+  });
+}
+
+function readTypedJsonIfExists(path, schema) {
+  if (isDurableAuxiliaryPath(path)) return null;
+  if (!existsSync(path)) return null;
+  if (statusJson) {
+    try {
+      return schema.parse(readDurableJsonReadOnly(path));
+    } catch {
+      return null;
+    }
+  }
+  if (jsonFileLockHeldByCurrentStack(path)) {
+    return readTypedJsonIfExistsUnlocked(path, schema);
+  }
+  try {
+    reconcileDurableJsonTarget(path);
+    return schema.parse(readJson(path));
+  } catch {
+    return null;
+  }
+}
+
+function readTypedJsonIfExistsUnlocked(path, schema) {
+  if (isDurableAuxiliaryPath(path)) return null;
+  if (!existsSync(path)) return null;
+  if (statusJson) {
+    try {
+      return schema.parse(readDurableJsonReadOnly(path));
+    } catch {
+      return null;
+    }
+  }
+  try {
+    reconcileDurableJsonTargetUnlocked(path);
+    return schema.parse(readJson(path));
+  } catch {
+    return null;
+  }
+}
+
+function readExistingEventSequence() {
+  if (statusJson || !existsSync(eventsPath)) return 0;
+  let maxSequence = 0;
+  let lineCount = 0;
+  for (const line of readFileSync(eventsPath, "utf8").split(/\r?\n/u)) {
+    if (!line.trim()) continue;
+    lineCount += 1;
+    try {
+      const parsed = JSON.parse(line);
+      if (Number.isInteger(parsed.sequence)) {
+        maxSequence = Math.max(maxSequence, parsed.sequence);
+      }
+    } catch {
+      continue;
+    }
+  }
+  return Math.max(maxSequence, lineCount);
+}
+
+function eventRecoveryToken(prefix, parsed, lineIndex) {
+  return stableRecoveredToken(prefix, [
+    runId,
+    lineIndex,
+    parsed.eventId ?? null,
+    parsed.sequence ?? null,
+    parsed.event,
+    parsed.itemId ?? null,
+    parsed.command ?? null,
+    parsed.at,
+    sha256Text(JSON.stringify(redactJsonValue(parsed))),
+  ]);
+}
+
+function normalizeEventLogLines(lines) {
+  const normalized = [];
+  const seenEventIds = new Set();
+  let recovered = false;
+  const diagnostics = [];
+  let lineIndex = 0;
+  for (const line of lines) {
+    lineIndex += 1;
+    if (!line.trim()) continue;
+    let parsed;
+    try {
+      parsed = LegacyBatchEventLogSchema.parse(JSON.parse(line));
+    } catch {
+      recovered = true;
+      break;
+    }
+    const duplicateEventId =
+      typeof parsed.eventId === "string" && seenEventIds.has(parsed.eventId);
+    const sequence = normalized.length + 1;
+    const normalizedEvent = BatchEventLogSchema.parse({
+      ...parsed,
+      eventId: duplicateEventId || parsed.eventId == null
+        ? eventRecoveryToken("evt-recovered", parsed, lineIndex)
+        : parsed.eventId,
+      sequence,
+      runnerSessionId: parsed.runnerSessionId ?? runnerSessionId,
+      message: parsed.message ? redacted(parsed.message) : undefined,
+      metadata: parsed.metadata == null ? undefined : redactJsonValue(parsed.metadata),
+    });
+    if (
+      duplicateEventId ||
+      parsed.eventId == null ||
+      parsed.sequence !== sequence ||
+      parsed.runnerSessionId == null
+    ) {
+      recovered = true;
+      diagnostics.push(withoutUndefined({
+        lineIndex,
+        previousEventId: parsed.eventId,
+        recoveredEventId: normalizedEvent.eventId,
+        previousSequence: parsed.sequence,
+        recoveredSequence: sequence,
+        duplicateEventId,
+        missingEventId: parsed.eventId == null,
+        missingRunnerSessionId: parsed.runnerSessionId == null,
+      }));
+    }
+    seenEventIds.add(normalizedEvent.eventId);
+    normalized.push(normalizedEvent);
+  }
+  return {
+    recovered,
+    diagnostics,
+    lines: normalized.map((item) => JSON.stringify(item)),
+  };
+}
+
+function recoverEventLogTail() {
+  if (statusJson || !existsSync(eventsPath)) return false;
+  const text = readFileSync(eventsPath, "utf8");
+  const normalized = normalizeEventLogLines(text.split(/\r?\n/u));
+  const recovered = normalized.recovered;
+  if (!recovered) return false;
+  writeJsonlAtomic(eventsPath, normalized.lines);
+  eventSequence = readExistingEventSequence();
+  event({
+    event: "partial_event_tail_recovered",
+    status: "running",
+    metadata: {
+      retainedEventCount: normalized.lines.length,
+      normalizedEventLog: true,
+      diagnostics: normalized.diagnostics,
+    },
+  });
+  if (normalized.diagnostics.length > 0) {
+    event({
+      event: "event_log_normalized",
+      status: "pending",
+      metadata: {
+        retainedEventCount: normalized.lines.length,
+        diagnostics: normalized.diagnostics,
+      },
+    });
+  }
+  return true;
+}
+
+function readCoordinatorLock() {
+  if (!existsSync(coordinatorLockPath)) return null;
+  try {
+    return CoordinatorLockSchema.parse(readJson(coordinatorLockPath));
+  } catch {
+    return null;
+  }
+}
+
+function recoverCoordinatorRuntimeArtifacts() {
+  if (statusJson) return;
+  for (const provider of ["openai", "jina", "local_cpu", "qmd_index_writer"]) {
+    withJsonFileLock(providerSlotRegistryLockPath(provider), () => {
+      recoverStaleProviderSlotLeases(provider);
+    });
+  }
+  for (const record of activeSubprocessRecords()) {
+    const sameHost = record.runnerHost === runnerHost;
+    const liveChild = sameHost && processAlive(record.pid);
+    const parentAlive = sameHost && processAlive(record.runnerPid);
+    if (sameHost && liveChild && !parentAlive) {
+      terminatePid(record.pid, record.processGroup, "SIGTERM");
+      sleep(250);
+      if (processAlive(record.pid)) terminatePid(record.pid, record.processGroup, "SIGKILL");
+      const killed = !processAlive(record.pid);
+      updateSubprocessRecord(record.subprocessId, (current) => ({
+        ...(current ?? record),
+        heartbeatAt: now(),
+        status: killed ? "killed" : "quarantined",
+        signal: killed ? "ORPHAN_TERMINATED" : "ORPHAN_QUARANTINED",
+        completedAt: now(),
+      }));
+      event({
+        event: killed
+          ? "subprocess_orphan_terminated"
+          : "subprocess_orphan_quarantined",
+        status: killed ? "pending" : "failed",
+        recoveryDecision: killed ? "continue_pending" : "stop_until_fixed",
+        command: record.command,
+        metadata: {
+          itemId: record.itemId,
+          subprocessId: record.subprocessId,
+          pid: record.pid,
+          workerId: record.workerId,
+          bookId: record.bookId,
+          providerSlotId: record.providerSlotId,
+        },
+      });
+      if (!killed) {
+        requestBatchStop("live_orphan_subprocess_quarantined");
+      }
+      continue;
+    }
+    if (!sameHost || !processAlive(record.pid)) {
+      const status = sameHost ? "killed" : "quarantined";
+      const signal = sameHost ? "ORPHAN_RECOVERED" : "REMOTE_ORPHAN_QUARANTINED";
+      updateSubprocessRecord(record.subprocessId, (current) => ({
+        ...(current ?? record),
+        heartbeatAt: now(),
+        status,
+        signal,
+        completedAt: now(),
+      }));
+      event({
+        event: sameHost
+          ? "subprocess_orphan_recovered"
+          : "subprocess_orphan_quarantined",
+        status: sameHost ? "pending" : "failed",
+        recoveryDecision: sameHost ? "continue_pending" : "stop_until_fixed",
+        command: record.command,
+        metadata: {
+          itemId: record.itemId,
+          subprocessId: record.subprocessId,
+          pid: record.pid,
+          workerId: record.workerId,
+          bookId: record.bookId,
+          providerSlotId: record.providerSlotId,
+          runnerHost: record.runnerHost,
+          reason: sameHost ? "dead_child" : "remote_unknown",
+        },
+      });
+      if (!sameHost) {
+        requestBatchStop("remote_orphan_subprocess_quarantined");
+      }
+    }
+  }
+}
+
+function coordinatorLockLive(lock) {
+  if (lock == null) return false;
+  if (lock.runnerHost === runnerHost && processAlive(lock.runnerPid)) return true;
+  if (epochMs(lock.expiresAt) <= Date.now()) return false;
+  if (lock.runnerHost === runnerHost) return false;
+  return true;
+}
+
+function newCoordinatorLease(previous) {
+  const acquiredAt = now();
+  return CoordinatorLockSchema.parse({
+    schemaVersion: SchemaVersion,
+    runId,
+    runnerSessionId,
+    runnerHost,
+    runnerPid,
+    generation: (previous?.generation ?? 0) + 1,
+    fencingToken: randomToken("coordinator-fence"),
+    acquiredAt,
+    heartbeatAt: acquiredAt,
+    expiresAt: leaseExpiresAt(),
+    bookConcurrency,
+    openaiProviderConcurrency,
+    jinaProviderConcurrency,
+    localCpuConcurrency,
+  });
+}
+
+function acquireCoordinatorLock() {
+  if (statusJson) return null;
+  return withJsonFileLock(coordinatorLockPath, () => {
+    const current = readCoordinatorLock();
+    if (coordinatorLockLive(current)) {
+      throw new Error(
+        `run ${runId} already has a live coordinator: ` +
+          `session=${current.runnerSessionId} pid=${current.runnerPid} ` +
+          `host=${current.runnerHost} expiresAt=${current.expiresAt}`,
+      );
+    }
+    const lease = newCoordinatorLease(current);
+    writeJsonAtomicWithValue(coordinatorLockPath, lease);
+    coordinatorLease = lease;
+    recoverCoordinatorRuntimeArtifacts();
+    return lease;
+  });
+}
+
+function assertCoordinatorLease() {
+  if (statusJson || coordinatorLease == null) return;
+  const current = readCoordinatorLock();
+  if (
+    current?.runnerSessionId !== coordinatorLease.runnerSessionId ||
+    current?.generation !== coordinatorLease.generation ||
+    current?.fencingToken !== coordinatorLease.fencingToken
+  ) {
+    throw new Error(`coordinator lease lost for run ${runId}`);
+  }
+}
+
+function heartbeatCoordinatorLock() {
+  if (statusJson || coordinatorLease == null) return;
+  withJsonFileLock(coordinatorLockPath, () => {
+    const current = readCoordinatorLock();
+    if (
+      current?.runnerSessionId !== coordinatorLease.runnerSessionId ||
+      current?.generation !== coordinatorLease.generation ||
+      current?.fencingToken !== coordinatorLease.fencingToken
+    ) {
+      coordinatorLease = null;
+      throw new Error(`coordinator lease lost for run ${runId}`);
+    }
+    const updated = CoordinatorLockSchema.parse({
+      ...current,
+      heartbeatAt: now(),
+      expiresAt: leaseExpiresAt(),
+    });
+    writeJsonAtomicWithValue(coordinatorLockPath, updated);
+    coordinatorLease = updated;
+  });
+}
+
+function startCoordinatorHeartbeat() {
+  if (statusJson || coordinatorLease == null) return;
+  const intervalMs = Math.max(1000, heartbeatIntervalSeconds * 1000);
+  coordinatorHeartbeatTimer = setInterval(() => {
+    try {
+      heartbeatCoordinatorLock();
+    } catch (error) {
+      console.error(redactLog(
+        error instanceof Error ? error.stack ?? error.message : String(error),
+      ));
+      process.exitCode = 1;
+      clearInterval(coordinatorHeartbeatTimer);
+      coordinatorHeartbeatTimer = null;
+    }
+  }, intervalMs);
+  coordinatorHeartbeatTimer.unref?.();
+}
+
+function releaseCoordinatorLock() {
+  if (statusJson || coordinatorLease == null) return;
+  const lease = coordinatorLease;
+  if (coordinatorHeartbeatTimer != null) {
+    clearInterval(coordinatorHeartbeatTimer);
+    coordinatorHeartbeatTimer = null;
+  }
+  try {
+    withJsonFileLock(coordinatorLockPath, () => {
+      const current = readCoordinatorLock();
+      if (
+        current?.runnerSessionId === lease.runnerSessionId &&
+        current?.generation === lease.generation &&
+        current?.fencingToken === lease.fencingToken
+      ) {
+        rmSync(coordinatorLockPath, { force: true });
+        fsyncDirectory(dirname(coordinatorLockPath));
+      }
+    });
+  } finally {
+    coordinatorLease = null;
+  }
 }
 
 function repairOnlyBlockedLoopObserved(itemId) {
@@ -2070,7 +7111,11 @@ function repairOnlyBlockedLoopObserved(itemId) {
 function loadCatalogBySourceHash() {
   const catalogPath = join(stateRoot, "catalog", "books.yaml");
   if (!existsSync(catalogPath)) return new Map();
-  const catalog = YAML.parse(readFileSync(catalogPath, "utf8")) ?? {};
+  const catalog = statusJson
+    ? readDurableYamlReadOnly(catalogPath) ?? {}
+    : withJsonFileLock(catalogPath, () => {
+        return readDurableYamlAfterReconcileUnlocked(catalogPath) ?? {};
+      });
   const items = Array.isArray(catalog.items) ? catalog.items : [];
   return new Map(items
     .filter((item) => typeof item.sourceHash === "string")
@@ -2150,6 +7195,18 @@ function discoverItems() {
     });
 }
 
+function discoverItemsWithDurableFailureEvent() {
+  try {
+    return discoverItems();
+  } catch (error) {
+    if (!statusJson && error instanceof DurableStateError) {
+      eventSequence = readExistingEventSequence();
+      emitDurableFailureEvent("durable_replace_failed", error);
+    }
+    throw error;
+  }
+}
+
 function makeManifest(items) {
   return {
     schemaVersion: SchemaVersion,
@@ -2176,6 +7233,9 @@ function makeManifest(items) {
     maxProviderRecoveryWaits,
     commandTimeoutSeconds,
     heartbeatIntervalSeconds,
+    activeProviderSlots: 0,
+    activeSubprocesses: 0,
+    activeBookLeases: 0,
     startedAt: now(),
     updatedAt: now(),
     itemIds: items.map((item) => item.itemId),
@@ -2186,14 +7246,48 @@ function makeManifest(items) {
 }
 
 function loadManifest(items) {
+  reconcileDurableJsonTarget(manifestPath);
   if (existsSync(manifestPath)) {
-    const manifest = BatchRunManifestSchema.parse(readJson(manifestPath));
+    let manifest;
+    try {
+      manifest = BatchRunManifestSchema.parse(
+        statusJson ? readDurableJsonReadOnly(manifestPath) : readJson(manifestPath),
+      );
+    } catch (error) {
+      if (statusJson) throw error;
+      const quarantinePath = `${manifestPath}.corrupt-${Date.now()}`;
+      const operation = durableOperationEvidence(manifestPath, "json-quarantine", {
+        localFailureClass: "durable_target_invalid",
+        checksumRecoveryDecision: "stop_until_fixed",
+      });
+      try {
+        renameWithDurableEvidence(manifestPath, quarantinePath, operation);
+        fsyncDirectory(dirname(manifestPath), operation);
+      } catch (renameError) {
+        const durableError = classifyDurableWriteError(renameError, operation);
+        emitDurableFailureEvent("durable_replace_failed", durableError, {
+          targetLocator: relative(root, manifestPath),
+        });
+        throw durableError;
+      }
+      event({
+        event: "manifest_rebuilt",
+        status: "pending",
+        metadata: {
+          reason: "invalid_manifest_schema",
+          quarantineLocator: relative(root, quarantinePath),
+        },
+      });
+      const rebuilt = makeManifest(items);
+      return writeTypedJson(manifestPath, BatchRunManifestSchema, rebuilt);
+    }
+    const previousTotalItems = manifest.totalItems;
+    const previousItemIds = [...manifest.itemIds];
     manifest.sourceRootName = basename(sourceDir);
     manifest.stateRootLocator = relative(root, stateRoot);
     manifest.qmdIndexLocator = relative(root, qmdIndexPath);
     manifest.configLocator = relative(root, configPath);
-    manifest.totalItems = items.length;
-    manifest.itemIds = items.map((item) => item.itemId);
+    const itemIds = items.map((item) => item.itemId);
     manifest.expectedCommandCheckCount = expectedCommandCheckCount;
     manifest.maxCommandAttempts = maxCommandAttempts;
     manifest.maxTransientCommandAttempts = maxTransientCommandAttempts;
@@ -2204,6 +7298,30 @@ function loadManifest(items) {
     manifest.maxProviderRecoveryWaits = maxProviderRecoveryWaits;
     manifest.commandTimeoutSeconds = commandTimeoutSeconds;
     manifest.heartbeatIntervalSeconds = heartbeatIntervalSeconds;
+    manifest.activeProviderSlots = activeProviderSlotLeases().length;
+    manifest.activeSubprocesses = activeSubprocessRecords().length;
+    manifest.activeBookLeases = activeBookLeases().length;
+    const mismatch = previousTotalItems !== items.length ||
+      previousItemIds.length !== itemIds.length ||
+      previousItemIds.some((itemId, index) => itemId !== itemIds[index]);
+    if (mismatch && !statusJson) {
+      event({
+        event: "manifest_rebuilt",
+        status: "pending",
+        metadata: {
+          reason: "manifest_item_projection_mismatch",
+          previousTotalItems,
+          rebuiltTotalItems: items.length,
+        },
+      });
+      return writeTypedJson(
+        manifestPath,
+        BatchRunManifestSchema,
+        { ...makeManifest(items), startedAt: manifest.startedAt },
+      );
+    }
+    manifest.totalItems = items.length;
+    manifest.itemIds = itemIds;
     return manifest;
   }
   if (statusJson) {
@@ -2211,6 +7329,54 @@ function loadManifest(items) {
   }
   const manifest = makeManifest(items);
   return writeTypedJson(manifestPath, BatchRunManifestSchema, manifest);
+}
+
+function writeStartupRecoveryManifest(manifest, update = {}) {
+  if (statusJson) return manifest;
+  const current = manifest.metadata?.startupRecovery ?? {};
+  const startupRecovery = withoutUndefined({
+    ...current,
+    runId,
+    stage: "runner_start",
+    scopeCount: update.scopeCount ?? current.scopeCount ?? 0,
+    targetCount: update.targetCount ?? current.targetCount ?? 0,
+    mutationCount: update.mutationCount ?? current.mutationCount ?? 0,
+    firstSample: update.firstSample ?? current.firstSample,
+    lastSample: update.lastSample ?? current.lastSample,
+    decision: update.decision ?? current.decision ?? "created_before_preflight",
+    explicitRepairHint: update.explicitRepairHint ?? current.explicitRepairHint ??
+      "use explicit repair or migrate-only for provider request durable repairs",
+    providerRequestDiagnostics: update.providerRequestDiagnostics ??
+      current.providerRequestDiagnostics,
+    updatedAt: now(),
+  });
+  const next = {
+    ...manifest,
+    updatedAt: now(),
+    metadata: withoutUndefined({
+      ...(manifest.metadata ?? {}),
+      startupRecovery,
+    }),
+  };
+  return writeTypedJson(manifestPath, BatchRunManifestSchema, next);
+}
+
+function updateManifestWithProviderRequestDiagnostics(manifest, diagnostics) {
+  if (statusJson || diagnostics.length === 0) return manifest;
+  const samples = diagnostics.flatMap((item) => item.sampleTargetLocators ?? []);
+  return writeStartupRecoveryManifest(manifest, {
+    targetCount: diagnostics.reduce(
+      (total, item) => Math.max(total, item.scannedTargetCount ?? 0),
+      0,
+    ),
+    mutationCount: 0,
+    firstSample: samples[0],
+    lastSample: samples.at(-1),
+    decision: "continue_with_provider_request_diagnostic",
+    providerRequestDiagnostics: diagnostics.map((item) =>
+      DurableStateDiagnosticSchema.parse(withoutUndefined(item))
+    ),
+  });
 }
 
 function itemPath(item) {
@@ -2337,7 +7503,21 @@ function loadCheckpoint(item, completedSeed) {
       withBuildStatusSnapshot(item, checkpoint),
     );
   }
-  const hydrated = hydrateCheckpoint(item, readJson(path));
+  const hydrated = hydrateCheckpoint(
+    item,
+    statusJson ? readDurableJsonReadOnly(path) : readJson(path),
+  );
+  if (hydrated.status === "running") {
+    hydrated.leaseGeneration = hydrated.leaseGeneration ??
+      hydrated.metadata?.leaseGeneration ?? 1;
+    hydrated.fencingToken = hydrated.fencingToken ??
+      hydrated.metadata?.fencingToken ?? randomToken("legacy-item-fence");
+    hydrated.leaseExpiresAt = hydrated.leaseExpiresAt ?? leaseExpiresAt();
+    hydrated.bookLeaseGeneration = hydrated.bookLeaseGeneration ??
+      hydrated.metadata?.bookLeaseGeneration ?? hydrated.leaseGeneration;
+    hydrated.bookFencingToken = hydrated.bookFencingToken ??
+      hydrated.metadata?.bookFencingToken ?? randomToken("legacy-book-fence");
+  }
   const hydratedEvidenceItem = evidenceItemForCheckpoint(item, hydrated);
   if (migrateOnly) {
     const checkpoint = recoverProviderTransientCheckpoint(item,
@@ -2402,18 +7582,134 @@ function withCheckpointPersistenceInvariants(checkpoint) {
   if (checkpoint.status === "running") return checkpoint;
   return {
     ...checkpoint,
+    runnerSessionId: undefined,
+    runnerHost: undefined,
+    runnerPid: undefined,
     currentCommand: undefined,
     activeCommand: checkpoint.activeCommand ?? checkpoint.currentCommand,
     currentCommandStartedAt: undefined,
+    leaseGeneration: undefined,
+    fencingToken: undefined,
+    leaseExpiresAt: undefined,
+    bookLeaseGeneration: undefined,
+    bookFencingToken: undefined,
   };
 }
 
-function saveCheckpoint(item, checkpoint) {
-  return writeTypedJson(
-    itemPath(item),
-    BatchItemCheckpointSchema,
-    withCheckpointPersistenceInvariants(withBuildStatusSnapshot(item, checkpoint)),
+function assertBookLeaseForCheckpoint(checkpoint, expectedStatus = undefined) {
+  assertCoordinatorLease();
+  if (
+    expectedStatus != null &&
+    checkpoint.status !== expectedStatus
+  ) {
+    throw new Error(
+      `checkpoint status changed before fenced write: ${checkpoint.itemId}`,
+    );
+  }
+  const currentLease = readTypedJsonIfExists(
+    bookLeasePath(checkpoint.bookId),
+    BookLeaseSchema,
   );
+  if (currentLease == null) {
+    throw new Error(`missing book lease for checkpoint: ${checkpoint.bookId}`);
+  }
+  if (
+    currentLease.runnerSessionId !== runnerSessionId ||
+    currentLease.fencingToken !== checkpoint.bookFencingToken ||
+    currentLease.generation !== checkpoint.bookLeaseGeneration
+  ) {
+    throw new Error(`book lease is owned by another runner: ${checkpoint.bookId}`);
+  }
+}
+
+function assertItemCheckpointFence(current, next, expectedStatus = undefined) {
+  if (current == null) return;
+  if (
+    expectedStatus != null &&
+    next.status !== expectedStatus
+  ) {
+    throw new Error(
+      `checkpoint status changed before fenced write: ${next.itemId}`,
+    );
+  }
+  if (next.status !== "running" && next.fencingToken == null) return;
+  const fencedFields = [
+    "runnerSessionId",
+    "runnerHost",
+    "runnerPid",
+    "leaseGeneration",
+    "fencingToken",
+    "bookLeaseGeneration",
+    "bookFencingToken",
+  ];
+  for (const field of fencedFields) {
+    if (next[field] == null) continue;
+    if (current[field] !== next[field]) {
+      throw new Error(
+        `item checkpoint fencing rejected stale write for ${next.itemId}: ${field}`,
+      );
+    }
+  }
+  if (
+    current.status === "running" &&
+    next.status !== "running" &&
+    current.runnerSessionId !== runnerSessionId
+  ) {
+    throw new Error(
+      `item checkpoint terminal write is owned by another runner: ${next.itemId}`,
+    );
+  }
+  if (
+    current.status === "running" &&
+    current.leaseExpiresAt != null &&
+    epochMs(current.leaseExpiresAt) <= Date.now()
+  ) {
+    throw new Error(`item checkpoint lease expired before write: ${next.itemId}`);
+  }
+}
+
+function mergeCurrentItemLeaseProjection(current, snapshot) {
+  if (
+    current == null ||
+    snapshot.status !== "running" ||
+    current.status !== "running" ||
+    current.runnerSessionId !== snapshot.runnerSessionId ||
+    current.runnerHost !== snapshot.runnerHost ||
+    current.runnerPid !== snapshot.runnerPid ||
+    current.leaseGeneration !== snapshot.leaseGeneration ||
+    current.fencingToken !== snapshot.fencingToken ||
+    current.bookLeaseGeneration !== snapshot.bookLeaseGeneration ||
+    current.bookFencingToken !== snapshot.bookFencingToken
+  ) {
+    return snapshot;
+  }
+  return {
+    ...snapshot,
+    runnerHeartbeatAt: epochMs(current.runnerHeartbeatAt) >
+      epochMs(snapshot.runnerHeartbeatAt)
+      ? current.runnerHeartbeatAt
+      : snapshot.runnerHeartbeatAt,
+    leaseExpiresAt: epochMs(current.leaseExpiresAt) >
+      epochMs(snapshot.leaseExpiresAt)
+      ? current.leaseExpiresAt
+      : snapshot.leaseExpiresAt,
+  };
+}
+
+function saveCheckpoint(item, checkpoint, options = {}) {
+  if (checkpoint.status === "running" || options.requireBookLease === true) {
+    assertBookLeaseForCheckpoint(checkpoint, options.expectedStatus);
+  } else {
+    assertCoordinatorLease();
+  }
+  const path = itemPath(item);
+  return lockedReadWriteTypedJson(path, BatchItemCheckpointSchema, (current) => {
+    const snapshot = withBuildStatusSnapshot(item, checkpoint);
+    assertItemCheckpointFence(current, snapshot, options.expectedStatus);
+    return withCheckpointPersistenceInvariants(
+      mergeCurrentItemLeaseProjection(current, snapshot),
+    );
+  });
 }
 
 function appendCommandCheckCheckpoint(item, checkpoint, check) {
@@ -2433,174 +7729,55 @@ function appendCommandCheckCheckpoint(item, checkpoint, check) {
   return updated;
 }
 
-function heartbeatMonitorScript() {
-  return String.raw`
-const fs = require("node:fs");
-
-const [
-  checkpointPath,
-  stopPath,
-  runnerSessionId,
-  runnerHost,
-  runnerPidText,
-  command,
-  commandStartedAt,
-  intervalMsText,
-] = process.argv.slice(1);
-const runnerPid = Number.parseInt(runnerPidText, 10);
-const intervalMs = Math.max(100, Number.parseInt(intervalMsText, 10) || 30000);
-const lockStaleMs = 120000;
-let lifelineAlive = true;
-
-function sleep(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-try {
-  const lifeline = fs.createReadStream(null, { fd: 3, autoClose: false });
-  const stop = () => {
-    lifelineAlive = false;
-    process.exit(0);
-  };
-  lifeline.on("end", stop);
-  lifeline.on("close", stop);
-  lifeline.on("error", stop);
-  lifeline.resume();
-} catch {
-  lifelineAlive = false;
-}
-
-function readCheckpoint() {
-  try {
-    return JSON.parse(fs.readFileSync(checkpointPath, "utf8"));
-  } catch {
-    return null;
-  }
-}
-
-function parentAlive() {
-  if (!lifelineAlive) return false;
-  if (!Number.isInteger(runnerPid) || runnerPid <= 0) return false;
-  try {
-    process.kill(runnerPid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function writeJsonAtomic(path, text) {
-  const temporaryPath = path + "." + process.pid + "." + Date.now() + ".tmp";
-  fs.writeFileSync(temporaryPath, text, "utf8");
-  fs.renameSync(temporaryPath, path);
-}
-
-function withCheckpointLock(callback) {
-  const lockPath = checkpointPath + ".lock";
-  for (;;) {
-    let fd = null;
-    try {
-      fd = fs.openSync(lockPath, "wx");
-      return callback();
-    } catch (error) {
-      if (error && error.code !== "EEXIST") throw error;
-      try {
-        const entry = fs.statSync(lockPath);
-        if (Date.now() - entry.mtimeMs > lockStaleMs) fs.unlinkSync(lockPath);
-      } catch {
-        // Missing or concurrently removed locks are expected under contention.
-      }
-      sleep(25);
-    } finally {
-      if (fd != null) {
-        try {
-          fs.closeSync(fd);
-        } catch {}
-        try {
-          fs.unlinkSync(lockPath);
-        } catch {}
-      }
-    }
-  }
-}
-
-function writeHeartbeat() {
-  if (fs.existsSync(stopPath) || !parentAlive()) return false;
-  return withCheckpointLock(() => {
-    if (fs.existsSync(stopPath) || !parentAlive()) return false;
-    const checkpoint = readCheckpoint();
-    if (checkpoint == null) return true;
-    if (
-      checkpoint.status !== "running" ||
-      checkpoint.runnerSessionId !== runnerSessionId ||
-      checkpoint.runnerHost !== runnerHost ||
-      checkpoint.runnerPid !== runnerPid
-    ) {
-      return false;
-    }
-    const updated = {
-      ...checkpoint,
-      runnerHeartbeatAt: new Date().toISOString(),
-      currentCommand: command,
-      activeCommand: command,
-      currentCommandStartedAt: commandStartedAt,
-    };
-    writeJsonAtomic(checkpointPath, JSON.stringify(updated, null, 2) + "\n");
-    return true;
-  });
-}
-
-if (!writeHeartbeat()) process.exit(0);
-const timer = setInterval(() => {
-  if (!writeHeartbeat()) {
-    clearInterval(timer);
-    process.exit(0);
-  }
-}, intervalMs);
-`;
-}
-
 function startCommandHeartbeatMonitor(item, command, commandStartedAt) {
   if (statusJson) return null;
   const intervalMs = heartbeatIntervalSeconds * 1000;
-  const safeCommand = command.replace(/[^A-Za-z0-9_.-]/gu, "_");
-  const stopPath = join(
-    logRoot,
-    `${item.itemId}-${safeCommand}-${runnerSessionId}.heartbeat-stop`,
-  );
-  rmSync(stopPath, { force: true });
-  const monitor = spawn(process.execPath, [
-    "-e",
-    heartbeatMonitorScript(),
-    itemPath(item),
-    stopPath,
-    runnerSessionId,
-    runnerHost,
-    String(runnerPid),
-    command,
-    commandStartedAt,
-    String(intervalMs),
-  ], {
-    cwd: root,
-    detached: true,
-    stdio: ["ignore", "ignore", "ignore", "pipe"],
-    windowsHide: true,
-  });
-  const lifeline = monitor.stdio[3];
-  lifeline?.unref?.();
-  monitor.unref();
+  let stopped = false;
+  let failure = null;
+  const writeHeartbeat = () => {
+    if (stopped || failure != null || !existsSync(itemPath(item))) return false;
+    try {
+      return withJsonFileLock(itemPath(item), () => {
+        if (stopped || failure != null || !existsSync(itemPath(item))) return false;
+        const checkpoint = BatchItemCheckpointSchema.parse(readJson(itemPath(item)));
+        if (
+          checkpoint.status !== "running" ||
+          checkpoint.runnerSessionId !== runnerSessionId ||
+          checkpoint.runnerHost !== runnerHost ||
+          checkpoint.runnerPid !== runnerPid
+        ) {
+          return false;
+        }
+        const updated = BatchItemCheckpointSchema.parse({
+          ...checkpoint,
+          runnerHeartbeatAt: now(),
+          currentCommand: command,
+          activeCommand: command,
+          currentCommandStartedAt: commandStartedAt,
+        });
+        writeJsonAtomicWithValue(itemPath(item), updated);
+        return true;
+      });
+    } catch (error) {
+      emitDurableFailureEvent("durable_replace_failed", error, {
+        targetLocator: relative(root, itemPath(item)),
+      });
+      failure = error;
+      return false;
+    }
+  };
+  writeHeartbeat();
+  const timer = setInterval(() => {
+    if (!writeHeartbeat()) clearInterval(timer);
+  }, intervalMs);
+  timer.unref?.();
   return {
     stop() {
-      try {
-        writeFileSync(stopPath, "stop\n", "utf8");
-      } catch {
-        // Best-effort only; closing the lifeline below is the primary shutdown.
-      }
-      try {
-        lifeline?.destroy?.();
-      } catch {
-        // Closing the parent side of the pipe releases the monitor lifeline.
-      }
+      stopped = true;
+      clearInterval(timer);
+    },
+    assertHealthy() {
+      if (failure != null) throw failure;
     },
   };
 }
@@ -2622,20 +7799,38 @@ function clearCommandHeartbeat(item, command) {
       const cleaned = BatchItemCheckpointSchema.parse(withoutUndefined({
         ...withBuildStatusSnapshot(item, checkpoint),
         runnerHeartbeatAt: now(),
+        leaseExpiresAt: new Date(
+          Date.now() + Math.max(
+            heartbeatIntervalSeconds * 3000,
+            runnerHeartbeatTtlSeconds * 1000,
+          ),
+        ).toISOString(),
         currentCommand: undefined,
         activeCommand: checkpoint.activeCommand ?? checkpoint.currentCommand,
         currentCommandStartedAt: undefined,
       }));
-      writeJsonAtomic(itemPath(item), JSON.stringify(cleaned, null, 2) + "\n");
+      writeJsonAtomicWithValue(itemPath(item), cleaned);
     });
-  } catch {
-    return;
+  } catch (error) {
+    emitDurableFailureEvent("durable_replace_failed", error, {
+      targetLocator: relative(root, itemPath(item)),
+    });
+    throw error;
   }
 }
 
 function readYamlFileIfExists(path) {
   if (!existsSync(path)) return null;
-  return YAML.parse(readFileSync(path, "utf8")) ?? null;
+  if (statusJson) return readDurableYamlReadOnly(path);
+  return withJsonFileLock(path, () => {
+    return readDurableYamlAfterReconcileUnlocked(path);
+  });
+}
+
+function readDurableYamlAfterReconcileUnlocked(path) {
+  reconcileDurableYamlTargetUnlocked(path);
+  const text = readFileSync(path, "utf8");
+  return YAML.parse(text) ?? null;
 }
 
 function readYamlSchemaIfExists(path, schema) {
@@ -2645,13 +7840,17 @@ function readYamlSchemaIfExists(path, schema) {
 
 function readJsonSchemaIfExists(path, schema) {
   if (!existsSync(path)) return null;
-  const parsed = schema.safeParse(readJson(path));
+  if (!statusJson) reconcileDurableJsonTarget(path);
+  const parsed = schema.safeParse(
+    statusJson ? readDurableJsonReadOnly(path) : readJson(path),
+  );
   return parsed.success ? parsed.data : null;
 }
 
 function readGraphOutputProducerManifest(path) {
   if (!existsSync(path)) return null;
-  const raw = readJson(path);
+  if (!statusJson) reconcileDurableJsonTarget(path);
+  const raw = statusJson ? readDurableJsonReadOnly(path) : readJson(path);
   const current = GraphRagOutputProducerManifestSchema.safeParse(raw);
   if (current.success) return current.data;
   const legacy = GraphRagOutputProducerManifestLegacySchema.safeParse(raw);
@@ -2771,16 +7970,28 @@ function hashDirectoryContents(rootDir) {
 }
 
 function readLanceRowCount(tableDir) {
-  try {
-    const parsed = JSON.parse(readFileSync(join(tableDir, "qmd_row_count.json"), "utf8"));
-    if (typeof parsed === "number") return parsed;
-    if (parsed && typeof parsed === "object" && typeof parsed.rowCount === "number") {
-      return parsed.rowCount;
-    }
-  } catch {
-    return null;
+  const rowCountPath = join(tableDir, "qmd_row_count.json");
+  if (!existsSync(rowCountPath)) return null;
+  if (!statusJson) reconcileDurableJsonTarget(rowCountPath);
+  const parsed = statusJson
+    ? readDurableJsonReadOnly(rowCountPath)
+    : JSON.parse(readFileSync(rowCountPath, "utf8"));
+  if (typeof parsed === "number") return parsed;
+  if (parsed && typeof parsed === "object" && typeof parsed.rowCount === "number") {
+    return parsed.rowCount;
   }
   return null;
+}
+
+function isDurableTargetError(error) {
+  return error instanceof Error &&
+    (
+      error.message.startsWith("invalid durable JSON target:") ||
+      error.message.startsWith("invalid durable YAML target:") ||
+      error.message.includes("durable json checksum_mismatch") ||
+      error.message.includes("durable yaml checksum_mismatch") ||
+      error.message.includes("durable checksum_mismatch")
+    );
 }
 
 function validateLanceDbDirectory(path) {
@@ -2809,7 +8020,8 @@ function validateLanceDbDirectory(path) {
       }
     }
     return null;
-  } catch {
+  } catch (error) {
+    if (isDurableTargetError(error)) throw error;
     return "lancedb_path_missing_or_unreadable";
   }
 }
@@ -3033,7 +8245,8 @@ function validateArtifactContent(artifact, bookId) {
       }
     }
     return null;
-  } catch {
+  } catch (error) {
+    if (isDurableTargetError(error)) throw error;
     return "path_missing_or_unreadable";
   }
 }
@@ -3430,11 +8643,11 @@ function migrateGraphOutputProducerManifests() {
     if (!existsSync(manifestPath)) continue;
     let parsed;
     try {
-      parsed = JSON.parse(readFileSync(manifestPath, "utf8"));
+      parsed = readGraphOutputProducerManifest(manifestPath);
     } catch {
       continue;
     }
-    if (typeof parsed?.outputDir !== "string") continue;
+    if (parsed == null || typeof parsed.outputDir !== "string") continue;
     const expectedLocator = graphRagBookOutputLocator(item.bookId);
     if (parsed.outputDir === expectedLocator) continue;
     const resolvedOutputDir = resolve(parsed.outputDir);
@@ -3445,8 +8658,15 @@ function migrateGraphOutputProducerManifests() {
       "output",
     );
     if (resolvedOutputDir !== expectedOutputDir) continue;
-    parsed.outputDir = expectedLocator;
-    writeFileSync(manifestPath, JSON.stringify(parsed, null, 2) + "\n", "utf8");
+    const migrated = GraphRagOutputProducerManifestSchema.parse({
+      ...parsed,
+      outputDir: expectedLocator,
+    });
+    writeTypedJson(
+      manifestPath,
+      GraphRagOutputProducerManifestSchema,
+      migrated,
+    );
     event({
       itemId: item.itemId,
       event: "graph_output_manifest_migrated",
@@ -3629,6 +8849,12 @@ function qmdBuildEvidence(item) {
       qmdNativeCommandCheckNames.every((name) => commandNames.includes(name))
     ) ||
     (
+      process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS === "1" &&
+      commandNames.length === defaultRequiredCommandCheckNames.length &&
+      new Set(commandNames).size === defaultRequiredCommandCheckNames.length &&
+      defaultRequiredCommandCheckNames.every((name) => commandNames.includes(name))
+    ) ||
+    (
       commandNames.length === expectedCommandCheckCount &&
       new Set(commandNames).size === expectedCommandCheckCount &&
       requiredCommandCheckNames.every((name) => commandNames.includes(name))
@@ -3637,6 +8863,9 @@ function qmdBuildEvidence(item) {
     stableHash(qmdNativeCommandCheckNames),
     stableHash(requiredCommandCheckNames),
   ]);
+  if (process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS === "1") {
+    expectedCommandFingerprints.add(stableHash(defaultRequiredCommandCheckNames));
+  }
   const mismatch = [
     manifest.runId === runId ? null : "run_id_mismatch",
     manifest.itemId === item.itemId ? null : "item_id_mismatch",
@@ -3749,6 +8978,7 @@ function commandCheckSetEvidence(checkpoint) {
   const missing = requiredCommandCheckNames.filter((name) => !unique.has(name));
   const unexpected = names.filter((name) => !requiredCommandCheckNames.includes(name));
   const failed = commandChecks.find((check) => check.status !== "passed");
+  const durableFields = durableProjection(failed ?? checkpoint);
   if (
     commandChecks.length === expectedCommandCheckCount &&
     unique.size === expectedCommandCheckCount &&
@@ -3775,6 +9005,7 @@ function commandCheckSetEvidence(checkpoint) {
           ? "command_check_missing"
           : "command_check_set_incomplete",
     artifactIds: [],
+    ...durableFields,
   };
 }
 
@@ -4077,6 +9308,14 @@ function recoverProviderTransientCheckpoints(items, checkpoints) {
 }
 
 function updateManifest(manifest, checkpoints) {
+  const previousCounts = {
+    pendingItems: manifest.pendingItems,
+    runningItems: manifest.runningItems,
+    completedItems: manifest.completedItems,
+    skippedItems: manifest.skippedItems,
+    importedCompletedItems: manifest.importedCompletedItems,
+    failedItems: manifest.failedItems,
+  };
   manifest.totalItems = checkpoints.length;
   manifest.itemIds = checkpoints.map((item) => item.itemId);
   const pending = checkpoints.filter((item) => item.status === "pending").length;
@@ -4103,7 +9342,45 @@ function updateManifest(manifest, checkpoints) {
   manifest.maxProviderRecoveryWaits = maxProviderRecoveryWaits;
   manifest.commandTimeoutSeconds = commandTimeoutSeconds;
   manifest.heartbeatIntervalSeconds = heartbeatIntervalSeconds;
+  manifest.activeProviderSlots = activeProviderSlotLeases().length;
+  manifest.activeSubprocesses = activeSubprocessRecords().length;
+  manifest.activeBookLeases = activeBookLeases().length;
   manifest.updatedAt = now();
+  const durableFailure = [...checkpoints]
+    .reverse()
+    .find((item) =>
+      item.failureKind === "local_state_integrity" ||
+      item.failureKind === "local_state_lock_timeout" ||
+      durableProjection(item).localFailureClass != null
+    );
+  manifest.durableFailureSummary = durableFailure == null
+    ? undefined
+    : withoutUndefined({
+        ...durableProjection(durableFailure),
+        recoveryDecision: durableFailure.recoveryDecision,
+        failedStage: durableFailure.failedStage,
+      });
+  const expectedCounts = {
+    pendingItems: pending,
+    runningItems: running,
+    completedItems: completed,
+    skippedItems: skipped,
+    importedCompletedItems: importedCompleted,
+    failedItems: failed,
+  };
+  const mismatchedCounts = Object.entries(expectedCounts)
+    .filter(([field, expected]) => previousCounts[field] !== expected)
+    .map(([field]) => field);
+  if (mismatchedCounts.length > 0 && !statusJson) {
+    event({
+      event: "manifest_rebuilt",
+      status: "pending",
+      metadata: {
+        reason: "manifest_checkpoint_projection_mismatch",
+        mismatchedCounts,
+      },
+    });
+  }
   const providerWaitLimitReached =
     running === 0 &&
     checkpoints.some((item) =>
@@ -4162,7 +9439,37 @@ function persistFailFastInterruptedManifest(manifest, checkpoints, reason) {
 }
 
 function buildRecoverySummary(manifest, checkpoints) {
+  const activeSlotsByItem = new Map();
+  for (const lease of activeProviderSlotLeases()) {
+    if (lease.itemId == null) continue;
+    const current = activeSlotsByItem.get(lease.itemId) ?? {
+      activeProviderSlots: 0,
+      providerWaitMs: 0,
+      providerSlotGeneration: lease.generation,
+    };
+    current.activeProviderSlots += 1;
+    if (lease.waitMs != null) {
+      current.providerWaitMs = Math.max(
+        current.providerWaitMs ?? 0,
+        lease.waitMs,
+      );
+    }
+    current.providerSlotGeneration = Math.max(
+      current.providerSlotGeneration ?? 0,
+      lease.generation,
+    );
+    activeSlotsByItem.set(lease.itemId, current);
+  }
+  const activeSubprocessesByItem = new Map();
+  for (const record of activeSubprocessRecords()) {
+    if (record.itemId == null) continue;
+    activeSubprocessesByItem.set(
+      record.itemId,
+      (activeSubprocessesByItem.get(record.itemId) ?? 0) + 1,
+    );
+  }
   const items = checkpoints.map((item) => {
+    const slotSummary = activeSlotsByItem.get(item.itemId);
     const qmdStatus = qmdBuildEvidence(item);
     const commandCheckStatus = commandCheckSetEvidence(item);
     const graphStatus = graphBuildEvidence(item);
@@ -4180,6 +9487,7 @@ function buildRecoverySummary(manifest, checkpoints) {
       itemId: item.itemId,
       sourceName: item.sourceName,
       bookId: item.bookId,
+      workerId: item.workerId ?? item.metadata?.workerId,
       status: item.status,
       attempts: item.attempts,
       qmdBuildStatus: redactJsonValue(qmdStatus),
@@ -4190,6 +9498,7 @@ function buildRecoverySummary(manifest, checkpoints) {
       retryable: item.retryable,
       retryExhausted: item.retryExhausted,
       recoveryDecision: item.recoveryDecision,
+      ...durableProjection(failedCommand ?? item),
       failedStage: item.failedStage,
       providerStatusCode: failedCommand?.providerStatusCode,
       retryAfterSeconds: failedCommand?.retryAfterSeconds,
@@ -4209,10 +9518,22 @@ function buildRecoverySummary(manifest, checkpoints) {
       runnerHost: item.runnerHost,
       runnerPid: item.runnerPid,
       runnerHeartbeatAt: item.runnerHeartbeatAt,
+      leaseGeneration: failedCommand?.leaseGeneration ?? item.leaseGeneration,
+      fencingToken: item.fencingToken,
+      leaseExpiresAt: item.leaseExpiresAt,
+      bookLeaseGeneration:
+        failedCommand?.bookLeaseGeneration ?? item.bookLeaseGeneration,
+      bookFencingToken: item.bookFencingToken,
+      activeProviderSlots: slotSummary?.activeProviderSlots,
+      providerWaitMs: slotSummary?.providerWaitMs,
+      providerSlotGeneration: slotSummary?.providerSlotGeneration,
+      activeSubprocesses: activeSubprocessesByItem.get(item.itemId),
       orphanedRunnerDetectedAt: item.orphanedRunnerDetectedAt,
-      currentCommand: item.currentCommand,
+      currentCommand: item.status === "running" ? item.currentCommand : undefined,
       activeCommand: item.activeCommand ?? item.currentCommand,
-      currentCommandStartedAt: item.currentCommandStartedAt,
+      currentCommandStartedAt: item.status === "running"
+        ? item.currentCommandStartedAt
+        : undefined,
       waitingForProviderRecovery,
       reopenedFromStatus: item.metadata?.reopenedFromStatus,
       reopenedToStatus: item.metadata?.reopenedToStatus,
@@ -4248,6 +9569,7 @@ function buildRecoverySummary(manifest, checkpoints) {
   const retryableItems = items.filter((item) =>
     item.retryable === true && item.status !== "completed"
   );
+  const durableStateFailures = mergedDurableStateFailures(items);
   return BatchRecoverySummarySchema.parse(withoutUndefined({
     schemaVersion: SchemaVersion,
     runId,
@@ -4260,6 +9582,9 @@ function buildRecoverySummary(manifest, checkpoints) {
       completedItems: manifest.completedItems,
       skippedItems: manifest.skippedItems,
       failedItems: manifest.failedItems,
+      activeProviderSlots: manifest.activeProviderSlots,
+      activeSubprocesses: manifest.activeSubprocesses,
+      activeBookLeases: manifest.activeBookLeases,
       updatedAt: manifest.updatedAt,
       completedAt: manifest.completedAt,
       failedAt: manifest.failedAt,
@@ -4282,6 +9607,13 @@ function buildRecoverySummary(manifest, checkpoints) {
       .map((item) => item.nextRetryAt)
       .filter(Boolean)
       .sort()[0],
+    durableStateFailures: durableStateFailures.length > 0
+      ? durableStateFailures
+      : undefined,
+    durableTempDiagnostics: durableStateFailures
+      .filter((item) => String(item.localFailureClass ?? "").includes("temp")),
+    durableLockDiagnostics: durableStateFailures
+      .filter((item) => String(item.localFailureClass ?? "").includes("lock")),
     items,
   }));
 }
@@ -4289,6 +9621,7 @@ function buildRecoverySummary(manifest, checkpoints) {
 function writeRecoverySummary(manifest, checkpoints) {
   const summary = buildRecoverySummary(manifest, checkpoints);
   writeTypedJson(recoverySummaryPath, BatchRecoverySummarySchema, summary);
+  writeTypedJson(batchStatusPath, BatchRecoverySummarySchema, summary);
   return summary;
 }
 
@@ -4328,13 +9661,43 @@ function migrateEventLog(checkpoints) {
   const lines = readFileSync(eventsPath, "utf8")
     .split(/\r?\n/u)
     .filter((line) => line.trim().length > 0);
+  let legacySequence = 0;
+  const seenEventIds = new Set();
+  const diagnostics = [];
   const migrated = lines.map((line) => {
-    const item = BatchEventLogSchema.parse(JSON.parse(line));
+    legacySequence += 1;
+    const item = LegacyBatchEventLogSchema.parse(JSON.parse(line));
+    const duplicateEventId =
+      typeof item.eventId === "string" && seenEventIds.has(item.eventId);
+    const eventId = duplicateEventId || item.eventId == null
+      ? eventRecoveryToken("evt-migrated", item, legacySequence)
+      : item.eventId;
+    if (
+      duplicateEventId ||
+      item.eventId == null ||
+      item.sequence !== legacySequence ||
+      item.runnerSessionId == null
+    ) {
+      diagnostics.push(withoutUndefined({
+        lineIndex: legacySequence,
+        previousEventId: item.eventId,
+        migratedEventId: eventId,
+        previousSequence: item.sequence,
+        migratedSequence: legacySequence,
+        duplicateEventId,
+        missingEventId: item.eventId == null,
+        missingRunnerSessionId: item.runnerSessionId == null,
+      }));
+    }
     const sanitized = BatchEventLogSchema.parse({
       ...item,
+      eventId,
+      sequence: legacySequence,
+      runnerSessionId: item.runnerSessionId ?? runnerSessionId,
       message: item.message ? redacted(item.message) : undefined,
       metadata: item.metadata == null ? undefined : redactJsonValue(item.metadata),
     });
+    seenEventIds.add(sanitized.eventId);
     const checkpoint = item.itemId ? byItemId.get(item.itemId) : undefined;
     const check = checkpoint?.commandChecks?.find((value) =>
       value.status === "failed" && (!sanitized.command || value.name === sanitized.command),
@@ -4399,6 +9762,16 @@ function migrateEventLog(checkpoints) {
       migrated.push(BatchEventLogSchema.parse({
         schemaVersion: SchemaVersion,
         runId,
+        eventId: stableRecoveredToken("evt-migrated", [
+          runId,
+          checkpoint.itemId,
+          check.name,
+          check.completedAt,
+          check.errorSummary,
+        ]),
+        sequence: migrated.length + 1,
+        runnerSessionId,
+        coordinatorGeneration: coordinatorLease?.generation,
         itemId: checkpoint.itemId,
         event: "command_retry_exhausted",
         command: check.name,
@@ -4416,10 +9789,30 @@ function migrateEventLog(checkpoints) {
       exhaustedEvents.add(key);
     }
   }
-  writeFileSync(
+  const sequenced = migrated.map((item, index) =>
+    BatchEventLogSchema.parse({ ...item, sequence: index + 1 })
+  );
+  if (diagnostics.length > 0) {
+    sequenced.push(BatchEventLogSchema.parse({
+      schemaVersion: SchemaVersion,
+      runId,
+      eventId: stableRecoveredToken("evt-migrated", [
+        runId,
+        "event-log-normalized",
+        diagnostics,
+      ]),
+      sequence: sequenced.length + 1,
+      runnerSessionId,
+      coordinatorGeneration: coordinatorLease?.generation,
+      event: "event_log_normalized",
+      status: "pending",
+      at: now(),
+      metadata: { diagnostics },
+    }));
+  }
+  writeJsonlAtomic(
     eventsPath,
-    migrated.map((item) => JSON.stringify(item)).join("\n") + "\n",
-    "utf8",
+    sequenced.map((item) => JSON.stringify(item)),
   );
 }
 
@@ -4532,7 +9925,147 @@ function resumeRunnerArgs() {
     : [scriptPath];
 }
 
-function runCommand(item, name, command, args, options = {}) {
+function spawnCommand(command, args, options) {
+  return new Promise((resolveResult) => {
+    const subprocessId = randomToken("subprocess");
+    const startedAt = now();
+    let child;
+    try {
+      child = spawn(command, args, {
+        cwd: options.cwd,
+        env: options.env,
+        shell: options.shell,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: process.platform !== "win32",
+      });
+    } catch (error) {
+      const record = {
+        schemaVersion: SchemaVersion,
+        runId,
+        subprocessId,
+        runnerSessionId,
+        runnerHost,
+        runnerPid,
+        command: options.name ?? command,
+        itemId: options.itemId,
+        bookId: options.bookId,
+        workerId: options.workerId,
+        providerSlotId: options.providerSlotLease?.slotId,
+        providerSlotProvider: options.providerSlotLease?.provider,
+        providerSlotGeneration: options.providerSlotLease?.generation,
+        providerSlotFencingToken: options.providerSlotLease?.fencingToken,
+        processGroup: process.platform !== "win32",
+        startedAt,
+        heartbeatAt: now(),
+        status: "spawn_error",
+        completedAt: now(),
+      };
+      writeSubprocessRecord(record);
+      resolveResult({ status: 1, stdout: "", stderr: "", error });
+      return;
+    }
+    const baseRecord = {
+      schemaVersion: SchemaVersion,
+      runId,
+      subprocessId,
+      runnerSessionId,
+      runnerHost,
+      runnerPid,
+      pid: child.pid,
+      command: options.name ?? command,
+      itemId: options.itemId,
+      bookId: options.bookId,
+      workerId: options.workerId,
+      providerSlotId: options.providerSlotLease?.slotId,
+      providerSlotProvider: options.providerSlotLease?.provider,
+      providerSlotGeneration: options.providerSlotLease?.generation,
+      providerSlotFencingToken: options.providerSlotLease?.fencingToken,
+      processGroup: process.platform !== "win32",
+      startedAt,
+      heartbeatAt: startedAt,
+      status: "running",
+    };
+    writeSubprocessRecord(baseRecord);
+    if (child.pid != null) activeChildProcesses.set(subprocessId, child);
+    const maxBuffer = options.maxBuffer ?? 128 * 1024 * 1024;
+    let stdout = "";
+    let stderr = "";
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    let timedOut = false;
+    let bufferExceeded = false;
+    let spawnError = null;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      terminateProcessTree(child, "SIGTERM");
+      setTimeout(() => {
+        terminateProcessTree(child, "SIGKILL");
+      }, 2000).unref();
+    }, options.timeoutMs);
+    timeout.unref();
+    const finish = (status) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      activeChildProcesses.delete(subprocessId);
+      const failedBeforeExitCode = timedOut || bufferExceeded || spawnError != null;
+      resolveResult({
+        status: status ?? (failedBeforeExitCode ? 1 : 0),
+        stdout,
+        stderr,
+        error: timedOut
+          ? Object.assign(new Error("command timed out"), { code: "ETIMEDOUT" })
+          : bufferExceeded
+            ? Object.assign(new Error("command output exceeded maxBuffer"), {
+                code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+              })
+            : spawnError,
+      });
+    };
+    child.stdout?.on("data", (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes <= maxBuffer) stdout += chunk.toString();
+      if (stdoutBytes > maxBuffer && !child.killed) {
+        bufferExceeded = true;
+        terminateProcessTree(child, "SIGTERM");
+      }
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes <= maxBuffer) stderr += chunk.toString();
+      if (stderrBytes > maxBuffer && !child.killed) {
+        bufferExceeded = true;
+        terminateProcessTree(child, "SIGTERM");
+      }
+    });
+    child.once("error", (error) => {
+      spawnError = error;
+      activeChildProcesses.delete(subprocessId);
+      updateSubprocessRecord(subprocessId, (current) => ({
+        ...(current ?? baseRecord),
+        status: "spawn_error",
+        completedAt: now(),
+      }));
+      finish(1);
+    });
+    child.once("close", (code, signal) => {
+      activeChildProcesses.delete(subprocessId);
+      updateSubprocessRecord(subprocessId, (current) => ({
+        ...(current ?? baseRecord),
+        heartbeatAt: now(),
+        status: timedOut || bufferExceeded || signal != null ? "killed" : "exited",
+        exitCode: code,
+        signal,
+        completedAt: now(),
+      }));
+      finish(code);
+    });
+  });
+}
+
+async function runCommand(item, name, command, args, options = {}) {
   const baseAttempts = options.attempts ?? 1;
   const attempts = options.allowTransientBudget
     ? Math.max(baseAttempts, maxTransientCommandAttempts)
@@ -4540,6 +10073,9 @@ function runCommand(item, name, command, args, options = {}) {
   let last = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const startedAt = now();
+    if (batchStopRequested) {
+      throw batchStopInterruptError(name);
+    }
     event({
       itemId: item.itemId,
       event: "command_start",
@@ -4549,21 +10085,48 @@ function runCommand(item, name, command, args, options = {}) {
     const heartbeatMonitor = startCommandHeartbeatMonitor(item, name, startedAt);
     let result;
     try {
-      result = spawnSync(command, args, {
+      result = await spawnCommand(command, args, {
         cwd: root,
-        encoding: "utf8",
         maxBuffer: options.maxBuffer ?? 128 * 1024 * 1024,
         shell: process.platform === "win32",
-        timeout: commandTimeoutSeconds * 1000,
+        timeoutMs: commandTimeoutSeconds * 1000,
+        name,
+        itemId: item.itemId,
+        bookId: item.bookId,
+        workerId: options.workerId,
+        providerSlotLease: options.providerSlotLease,
         env: {
           ...process.env,
           INDEX_PATH: qmdIndexPath,
           QMD_CONFIG_DIR: dirname(configPath),
           QMD_GRAPH_VAULT: stateRoot,
           QMD_DOCTOR_DEVICE_PROBE: "0",
+          QMD_GRAPHRAG_RUN_ID: runId,
+          QMD_GRAPHRAG_ITEM_ID: item.itemId,
+          QMD_GRAPHRAG_BOOK_ID: item.bookId,
+          QMD_GRAPHRAG_COMMAND_NAME: name,
+          QMD_GRAPHRAG_WORKER_ID: options.workerId ?? "",
+          QMD_GRAPHRAG_RUNNER_SESSION_ID: runnerSessionId,
+          QMD_GRAPHRAG_RUNNER_HOST: runnerHost,
+          QMD_GRAPHRAG_RUNNER_PID: String(runnerPid),
+          QMD_GRAPHRAG_SUBPROCESS_REGISTRY_DIR: subprocessRoot,
+          QMD_GRAPHRAG_BOOK_LEASE_GENERATION:
+            item.bookLeaseGeneration == null ? "" : String(item.bookLeaseGeneration),
+          QMD_GRAPHRAG_BOOK_FENCING_TOKEN: item.bookFencingToken ?? "",
+          QMD_GRAPHRAG_ITEM_FENCING_TOKEN: item.fencingToken ?? "",
+          QMD_GRAPHRAG_PROVIDER_SLOT_ID: options.providerSlotLease?.slotId ?? "",
+          QMD_GRAPHRAG_PROVIDER_SLOT_PROVIDER:
+            options.providerSlotLease?.provider ?? "",
+          QMD_GRAPHRAG_PROVIDER_SLOT_GENERATION:
+            options.providerSlotLease?.generation == null
+              ? ""
+              : String(options.providerSlotLease.generation),
+          QMD_GRAPHRAG_PROVIDER_SLOT_FENCING_TOKEN:
+            options.providerSlotLease?.fencingToken ?? "",
           ...(options.env ?? {}),
         },
       });
+      heartbeatMonitor?.assertHealthy?.();
     } finally {
       heartbeatMonitor?.stop();
       clearCommandHeartbeat(item, name);
@@ -4578,9 +10141,36 @@ function runCommand(item, name, command, args, options = {}) {
         ? `command timed out after ${commandTimeoutSeconds} seconds`
         : "";
     const failureText = timeoutMessage || stderr || stdout || result.error?.message || "";
-    const failure = result.status === 0 ? null : classifyFailure(failureText);
+    const envelopeText = [stdout, stderr].filter(Boolean).join("\n");
+    const envelopeFailure = result.status === 0
+      ? null
+      : parseDurableFailureEnvelope(envelopeText, name, {
+          ...item,
+          workerId: options.workerId,
+        });
+    const legacyFailure = result.status === 0 || envelopeFailure != null
+      ? null
+      : classifyFailure(failureText);
+    const missingEnvelopeFailure = result.status === 0 || envelopeFailure != null
+      ? null
+      : missingDurableSubprocessEnvelopeFailure(name, {
+          ...item,
+          workerId: options.workerId,
+        }, legacyFailure);
+    const failure = result.status === 0
+      ? null
+      : envelopeFailure ?? missingEnvelopeFailure ?? legacyFailure;
+    const durableFailure = result.status === 0 || envelopeFailure != null
+      ? {}
+      : durableFailureForError(result.error, itemPath(item));
     const projectionFailureMetadata =
       settingsProjectionRejectionMetadataFromText(failureText, name);
+    const localRetryMetadata = failure?.localRetryClass == null
+      ? {}
+      : {
+          localRetryClass: failure.localRetryClass,
+          localRetryBudget: "bounded_command_attempts",
+        };
     const retryDelaySeconds = failure?.retryAfterSeconds ??
       retryDelaySecondsForAttempt(attempt);
     const shouldRetry =
@@ -4607,6 +10197,7 @@ function runCommand(item, name, command, args, options = {}) {
         ? {}
         : {
             ...failure,
+            ...durableFailure,
             nextRetryAt,
             retryDelaySeconds,
             attemptExhausted: !shouldRetry,
@@ -4629,8 +10220,9 @@ function runCommand(item, name, command, args, options = {}) {
       retryAfterSeconds: check.retryAfterSeconds,
         attemptExhausted: check.attemptExhausted,
         providerStatusCode: check.providerStatusCode,
-        recoveryDecision: check.recoveryDecision ??
+      recoveryDecision: check.recoveryDecision ??
           (check.retryable ? "retry_same_run_id" : "stop_until_fixed"),
+        ...durableProjection(check),
         failedStage: name,
         metadata: {
           attempt,
@@ -4643,6 +10235,8 @@ function runCommand(item, name, command, args, options = {}) {
             ? elapsedRetrySeconds(options.checkpoint)
             : undefined,
           nextRetryAt,
+          ...durableProjection(check),
+          ...localRetryMetadata,
           ...projectionFailureMetadata,
         },
       });
@@ -4663,12 +10257,13 @@ function runCommand(item, name, command, args, options = {}) {
         nextRetryAt,
         retryBudgetSeconds,
         commandTimeoutSeconds,
+        ...localRetryMetadata,
       },
     });
     if (options.allowTransientBudget) {
       throw Object.assign(new Error(check.errorSummary), { commandCheck: check });
     }
-    sleep(delayMs);
+    await delay(delayMs);
   }
   const summary = last?.check?.errorSummary ?? `${name} failed`;
   if (last?.check?.status === "failed") {
@@ -4693,6 +10288,7 @@ function runCommand(item, name, command, args, options = {}) {
         maxAttempts: attempts,
         retryBudgetSeconds,
         commandTimeoutSeconds,
+        ...durableProjection(last.check),
         ...settingsProjectionRejectionMetadataFromText(
           last.check.errorSummary,
           name,
@@ -4712,11 +10308,45 @@ function runCommand(item, name, command, args, options = {}) {
   throw Object.assign(new Error(summary), { commandCheck: last?.check });
 }
 
-function qmd(item, name, args, attempts = 1) {
+async function qmd(item, name, args, attempts = 1, options = {}) {
   const runner = qmdRunner();
-  return runCommand(item, name, runner.command, [...runner.args, ...args], {
+  const execute = (lease = {}) => runCommand(item, name, runner.command, [
+    ...runner.args,
+    ...args,
+  ], {
     attempts,
+    env: options.env,
+    workerId: options.workerId,
+    providerSlotLease: lease.providerSlotLease,
   });
+  const provider = providerSemaphoreForCommand(name);
+  const writerWrapped = (lease = {}) => qmdIndexLockedCommandNames.has(name)
+    ? withSemaphore(qmdIndexWriterLane, {
+      itemId: item.itemId,
+      bookId: item.bookId,
+      command: name,
+      status: "running",
+      workerId: options.workerId,
+    }, () => withQmdIndexFileLock(
+      () => execute(lease),
+      {
+        itemId: item.itemId,
+        bookId: item.bookId,
+        command: name,
+        status: "running",
+        workerId: options.workerId,
+      },
+    ))
+    : execute(lease);
+  if (provider == null) return writerWrapped();
+  return withSemaphore(provider.semaphore, {
+    itemId: item.itemId,
+    bookId: item.bookId,
+    command: name,
+    provider: provider.provider,
+    status: "running",
+    workerId: options.workerId,
+  }, writerWrapped);
 }
 
 function parseResumeOutput(stdout) {
@@ -4737,7 +10367,7 @@ function requirePath(path, label) {
   }
 }
 
-function normalizeEpubToMarkdown(item) {
+async function normalizeEpubToMarkdown(item, options = {}) {
   if (existsSync(item.normalizedPath)) return;
   mkdirSync(dirname(item.normalizedPath), { recursive: true });
   const script = String.raw`
@@ -4845,22 +10475,45 @@ with zipfile.ZipFile(source_path) as zf:
 with open(output_path, "w", encoding="utf-8") as handle:
     handle.write(markdown)
 `;
-  runCommand(item, "normalize-epub", pythonBin, [
-    "-c",
-    script,
-    item.sourcePath,
-    item.normalizedPath,
-  ]);
+  await withSemaphore(localCpuSlots, {
+    itemId: item.itemId,
+    bookId: item.bookId,
+    command: "normalize-epub",
+    status: "running",
+    workerId: options.workerId,
+  }, (lease) => runCommand(item, "normalize-epub", pythonBin, [
+      "-c",
+      script,
+      item.sourcePath,
+      item.normalizedPath,
+    ], {
+      workerId: options.workerId,
+      providerSlotLease: lease.providerSlotLease,
+    }));
 }
 
-function runGraphResume(item, checkpoint, options = {}) {
+async function runGraphResume(item, checkpoint, options = {}) {
   requirePath(pythonBin, "GraphRAG Python");
   let lastResult = null;
+  let nextStageHint = checkpoint?.graphBuildStatus?.stage ?? checkpoint?.failedStage;
   for (let pass = 1; pass <= maxResumePasses; pass += 1) {
     const name = options.repairLocalArtifactGateOnly
       ? `repair-local-artifact-gate-${pass}`
       : `resume-book-${pass}`;
-    const result = runCommand(item, name, process.execPath, [
+    const commandItem = {
+      ...item,
+      leaseGeneration: checkpoint?.leaseGeneration,
+      fencingToken: checkpoint?.fencingToken,
+      bookLeaseGeneration: checkpoint?.bookLeaseGeneration,
+      bookFencingToken: checkpoint?.bookFencingToken,
+    };
+    durablePreflight("before_resume_book", commandItem);
+    const provider = nextStageHint == null
+      ? providerSemaphoreForResumeStage(checkpoint)
+      : providerSemaphoreForResumeNextStage(nextStageHint);
+    const qmdIndexWriteStage = ["ingest", "normalize", "query_ready"]
+      .includes(String(nextStageHint ?? checkpoint?.graphBuildStatus?.stage ?? ""));
+    const runResumeCommand = (lease) => runCommand(commandItem, name, process.execPath, [
       ...resumeRunnerArgs(),
       "--state-root",
       stateRoot,
@@ -4891,8 +10544,36 @@ function runGraphResume(item, checkpoint, options = {}) {
       attempts: maxCommandAttempts,
       allowTransientBudget: true,
       checkpoint,
+      workerId: options.workerId,
+      providerSlotLease: lease.providerSlotLease,
     });
+    const result = await withSemaphore(provider.semaphore, {
+      itemId: commandItem.itemId,
+      bookId: commandItem.bookId,
+      command: name,
+      provider: provider.provider,
+      status: "running",
+      workerId: options.workerId,
+    }, (lease) => qmdIndexWriteStage
+      ? withSemaphore(qmdIndexWriterLane, {
+        itemId: commandItem.itemId,
+        bookId: commandItem.bookId,
+        command: name,
+        status: "running",
+        workerId: options.workerId,
+      }, () => runResumeCommand(lease))
+      : runResumeCommand(lease));
     lastResult = result;
+    checkpoint = {
+      ...checkpoint,
+      bookLeaseGeneration: result?.check?.bookLeaseGeneration ??
+        checkpoint?.bookLeaseGeneration,
+      bookFencingToken: result?.check?.bookFencingToken ??
+        checkpoint?.bookFencingToken,
+      leaseGeneration: result?.check?.leaseGeneration ??
+        checkpoint?.leaseGeneration,
+      fencingToken: result?.check?.fencingToken ?? checkpoint?.fencingToken,
+    };
 
     let resume;
     try {
@@ -4915,9 +10596,11 @@ function runGraphResume(item, checkpoint, options = {}) {
         command: name,
         resumeStatus: resume.status,
         nextStage: resume.nextStage,
+        providerSlotProvider: provider.provider,
         ...settingsProjectionMetadata(resume),
       },
     });
+    nextStageHint = resume.nextStage;
     if (
       (resume.status === "ready" && resume.nextStage == null) ||
       (options.repairLocalArtifactGateOnly && resume.status === "repaired")
@@ -4937,9 +10620,10 @@ function runGraphResume(item, checkpoint, options = {}) {
   );
 }
 
-function repairLocalArtifactGate(item, checkpoint) {
-  const repairResult = runGraphResume(item, checkpoint, {
+async function repairLocalArtifactGate(item, checkpoint, options = {}) {
+  const repairResult = await runGraphResume(item, checkpoint, {
     repairLocalArtifactGateOnly: true,
+    workerId: options.workerId,
   });
   const repairFailureText = redacted(checkpointFailureText(checkpoint));
   const projectionMetadata = settingsProjectionMetadata(repairResult.resume);
@@ -5147,7 +10831,7 @@ function validateCommandChecks(commandChecks) {
   }
 }
 
-function runCliChecks(item, checkpoint) {
+async function runCliChecks(item, checkpoint, options = {}) {
   const reusableChecks = (checkpoint.commandChecks ?? []).filter((check) =>
     check.status === "passed" && requiredCommandCheckNames.includes(check.name)
   );
@@ -5169,57 +10853,60 @@ function runCliChecks(item, checkpoint) {
       result.check,
     );
   };
-  const recordQmd = (name, args, attempts = 1) => {
+  const recordQmd = async (name, args, attempts = 1) => {
+    if (!requiredCommandCheckNames.includes(name)) return;
     if (seen.has(name)) return;
-    record(qmd(item, name, args, attempts));
+    record(await qmd(item, name, args, attempts, {
+      workerId: options.workerId,
+    }));
   };
-  recordQmd("qmd-version", ["--version"]);
-  recordQmd("qmd-status", ["status"]);
-  recordQmd("qmd-doctor-json", ["doctor", "--json"]);
-  recordQmd("qmd-pull", ["pull"]);
-  recordQmd("qmd-update", ["update"]);
-  recordQmd(
+  await recordQmd("qmd-version", ["--version"]);
+  await recordQmd("qmd-status", ["status"]);
+  await recordQmd("qmd-doctor-json", ["doctor", "--json"]);
+  await recordQmd("qmd-pull", ["pull"]);
+  await recordQmd("qmd-update", ["update"]);
+  await recordQmd(
     "qmd-embed",
     ["embed", "--max-docs-per-batch", "1"],
     maxCommandAttempts,
   );
-  recordQmd("qmd-ls-books", ["ls", "books"]);
-  recordQmd("qmd-search-json", ["search", "--json", "software design complexity"]);
-  recordQmd("qmd-search-csv", ["search", "--csv", "software design complexity"]);
-  recordQmd("qmd-search-md", ["search", "--md", "software design complexity"]);
-  recordQmd("qmd-search-xml", ["search", "--xml", "software design complexity"]);
-  recordQmd("qmd-search-files", ["search", "--files", "software design complexity"]);
-  recordQmd(
+  await recordQmd("qmd-ls-books", ["ls", "books"]);
+  await recordQmd("qmd-search-json", ["search", "--json", "software design complexity"]);
+  await recordQmd("qmd-search-csv", ["search", "--csv", "software design complexity"]);
+  await recordQmd("qmd-search-md", ["search", "--md", "software design complexity"]);
+  await recordQmd("qmd-search-xml", ["search", "--xml", "software design complexity"]);
+  await recordQmd("qmd-search-files", ["search", "--files", "software design complexity"]);
+  await recordQmd(
     "qmd-vsearch-json",
     ["vsearch", "--json", "software design complexity"],
     maxCommandAttempts,
   );
-  recordQmd("qmd-query-json", ["query", "--json", query], maxCommandAttempts);
-  recordQmd(
+  await recordQmd("qmd-query-json", ["query", "--json", query], maxCommandAttempts);
+  await recordQmd(
     "qmd-get-book",
     ["get", `qmd://books/${basename(item.normalizedPath)}`, "-l", "5"],
   );
-  recordQmd("qmd-multi-get-json", ["multi-get", "books/*.md", "-l", "1", "--json"]);
-  recordQmd("qmd-collection-list", ["collection", "list"]);
-  recordQmd("qmd-collection-show-books", ["collection", "show", "books"]);
-  recordQmd("qmd-context-list", ["context", "list"]);
-  recordQmd("qmd-skills-list-json", ["skills", "list", "--json"]);
-  recordQmd("qmd-skills-get-json", ["skills", "get", "qmd", "--json"]);
-  recordQmd("qmd-skills-path-json", ["skills", "path", "qmd", "--json"]);
-  recordQmd("qmd-skill-show", ["skill", "show"]);
-  recordQmd("qmd-dspy-status-json", ["dspy", "status", "--json"]);
-  recordQmd("qmd-cleanup", ["cleanup"]);
+  await recordQmd("qmd-multi-get-json", ["multi-get", "books/*.md", "-l", "1", "--json"]);
+  await recordQmd("qmd-collection-list", ["collection", "list"]);
+  await recordQmd("qmd-collection-show-books", ["collection", "show", "books"]);
+  await recordQmd("qmd-context-list", ["context", "list"]);
+  await recordQmd("qmd-skills-list-json", ["skills", "list", "--json"]);
+  await recordQmd("qmd-skills-get-json", ["skills", "get", "qmd", "--json"]);
+  await recordQmd("qmd-skills-path-json", ["skills", "path", "qmd", "--json"]);
+  await recordQmd("qmd-skill-show", ["skill", "show"]);
+  await recordQmd("qmd-dspy-status-json", ["dspy", "status", "--json"]);
+  await recordQmd("qmd-cleanup", ["cleanup"]);
   writeQmdBuildManifest(item, checks);
   activeCheckpoint = saveCheckpoint(item, {
     ...activeCheckpoint,
     commandChecks: checks,
   });
-  recordQmd(
+  await recordQmd(
     "qmd-query-auto-json",
     ["query", "--mode", "auto", "--json", query],
     maxCommandAttempts,
   );
-  recordQmd(
+  await recordQmd(
     "qmd-query-graphrag-json",
     ["query", "--graphrag", "--graph-book-id", item.bookId, "--json", query],
     maxCommandAttempts,
@@ -5228,9 +10915,11 @@ function runCliChecks(item, checkpoint) {
   return checks;
 }
 
-function runItem(item, checkpoint) {
-  normalizeEpubToMarkdown(item);
-  const resumeResult = runGraphResume(item, checkpoint);
+async function runItem(item, checkpoint, options = {}) {
+  await normalizeEpubToMarkdown(item, { workerId: options.workerId });
+  const resumeResult = await runGraphResume(item, checkpoint, {
+    workerId: options.workerId,
+  });
   const resolvedBookId = resumeResult?.bookId ?? checkpoint.bookId;
   const projectionMetadata = settingsProjectionMetadata(resumeResult?.resume);
   const resolvedItem = {
@@ -5271,7 +10960,9 @@ function runItem(item, checkpoint) {
       },
     });
   }
-  const commandChecks = runCliChecks(resolvedItem, checkpoint);
+  const commandChecks = await runCliChecks(resolvedItem, checkpoint, {
+    workerId: options.workerId,
+  });
   const qmdBuildStatus = qmdBuildEvidence(resolvedItem);
   const graphBuildStatus = graphBuildEvidence(resolvedItem);
   const graphQueryStatus = graphQueryEvidence({ commandChecks });
@@ -5324,6 +11015,7 @@ function runItem(item, checkpoint) {
       },
     );
   }
+  const terminalFinalization = buildTerminalFinalizationFence(checkpoint);
   const completed = {
     ...checkpoint,
     status: "completed",
@@ -5344,10 +11036,19 @@ function runItem(item, checkpoint) {
     metadata: {
       ...(checkpoint.metadata ?? {}),
       ...projectionMetadata,
+      terminalFinalization,
     },
   };
-  saveCheckpoint(resolvedItem, completed);
-  event({ itemId: item.itemId, event: "item_completed", status: "completed" });
+  saveCheckpoint(resolvedItem, completed, {
+    requireBookLease: true,
+    expectedStatus: "completed",
+  });
+  event({
+    itemId: item.itemId,
+    event: "item_completed",
+    status: "completed",
+    metadata: { terminalFinalization },
+  });
   return completed;
 }
 
@@ -5385,8 +11086,39 @@ function buildRecoverableTransientCheckpoint({ item, running, commandCheck, erro
   };
 }
 
-function markItemRunning(item, checkpoint, checkpoints, manifest) {
+function buildInterruptedCheckpoint({ running, error }) {
+  const commandCheck = error?.commandCheck;
+  return {
+    ...running,
+    status: "pending",
+    failedAt: undefined,
+    errorSummary: redacted(error instanceof Error ? error.message : String(error)),
+    failureKind: undefined,
+    retryable: undefined,
+    retryExhausted: undefined,
+    recoveryDecision: "continue_pending",
+    failedStage: commandCheck?.name ?? running.currentCommand ?? running.failedStage,
+    nextRetryAt: undefined,
+    retryDelaySeconds: undefined,
+    runnerHeartbeatAt: now(),
+    activeCommand: commandCheck?.name ?? running.currentCommand ?? running.activeCommand,
+    commandChecks: commandCheck
+      ? [...(running.commandChecks ?? []), commandCheck]
+      : (running.commandChecks ?? []),
+    metadata: {
+      ...(running.metadata ?? {}),
+      waitingForProviderRecovery: false,
+      interruptedByBatchStop: true,
+      batchStopReason: batchStopReason ?? "unknown",
+    },
+  };
+}
+
+function markItemRunning(item, checkpoint, checkpoints, manifest, workerId) {
+  durablePreflight("before_claim", item);
   const startedAt = now();
+  const bookLease = acquireBookLease(item, workerId);
+  const itemFencingToken = randomToken("item-fence");
   const running = lockedReadWriteTypedJson(
     itemPath(item),
     BatchItemCheckpointSchema,
@@ -5433,9 +11165,19 @@ function markItemRunning(item, checkpoint, checkpoints, manifest) {
         runnerHost,
         runnerPid,
         runnerHeartbeatAt: startedAt,
+        leaseGeneration: coordinatorLease?.generation ?? 1,
+        fencingToken: itemFencingToken,
+        leaseExpiresAt: leaseExpiresAt(),
+        bookLeaseGeneration: bookLease?.generation ?? 1,
+        bookFencingToken: bookLease?.fencingToken ?? randomToken("book-fence"),
         metadata: {
           ...(current.metadata ?? {}),
           waitingForProviderRecovery: false,
+          workerId,
+          coordinatorGeneration: coordinatorLease?.generation ?? 1,
+          itemFencingToken,
+          bookLeaseGeneration: bookLease?.generation,
+          bookFencingToken: bookLease?.fencingToken,
         },
       });
     },
@@ -5443,7 +11185,7 @@ function markItemRunning(item, checkpoint, checkpoints, manifest) {
   checkpoints.set(item.itemId, running);
   updateManifest(manifest, Array.from(checkpoints.values()));
   event({ itemId: item.itemId, event: "item_start", status: "running" });
-  return running;
+  return { running, bookLease };
 }
 
 function retryWindowDelayMs(checkpoint) {
@@ -5496,17 +11238,23 @@ function eventProviderRecoveryWaitLimit(items, checkpoints) {
     const activeItem = runtimeItemForCheckpoint(item, checkpoint);
     const updated = {
       ...checkpoint,
-      retryExhausted: false,
-      recoveryDecision: "retry_same_run_id",
+      status: "failed",
+      failedAt: now(),
+      nextRetryAt: undefined,
+      retryDelaySeconds: undefined,
+      retryable: false,
+      retryExhausted: true,
+      recoveryDecision: "stop_until_fixed",
       retryBudgetSeconds: checkpoint.retryBudgetSeconds ?? retryBudgetSeconds,
       metadata: {
         ...(checkpoint.metadata ?? {}),
-        waitingForProviderRecovery: true,
+        waitingForProviderRecovery: false,
         providerRecoveryReason: "provider_recovery_wait_limit_reached",
         providerRecoveryWaitCount: providerRecoveryWaitCount(checkpoint),
         maxProviderRecoveryWaits,
         retryBudgetSeconds,
         providerRecoveryWaitLimitReached: true,
+        providerRecoveryExcludedFromRun: true,
       },
     };
     saveCheckpoint(activeItem, updated);
@@ -5519,12 +11267,12 @@ function eventProviderRecoveryWaitLimit(items, checkpoints) {
   event({
     event: "batch_provider_recovery_wait_limit",
     status: "pending",
-    recoveryDecision: "retry_same_run_id",
+    recoveryDecision: "stop_until_fixed",
     metadata: {
       limitedItemCount: limited.length,
       maxProviderRecoveryWaits,
       nextRetryAt,
-      retryPolicy: "exit_current_runner_recover_same_run_id",
+      retryPolicy: "retry_exhausted_excluded_until_operator_review",
     },
   });
   return true;
@@ -5553,11 +11301,13 @@ function emitBatchStoppedAfterNonTransientFailure(checkpoint) {
     failureKind: checkpoint.failureKind ?? "unknown",
     retryable: false,
     recoveryDecision: "stop_until_fixed",
+    ...durableProjection(checkpoint),
     failedStage: checkpoint.failedStage,
     message: checkpoint.errorSummary,
     metadata: {
       policy: "stop_current_runner_until_fixed",
       stopReason,
+      ...durableProjection(checkpoint),
     },
   };
   if (stopReason === "data_compatibility") {
@@ -5578,7 +11328,565 @@ function emitBatchStoppedAfterNonTransientFailure(checkpoint) {
   });
 }
 
-function waitForNextRetryWindow(items, checkpoints) {
+function updateManifestState(manifestState, checkpoints) {
+  manifestState.manifest = updateManifest(
+    manifestState.manifest,
+    Array.from(checkpoints.values()),
+  );
+  return manifestState.manifest;
+}
+
+function persistBatchStopManifest(manifest, checkpoints, reason) {
+  const stopped = BatchRunManifestSchema.parse(withoutUndefined({
+    ...manifest,
+    status: "failed",
+    failedAt: now(),
+    completedAt: undefined,
+    updatedAt: now(),
+    metadata: {
+      ...(manifest.metadata ?? {}),
+      batchStopRequested: true,
+      batchStopReason: reason,
+    },
+  }));
+  writeTypedJson(manifestPath, BatchRunManifestSchema, stopped);
+  writeRecoverySummary(stopped, checkpoints);
+  return stopped;
+}
+
+async function handleRunItemFailure({
+  error,
+  item,
+  activeItem,
+  checkpoint,
+  checkpoints,
+  completedSeed,
+  manifestState,
+  stopLoggedThisRun,
+}) {
+  const running = existsSync(itemPath(item))
+    ? loadCheckpoint(activeItem, completedSeed)
+    : checkpoint ?? defaultCheckpoint(item, completedSeed);
+  let activeRuntimeItem = runtimeItemForCheckpoint(item, running);
+  const commandCheck = error?.commandCheck;
+  const durableFailure = durableFailureForError(error, itemPath(item));
+  const commandDurableProjection = durableProjection(commandCheck);
+  const errorDurableProjection = durableProjection(durableFailure);
+  const durableFields = {
+    ...errorDurableProjection,
+    ...commandDurableProjection,
+  };
+  if (isBatchStopInterrupt(error)) {
+    const interrupted = buildInterruptedCheckpoint({ running, error });
+    saveCheckpoint(activeRuntimeItem, interrupted);
+    checkpoints.set(item.itemId, interrupted);
+    updateManifestState(manifestState, checkpoints);
+    event({
+      itemId: item.itemId,
+      event: "item_interrupted_by_batch_stop",
+      status: "pending",
+      recoveryDecision: "continue_pending",
+      failedStage: interrupted.failedStage,
+      message: interrupted.errorSummary,
+      metadata: {
+        batchStopReason: batchStopReason ?? "unknown",
+        activeCommand: interrupted.activeCommand,
+      },
+    });
+    return { processed: true, stopAfterNonTransientFailure: false };
+  }
+  const failureKind =
+    commandCheck?.failureKind ??
+    durableFields.failureKind ??
+    "unknown";
+  const retryable = commandCheck?.retryable ?? false;
+  const canRecoverInThisRun =
+    retryable && failureKind === "transient" && transientBudgetAvailable(running);
+  if (canRecoverInThisRun) {
+    const recoverable = buildRecoverableTransientCheckpoint({
+      item: activeRuntimeItem,
+      running,
+      commandCheck,
+      error,
+    });
+    saveCheckpoint(activeRuntimeItem, recoverable);
+    checkpoints.set(item.itemId, recoverable);
+    updateManifestState(manifestState, checkpoints);
+    event({
+      itemId: item.itemId,
+      event: "item_retry_deferred",
+      status: "pending",
+      message: recoverable.errorSummary,
+      failureKind: recoverable.failureKind,
+      retryable: true,
+      attemptExhausted: false,
+      providerStatusCode: commandCheck?.providerStatusCode,
+      retryAfterSeconds: commandCheck?.retryAfterSeconds,
+      recoveryDecision: "retry_same_run_id",
+      failedStage: recoverable.failedStage,
+      metadata: {
+        nextRetryAt: recoverable.nextRetryAt,
+        retryDelaySeconds: recoverable.retryDelaySeconds,
+        retryBudgetSeconds,
+        elapsedRetrySeconds: elapsedRetrySeconds(recoverable),
+      },
+    });
+    if (failFast) {
+      manifestState.manifest = persistFailFastInterruptedManifest(
+        manifestState.manifest,
+        Array.from(checkpoints.values()),
+        "recoverable_transient_failure",
+      );
+      markBatchFailureHandled(error);
+      throw error;
+    }
+    return { processed: true, stopAfterNonTransientFailure: false };
+  }
+
+  const recoverableProviderFailure =
+    retryable &&
+    failureKind === "transient";
+  const providerRecoveryWaitStillAvailable =
+    recoverableProviderFailure && providerRecoveryWaitAvailable(running);
+  if (recoverableProviderFailure && !providerRecoveryWaitStillAvailable) {
+    const waitCount = providerRecoveryWaitCount(running);
+    const limited = {
+      ...running,
+      status: "failed",
+      failedAt: now(),
+      errorSummary: redacted(error instanceof Error
+        ? error.message
+        : String(error)),
+      failureKind: "transient",
+      retryable: false,
+      retryExhausted: true,
+      recoveryDecision: "stop_until_fixed",
+      ...durableFields,
+      failedStage: commandCheck?.name,
+      retryStartedAt: running.retryStartedAt ?? commandCheck?.completedAt ?? now(),
+      nextRetryAt: undefined,
+      retryDelaySeconds: undefined,
+      retryBudgetSeconds,
+      runnerHeartbeatAt: now(),
+      metadata: {
+        ...(running.metadata ?? {}),
+        waitingForProviderRecovery: false,
+        providerRecoveryWaitStartedAt:
+          running.metadata?.providerRecoveryWaitStartedAt ?? now(),
+        providerRecoveryReason: "provider_recovery_wait_limit_reached",
+        providerRecoveryWaitCount: waitCount,
+          maxProviderRecoveryWaits,
+          retryBudgetSeconds,
+          sourceName: activeRuntimeItem.sourceName,
+          providerRecoveryWaitLimitReached: true,
+          providerRecoveryExcludedFromRun: true,
+          ...durableFields,
+        },
+      };
+    if (commandCheck) {
+      limited.commandChecks = [
+        ...(limited.commandChecks ?? []),
+        commandCheck.status === "failed"
+          ? {
+              ...commandCheck,
+              retryable: false,
+              recoveryDecision: "stop_until_fixed",
+              attemptExhausted: true,
+            }
+          : commandCheck,
+      ];
+    }
+    saveCheckpoint(activeRuntimeItem, limited);
+    checkpoints.set(item.itemId, limited);
+    updateManifestState(manifestState, checkpoints);
+    event({
+      itemId: item.itemId,
+      event: "item_provider_recovery_wait_limit_reached",
+      status: "failed",
+      message: limited.errorSummary,
+      failureKind: "transient",
+      retryable: false,
+      attemptExhausted: true,
+      providerStatusCode: commandCheck?.providerStatusCode,
+      retryAfterSeconds: commandCheck?.retryAfterSeconds,
+      recoveryDecision: "stop_until_fixed",
+      failedStage: limited.failedStage,
+      ...durableFields,
+      metadata: {
+        retryBudgetSeconds,
+        providerRecoveryWaitCount: waitCount,
+        maxProviderRecoveryWaits,
+        retryPolicy: "retry_exhausted_excluded_until_operator_review",
+        ...durableFields,
+      },
+    });
+    return { processed: true, stopAfterNonTransientFailure: true };
+  }
+
+  const providerRecoveryDelay = recoverableProviderFailure
+    ? providerRecoveryDelaySeconds(running)
+    : undefined;
+  const recoveryWaitCount = recoverableProviderFailure
+    ? nextProviderRecoveryWaitCount(running)
+    : undefined;
+  const projectionRejectionMetadata =
+    rejectedSettingsProjectionMetadata(error);
+  const authFailureMetadata = providerAuthFailureMetadata(commandCheck);
+  const failed = recoverableProviderFailure
+    ? {
+        ...running,
+        status: "failed",
+        failedAt: now(),
+        errorSummary: redacted(
+          error instanceof Error ? error.message : String(error),
+        ),
+        failureKind: "transient",
+        retryable: false,
+        retryExhausted: true,
+        recoveryDecision: "stop_until_fixed",
+        ...durableFields,
+        failedStage: commandCheck?.name ?? durableFields.failedStage,
+        retryStartedAt:
+          running.retryStartedAt ?? commandCheck?.completedAt ?? now(),
+        nextRetryAt: undefined,
+        retryDelaySeconds: undefined,
+        runnerHeartbeatAt: now(),
+        activeCommand: commandCheck?.name ?? running.activeCommand ??
+          running.currentCommand ?? running.failedStage,
+        metadata: {
+          ...(running.metadata ?? {}),
+          waitingForProviderRecovery: false,
+          providerRecoveryWaitStartedAt: now(),
+          providerRecoveryReason: providerRecoveryWaitStillAvailable
+            ? "transient_retry_budget_window_elapsed"
+            : "provider_recovery_wait_limit_reached",
+          providerRecoveryWaitCount: recoveryWaitCount,
+          maxProviderRecoveryWaits,
+          retryBudgetSeconds,
+          providerRecoveryExcludedFromRun: true,
+          sourceName: activeRuntimeItem.sourceName,
+          ...durableFields,
+        },
+      }
+    : {
+        ...running,
+        status: "failed",
+        failedAt: now(),
+        errorSummary: redacted(
+          error instanceof Error ? error.message : String(error),
+        ),
+        failureKind,
+        retryable: false,
+        retryExhausted: Boolean(commandCheck?.attemptExhausted) ||
+          (retryable && failureKind === "transient"),
+        recoveryDecision: "stop_until_fixed",
+        ...durableFields,
+        failedStage: commandCheck?.name ?? durableFields.failedStage,
+        nextRetryAt: undefined,
+        retryDelaySeconds: undefined,
+        runnerHeartbeatAt: now(),
+        activeCommand: commandCheck?.name ?? running.activeCommand ??
+          running.currentCommand ?? running.failedStage,
+        metadata: {
+          ...(running.metadata ?? {}),
+          ...projectionRejectionMetadata,
+          ...authFailureMetadata,
+          ...durableFields,
+          waitingForProviderRecovery: false,
+        },
+      };
+  if (commandCheck) {
+    failed.commandChecks = [
+      ...(failed.commandChecks ?? []),
+      commandCheck.status === "failed"
+        ? {
+            ...commandCheck,
+            recoveryDecision: commandCheck.recoveryDecision ??
+              failed.recoveryDecision,
+          }
+        : commandCheck,
+    ];
+  }
+  saveCheckpoint(activeRuntimeItem, failed);
+  checkpoints.set(item.itemId, failed);
+  updateManifestState(manifestState, checkpoints);
+  event({
+    itemId: item.itemId,
+    event: recoverableProviderFailure ? "item_provider_recovery_wait" : "item_failed",
+    status: failed.status,
+    message: failed.errorSummary,
+    failureKind: failed.failureKind,
+    retryable: failed.retryable,
+    attemptExhausted: failed.retryExhausted,
+    providerStatusCode: commandCheck?.providerStatusCode,
+    retryAfterSeconds: commandCheck?.retryAfterSeconds,
+    recoveryDecision: failed.recoveryDecision,
+    ...durableProjection(failed),
+    failedStage: failed.failedStage,
+    metadata: recoverableProviderFailure
+      ? {
+          retryBudgetSeconds,
+          elapsedRetrySeconds: elapsedRetrySeconds(failed),
+          providerRecoveryWaitCount: recoveryWaitCount,
+          maxProviderRecoveryWaits,
+          waitLimitReached: !providerRecoveryWaitStillAvailable,
+          retryPolicy: "retry_exhausted_excluded_until_operator_review",
+          ...durableProjection(failed),
+        }
+      : {
+          activeCommand: failed.activeCommand,
+          command: commandCheck?.name,
+          ...projectionRejectionMetadata,
+          ...authFailureMetadata,
+          ...durableProjection(failed),
+        },
+  });
+  if (
+    !recoverableProviderFailure &&
+    authFailureMetadata.providerAuthFailureDetected === true
+  ) {
+    event({
+      itemId: item.itemId,
+      event: "item_provider_auth_refailed",
+      status: "failed",
+      message: failed.errorSummary,
+      failureKind: failed.failureKind,
+      retryable: false,
+      attemptExhausted: failed.retryExhausted,
+      providerStatusCode: commandCheck?.providerStatusCode,
+      recoveryDecision: "stop_until_fixed",
+      failedStage: failed.failedStage,
+      metadata: {
+        activeCommand: failed.activeCommand,
+        command: commandCheck?.name,
+        providerAuthReopenAttemptCount:
+          providerAuthReopenAttemptCount(failed),
+        ...authFailureMetadata,
+      },
+    });
+  }
+  if (failFast) {
+    manifestState.manifest = persistFailFastInterruptedManifest(
+      manifestState.manifest,
+      Array.from(checkpoints.values()),
+      recoverableProviderFailure
+        ? "provider_recovery_wait"
+        : "command_failure",
+    );
+    markBatchFailureHandled(error);
+    throw error;
+  }
+  if (shouldStopBatchAfterFailure(failed)) {
+    if (!stopLoggedThisRun.has(failed.itemId)) {
+      emitBatchStoppedAfterNonTransientFailure(failed);
+      stopLoggedThisRun.add(failed.itemId);
+    }
+    return { processed: true, stopAfterNonTransientFailure: true };
+  }
+  return { processed: true, stopAfterNonTransientFailure: false };
+}
+
+function markBatchFailureHandled(error) {
+  if (error && typeof error === "object") {
+    error.batchFailureHandled = true;
+  }
+}
+
+function batchFailureWasHandled(error) {
+  return error != null &&
+    typeof error === "object" &&
+    error.batchFailureHandled === true;
+}
+
+async function runClaimedBatchItem({
+  item,
+  activeItem,
+  running,
+  bookLease,
+  checkpoints,
+  completedSeed,
+  manifestState,
+  stopLoggedThisRun,
+  workerId,
+}) {
+  event({
+    itemId: item.itemId,
+    event: "item_worker_start",
+    status: "running",
+    metadata: { workerId, bookConcurrency },
+  });
+  let activeBookLease = refreshBookLease(bookLease);
+  try {
+    const completed = await runItem(activeItem, running, { workerId });
+    checkpoints.set(item.itemId, completed);
+    updateManifestState(manifestState, checkpoints);
+    event({
+      itemId: item.itemId,
+      event: "item_worker_completed",
+      status: "completed",
+      metadata: {
+        workerId,
+        bookConcurrency,
+        terminalFinalization: completed.metadata?.terminalFinalization,
+      },
+    });
+    releaseBookLease(activeBookLease, "completed");
+    return { processed: true, stopAfterNonTransientFailure: false };
+  } catch (error) {
+    const result = await handleRunItemFailure({
+      error,
+      item,
+      activeItem,
+      checkpoint: running,
+      checkpoints,
+      completedSeed,
+      manifestState,
+      stopLoggedThisRun,
+    });
+    markBatchFailureHandled(error);
+    event({
+      itemId: item.itemId,
+      event: "item_worker_stopped",
+      status: checkpoints.get(item.itemId)?.status,
+      recoveryDecision: checkpoints.get(item.itemId)?.recoveryDecision,
+      metadata: {
+        workerId,
+        bookConcurrency,
+        stopAfterNonTransientFailure: result.stopAfterNonTransientFailure,
+      },
+    });
+    releaseBookLease(activeBookLease, checkpoints.get(item.itemId)?.status ?? "failed");
+    return result;
+  }
+}
+
+async function runWorkerPool({
+  candidates,
+  checkpoints,
+  completedSeed,
+  manifestState,
+  stopLoggedThisRun,
+  nextWorkerId,
+}) {
+  let candidateIndex = 0;
+  let activeCount = 0;
+  const results = [];
+  let rejectedError;
+  let stopAfterNonTransientFailure = false;
+  let processed = false;
+
+  return await new Promise((resolvePool, rejectPool) => {
+    const settleIfDone = () => {
+      if (activeCount !== 0) return;
+      if (
+        (candidateIndex >= candidates.length || stopAfterNonTransientFailure) &&
+        rejectedError == null
+      ) {
+        resolvePool({ processed, stopAfterNonTransientFailure, results });
+      } else if (rejectedError != null) {
+        rejectPool(rejectedError);
+      }
+    };
+
+    const launchMore = () => {
+      while (
+        activeCount < bookConcurrency &&
+        candidateIndex < candidates.length &&
+        !stopAfterNonTransientFailure &&
+        rejectedError == null
+      ) {
+        const candidate = candidates[candidateIndex];
+        candidateIndex += 1;
+        let running;
+        let workerId;
+        try {
+          const current = checkpoints.get(candidate.item.itemId) ??
+            defaultCheckpoint(candidate.item, completedSeed);
+          if (current.status !== "pending") continue;
+          const activeItem = runtimeItemForCheckpoint(candidate.item, current);
+          if (activeRunningBookCheckpoint(activeItem, checkpoints) != null) {
+            event({
+              itemId: candidate.item.itemId,
+              event: "item_book_running_observed",
+              status: "pending",
+              recoveryDecision: "continue_pending",
+              metadata: {
+                bookId: activeItem.bookId,
+                workerPoolDeferred: true,
+              },
+            });
+            continue;
+          }
+          workerId = nextWorkerId();
+          const claim = markItemRunning(
+            activeItem,
+            current,
+            checkpoints,
+            manifestState.manifest,
+            workerId,
+          );
+          running = claim.running;
+          event({
+            itemId: candidate.item.itemId,
+            event: "item_worker_queued",
+            status: "running",
+            metadata: {
+              workerId,
+              bookConcurrency,
+              candidateIndex,
+              remainingCandidates: candidates.length - candidateIndex,
+            },
+          });
+          activeCount += 1;
+          runClaimedBatchItem({
+            item: candidate.item,
+            activeItem,
+            running,
+            bookLease: claim.bookLease,
+            checkpoints,
+            completedSeed,
+            manifestState,
+            stopLoggedThisRun,
+            workerId,
+          }).then((result) => {
+            results.push(result);
+            processed = processed || result.processed;
+            stopAfterNonTransientFailure = stopAfterNonTransientFailure ||
+              result.stopAfterNonTransientFailure;
+            if (result.stopAfterNonTransientFailure) {
+              requestBatchStop("worker_stop_until_fixed");
+              terminateActiveSubprocesses("worker_stop_until_fixed");
+            }
+          }, (error) => {
+            rejectedError = error;
+            requestBatchStop("worker_pool_error");
+            terminateActiveSubprocesses("worker_pool_error");
+          }).finally(() => {
+            activeCount -= 1;
+            if (rejectedError != null) {
+              settleIfDone();
+              return;
+            }
+            launchMore();
+            settleIfDone();
+          });
+        } catch (error) {
+          rejectedError = error;
+          break;
+        }
+      }
+      settleIfDone();
+    };
+
+    try {
+      launchMore();
+    } catch (error) {
+      rejectPool(error);
+    }
+  });
+}
+
+async function waitForNextRetryWindow(items, checkpoints) {
   const waiting = items
     .map((item) => ({ item, checkpoint: checkpoints.get(item.itemId) }))
     .filter(({ checkpoint }) =>
@@ -5607,20 +11915,70 @@ function waitForNextRetryWindow(items, checkpoints) {
       retryBudgetSeconds,
     },
   });
-  sleep(delayMs);
+  await delay(delayMs);
   return true;
 }
 
-function main() {
+async function main() {
   loadDotenv();
   ensureDirs();
   requirePath(sourceDir, "source directory");
   requirePath(configPath, "qmd config");
-  const items = discoverItems();
+  const items = discoverItemsWithDurableFailureEvent();
   if (items.length === 0) {
     throw new Error(`no EPUB files found in ${sourceDir}`);
   }
-  let manifest = loadManifest(items);
+  eventSequence = readExistingEventSequence();
+  let manifest;
+  if (!statusJson) {
+    acquireCoordinatorLock();
+    manifest = loadManifest(items);
+    manifest = writeStartupRecoveryManifest(manifest, {
+      scopeCount: durablePreflightTargetsForItems(items).length,
+      targetCount: 0,
+      mutationCount: 0,
+      decision: "created_before_preflight",
+    });
+    if (!testSkipRunnerStartPreflight) {
+      const providerRequestDiagnostics = [];
+      durablePreflight("runner_start", undefined, {
+        targets: durablePreflightTargetsForItems(items),
+        providerRequestDiagnostics,
+      });
+      manifest = updateManifestWithProviderRequestDiagnostics(
+        manifest,
+        providerRequestDiagnostics,
+      );
+    }
+    reconcileDurableRunFiles();
+    startCoordinatorHeartbeat();
+    recoverEventLogTail();
+    event({
+      event: "coordinator_lock_acquired",
+      status: "running",
+      metadata: {
+        runnerSessionId,
+        runnerHost,
+        runnerPid,
+        generation: coordinatorLease?.generation,
+        fencingToken: coordinatorLease?.fencingToken,
+        expiresAt: coordinatorLease?.expiresAt,
+      },
+    });
+  } else {
+    manifest = loadManifest(items);
+    const providerRequestDiagnostics = [];
+    for (const target of durablePreflightTargetsForItems(items)) {
+      if (!target.providerRequestReadOnly) continue;
+      durablePreflightScanDirectory(target.directory, {
+        providerRequestReadOnly: true,
+        providerRequestDiagnostics,
+      });
+    }
+    for (const diagnostic of providerRequestDiagnostics) {
+      recordStatusJsonDurableDiagnostic(diagnostic);
+    }
+  }
   const completedSeed = loadCompletedSeed();
   const checkpoints = new Map(items.map((item) => [
     item.itemId,
@@ -5628,6 +11986,27 @@ function main() {
   ]));
   if (!statusJson) migrateGraphOutputProducerManifests();
   manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+  if (!statusJson && batchStopRequested) {
+    manifest = persistBatchStopManifest(
+      manifest,
+      Array.from(checkpoints.values()),
+      batchStopReason ?? "batch_stop_requested",
+    );
+    event({
+      event: "batch_incomplete",
+      recoveryDecision: "stop_until_fixed",
+      metadata: {
+        pendingItems: manifest.pendingItems,
+        runningItems: manifest.runningItems,
+        completedItems: manifest.completedItems,
+        skippedItems: manifest.skippedItems,
+        failedItems: manifest.failedItems,
+        batchStopReason: batchStopReason ?? "batch_stop_requested",
+      },
+    });
+    process.exitCode = 1;
+    return;
+  }
   if (statusJson) {
     printStatusAndExit(manifest, Array.from(checkpoints.values()));
     return;
@@ -5655,6 +12034,21 @@ function main() {
     return;
   }
 
+  const manifestState = { manifest };
+  let workerSequence = 1;
+  event({
+    event: "batch_runner_configured",
+    metadata: {
+      runnerSessionId,
+      runnerHost,
+      runnerPid,
+      bookConcurrency,
+      openaiProviderConcurrency,
+      jinaProviderConcurrency,
+      localCpuConcurrency,
+    },
+  });
+
   let processedInPass = true;
   const repairBlockedThisRun = new Set();
   const stopLoggedThisRun = new Set();
@@ -5666,6 +12060,7 @@ function main() {
       applyProviderAuthReopenPass(items, checkpoints);
     if (providerAuthReopenedCount > 0) {
       manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+      manifestState.manifest = manifest;
       writeRecoverySummary(manifest, Array.from(checkpoints.values()));
       processedInPass = true;
     }
@@ -5673,6 +12068,7 @@ function main() {
       recoverProviderTransientCheckpoints(items, checkpoints);
     if (recoveredProviderTransientCount > 0) {
       manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+      manifestState.manifest = manifest;
       writeRecoverySummary(manifest, Array.from(checkpoints.values()));
       processedInPass = true;
     }
@@ -5687,6 +12083,7 @@ function main() {
       stopAfterNonTransientFailure = true;
       break;
     }
+    const runnableCandidates = [];
     for (const item of items) {
       if (repairBlockedThisRun.has(item.itemId)) {
         event({
@@ -5778,7 +12175,7 @@ function main() {
           });
           try {
             activeItem = runtimeItemForCheckpoint(item, checkpoint);
-            const repaired = repairLocalArtifactGate(activeItem, checkpoint);
+            const repaired = await repairLocalArtifactGate(activeItem, checkpoint);
             saveCheckpoint(activeItem, repaired);
             checkpoints.set(item.itemId, repaired);
             manifest = updateManifest(manifest, Array.from(checkpoints.values()));
@@ -5800,6 +12197,13 @@ function main() {
           } catch (error) {
             const projectionRejectionMetadata =
               rejectedSettingsProjectionMetadata(error);
+            const durableFields = {
+              ...durableProjection(durableFailureForError(
+                error,
+                itemPath(activeItem ?? item),
+              )),
+              ...durableProjection(error?.commandCheck),
+            };
             const activeCommand =
               error?.commandCheck?.name ?? checkpoint.activeCommand ??
                 checkpoint.currentCommand ?? checkpoint.failedStage ??
@@ -5815,6 +12219,7 @@ function main() {
               retryable: false,
               retryExhausted: true,
               recoveryDecision: "stop_until_fixed",
+              ...durableFields,
               failedStage: "repair-local-artifact-gate",
               activeCommand,
               runnerHeartbeatAt: now(),
@@ -5822,6 +12227,7 @@ function main() {
                 ...(checkpoint.metadata ?? {}),
                 ...projectionRejectionMetadata,
                 localArtifactGateRepairFailed: true,
+                ...durableFields,
                 waitingForProviderRecovery: false,
               },
             };
@@ -5848,12 +12254,14 @@ function main() {
               failureKind: "permanent",
               retryable: false,
               recoveryDecision: "stop_until_fixed",
+              ...durableProjection(failed),
               failedStage: "repair-local-artifact-gate",
               message: failed.errorSummary,
               metadata: {
                 activeCommand,
                 command: commandCheck?.name,
                 ...projectionRejectionMetadata,
+                ...durableProjection(failed),
               },
             });
             continue;
@@ -5958,294 +12366,114 @@ function main() {
           deferredForRetryWindow = true;
           continue;
         }
-        const running = markItemRunning(activeItem, starting, checkpoints, manifest);
-        const completed = runItem(activeItem, running);
-        checkpoints.set(item.itemId, completed);
-        manifest = updateManifest(manifest, Array.from(checkpoints.values()));
-        processedInPass = true;
-      } catch (error) {
-        const running = existsSync(itemPath(item))
-          ? loadCheckpoint(activeItem, completedSeed)
-          : checkpoint ?? defaultCheckpoint(item, completedSeed);
-        activeItem = runtimeItemForCheckpoint(item, running);
-        const commandCheck = error?.commandCheck;
-        const failureKind = commandCheck?.failureKind ?? "unknown";
-        const retryable = commandCheck?.retryable ?? false;
-        const canRecoverInThisRun =
-          retryable && failureKind === "transient" && transientBudgetAvailable(running);
-        if (canRecoverInThisRun) {
-          const recoverable = buildRecoverableTransientCheckpoint({
-            item: activeItem,
-            running,
-            commandCheck,
-            error,
-          });
-          saveCheckpoint(activeItem, recoverable);
-          checkpoints.set(item.itemId, recoverable);
-          manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+        if (bookConcurrency > 1) {
+          runnableCandidates.push({ item });
           event({
             itemId: item.itemId,
-            event: "item_retry_deferred",
+            event: "item_worker_candidate",
             status: "pending",
-            message: recoverable.errorSummary,
-            failureKind: recoverable.failureKind,
-            retryable: true,
-            attemptExhausted: false,
-            providerStatusCode: commandCheck?.providerStatusCode,
-            retryAfterSeconds: commandCheck?.retryAfterSeconds,
-            recoveryDecision: "retry_same_run_id",
-            failedStage: recoverable.failedStage,
             metadata: {
-              nextRetryAt: recoverable.nextRetryAt,
-              retryDelaySeconds: recoverable.retryDelaySeconds,
-              retryBudgetSeconds,
-              elapsedRetrySeconds: elapsedRetrySeconds(recoverable),
+              bookConcurrency,
+              candidateCount: runnableCandidates.length,
             },
           });
-          processedInPass = true;
-          if (failFast) {
-            manifest = persistFailFastInterruptedManifest(
-              manifest,
-              Array.from(checkpoints.values()),
-              "recoverable_transient_failure",
-            );
-            throw error;
-          }
           continue;
         }
-        const recoverableProviderFailure =
-          retryable &&
-          failureKind === "transient";
-        const providerRecoveryWaitStillAvailable =
-          recoverableProviderFailure && providerRecoveryWaitAvailable(running);
-        if (recoverableProviderFailure && !providerRecoveryWaitStillAvailable) {
-          const waitCount = providerRecoveryWaitCount(running);
-          const delaySeconds = providerRecoveryDelaySeconds(running);
-          const nextRetryAt = running.nextRetryAt ?? isoAfterSeconds(delaySeconds);
-          const limited = {
-            ...running,
-            status: "pending",
-            failedAt: undefined,
-            errorSummary: redacted(error instanceof Error
-              ? error.message
-              : String(error)),
-            failureKind: "transient",
-            retryable: true,
-            retryExhausted: false,
-            recoveryDecision: "retry_same_run_id",
-            failedStage: commandCheck?.name,
-            retryStartedAt: running.retryStartedAt ?? commandCheck?.completedAt ?? now(),
-            nextRetryAt,
-            retryDelaySeconds: delaySeconds,
-            retryBudgetSeconds,
-            runnerHeartbeatAt: now(),
-            metadata: {
-              ...(running.metadata ?? {}),
-              waitingForProviderRecovery: true,
-              providerRecoveryWaitStartedAt:
-                running.metadata?.providerRecoveryWaitStartedAt ?? now(),
-              providerRecoveryReason: "provider_recovery_wait_limit_reached",
-              providerRecoveryWaitCount: waitCount,
-              maxProviderRecoveryWaits,
-              retryBudgetSeconds,
-              sourceName: activeItem.sourceName,
-              providerRecoveryWaitLimitReached: true,
-            },
-          };
-          if (commandCheck) {
-            limited.commandChecks = [
-              ...(limited.commandChecks ?? []),
-              commandCheck.status === "failed"
-                ? {
-                    ...commandCheck,
-                    recoveryDecision: "retry_same_run_id",
-                    attemptExhausted: true,
-                  }
-                : commandCheck,
-            ];
-          }
-          saveCheckpoint(activeItem, limited);
-          checkpoints.set(item.itemId, limited);
-          manifest = updateManifest(manifest, Array.from(checkpoints.values()));
-          event({
-            itemId: item.itemId,
-            event: "item_provider_recovery_wait_limit_reached",
-            status: "pending",
-            message: limited.errorSummary,
-            failureKind: "transient",
-            retryable: true,
-            attemptExhausted: true,
-            providerStatusCode: commandCheck?.providerStatusCode,
-            retryAfterSeconds: commandCheck?.retryAfterSeconds,
-            recoveryDecision: "retry_same_run_id",
-            failedStage: limited.failedStage,
-            metadata: {
-              nextRetryAt,
-              retryDelaySeconds: delaySeconds,
-              retryBudgetSeconds,
-              providerRecoveryWaitCount: waitCount,
-              maxProviderRecoveryWaits,
-              retryPolicy: "scheduler_resume_same_run_after_provider_wait_limit",
-            },
-          });
-          stopAfterNonTransientFailure = true;
-          break;
-        }
-        const providerRecoveryDelay = recoverableProviderFailure
-          ? providerRecoveryDelaySeconds(running)
-          : undefined;
-        const recoveryWaitCount = recoverableProviderFailure
-          ? nextProviderRecoveryWaitCount(running)
-          : undefined;
-        const projectionRejectionMetadata =
-          rejectedSettingsProjectionMetadata(error);
-        const authFailureMetadata = providerAuthFailureMetadata(commandCheck);
-        const failed = recoverableProviderFailure
-          ? {
-              ...running,
-              status: "pending",
-              failedAt: undefined,
-              errorSummary: redacted(
-                error instanceof Error ? error.message : String(error),
-              ),
-              failureKind: "transient",
-              retryable: true,
-              retryExhausted: false,
-              recoveryDecision: "retry_same_run_id",
-              failedStage: commandCheck?.name,
-              retryStartedAt:
-                running.retryStartedAt ?? commandCheck?.completedAt ?? now(),
-              nextRetryAt: isoAfterSeconds(providerRecoveryDelay),
-              retryDelaySeconds: providerRecoveryDelay,
-              runnerHeartbeatAt: now(),
-              activeCommand: commandCheck?.name ?? running.activeCommand ??
-                running.currentCommand ?? running.failedStage,
-              metadata: {
-                ...(running.metadata ?? {}),
-                waitingForProviderRecovery: true,
-                providerRecoveryWaitStartedAt: now(),
-                providerRecoveryReason: providerRecoveryWaitStillAvailable
-                  ? "transient_retry_budget_window_elapsed"
-                  : "provider_recovery_wait_limit_reached",
-                providerRecoveryWaitCount: recoveryWaitCount,
-                maxProviderRecoveryWaits,
-                retryBudgetSeconds,
-                sourceName: activeItem.sourceName,
-              },
-            }
-          : {
-              ...running,
-              status: "failed",
-              failedAt: now(),
-              errorSummary: redacted(
-                error instanceof Error ? error.message : String(error),
-              ),
-              failureKind,
-              retryable: false,
-              retryExhausted: Boolean(commandCheck?.attemptExhausted) ||
-                (retryable && failureKind === "transient"),
-              recoveryDecision: "stop_until_fixed",
-              failedStage: commandCheck?.name,
-              nextRetryAt: undefined,
-              retryDelaySeconds: undefined,
-              runnerHeartbeatAt: now(),
-              activeCommand: commandCheck?.name ?? running.activeCommand ??
-                running.currentCommand ?? running.failedStage,
-              metadata: {
-                ...(running.metadata ?? {}),
-                ...projectionRejectionMetadata,
-                ...authFailureMetadata,
-                waitingForProviderRecovery: false,
-              },
-            };
-        if (commandCheck) {
-          failed.commandChecks = [
-            ...(failed.commandChecks ?? []),
-            commandCheck.status === "failed"
-              ? {
-                  ...commandCheck,
-                  recoveryDecision: commandCheck.recoveryDecision ??
-                    failed.recoveryDecision,
-                }
-              : commandCheck,
-          ];
-        }
-        saveCheckpoint(activeItem, failed);
-        checkpoints.set(item.itemId, failed);
-        manifest = updateManifest(manifest, Array.from(checkpoints.values()));
-        event({
-          itemId: item.itemId,
-          event: recoverableProviderFailure ? "item_provider_recovery_wait" : "item_failed",
-          status: failed.status,
-          message: failed.errorSummary,
-          failureKind: failed.failureKind,
-          retryable: failed.retryable,
-          attemptExhausted: recoverableProviderFailure ? false : failed.retryExhausted,
-          providerStatusCode: commandCheck?.providerStatusCode,
-          retryAfterSeconds: commandCheck?.retryAfterSeconds,
-          recoveryDecision: failed.recoveryDecision,
-          failedStage: failed.failedStage,
-          metadata: recoverableProviderFailure
-            ? {
-                nextRetryAt: failed.nextRetryAt,
-                retryDelaySeconds: failed.retryDelaySeconds,
-                retryBudgetSeconds,
-                elapsedRetrySeconds: elapsedRetrySeconds(failed),
-                providerRecoveryWaitCount: recoveryWaitCount,
-                maxProviderRecoveryWaits,
-                waitLimitReached: !providerRecoveryWaitStillAvailable,
-              }
-            : {
-                activeCommand: failed.activeCommand,
-                command: commandCheck?.name,
-                ...projectionRejectionMetadata,
-                ...authFailureMetadata,
-              },
+        const workerId = `worker-${workerSequence}`;
+        workerSequence += 1;
+        const claim = markItemRunning(
+          activeItem,
+          starting,
+          checkpoints,
+          manifest,
+          workerId,
+        );
+        const running = claim.running;
+        manifestState.manifest = manifest;
+        const result = await runClaimedBatchItem({
+          item,
+          activeItem,
+          running,
+          bookLease: claim.bookLease,
+          checkpoints,
+          completedSeed,
+          manifestState,
+          stopLoggedThisRun,
+          workerId,
         });
-        if (
-          !recoverableProviderFailure &&
-          authFailureMetadata.providerAuthFailureDetected === true
-        ) {
-          event({
-            itemId: item.itemId,
-            event: "item_provider_auth_refailed",
-            status: "failed",
-            message: failed.errorSummary,
-            failureKind: failed.failureKind,
-            retryable: false,
-            attemptExhausted: failed.retryExhausted,
-            providerStatusCode: commandCheck?.providerStatusCode,
-            recoveryDecision: "stop_until_fixed",
-            failedStage: failed.failedStage,
-            metadata: {
-              activeCommand: failed.activeCommand,
-              command: commandCheck?.name,
-              providerAuthReopenAttemptCount:
-                providerAuthReopenAttemptCount(failed),
-              ...authFailureMetadata,
-            },
-          });
-        }
-        if (failFast) {
-          manifest = persistFailFastInterruptedManifest(
-            manifest,
-            Array.from(checkpoints.values()),
-            recoverableProviderFailure
-              ? "provider_recovery_wait"
-              : "command_failure",
-          );
-          throw error;
-        }
-        if (shouldStopBatchAfterFailure(failed)) {
-          if (!stopLoggedThisRun.has(failed.itemId)) {
-            emitBatchStoppedAfterNonTransientFailure(failed);
-            stopLoggedThisRun.add(failed.itemId);
-          }
+        manifest = manifestState.manifest;
+        processedInPass = result.processed || processedInPass;
+        if (result.stopAfterNonTransientFailure) {
           stopAfterNonTransientFailure = true;
+          requestBatchStop("single_worker_stop_until_fixed");
+          terminateActiveSubprocesses("single_worker_stop_until_fixed");
           break;
         }
-        processedInPass = true;
+      } catch (error) {
+        if (batchFailureWasHandled(error)) throw error;
+        const result = await handleRunItemFailure({
+          error,
+          item,
+          activeItem,
+          checkpoint,
+          checkpoints,
+          completedSeed,
+          manifestState,
+          stopLoggedThisRun,
+        });
+        manifest = manifestState.manifest;
+        processedInPass = result.processed || processedInPass;
+        if (result.stopAfterNonTransientFailure) {
+          stopAfterNonTransientFailure = true;
+          requestBatchStop("single_worker_failure_stop_until_fixed");
+          terminateActiveSubprocesses("single_worker_failure_stop_until_fixed");
+          break;
+        }
       }
+    }
+    if (runnableCandidates.length > 0) {
+      event({
+        event: "batch_worker_pool_start",
+        status: "running",
+        metadata: {
+          bookConcurrency,
+          candidateCount: runnableCandidates.length,
+          itemIds: runnableCandidates.map((candidate) => candidate.item.itemId),
+        },
+      });
+      const poolResult = await runWorkerPool({
+        candidates: runnableCandidates,
+        checkpoints,
+        completedSeed,
+        manifestState,
+        stopLoggedThisRun,
+        nextWorkerId: () => {
+          const workerId = `worker-${workerSequence}`;
+          workerSequence += 1;
+          return workerId;
+        },
+      });
+      manifest = manifestState.manifest;
+      processedInPass = processedInPass || poolResult.processed;
+      stopAfterNonTransientFailure = stopAfterNonTransientFailure ||
+        poolResult.stopAfterNonTransientFailure;
+      if (poolResult.stopAfterNonTransientFailure) {
+        requestBatchStop("worker_pool_stop_until_fixed");
+        terminateActiveSubprocesses("worker_pool_stop_until_fixed");
+      }
+      event({
+        event: "batch_worker_pool_settled",
+        status: stopAfterNonTransientFailure ? "failed" : "running",
+        recoveryDecision: stopAfterNonTransientFailure
+          ? "stop_until_fixed"
+          : "continue_pending",
+        metadata: {
+          bookConcurrency,
+          candidateCount: runnableCandidates.length,
+          processedWorkerCount: poolResult.results.length,
+          stopAfterNonTransientFailure,
+        },
+      });
     }
     if (stopAfterNonTransientFailure) break;
     if (!processedInPass && deferredForRetryWindow) {
@@ -6253,7 +12481,7 @@ function main() {
         eventProviderRecoveryWaitLimit(items, checkpoints);
         break;
       }
-      processedInPass = waitForNextRetryWindow(items, checkpoints);
+      processedInPass = await waitForNextRetryWindow(items, checkpoints);
     }
   }
 
@@ -6283,8 +12511,11 @@ function main() {
 }
 
 try {
-  main();
+  installTerminationSignalHandlers();
+  await main();
 } catch (error) {
   console.error(redactLog(error instanceof Error ? error.stack ?? error.message : String(error)));
   process.exitCode = 1;
+} finally {
+  releaseCoordinatorLock();
 }

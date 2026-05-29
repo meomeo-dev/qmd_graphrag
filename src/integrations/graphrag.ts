@@ -1,5 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 import { SchemaVersion } from "../contracts/common.js";
 import {
@@ -27,6 +26,7 @@ import {
   createDeterministicHash,
   toIsoTimestamp,
 } from "../job-state/fingerprint.js";
+import { writeJsonFileDurable } from "../job-state/durable-json.js";
 import { callPythonBridge } from "./python-bridge.js";
 import type { BookStage } from "../contracts/book-job.js";
 import type { PythonBridgeEarlyStop } from "./python-bridge.js";
@@ -159,8 +159,10 @@ async function writeGraphRagProviderRequestArtifact(input: {
       adapter: "python/qmd_graphrag/bridge.py",
     },
   });
-  await mkdir(dirname(absolutePath), { recursive: true });
-  await writeFile(absolutePath, JSON.stringify(requestArtifact, null, 2), "utf8");
+  await writeJsonFileDurable(
+    absolutePath,
+    JSON.stringify(requestArtifact, null, 2) + "\n",
+  );
   return { artifactId, artifactPath, requestFingerprint };
 }
 

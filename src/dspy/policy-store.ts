@@ -4,9 +4,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
-  renameSync,
   rmSync,
-  writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -54,6 +52,12 @@ import type {
   QueryExpansionFailureReason,
 } from "../contracts/dspy.js";
 import { createDeterministicHash, createRunId } from "../job-state/fingerprint.js";
+import {
+  readYamlUnknownDurableSync,
+  writeOpaqueFileDurableSync,
+  writeJsonFileDurableSync,
+  writeYamlFileDurableSync,
+} from "../job-state/durable-state-store.js";
 
 export const DSPY_POLICY_POINTER_RELATIVE_PATH =
   "dspy/policies/query-expansion/current.yaml";
@@ -184,23 +188,16 @@ function nowIso(now: () => Date): string {
 }
 
 function loadYamlFile(path: string): unknown {
-  return YAML.parse(readFileSync(path, "utf-8"));
+  return readYamlUnknownDurableSync(path);
 }
 
 function writeYamlFile(path: string, value: unknown): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const body = YAML.stringify(value, { indent: 2, lineWidth: 0 });
-  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-  writeFileSync(tmp, body, "utf-8");
-  renameSync(tmp, path);
+  writeYamlFileDurableSync(path, value);
 }
 
 function writeJsonFile(path: string, value: unknown): void {
-  mkdirSync(dirname(path), { recursive: true });
   const body = `${JSON.stringify(value, null, 2)}\n`;
-  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-  writeFileSync(tmp, body, "utf-8");
-  renameSync(tmp, path);
+  writeJsonFileDurableSync(path, body);
 }
 
 function withDirectoryLock<T>(
@@ -632,8 +629,7 @@ export class DspyPolicyStore {
         `dspy/dataset-files/${registrySlug(input.datasetId)}/${role}-${hash.slice(0, 16)}${ext}`,
       );
       const targetPath = this.resolvePath(target);
-      mkdirSync(dirname(targetPath), { recursive: true });
-      writeFileSync(targetPath, readFileSync(source));
+      writeOpaqueFileDurableSync(targetPath, readFileSync(source));
       return { path: target, hash, count: countJsonlRecords(source) };
     };
 
@@ -1212,8 +1208,7 @@ export class DspyPolicyStore {
     const target = normalizeVaultRelative(`dspy/artifact-files/${artifactId}/${filename}`);
     const body = readFileSync(source);
     const targetPath = this.resolvePath(target);
-    mkdirSync(dirname(targetPath), { recursive: true });
-    writeFileSync(targetPath, body);
+    writeOpaqueFileDurableSync(targetPath, body);
     return target;
   }
 
@@ -1329,8 +1324,7 @@ export class DspyPolicyStore {
       `dspy/manual/generated-${recordsHash.slice(0, 16)}.jsonl`,
     );
     const generatedAbsolutePath = this.resolvePath(generatedPath);
-    mkdirSync(dirname(generatedAbsolutePath), { recursive: true });
-    writeFileSync(generatedAbsolutePath, recordsBody, "utf-8");
+    writeOpaqueFileDurableSync(generatedAbsolutePath, recordsBody);
     const pseudoRequest = {
       optimizer: "gepa" as const,
       trainsetPath: generatedAbsolutePath,

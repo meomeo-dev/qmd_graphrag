@@ -10,6 +10,10 @@ import type {
 import { resolveVaultRelativePath } from "../vault/path.js";
 import { createDeterministicHash, hashFile } from "./fingerprint.js";
 import { hashContent } from "../store.js";
+import {
+  DurableStateError,
+  readJsonFileDurable,
+} from "./durable-json.js";
 
 export { resolveVaultRelativePath } from "../vault/path.js";
 
@@ -117,6 +121,7 @@ export async function hashLanceDbDirectoryContents(rootDir: string): Promise<str
   for (const tableName of REQUIRED_LANCEDB_TABLES) {
     const tableDir = join(rootDir, tableName);
     const dataDir = join(tableDir, "data");
+    await readLanceRowCountSidecars(tableDir);
     const dataFiles = await readdir(dataDir);
     files.push(
       ...dataFiles
@@ -161,7 +166,15 @@ async function validateLanceTable(tableDir: string): Promise<ArtifactValidationR
     return { valid: false, reason: "lancedb_table_has_no_non_empty_fragments" };
   }
 
-  const hasRowCountProof = await hasPositiveLanceRowCount(tableDir);
+  let hasRowCountProof = false;
+  try {
+    hasRowCountProof = await hasPositiveLanceRowCount(tableDir);
+  } catch (error) {
+    if (error instanceof DurableStateError) {
+      return { valid: false, reason: "lancedb_table_missing_positive_row_count" };
+    }
+    throw error;
+  }
   if (!hasRowCountProof) {
     return { valid: false, reason: "lancedb_table_missing_positive_row_count" };
   }
@@ -176,8 +189,7 @@ async function hasPositiveLanceRowCount(tableDir: string): Promise<boolean> {
 
 async function readLanceRowCountSidecars(tableDir: string): Promise<number | null> {
   try {
-    const raw = await readFile(join(tableDir, "qmd_row_count.json"), "utf8");
-    const parsed = JSON.parse(raw) as unknown;
+    const parsed = await readJsonFileDurable(join(tableDir, "qmd_row_count.json"));
     const count =
       typeof parsed === "number"
         ? parsed
@@ -188,7 +200,8 @@ async function readLanceRowCountSidecars(tableDir: string): Promise<number | nul
           ? parsed.rowCount
           : null;
     if (count != null) return count;
-  } catch {
+  } catch (error) {
+    if (error instanceof DurableStateError) throw error;
     return null;
   }
   return null;

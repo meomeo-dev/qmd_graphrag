@@ -33,6 +33,7 @@ import {
   appendProviderCostAccounting,
   buildProviderCostAccounting,
 } from "./provider/cost-accounting.js";
+import { writeJsonFileDurable } from "./job-state/durable-json.js";
 import {
   createDeterministicHash,
   toIsoTimestamp,
@@ -2042,10 +2043,9 @@ export class LlamaCpp implements LLM {
       createdAt: toIsoTimestamp(),
       metadata: metadata ?? {},
     });
-    writeFileSync(
+    await writeJsonFileDurable(
       requestArtifactPath,
-      JSON.stringify(requestArtifact, null, 2),
-      "utf8",
+      JSON.stringify(requestArtifact, null, 2) + "\n",
     );
     const lineageMode = resolveProviderCostLineageMode(input.costLineage);
 
