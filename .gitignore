@@ -27,3 +27,4 @@ finetune/data/train/
 graph_vault/
 inbox/
 tmp/
+.tmp-tests

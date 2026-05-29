@@ -1,74 +1,2174 @@
 schemaVersion: "1.0.0"
-title: GraphRAG Parallel Runner Design
-status: proposed
-context:
-  problem: >
-    Sequential batch processing can leave OpenAI, Jina or local qmd resources
-    idle while another provider or stage waits. Parallel processing is useful
-    only after writer ownership and shared-resource contention are controlled.
-  currentBoundary: >
-    The production writer remains a single runner per batch run. Multiple
-    independent writer processes for the same runId are not supported.
-requiredControls:
-  itemLease:
-    capacity: 1
-    fields:
-      - itemId
-      - runId
-      - runnerSessionId
-      - fencingToken
-      - heartbeatAt
-      - expiresAt
-  bookLease:
-    capacity: 1
-    purpose: Prevent two items that resolve to the same bookId from writing the
-      same book-scoped output and checkpoints.
-  catalogWriterLane:
-    capacity: 1
-    protects:
-      - graph_vault/catalog/books.yaml
-      - graph_vault/catalog/runs.yaml
-      - graph_vault/catalog/document-identity-map.yaml
-      - graph_vault/catalog/graph-capabilities.yaml
-  qmdIndexWriterLane:
-    capacity: 1
-    protects:
-      - .qmd/index.sqlite
-      - qmd corpus registration
-      - qmd embedding writes
+title: GraphRAG 多书并行 Runner 生产设计
+status: production_ready_design
+owner: qmd_graphrag
+lastReviewed: "2026-05-29"
+
+purpose: >
+  在一个 batch run 内安全并行处理多本 EPUB 图书，提升 OpenAI、Jina 与本地
+  qmd 资源利用率，同时保持每本书的 qmd 与 GraphRAG 构建闭环、状态可观测、
+  失败可恢复、共享资源无竞争写入。
+
+scope:
+  included:
+    - batch-epub-workflow 单进程协调器内部的多 worker 并行调度。
+    - 每本书独立执行 EPUB 归一化、qmd 建库、GraphRAG 构建、query-ready
+      门控与全部验证子命令。
+    - graph_vault 下 book-scoped GraphRAG 产物隔离。
+    - catalog、events、manifest、checkpoint 与 .qmd/index.sqlite 的并发安全写入。
+    - OpenAI、Jina 与本地资源的全局并发限流。
+    - provider 抖动、worker 崩溃、进程中断后的状态恢复与重入。
+  excluded:
+    - 多个独立 OS 级 batch-epub-workflow 进程写入同一个 runId。
+    - 多台机器共同写入同一个 stateRoot。
+    - 多本书共享同一个 graph_vault/output 作为 GraphRAG 工作输出目录。
+    - 绕过 qmd 或 GraphRAG 真实构建的模拟完成状态。
+
+productionContract:
+  runnerTopology:
+    coordinator:
+      processCountPerRunId: 1
+      responsibility: >
+        唯一协调 item claim、worker 生命周期、全局限流、共享写入通道、
+        run manifest 派生、停止策略与恢复策略。
+    workers:
+      model: in_process_async_workers
+      configuredBy: "--book-concurrency"
+      defaultConcurrency: 2
+      minimumConcurrency: 1
+      maximumConcurrencyPolicy: >
+        不得超过 provider 限流、CPU、内存、磁盘 I/O 与 SQLite 写锁容量的
+        保守上限。生产默认保持 2，扩大前必须通过真实批处理观测确认。
+      responsibility: >
+        每个 worker 一次只处理一本书，并在该书内按固定顺序完成 qmd、
+        GraphRAG 与验证子命令闭环。
+  unsupportedTopology:
+    - 同一个 runId 启动多个 batch-epub-workflow 写入器。
+    - 不经 coordinator 直接修改 item checkpoint、catalog 或 qmd index。
+    - worker 持有过期 lease 后继续写入任何持久状态。
+  runLock:
+    path: graph_vault/catalog/batch-runs/{runId}/coordinator-lock.json
+    acquirePrimitive: >
+      使用同目录临时文件写入、fsync、原子 rename 与 generation compare-and-swap。
+      acquire 只能在 lock 缺失、lock 已过期且记录的 coordinator pid 不存活，
+      或显式 resume takeover 验证通过后成功。
+    heartbeatPrimitive: >
+      heartbeat 必须带 current generation 与 runnerSessionId。generation 不匹配
+      时续租失败，旧 coordinator 必须停止 claim 和持久写入。
+    takeoverGuard: >
+      接管前必须扫描 durable subprocess registry。若旧 coordinator 或其记录的
+      子进程组仍存活且无法终止，恢复流程必须停在 stop_until_fixed，
+      不能启动新 writer。
+
+hardInvariants:
+  - id: single_coordinator_per_run
+    rule: 同一个 runId 同时只能存在一个有效 coordinator。
+    enforcement:
+      - run lock 记录 runnerSessionId、pid、startedAt、heartbeatAt、expiresAt。
+      - 新 coordinator 启动时必须拒绝未过期锁，或接管已过期且无
+        活进程的锁。
+      - coordinator 心跳停止后，只能通过恢复流程重建运行状态。
+  - id: one_item_one_worker
+    rule: 同一个 itemId 同时只能被一个 worker 持有。
+    enforcement:
+      - item lease 必须包含 runnerSessionId、workerId、fencingToken、
+        heartbeatAt 与 expiresAt。
+      - claim 操作必须是原子 compare-and-swap。
+      - 每次 checkpoint、event、catalog、manifest、qmd index 与 book-scoped
+        artifact 提交前必须验证 fencingToken 仍然有效。
+  - id: one_book_one_writer
+    rule: 同一个 bookId 同时只能有一个 worker 写入 book-scoped 产物。
+    enforcement:
+      - book lease 独立于 item lease，且必须拥有等强度 schema。
+      - book lease 必须包含 runId、bookId、itemId、runnerSessionId、workerId、
+        fencingToken、producerScope、heartbeatAt、expiresAt 与 generation。
+      - book lease claim、heartbeat、expiry takeover 必须使用原子
+        compare-and-swap。
+      - 所有 book-scoped artifact、producer run record、graph capability 与
+        book checkpoint 写入前必须验证 book fencingToken。
+      - itemId 不同但解析到相同 bookId 时，后到 worker 必须等待、跳过或
+        重新排队，不能并发写入。
+  - id: graph_artifact_isolation
+    rule: 每本书必须拥有独立 GraphRAG 工作目录、输出目录与报告目录。
+    enforcement:
+      - GraphRAG stage runId 必须包含 stage、timestamp 与唯一后缀。
+      - query_ready 只能引用同一 bookId 下已完成的 graph_extract、
+        community_report 与 embed producer run。
+      - 禁止把 graph_vault/output 作为跨书共享生产输出目录。
+  - id: serialized_global_writes
+    rule: 全局状态写入必须串行化。
+    enforcement:
+      - catalogWriterLane 保护 graph_vault/catalog 下共享索引。
+      - qmdIndexWriterLane 保护 .qmd/index.sqlite 与 qmd corpus 写入。
+      - eventWriterLane 保护 events.jsonl 原子追加。
+      - manifestWriterLane 只写派生后的 manifest，不维护未同步内存计数。
+      - writer lane 默认不得嵌套持有。确需嵌套时必须按 qmdIndexWriterLane、
+        catalogWriterLane、checkpointWriterLane、eventWriterLane、
+        manifestWriterLane 的总顺序获取，并带 timeout 与 release-on-error。
+  - id: derived_run_manifest
+    rule: run 级统计必须从 item checkpoint 与事件派生。
+    enforcement:
+      - completed、pending、running、failed、skipped 不以 worker 内存变量为权威。
+      - coordinator 定期扫描 checkpoint 重建 manifest。
+      - 进程恢复后 manifest 必须可由磁盘状态完整重算。
+  - id: real_build_by_default
+    rule: 默认批处理必须真实执行完整 qmd 与 GraphRAG。
+    enforcement:
+      - 已完成状态必须有 qmd 验证子命令通过记录。
+      - GraphRAG completed 必须通过 stage gate、producer lineage 与 query_ready
+        能力投影验证。
+      - 除显式 repair-only 或 status-only 命令外，不允许把缺失产物标记为完成。
+
+resourceControls:
   providerSemaphores:
+    subprocessEnforcement:
+      model: coordinator_granted_provider_slots
+      contract: >
+        GraphRAG 与 qmd 子进程不得自行绕过全局 provider semaphore。worker 在启动
+        任何可能调用 provider 的子进程前，必须向 coordinator 申请 provider
+        slot lease，并把 slot id、provider、limit generation 与 redacted
+        diagnostic env 传入子进程。
+      subprocessModes:
+        - mode: process_level_slot
+          useWhen: >
+            子进程无法逐请求回调 coordinator 时使用。一个 GraphRAG/qmd provider
+            子进程占用对应 provider slot 直到进程退出或被取消。
+        - mode: request_level_proxy
+          useWhen: >
+            provider adapter 可配置本地 proxy 或 IPC gate 时使用。每个真实 API
+            request 进入 proxy 前申请 slot，完成、失败或超时后释放。
+      enforcementRules:
+        - 未获得 slot lease 的 provider 子进程不得启动。
+        - slot lease 必须包含 provider、workerId、itemId、bookId、commandId、
+          expiresAt、fencingToken 与 release event。
+        - 子进程退出、被 kill、超时或 worker lease 丢失时必须释放 provider slot。
+        - 恢复时发现 slot lease 无活进程，coordinator 必须回收 slot 并记录事件。
+        - status-json 必须展示 activeProviderSlots、providerWaitMs 与
+          providerSlotGeneration。
     openai:
-      purpose: Bound concurrent Responses or GraphRAG LLM calls.
+      protects:
+        - GraphRAG extract_graph LLM calls
+        - GraphRAG create_community_reports LLM calls
+        - qmd query commands using OpenAI-compatible providers
+      configuredBy:
+        - "--openai-provider-concurrency"
+        - "QMD_OPENAI_PROVIDER_CONCURRENCY"
+      defaultLimit: 1
+      requiredBehavior: >
+        所有 worker 的 OpenAI 请求必须共享同一个 semaphore。429、5xx、timeout、
+        Responses output none 与网络中断必须进入统一 retry/recovery 分类。
+      childProcessBoundary: >
+        对 GraphRAG LLM 子进程，默认使用 process_level_slot。若未来 adapter
+        支持 request_level_proxy，必须保留同一 status/event 证据字段。
     jina:
-      purpose: Bound embeddings/rerank calls.
+      protects:
+        - GraphRAG embedding calls
+        - qmd embedding or rerank calls using Jina
+      configuredBy:
+        - "--jina-provider-concurrency"
+        - "QMD_JINA_PROVIDER_CONCURRENCY"
+      defaultLimit: 2
+      requiredBehavior: >
+        所有 worker 的 Jina 请求必须共享同一个 semaphore。单本书不得独占全部
+        Jina 容量，worker 调度必须允许其他书在 OpenAI 等待期间推进。
+      childProcessBoundary: >
+        对 GraphRAG embedding 与 qmd embedding 子进程，默认使用
+        process_level_slot；若命令支持分片执行，coordinator 可把单书 embedding
+        切成多个 bounded chunk，但仍必须由 slot lease 控制真实请求并发。
     localCpu:
-      purpose: Bound EPUB normalization and parquet/LanceDB validation.
-  eventManifestAggregation:
+      protects:
+        - EPUB extraction and normalization
+        - parquet validation
+        - LanceDB and local file scans
+      configuredBy:
+        - "--local-cpu-concurrency"
+        - "QMD_LOCAL_CPU_CONCURRENCY"
+      defaultLimit: 2
+  writerLanes:
+    catalogWriterLane:
+      capacity: 1
+      protects:
+        - graph_vault/catalog/books.yaml
+        - graph_vault/catalog/runs.yaml
+        - graph_vault/catalog/document-identity-map.yaml
+        - graph_vault/catalog/graph-capabilities.yaml
+    qmdIndexWriterLane:
+      capacity: 1
+      protects:
+        - .qmd/index.sqlite
+        - qmd book registration
+        - qmd embedding writes
+        - qmd cleanup writes
+    eventWriterLane:
+      capacity: 1
+      protects:
+        - graph_vault/catalog/batch-runs/**/events.jsonl
+    checkpointWriterLane:
+      capacity: 1
+      protects:
+        - graph_vault/books/**/job.yaml
+        - graph_vault/books/**/artifacts.yaml
+        - graph_vault/books/**/checkpoints.yaml
+        - graph_vault/books/**/runs/*.yaml
+        - graph_vault/catalog/batch-runs/**/book-leases/*.json
+        - item checkpoint files under batch run state
+    manifestWriterLane:
+      capacity: 1
+      protects:
+        - graph_vault/catalog/batch-runs/**/coordinator-lock.json
+        - graph_vault/catalog/batch-runs/**/provider-slots/*.json
+        - graph_vault/catalog/batch-runs/**/subprocesses/*.json
+        - graph_vault/catalog/batch-runs/**/manifest.json
+        - graph_vault/catalog/batch-runs/**/status.json
+        - durable checksum sidecars for all files protected by this lane
+    targetMappingContract:
+      rule: >
+        每个生产持久化目标必须能从 targetMapping 追溯到唯一 lane、owner、
+        durableKind、laneTimeoutMs 与 releaseOn。未列入 targetMapping 的
+        durable YAML/JSON/SQLite 目标不得由并行 runner 写入。
+      defaultLaneTimeoutMs: 120000
+      defaultReleaseOn:
+        - commit
+        - error
+        - cancellation
+        - lease_loss
+        - timeout
+      timeoutFailureEvent: writer_lane_timeout
+      releaseRule: >
+        lane 必须在 finally 中释放。timeout、取消、lease loss 或 durable write
+        失败时，释放前必须保留 targetLocator、lane、owner、operationId 与
+        fencingTokenHash 诊断证据。
+      preflightScopeRule: >
+        每个 targetMapping 条目必须能派生 preflight scan root。精确文件条目
+        使用父目录；含 {bookId} 的条目使用当前 bookId 实例化；含通配或深层
+        pattern 的条目必须声明 recursive scope。beforeClaim、beforeResumeBook
+        与 runner_start 不得维护独立的手写 durable 目录清单。runner_start
+        必须按 target family 的 startupCriticality 选择扫描模式，并对已发现
+        batch items 展开 item-derived bookId scope；runner_start 不得跳过
+        critical target 的 temp 扫描。historical_observation target 不得因出现在
+        targetMapping 中自动升级为 runner_start 阻断性写入 preflight。
+      derivedSidecarRule: >
+        每个 durable YAML/JSON primary target 隐式拥有 checksum sidecar
+        `{target}.sha256` 与 checksum meta sidecar `{target}.sha256.meta.json`。
+        sidecar 继承 primary target 的 lane、owner、laneTimeoutMs、releaseOn、
+        durableMode 与 preflight scope；sidecar 不得作为新的 primary target 递归
+        生成 `.sha256.meta.json.sha256`。sidecar failure evidence 必须同时包含
+        primaryTargetLocator、sidecarTargetLocator 与 sidecarKind。
+      directoryFsyncRule: >
+        parent directory fsync 是 primary 或 sidecar durable write 的派生提交
+        步骤，不是独立业务 target。实现为 directory fsync 生成 evidence 时，
+        必须先解析触发该 fsync 的 primaryTargetLocator 或 sidecarTargetLocator，
+        并继承其 lane、owner、laneTimeoutMs、releaseOn 与 preflight scope。
+        primary 或 sidecar 的 durable kind 必须写入 primaryDurableKind；
+        目录操作自身的 kind 必须写入 directoryDurableKind: directory。
+        若只能看到目录路径，必须按目录 scope 映射到唯一 durable target family；
+        目录路径不得因缺少文件名而触发 durable_target_mapping_missing。若目录
+        scope 无法唯一映射，恢复决策为 stop_until_fixed。
+      directoryFsyncEvidence:
+        requiredFields:
+          - directoryTargetLocator
+          - primaryTargetLocator or sidecarTargetLocator
+          - sidecarKind when fsync follows sidecar write
+          - lane
+          - targetMappingOwner
+          - directoryDurableKind
+          - primaryDurableKind when primary or sidecar target is visible
+          - operationId
+          - fsyncTarget
+          - fsyncPlatform
+          - fsyncErrno when fsync fails
+          - completedPublishRule
+        readOnlyRule: >
+          status-json read-only 不得执行目录 fsync，但它报告 checksum meta 缺失、
+          checksum mismatch 或 unresolved temp/lock 时，诊断中的目录 scope 必须
+          使用同一 directoryFsyncRule 推导 lane 与 owner。repair writer 与正常
+          resume 使用同一映射规则执行真实 fsync。
+        unavailableSentinelRule: >
+          directory fsync unsupported、uncertain 或平台 API 未返回 errno 时，不得
+          省略 fsyncErrno。实现必须写入显式 sentinel，例如 unsupported、
+          unavailable、unknown 或 platform_no_errno，并在
+          unavailableFieldSentinels 中列出 fsyncErrno。所有 event、checkpoint、
+          command check、status-json 与 recovery summary 必须保留该 sentinel。
+      directoryFsyncScopes:
+        - scope: graph_vault
+          lane: catalogWriterLane
+          owner: settingsProjection
+          directoryDurableKind: directory
+        - scope: graph_vault/catalog
+          lane: catalogWriterLane
+          owner: repository
+          directoryDurableKind: directory
+        - scope: graph_vault/catalog/provider-requests
+          lane: catalogWriterLane
+          owner: providerRequestFingerprint
+          directoryDurableKind: directory
+          purpose: directory_fsync_mapping_only
+          startupCriticality: historical_observation
+        - scope: graph_vault/catalog/batch-runs/{runId}
+          lane: manifestWriterLane
+          owner: batchCoordinator
+          directoryDurableKind: directory
+        - scope: graph_vault/catalog/batch-runs/{runId}/items
+          lane: checkpointWriterLane
+          owner: batchCoordinator
+          directoryDurableKind: directory
+        - scope: graph_vault/catalog/batch-runs/{runId}/provider-slots
+          lane: manifestWriterLane
+          owner: batchCoordinator
+          directoryDurableKind: directory
+        - scope: graph_vault/catalog/batch-runs/{runId}/subprocesses
+          lane: manifestWriterLane
+          owner: batchCoordinator
+          directoryDurableKind: directory
+        - scope: graph_vault/catalog/batch-runs/{runId}/book-leases
+          lane: checkpointWriterLane
+          owner: batchCoordinator
+          directoryDurableKind: directory
+        - scope: graph_vault/books/{bookId}
+          lane: checkpointWriterLane
+          owner: repository
+          directoryDurableKind: directory
+        - scope: graph_vault/books/{bookId}/runs
+          lane: checkpointWriterLane
+          owner: repository
+          directoryDurableKind: directory
+        - scope: graph_vault/books/{bookId}/qmd
+          lane: checkpointWriterLane
+          owner: qmd
+          directoryDurableKind: directory
+        - scope: graph_vault/books/{bookId}/output
+          lane: checkpointWriterLane
+          owner: graphOutputProducer
+          directoryDurableKind: directory
+          recursion: >
+            recursive family scope; includes output/lancedb/*.lance directory
+            fsyncs for qmd_row_count.json and other production output sidecars.
+        - scope: graph_vault/output/lancedb/*.lance
+          lane: checkpointWriterLane
+          owner: artifactValidation
+          directoryDurableKind: directory
+        - scope: graph_vault/dspy
+          lane: catalogWriterLane
+          owner: dspyPolicyStore
+          directoryDurableKind: directory
+          recursion: >
+            recursive family scope; includes all descendant directories that
+            hold registered DSPy YAML/JSON targets or their checksum sidecars.
+        - scope: .qmd
+          lane: qmdIndexWriterLane
+          owner: qmd
+          directoryDurableKind: directory
+    targetMapping:
+      - target: graph_vault/catalog/books.yaml
+        lane: catalogWriterLane
+        durableKind: yaml
+        owner: repository
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/catalog/runs.yaml
+        lane: catalogWriterLane
+        durableKind: yaml
+        owner: repository
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/catalog/sources.yaml
+        lane: catalogWriterLane
+        durableKind: yaml
+        owner: repository
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/catalog/document-identity-map.yaml
+        lane: catalogWriterLane
+        durableKind: yaml
+        owner: repository
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/catalog/graph-capabilities.yaml
+        lane: catalogWriterLane
+        durableKind: yaml
+        owner: capabilityCatalog
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/books/{bookId}/job.yaml
+        lane: checkpointWriterLane
+        durableKind: yaml
+        owner: repository
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/books/{bookId}/artifacts.yaml
+        lane: checkpointWriterLane
+        durableKind: yaml
+        owner: repository
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/books/{bookId}/checkpoints.yaml
+        lane: checkpointWriterLane
+        durableKind: yaml
+        owner: repository
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/books/{bookId}/runs/{runId}.yaml
+        lane: checkpointWriterLane
+        durableKind: yaml
+        owner: repository
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/settings.yaml
+        lane: catalogWriterLane
+        durableKind: yaml
+        owner: settingsProjection
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/catalog/batch-runs/{runId}/items/{itemId}.json
+        lane: checkpointWriterLane
+        durableKind: json
+        owner: batchCoordinator
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/catalog/batch-runs/{runId}/manifest.json
+        lane: manifestWriterLane
+        durableKind: json
+        owner: batchCoordinator
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/catalog/batch-runs/{runId}/events.jsonl
+        lane: eventWriterLane
+        durableKind: jsonl
+        owner: batchCoordinator
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/catalog/batch-runs/{runId}/status.json
+        lane: manifestWriterLane
+        durableKind: json
+        owner: batchCoordinator
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/catalog/batch-runs/{runId}/recovery-summary.json
+        lane: manifestWriterLane
+        durableKind: json
+        owner: batchCoordinator
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/catalog/batch-runs/{runId}/coordinator-lock.json
+        lane: manifestWriterLane
+        durableKind: json
+        owner: batchCoordinator
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/catalog/batch-runs/{runId}/provider-slots/*.json
+        lane: manifestWriterLane
+        durableKind: json
+        owner: batchCoordinator
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/catalog/batch-runs/{runId}/subprocesses/*.json
+        lane: manifestWriterLane
+        durableKind: json
+        owner: batchCoordinator
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/catalog/batch-runs/{runId}/book-leases/*.json
+        lane: checkpointWriterLane
+        durableKind: json
+        owner: batchCoordinator
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/catalog/provider-requests/*.json
+        lane: catalogWriterLane
+        durableKind: json
+        owner: providerRequestFingerprint
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+        targetFamily: provider_request_fingerprint
+        criticality: historical_observation
+        startupCriticality: non_blocking
+        runnerStartPreflightMode: read_only_capped_diagnostic
+        normalRunnerMutationPolicy: no_primary_quarantine
+        writableRepairBoundary: explicit_repair_or_migrate_only
+        retentionAuthority: cache_like_observation
+      - target: graph_vault/catalog/cost-accounting.jsonl
+        lane: eventWriterLane
+        durableKind: jsonl
+        owner: providerCostAccounting
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/dspy/**/*.yaml
+        lane: catalogWriterLane
+        durableKind: yaml
+        owner: dspyPolicyStore
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/dspy/**/*.json
+        lane: catalogWriterLane
+        durableKind: json
+        owner: dspyPolicyStore
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/books/{bookId}/qmd/qmd_build_manifest.json
+        lane: checkpointWriterLane
+        durableKind: json
+        owner: qmd
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/books/{bookId}/output/qmd_output_manifest.json
+        lane: checkpointWriterLane
+        durableKind: json
+        owner: graphOutputProducer
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/books/{bookId}/output/qmd_graph_text_unit_identity.json
+        lane: checkpointWriterLane
+        durableKind: json
+        owner: graphOutputProducer
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/books/{bookId}/output/context.json
+        lane: checkpointWriterLane
+        durableKind: json
+        owner: graphOutputProducer
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/books/{bookId}/output/stats.json
+        lane: checkpointWriterLane
+        durableKind: json
+        owner: graphOutputProducer
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/books/{bookId}/output/lancedb/*.lance/qmd_row_count.json
+        lane: checkpointWriterLane
+        durableKind: json
+        owner: artifactValidation
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/output/lancedb/*.lance/qmd_row_count.json
+        lane: checkpointWriterLane
+        durableKind: json
+        owner: artifactValidation
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: .qmd/index.sqlite
+        lane: qmdIndexWriterLane
+        durableKind: sqlite
+        owner: qmd
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
+  writerLaneProtocol:
+    acquisitionOrder:
+      - qmdIndexWriterLane
+      - catalogWriterLane
+      - checkpointWriterLane
+      - eventWriterLane
+      - manifestWriterLane
+    rules:
+      - 单个 critical section 应只持有一个 lane。
+      - 需要多 lane 的终态提交必须按 acquisitionOrder 获取。
+      - lane 获取必须有 timeout；timeout 后释放已持有 lane 并记录
+        writer_lane_timeout。
+      - worker cancellation、lease loss 或子进程失败必须 release-on-error。
+      - event append 不得等待 manifest refresh；manifest 从 durable checkpoint
+        和 durable events 派生。
+    durableWriteContract:
+      jsonlAppend: >
+        每个 event 必须是单行 JSON、包含 eventId 与 sequence，以单次 append
+        写入 newline，随后 flush/fsync。恢复时尾部非完整 JSON 行必须截断并
+        记录 partial_event_tail_recovered。
+      yamlOrJsonReplace: >
+        checkpoint、manifest、lock 与 catalog 文件必须写入同目录 temp file，
+        fsync 文件，atomic rename，再 fsync 父目录。文件内容必须包含 generation
+        或 checksum，以便恢复时拒绝半写入状态。
+      platformFsyncBoundary:
+        rule: >
+          durable replace 必须显式处理 file fsync 与 parent directory fsync 的平台
+          边界。生产终态 checkpoint、catalog、lock、provider slot、manifest 与
+          status 写入默认使用 strict mode；任一 fsync 失败、不可用或语义不可判定
+          时，不得发布 completed。
+        fileFsyncFailure:
+          failureKind: local_state_integrity
+          localFailureClass: durable_fsync_failed
+          recoveryDecision: stop_until_fixed
+          completedPublishRule: forbidden
+        directoryFsyncUnsupported:
+          failureKind: local_state_integrity
+          localFailureClass: durable_directory_fsync_unsupported
+          recoveryDecision: stop_until_fixed
+          completedPublishRule: forbidden
+          allowedOnlyFor: >
+            非权威派生缓存可在记录 durable_directory_fsync_best_effort 后重建；
+            item/book checkpoint、catalog、lock、provider slot 与 terminal manifest
+            不得在 unsupported 边界下提交 completed。
+        directoryFsyncWeakOrUnknown:
+          failureKind: local_state_integrity
+          localFailureClass: durable_directory_fsync_uncertain
+          recoveryDecision: stop_until_fixed
+          completedPublishRule: forbidden
+          recovery: >
+            下次启动必须重新读取 target、checksum、generation 与 event evidence。
+            若无法证明 commit 完整，则按 checksum crash window 收敛，不能用
+            manifest 或 event 单独证明 completed。
+        requiredDiagnostics:
+          - targetLocator
+          - directoryTargetLocator when fsyncTarget is parent_directory
+          - primaryTargetLocator or sidecarTargetLocator when fsyncTarget is
+            parent_directory
+          - sidecarKind when parent directory fsync follows sidecar write
+          - operationId
+          - tempId
+          - fsyncTarget
+          - fsyncErrno
+          - fsyncPlatform
+          - lane
+          - targetMappingOwner
+          - directoryDurableKind when fsyncTarget is parent_directory
+          - primaryDurableKind when primary or sidecar target is visible
+          - durableMode
+          - completedPublishRule
+      singleDurableBoundary:
+        apiName: durableStateStore
+        rule: >
+          YAML/JSON durable replace、read-before-reconcile、checksum backfill、
+          quarantine、temp cleanup 与 lock recovery 必须通过一个共享契约或
+          经适配器声明等价。模块不能各自定义 temp 命名、lock stale、
+          checksum 或 fsync 语义。
+        owningModules:
+          - repository
+          - capabilityCatalog
+          - settingsProjection
+          - providerRequestFingerprint
+          - batchCoordinator
+          - batchEvidenceReader
+          - pythonBridgeSubprocessRegistry
+        forbiddenBypass:
+          - 裸 YAML.parse(readFile(...)) 后直接作为可提交状态使用。
+          - 未持有 per-target lock 的 checksum backfill。
+          - 未持有 per-target lock 的 temp cleanup。
+          - 使用 pid + Date.now 作为唯一 temp 身份。
+          - checksum sidecar 非 durable replace 写入。
+        adapterRule: >
+          若某模块因同步 API 或子进程边界不能直接调用 durableStateStore，
+          其 adapter 必须实现同一 temp identity、exclusive create、owner
+          evidence、checksum、fsync、lock 与 failure classification 契约。
+      temporaryFileIdentity:
+        rule: >
+          durable replace 的 temp 文件名必须在单进程多 worker、多进程恢复与同毫秒
+          写入下保持唯一（globally unique temporary path）。
+        requiredFields:
+          - target basename
+          - process pid
+          - wall-clock timestamp
+          - high-entropy uuid or equivalent nonce
+          - operationId
+          - runnerSessionId when available
+        forbidden:
+          - 仅使用 process.pid 加 Date.now 作为唯一性来源。
+          - 复用固定 temp path。
+          - 在未持有目标文件 durable lock 时清理该目标的 temp 文件。
+        exclusiveCreate: >
+          temp 文件必须使用 exclusive create 或等价机制创建。碰撞必须在写入
+          开始前被检测出来，并进入 bounded retry；retry 后仍失败时记录
+          local_state_integrity，不得覆盖或截断其他 writer 的 temp。
+        ownerEvidence:
+          requiredFields:
+            - tempId
+            - targetLocator
+            - operationId
+            - runnerSessionId
+            - workerId or coordinatorSessionId
+            - itemId when item-scoped
+            - bookId when book-scoped
+            - leaseGeneration when available
+            - fencingTokenHash when available
+            - createdAt
+            - ownerPid
+            - ownerHost
+          storage: >
+            owner evidence 可嵌入 temp sidecar、lock owner record 或 durable
+            event，但 recovery 必须能在清理 temp 前读取并校验。
+      temporaryFileLifecycle:
+        create: >
+          writer 必须持有目标 lane/per-target lock，验证 item/book/coordinator
+          fencing，exclusive-create 唯一 temp，写入 owner evidence，再写入内容并
+          fsync；若任一步失败，不能修改 target 或 checksum。
+        commit: >
+          commit 只能从本 writer 创建的 temp path rename 到 target。rename 前、
+          checksum/generation 写入前和父目录 fsync 前都必须重新验证当前 fencing。
+          rename 成功后才能写 checksum，并在 checksum fsync 后 fsync 父目录。
+          父目录 fsync 必须按 directoryFsyncRule 继承刚完成的 primary 或 sidecar
+          target mapping；不能用裸目录路径绕过或触发 targetMapping 缺失。
+        reconcile: >
+          recovery 只能清理超过 durable temp stale TTL 的 temp 文件。不得仅凭
+          basename 前缀删除未过期 temp，避免删除仍在写入或即将 rename 的 live
+          temp。
+        cleanupDecision:
+          requiredChecks:
+            - temp age exceeds stale TTL
+            - owner pid is not live on the recorded host, or owner lease expired
+            - target generation did not advance from this operation
+            - per-target lock is held by the cleaner
+          event: durable_temp_reconciled
+          eventFields:
+            - targetLocator
+            - tempId
+            - operationId
+            - ownerPid
+            - ownerHost
+            - ownerSessionId
+            - staleAgeMs
+            - cleanupReason
+        legacyTempCleanup: >
+          旧格式 temp 可在确认超过 stale TTL 后清理；未过期旧 temp 必须保留并
+          让当前 writer 等待或重试。
+      durableYamlLock:
+        ownerRecord:
+          - pid
+          - host
+          - runnerSessionId
+          - generation
+          - fencingTokenHash
+          - targetLocator
+          - lane
+          - operationId
+          - heartbeatAt
+          - expiresAt
+          - createdAt
+        staleRule: >
+          lock 只有在超过 stale TTL 且 owner pid 不存活，或具备等价 fencing
+          证据时才能被移除。不得仅凭 mtime 删除仍由活进程持有的 lock。
+        heartbeatRule: >
+          预计可能超过 stale TTL 的 critical section 必须刷新 lock heartbeat。
+          不支持 heartbeat 的短 critical section 必须声明最大执行时间小于
+          stale TTL，并在超时前失败释放。
+        fencingRule: >
+          lock acquire、temp create、rename、checksum/generation commit 与父目录
+          fsync 前后都必须验证当前 generation 与 fencing token。验证失败时必须
+          删除本 writer 未提交 temp，并记录 stale_writer_commit_rejected。
+        waitRule: >
+          如果 owner 仍存活但 lock 超过 stale TTL，等待方必须继续等待直到
+          lock wait timeout，并把 timeout 分类为 local_state_lock_timeout。
+        staleRemovalEvent: durable_lock_recovered
+        releaseRule: >
+          writer 必须在 finally 中关闭 lock handle 并删除自己持有的 lock；删除
+          失败由 stale lock recovery 处理。
+        sameStackReentryRule: >
+          同一进程调用栈已持有同一 target 的 per-target lock 时，事件 fence
+          校验、checksum reconcile 或 typed read 可使用 unlocked read/reconcile
+          路径，但不得跳过 target checksum 校验。该例外只适用于同 target、
+          同调用栈，不能授予其他 target 或其他进程锁权限。
+      checksumCommit:
+        rule: >
+          checksum/generation sidecar 必须使用 durable replace，或与 target 在同一
+          提交记录中原子提交。禁止直接覆盖 checksum 后不 fsync。
+        missingChecksumRule: >
+          当 target 有效且 checksum sidecar 缺失时，reconcile 可回填 checksum。
+          若 checksum meta 不存在，可按 legacy target onboarding 记录
+          target_new_checksum_missing；若 meta 存在，必须校验 checksum、
+          operationId、runnerSessionId、fencingTokenHash、targetGeneration 与
+          targetLocator。任何 meta 冲突都必须按 sidecarQuarantineDecisionTable
+          选择隔离对象，不得把 sidecar-only 污染误判为 primary corruption。
+        reconcileModes:
+          repairWriter: >
+            normal resume、migrate-only 或显式 repair command 可在持有 per-target
+            lock 时执行 temp cleanup、checksum backfill、checksum meta backfill 与
+            quarantine，并必须写入 durable event 或 recovery summary evidence。
+            target family 可收窄该许可。provider_request_fingerprint 属于
+            historical_observation；normal runner_start 与 normal resume 默认只能
+            执行 read-only/capped diagnostic，不得 quarantine primary target。
+            对该 family 的 writable checksum backfill、meta backfill 或 primary
+            quarantine 只能发生在 explicit repair 或 migrate-only 边界内，并必须
+            有数量上限与 operator-visible summary。
+          readOnlyObserver: >
+            --status-json 必须使用 read-only durable inspection。该模式不得创建
+            lock、temp、owner、checksum、checksum meta、quarantine target 或追加
+            event；checksum 与 target 匹配但 checksum meta 缺失时，只能投影
+            checksumRecoveryDecision=metadata_missing_read_only，不能 backfill。
+        targetFamilyOverrides:
+          - family: provider_request_fingerprint
+            targetPattern: graph_vault/catalog/provider-requests/*.json
+            criticality: historical_observation
+            authority: cache_like_observation
+            runnerStartPreflightMode: read_only_capped_diagnostic
+            statusJsonProjection: same_scope_read_only_capped_diagnostic
+            normalRunnerPrimaryQuarantine: forbidden
+            explicitRepairPrimaryQuarantine: bounded_only
+            maxRunnerStartScannedTargets: 200
+            maxRunnerStartReportedSamples: 10
+            maxRunnerStartMutationCount: 0
+            recoveryDecision: continue_with_diagnostic_unless_catalog_blocked
+            stopRule: >
+              runner_start 发现 provider request checksum mismatch、checksum
+              missing、checksum meta missing 或 invalid JSON 时，不得写 checksum、
+              meta、event 或 quarantine target。它必须输出 capped diagnostic；
+              若 diagnostic 本身无法可信生成，则 stop_until_fixed，但仍不得
+              mutate provider-requests primary target。
+        sidecarQuarantineDecisionTable:
+          - state: target_valid_checksum_matches_meta_missing
+            primaryAction: keep_primary
+            checksumAction: keep_checksum
+            metaAction: repair_writer_may_backfill
+            statusJsonAction: read_only_degraded
+            recoveryDecision: metadata_missing_read_only
+          - state: target_valid_checksum_matches_meta_invalid
+            primaryAction: keep_primary
+            checksumAction: keep_checksum
+            metaAction: quarantine_meta_sidecar_only
+            repairAction: backfill_committed_meta_after_meta_quarantine
+            recoveryDecision: stop_until_fixed_if_sidecar_repair_fails
+          - state: target_valid_checksum_matches_meta_conflict
+            primaryAction: keep_primary
+            checksumAction: keep_checksum
+            metaAction: quarantine_meta_sidecar_only
+            repairAction: backfill_committed_meta_after_meta_quarantine
+            recoveryDecision: stop_until_fixed_if_sidecar_repair_fails
+          - state: target_valid_checksum_missing
+            primaryAction: keep_primary
+            checksumAction: repair_writer_may_backfill_checksum
+            metaAction: backfill_meta_after_checksum_commit
+            statusJsonAction: fail_closed_projection
+            recoveryDecision: stop_until_fixed_without_writer_evidence
+          - state: target_valid_checksum_mismatch
+            primaryAction: quarantine_primary_bundle
+            checksumAction: quarantine_with_primary_bundle
+            metaAction: quarantine_with_primary_bundle
+            recoveryDecision: stop_until_fixed
+          - state: target_invalid_or_unparseable
+            primaryAction: quarantine_primary_bundle
+            checksumAction: quarantine_with_primary_bundle
+            metaAction: quarantine_with_primary_bundle
+            recoveryDecision: stop_until_fixed
+          - state: checksum_sidecar_invalid_or_unparseable
+            primaryAction: keep_primary_if_target_valid
+            checksumAction: quarantine_checksum_sidecar_only
+            metaAction: quarantine_meta_sidecar_if_present
+            repairAction: backfill_checksum_and_meta_after_sidecar_quarantine
+            recoveryDecision: stop_until_fixed_if_sidecar_repair_fails
+        sidecarQuarantineRule: >
+          sidecar-only quarantine 必须持有 primary target lock，并保留
+          primaryTargetLocator、sidecarTargetLocator、sidecarKind、
+          checksumExpected、checksumActual 与 checksumRecoveryDecision。只有
+          target invalid、target checksum mismatch 或 primary 解析不可置信时，
+          才能 quarantine primary bundle。
+        crashWindows:
+          - window: temp_fsynced_target_old
+            recovery: 保留 target，超过 stale TTL 后清理 temp，状态保持未提交。
+          - window: target_new_checksum_old
+            recovery: >
+              若 target 内容有效且 generation/owner evidence 匹配当前 commit，
+              backfill checksum 并记录 checksum_backfilled；否则进入
+              stop_until_fixed，不得误隔离新 target。
+          - window: target_new_checksum_missing
+            recovery: >
+              若 target 内容有效且 generation/owner evidence 可验证，写入 checksum
+              并记录 checksum_backfilled；否则 quarantine 并 stop_until_fixed。
+          - window: checksum_meta_missing
+            recovery: >
+              repair writer 可在 target 内容有效且 checksum sidecar 匹配时回填
+              checksum meta；--status-json 只能报告 read_only_degraded diagnostic，
+              不得获取写锁或写入 `{target}.sha256.meta.json`。
+          - window: checksum_meta_backfill_rename_enoent
+            recovery: >
+              已进入 repair writer 并尝试写 checksum meta sidecar 时，rename ENOENT
+              必须分类为 local_state_integrity、durable_temp_rename_enoent 与
+              stop_until_fixed。primary target 与 checksum 匹配时不得隔离 primary
+              target；诊断必须指向 sidecar target 并保留 primaryTargetLocator。
+          - window: checksum_new_parent_fsync_failed
+            recovery: >
+              重新读取 target 与 checksum；匹配则 committed，不匹配则按
+              checksum mismatch recovery。
+          - window: event_committed_target_missing
+            recovery: >
+              event 只能作为审计线索，不能单独发布 completed；必须从 checkpoint、
+              producer evidence 与 artifact set 重建。
+      failurePolicy:
+        renameEnoent:
+          failureKind: local_state_integrity
+          retryable: false
+          recoveryDecision: stop_until_fixed
+          localFailureClass: durable_temp_rename_enoent
+          causeMatrix:
+            - cause: temp_collision
+              evidence:
+                - tempId reused or exclusive create collision recorded
+                - owner evidence does not match current operationId
+                - target generation unchanged
+              decision: stop_until_fixed
+            - cause: reconciler_mistaken_deletion
+              evidence:
+                - durable_temp_reconciled references same tempId before stale TTL
+                - owner pid or lease was live when cleanup occurred
+                - cleanup operation held same target lock after current temp create
+              decision: stop_until_fixed
+            - cause: concurrent_takeover
+              evidence:
+                - runnerSessionId or leaseGeneration changed before rename
+                - fencingTokenHash mismatch
+                - stale_writer_commit_rejected absent or delayed
+              decision: stop_until_fixed
+            - cause: generation_advanced
+              evidence:
+                - target checksum/generation changed after temp create
+                - current writer no longer owns item/book/coordinator lease
+                - commit compare-and-swap would reject current generation
+              decision: stop_until_fixed
+            - cause: filesystem_or_external_mutation
+              evidence:
+                - temp owner evidence was durably written
+                - no reconcile, collision or generation-change evidence exists
+                - errno is ENOENT from rename or equivalent syscall
+              decision: stop_until_fixed
+          classificationRule: >
+            rename ENOENT 必须选择一个 causeMatrix cause；证据不足时使用
+            filesystem_or_external_mutation，并仍保持 local_state_integrity 与
+            stop_until_fixed。不得降级为 unknown、provider transient 或业务失败。
+            implementation MAY retain legacy aliases only as compatibility metadata,
+            but renameCause 必须使用 temp_collision、reconciler_mistaken_deletion、
+            concurrent_takeover、generation_advanced 或
+            filesystem_or_external_mutation 之一。
+          requiredEvidence:
+            - targetLocator
+            - tempId
+            - operationId
+            - ownerPid
+            - ownerHost
+            - runnerSessionId
+            - workerId
+            - itemId
+            - bookId
+            - leaseGeneration
+            - failedSyscall
+            - errno
+          sidecarEvidence:
+            - primaryTargetLocator
+            - sidecarTargetLocator
+            - sidecarKind
+            - checksumActual
+            - checksumRecoveryDecision
+            - statusJsonMode
+        lockTimeout:
+          failureKind: local_state_lock_timeout
+          retryable: false
+          recoveryDecision: stop_until_fixed
+          requiredEvidence:
+            - targetLocator
+            - lane
+            - lockOwnerPid
+            - lockOwnerSessionId
+            - lockOwnerGeneration
+            - waitMs
+        liveTempDeleted:
+          failureKind: local_state_integrity
+          retryable: false
+          recoveryDecision: stop_until_fixed
+      sqliteWrite: >
+        qmd index 写入必须在 qmdIndexWriterLane 内执行，配置 busy_timeout，
+        locked/busy 错误按 bounded local retry 分类；超过上限后转为
+        failed_retryable 或 failed_stop_until_fixed，取决于错误证据。
+
+terminalCommitProtocol:
+  completed:
+    order:
+      - 验证 item lease、book lease 与 provider slot 均处于当前 generation。
+      - 验证 qmd、GraphRAG stage、producer lineage 与 query_ready 证据齐全。
+      - 写入 book checkpoint completed generation。
+      - 写入 item checkpoint completed generation。
+      - 追加 item_completed event。
+      - 从 checkpoint 与 events 派生并替换 manifest/status。
+      - 释放 provider slot、book lease 与 item lease。
+    forbidden:
+      - 先释放 lease 再写 completed。
+      - 未 fsync checkpoint 就追加 item_completed。
+      - 直接递增内存 completed counter 作为 manifest 权威。
+  failed:
+    order:
+      - 验证当前 item lease 与 book lease。
+      - 写入 failureKind、retryable、recoveryDecision、failedStage、
+        activeCommand、attempts、retryBudgetRemaining 与 nextRetryAt。
+      - 本地 durable state 失败还必须写入 localFailureClass、targetLocator
+        或 redactedEvidenceLocator、tempId、operationId、lockOwnerEvidence、
+        checksumRecoveryDecision 与 completedPublishRule。
+      - directory fsync boundary 失败还必须写入 directoryTargetLocator、
+        primaryTargetLocator 或 sidecarTargetLocator、lane、targetMappingOwner、
+        directoryDurableKind、primaryDurableKind、fsyncTarget、fsyncPlatform、
+        fsyncErrno 或显式 unavailable sentinel。
+      - 追加 item_failed 或 provider_retry_scheduled event。
+      - 派生并替换 manifest/status。
+      - 按 recoveryDecision 释放或保留必要 evidence lease 记录。
+    itemCheckpointFailureEvidence:
+      requiredForLocalStateFailures:
+        - failureKind
+        - localFailureClass
+        - recoveryDecision
+        - failedStage
+        - activeCommand
+        - targetLocator or redactedEvidenceLocator
+        - tempId
+        - operationId
+        - leaseGeneration
+        - retryable
+        - completedPublishRule
+      conditional:
+        renameEnoent:
+          - renameCause
+          - ownerPid
+          - ownerHost
+          - failedSyscall
+          - errno
+        lockTimeout:
+          - lockOwnerEvidence
+          - lane
+          - waitMs
+        checksumCrashWindow:
+          - checksumRecoveryDecision
+          - checksumExpected
+          - checksumActual
+        liveTempDeleted:
+          - cleanupReason
+          - cleanupOwnerSessionId
+          - staleAgeMs
+        fsyncBoundary:
+          - directoryTargetLocator when fsyncTarget is parent_directory
+          - primaryTargetLocator or sidecarTargetLocator when fsyncTarget is
+            parent_directory
+          - sidecarKind when parent directory fsync follows sidecar write
+          - lane
+          - targetMappingOwner
+          - directoryDurableKind when fsyncTarget is parent_directory
+          - primaryDurableKind when primary or sidecar target is visible
+          - fsyncTarget
+          - fsyncPlatform
+          - fsyncErrno when fsync fails
+          - unavailableFieldSentinels when fsyncErrno is sentinel
+
+scheduler:
+  queueSource:
+    - EPUB files discovered from --source-dir.
+    - Existing item checkpoints under the current runId.
+    - Retryable failed items whose nextRetryAt has elapsed.
+  orderingPolicy: >
+    Coordinator must prefer resumable incomplete items before new items, then
+    stable source path order. This keeps recovery deterministic across restarts.
+  claimPolicy:
+    eligibleStatuses:
+      - pending
+      - failed_retryable_due
+      - stale_running_expired
+    excludedStatuses:
+      - completed
+      - skipped
+      - failed_stop_until_fixed
+      - running_with_live_lease
+    duplicateBookPolicy: >
+      If another live worker owns the same bookId, the candidate item remains
+      queued until the book lease is released.
+  workerLifecycle:
+    startup: >
+      Worker receives item lease, book lease, provider semaphore handles and
+      writer lane handles from coordinator.
+    heartbeat: >
+      Worker heartbeat must update before half of lease TTL elapses. Missed
+      heartbeat marks the item recoverable only after lease expiry.
+    completion: >
+      Worker releases item and book leases only after final checkpoint,
+      item_completed event, and manifest refresh are durable.
+    failure: >
+      Worker records failureKind、retryable、recoveryDecision、failedStage、
+      activeCommand、attempt counters and nextRetryAt before releasing leases.
+    subprocessOwnership: >
+      Worker 启动 qmd 或 GraphRAG 子进程时必须创建独立 process group，并在
+      durable subprocess registry 记录 pid、pgid、commandId、itemId、bookId、
+      stage、provider slot leases、startedAt 与 expected output directories。
+      worker 失去 lease、收到 cancellation 或 coordinator quiesce 时，必须先
+      向 process group 发送 graceful terminate，再按 timeout kill，并记录
+      subprocess_cancelled 或 subprocess_killed。
+    subprocessDurableFailureProjection:
+      scope:
+        - resume-book-workspace
+        - qmd validation subprocesses
+        - GraphRAG producer subprocesses
+      firstHopEnvelope: >
+        子进程捕获 DurableStateError 或等价 durable local state failure 时，
+        必须输出单行机器可读 failure envelope。该 envelope 是父 batch runner
+        构造 commandCheck 的第一权威证据，不得只输出 raw stack 后要求父进程
+        从 stderr/stdout 推断 failureKind。
+      transport:
+        preferred: stdout_or_stderr_json_line
+        fallback: command_log_sidecar_with_json_line
+        marker: QMD_GRAPHRAG_DURABLE_FAILURE
+      requiredFields:
+        - schemaVersion
+        - marker
+        - status
+        - failureKind
+        - localFailureClass
+        - retryable
+        - recoveryDecision
+        - failedStage
+        - targetLocator or redactedEvidenceLocator
+        - tempId
+        - operationId
+        - failedSyscall
+        - errno
+        - renameCause
+        - lane
+        - targetMappingOwner
+        - directoryTargetLocator when localFailureClass is durable_directory_*
+        - primaryTargetLocator or sidecarTargetLocator when localFailureClass is
+          durable_directory_*
+        - sidecarKind when parent directory fsync follows sidecar write
+        - directoryDurableKind when localFailureClass is durable_directory_*
+        - primaryDurableKind when primary or sidecar target is visible
+        - fsyncTarget when localFailureClass is durable_directory_*
+        - fsyncPlatform when localFailureClass is durable_directory_*
+        - fsyncErrno when localFailureClass is durable_directory_*
+        - unavailableFieldSentinels when fsyncErrno is sentinel
+        - itemId
+        - bookId
+        - workerId
+        - leaseGeneration
+        - completedPublishRule
+      failClosedMissingFields: >
+        父 runner 校验 envelope 完整性时必须使用本 requiredFields 集合。
+        `targetLocator or redactedEvidenceLocator` 允许二选一；其余字段缺失、
+        空字符串或不符合固定值时，commandCheck 必须改写为
+        durable_subprocess_evidence_incomplete，并设置 evidenceIncomplete、
+        evidenceIncompleteReason、unavailableFieldSentinels 与
+        completedPublishRule forbidden。父进程可以回填 itemId、bookId、
+        workerId 或 leaseGeneration 以便定位，但回填不得把 partial
+        envelope 视为完整证据。
+      commandIdentityRule: >
+        commandCheck.name 与 activeCommand 必须保留父 runner 调度的命令身份，
+        例如 resume-book-2。durable 根因身份由 failureKind、
+        localFailureClass、targetLocator、failedSyscall、errno 与 renameCause
+        表达。failedStage 在子进程 durable failure 中等同 commandCheck.name，
+        不得用内部函数名覆盖命令身份。
+      parentParsingRule: >
+        父 runner 必须先解析 typed failure envelope，再使用 legacy 文本分类。
+        envelope 可解析时，commandCheck、item checkpoint、command_failed、
+        item_failed、status-json 与 recovery summary 必须无损投影其 durable
+        fields。文本分类只作为 legacy compatibility fallback。
+      failClosedRule: >
+        envelope 缺失、不可解析或 requiredFields 不完整，但父 runner 可确认失败
+        发生在 durable subprocess boundary 时，必须 fail closed 为
+        local_state_integrity、retryable false 与 stop_until_fixed，并记录
+        evidenceIncomplete diagnostic；不得回退为 unknown 或 provider transient。
+        若 marker 完全缺失，父 runner 只有在 legacy classifier 或等价信号确认
+        failureKind 为 local_state_integrity 或 local_state_lock_timeout 时，才可将
+        该缺失视为 confirmed durable subprocess failure；普通 provider、auth、
+        data compatibility 或业务失败必须保留原分类。
+      incompleteEvidenceProjection:
+        fallbackLocalFailureClass: durable_subprocess_evidence_incomplete
+        completedPublishRule: forbidden
+        sentinelRule: >
+          缺失的 targetLocator、tempId、operationId、failedSyscall、errno 或
+          renameCause 必须使用 unavailable sentinel，并同时写入
+          redactedEvidenceLocator 指向 command log 或 durable failure sidecar。
+          checkpoint、command_failed、item_failed、status-json 与 recovery summary
+          均必须保留 evidenceIncomplete true，直到显式 repair 或 resume 产生完整
+          typed evidence。
+
+stateModel:
+  itemStates:
+    pending: 尚未领取，或等待 retry 时间到达。
+    running: 已被 live worker 领取且 lease 未过期。
+    completed: qmd、GraphRAG、query_ready 与验证子命令全部通过。
+    failed_retryable: 失败可恢复，等待 nextRetryAt 后重新领取。
+    failed_retry_exhausted: transient retry budget 已耗尽，需人工检查或重置预算。
+    failed_stop_until_fixed: 非 transient 失败，当前 batch 必须停止等待修复。
+    skipped: 显式策略跳过，不计为成功完成。
+  stopUntilFixedResumePolicy: >
+    同一 runId 内，failed_stop_until_fixed checkpoint 是故障证据主链。实现修复
+    或设计审计通过后，普通恢复流程不得静默改写该 checkpoint 为 pending。
+    继续同一 item 只能通过显式 repair/resume 操作记录恢复事件；若目标是验证
+    修复后的全目录闭环，可使用新的 runId 对相同 EPUB 目录重新执行真实 runner。
+    新 run 必须重新发现所有 EPUB，并从当前 durable catalog、book-scoped state、
+    qmd index 与 producer evidence 重新建立闭环，不得把旧 manifest 当成完成依据。
+  stageStates:
+    qmd:
+      requiredEvidence:
+        - qmd registration succeeded
+        - qmd embed/update succeeded when configured
+        - required qmd validation subcommands succeeded
+    graph_extract:
+      requiredEvidence:
+        - GraphRAG workflow succeeded
+        - producer run record persisted
+        - expected graph parquet artifacts validated
+    community_report:
+      requiredEvidence:
+        - GraphRAG community report workflow succeeded
+        - report parquet artifacts validated
+        - producer lineage points to the same bookId
+    embed:
+      requiredEvidence:
+        - GraphRAG embedding workflow succeeded
+        - vector artifacts validated
+        - provider metrics or stage logs captured
+    query_ready:
+      requiredEvidence:
+        - graph_extract、community_report 与 embed completed
+        - graph capability projection present
+        - qmd GraphRAG query succeeds for the book
+
+failureRecovery:
+  transientProviderFailures:
+    examples:
+      - HTTP 429
+      - HTTP 5xx
+      - network timeout
+      - connection reset
+      - Responses API output none with completed status
+      - provider concurrency or rate-limit messages
+    behavior:
+      - classify as retryable unless auth or quota policy proves otherwise
+      - record nextRetryAt and retry budget
+      - release leases after durable failed_retryable state
+      - allow another worker to claim different books while waiting
+      - retry budget exhausted 时转为 failed_retry_exhausted，追加
+        retry_budget_exhausted event，并从 runnable queue 排除。
+      - failed_retry_exhausted 不停止 coordinator；其他可运行书继续推进。
+      - 人工修复后只能通过显式 resume/reset-retry-budget 命令恢复 pending。
+  permanentProviderFailures:
+    examples:
+      - INVALID_API_KEY
+      - authentication failed
+      - permission denied
+      - unsupported model
+      - schema/configuration error
+    behavior:
+      - classify as failed_stop_until_fixed
+      - stop the coordinator after durable failure event
+      - preserve completed books and retryable state for later resume
+      - stop 时必须先 quiesce scheduler，禁止新 claim，再取消未进入终态的
+        provider 子进程，并把 live running item 写成 recoverable stopped state。
+  artifactGateFailures:
+    behavior:
+      - missing producer lineage must not be silently accepted
+      - repair may reuse existing valid book-scoped artifacts only when
+        fingerprints, run records and required parquet files match
+      - repair-only operations must produce explicit events and cannot mark a
+        book completed without normal validation commands
+  workerCrash:
+    behavior:
+      - live coordinator detects missed heartbeat
+      - item remains running until lease expiry
+      - after expiry, item becomes stale_running_expired and claimable
+      - stale worker writes are rejected by fencingToken checks
+      - coordinator 必须检查 subprocess registry，终止或隔离失联 worker 的
+        process group。
+      - 失联 worker 可能产生的 GraphRAG/qmd 输出只能保留为 quarantined
+        artifact，不能被 query_ready 使用，除非 reconciliation 重新验证
+        producer run、fingerprint、book lease generation 与完整 artifact set。
+  coordinatorCrash:
+    behavior:
+      - no second coordinator may take over before run lock expiry
+      - resumed coordinator scans checkpoints and events to rebuild manifest
+      - expired running items become recoverable with stale lease evidence
+      - resumed coordinator 必须扫描 subprocess registry，终止孤儿子进程或
+        记录 orphan_process_unavailable。
+      - takeover 后旧 generation 的持久提交一律被 fencing 拒绝。
+  durableStatePreflight:
+    runnerStart:
+      - 必须先创建或加载最小 startup recovery manifest，再执行任何可写
+        runner-start recovery。该 manifest 至少包含 runId、stage、scopeCount、
+        targetCount、mutationCount、firstSample、lastSample、decision 与
+        explicitRepairHint。
+      - 对 critical catalog、current run、book-scoped target，runner_start 可执行
+        bounded writable repair，并在首次 blocker 后 fail fast。每个目录默认
+        最多扫描 200 个 primary targets、报告 10 个样本、执行 1 个 writable
+        quarantine；超过任一上限必须 stop_until_fixed。
+      - 对 provider_request_fingerprint 等 historical_observation target，
+        runner_start 只能执行 read-only capped diagnostic，mutationCount 必须为
+        0。不得创建 lock、temp、checksum、checksum meta、corrupt target 或
+        provider-requests 目录内 recovery event。
+      - status-json 必须能以相同 scope 的 read-only 方式预告 runner_start 会
+        看到的 provider request durable risk，并输出 capped count 与样本。
+      - normal runner 不得把历史 provider request checksum mismatch 作为阻止
+        38 本 EPUB 重新发现与 manifest 创建的唯一原因；该风险应作为 startup
+        diagnostic 暴露，除非它同时破坏 critical catalog authority。
+    beforeClaim:
+      - 扫描 durable YAML/JSON lock owner records。
+      - 扫描未过期 temp 与超过 stale TTL 的 orphan temp。
+      - 校验 target/checksum 或 target/generation 一致性。
+      - 校验 batch subprocess registry、provider slot leases 与 book leases。
+      - 扫描范围必须从 targetMapping 派生，并递归覆盖 book-scoped output
+        下的嵌套 durable targets 与 sidecars，包括
+        lancedb/*.lance/qmd_row_count.json、.lock、.tmp-*、.owner.json、
+        .sha256 与 .sha256.meta.json。
+      - 任一 target 出现 unknown temp、live temp 被误删证据、checksum 无法收敛
+        或 lock owner 不可判定时，coordinator 必须 stop_until_fixed，不能 claim
+        新 item。
+    beforeResumeBook:
+      - resume-book 子进程启动前必须完成 book-scoped durable state preflight。
+      - 发现同 bookId 旧 generation 的未决 temp、run record 半写或 checkpoint
+        checksum 不一致时，必须先 repair/quarantine/stop_until_fixed。
+      - book-scoped preflight 必须递归扫描 targetMapping 注册的嵌套 production
+        targets，不得只扫描固定目录一层。
+      - preflight 结果必须写入 event 或 recovery summary，不能只写 stdout。
+  partialWriteRecovery:
+    eventsJsonl:
+      - 恢复时扫描 events.jsonl，截断最后一个非完整 JSON 行。
+      - eventId 或 sequence 重复时保留首次 durable event，后续重复进入
+        duplicate_event_ignored 诊断。
+    checkpoints:
+      - 未过期 temp 文件必须视为 live 或 recently-live，不能删除；超过
+        durable temp stale TTL 后才可按 orphan temp 清理。
+      - temp 文件存在且 target generation 未更新时，只有在 temp 超过 stale
+        TTL 或拥有明确 writer-dead 证据后才能删除 temp。
+      - target checksum/generation 无效时回退到上一份 valid checkpoint。
+      - 无 valid checkpoint 但有 completed event 时进入 reconciliation，不得
+        直接标记 completed。
+    manifests:
+      - manifest generation 与 checkpoint 派生结果不一致时丢弃 manifest，
+        重新派生并记录 manifest_rebuilt。
+    sqlite:
+      - database locked/busy 按 bounded local retry 处理。
+      - SQLite integrity_check 失败必须 stop_until_fixed。
+    durableReplace:
+      - atomic rename 报 ENOENT 必须分类为 local_state_integrity，除非证据证明
+        当前 writer 从未成功创建 temp。
+      - live temp 被 reconcile 删除必须分类为 local_state_integrity，并触发
+        stop_until_fixed。
+      - durable YAML lock timeout 必须分类为 local_state_lock_timeout，并保留
+        lock owner evidence。
+      - target/checksum crash window 必须按 durableWriteContract.checksumCommit
+        的 window matrix 收敛到 committed、retryable repair 或 stop_until_fixed。
+      - rename ENOENT 不得降级为 unknown、provider transient 或普通业务失败。
+    providerRequestFingerprint:
+      authority: historical_observation
+      storage: graph_vault/catalog/provider-requests/*.json
+      normalRunnerRecovery: read_only_capped_diagnostic
+      explicitRepairRecovery: bounded_repair_or_quarantine
+      rules:
+        - 历史 provider request fingerprint 记录只用于成本、审计与高成本恢复
+          诊断，不是新 batch runner 的 completion authority。
+        - checksum meta missing 在 status-json 与 runner_start 中均投影为
+          read_only_degraded，不得 backfill。
+        - checksum missing、checksum mismatch 或 invalid target 在 runner_start
+          中投影为 provider_request_durable_degraded，并保留 count 与样本。
+        - explicit repair 可在每次最多 50 个 target 的上限内 backfill 或
+          quarantine，并必须先写 startup/repair summary。
+        - normal runner_start 不得对 provider-requests primary target 执行
+          primary bundle quarantine。
+
+recoveryReconciliation:
+  authorityOrder:
+    - valid item checkpoint with current generation
+    - valid book checkpoint with current book lease generation
+    - producer run record with matching bookId and input fingerprint
+    - complete parquet/vector artifact set with expected schema
+    - graph capability projection
+    - events.jsonl as audit trail, not sole completion authority
+    - manifest/status as derived cache only
+  derivedStateTargets:
+    - graph_vault/catalog/batch-runs/{runId}/manifest.json
+    - graph_vault/catalog/batch-runs/{runId}/status.json
+    - graph_vault/catalog/batch-runs/{runId}/recovery-summary.json
+  observabilityBoundary: >
+    manifest、status.json 与 recovery-summary.json 均为 checkpoint/event
+    派生状态。manifest 保留批次计数与最近 durableFailureSummary；
+    status.json 与 recovery-summary.json 承载逐 item durable diagnostics。
+    event/checkpoint 是故障证据主链，manifest/status 不得单独证明 completed。
+  matrix:
+    - case: checkpoint_completed_event_missing
+      action: >
+        保留 completed checkpoint，补写 reconciliation_event_missing_completed，
+        重新派生 manifest；若 qmd 或 GraphRAG evidence 缺失则降级为
+        failed_stop_until_fixed。
+    - case: event_completed_checkpoint_missing
+      action: >
+        不承认 completed。若 producer lineage、qmd evidence 与 artifacts 全部
+        有效，则重建 checkpoint 并记录 checkpoint_rebuilt_from_evidence；
+        否则恢复为 pending 或 failed_stop_until_fixed。
+    - case: producer_record_exists_artifact_missing
+      action: >
+        producer run 视为 incomplete，不得进入 query_ready。重新运行对应 stage
+        或在非 transient 证据下 stop_until_fixed。
+    - case: artifact_exists_producer_record_missing
+      action: >
+        artifact 进入 orphan quarantine。只有 fingerprint、schema、bookId 与
+        stage output 完整验证通过后才能重建 producer record。
+    - case: query_ready_projection_exists_producer_incomplete
+      action: >
+        projection 无效，删除或重写 projection，item 回到缺失 producer 的
+        nextStage。
+    - case: live_lease_expired_process_alive
+      action: >
+        先终止 process group；无法终止时 stop_until_fixed。终止后 item 变为
+        stale_running_expired。
+    - case: manifest_disagrees_with_checkpoints
+      action: >
+        manifest 作为派生缓存重建，不能覆盖 checkpoint。
+
+observability:
+  requiredEvents:
+    - batch_started
+    - coordinator_heartbeat
+    - worker_started
+    - item_claimed
+    - book_claimed
+    - item_start
+    - command_start
+    - command_ok
+    - command_failed
+    - provider_slot_acquired
+    - provider_slot_released
+    - provider_retry_scheduled
+    - retry_budget_exhausted
+    - lease_heartbeat_missed
+    - stale_item_reclaimed
+    - subprocess_cancelled
+    - subprocess_killed
+    - partial_event_tail_recovered
+    - checkpoint_rebuilt_from_evidence
+    - manifest_rebuilt
+    - durable_temp_created
+    - durable_temp_reconciled
+    - durable_lock_recovered
+    - durable_lock_timeout
+    - durable_replace_failed
+    - durable_checksum_backfilled
+    - stale_writer_commit_rejected
+    - item_completed
+    - item_failed
+    - manifest_refreshed
+    - batch_incomplete
+    - batch_completed
+  eventSchema:
+    requiredFields:
+      - schemaVersion
+      - eventId
+      - sequence
+      - runId
+      - at
+      - event
+      - status
+    conditionalFields:
+      - itemId
+      - bookId
+      - workerId
+      - stage
+      - commandId
+      - producerRunId
+      - provider
+      - providerSlotId
+      - fencingTokenHash
+      - leaseGeneration
+      - idempotencyKey
+      - durationMs
+      - providerWaitMs
+      - writerLaneWaitMs
+      - retryBudgetRemaining
+      - sqliteRetryCount
+      - lane
+      - failureKind
+      - failedStage
+      - targetLocator
+      - redactedEvidenceLocator
+      - tempId
+      - operationId
+      - failedSyscall
+      - errno
+      - localFailureClass
+      - retryable
+      - recoveryDecision
+      - targetMappingOwner
+      - lockOwnerPid
+      - lockOwnerSessionId
+      - lockOwnerGeneration
+      - renameCause
+      - cleanupReason
+      - completedPublishRule
+      - checksumRecoveryDecision
+      - evidenceIncomplete
+      - evidenceIncompleteReason
+      - unavailableFieldSentinels
+      - repairAllowed
+      - primaryTargetLocator
+      - sidecarTargetLocator
+      - sidecarKind
+      - directoryTargetLocator
+      - directoryDurableKind
+      - primaryDurableKind
+      - fsyncTarget
+      - fsyncPlatform
+      - fsyncErrno
+    redaction: >
+      fencingToken 只能输出稳定 hash 或短前缀诊断，不得输出 secret、API key、
+      Bearer token 或完整 provider credential。
+  durableFailureEventEvidence:
+    rule: >
+      durable state failure 相关事件必须携带稳定分类字段，保证 item
+      checkpoint、event、status-json 与 recovery summary 四个观测面一致。
+      事件不得只写 message 或 raw error 后由读取端推断 failureKind。
+    appliesTo:
+      - command_failed for subprocess durable failures
+      - durable_replace_failed
+      - durable_lock_timeout
+      - durable_temp_reconciled when cleanupReason indicates unexpected deletion
+      - durable_checksum_backfilled when checksumRecoveryDecision is not committed
+      - item_failed for local_state_integrity or local_state_lock_timeout
+    requiredFields:
+      - failureKind
+      - localFailureClass
+      - recoveryDecision
+      - failedStage
+      - redactedEvidenceLocator
+    conditionalFields:
+      renameEnoent:
+        - targetLocator
+        - tempId
+        - operationId
+        - failedSyscall
+        - errno
+        - renameCause
+        - lane
+        - targetMappingOwner
+        - leaseGeneration
+        - completedPublishRule
+        - evidenceIncomplete
+        - evidenceIncompleteReason
+        - unavailableFieldSentinels
+      lockTimeout:
+        - lane
+        - lockOwnerPid
+        - lockOwnerSessionId
+        - lockOwnerGeneration
+      liveTempDeleted:
+        - targetLocator
+        - tempId
+        - operationId
+        - cleanupReason
+      checksumCrashWindow:
+        - targetLocator
+        - checksumRecoveryDecision
+      fsyncBoundary:
+        - directoryTargetLocator when fsyncTarget is parent_directory
+        - primaryTargetLocator or sidecarTargetLocator when fsyncTarget is
+          parent_directory
+        - sidecarKind when parent directory fsync follows sidecar write
+        - lane
+        - targetMappingOwner
+        - directoryDurableKind when fsyncTarget is parent_directory
+        - primaryDurableKind when primary or sidecar target is visible
+        - fsyncTarget
+        - fsyncPlatform
+        - fsyncErrno when fsync fails
+        - unavailableFieldSentinels when fsyncErrno is sentinel
+        - completedPublishRule
+    degradationRule: >
+      派生 manifest、status-json 或 recovery summary 时，若发现 durable failure
+      event 缺失 requiredFields，必须把 run 标记为 local_state_integrity 与
+      stop_until_fixed，不能把该事件降级为 unknown 或 provider transient。
+  commandCheckDurableEvidence:
+    rule: >
+      BatchCommandCheck 是子进程 durable failure 的 first-hop carrier。
+      resume-book-*、qmd validation 或 GraphRAG producer 子进程返回 typed
+      envelope 时，commandCheck 必须保留 envelope 的 durable fields，并作为
+      terminal failed checkpoint 与 events 的输入。
+    requiredForSubprocessDurableFailures:
+      - failureKind
+      - localFailureClass
+      - retryable
+      - recoveryDecision
+      - failedStage
+      - targetLocator or redactedEvidenceLocator
+      - directoryTargetLocator when localFailureClass is durable_directory_*
+      - primaryTargetLocator or sidecarTargetLocator when localFailureClass is
+        durable_directory_*
+      - sidecarKind when parent directory fsync follows sidecar write
+      - tempId
+      - operationId
+      - failedSyscall
+      - errno
+      - renameCause
+      - lane
+      - targetMappingOwner
+      - directoryDurableKind when localFailureClass is durable_directory_*
+      - primaryDurableKind when primary or sidecar target is visible
+      - fsyncTarget when localFailureClass is durable_directory_*
+      - fsyncPlatform when localFailureClass is durable_directory_*
+      - fsyncErrno when localFailureClass is durable_directory_*
+      - unavailableFieldSentinels when fsyncErrno is sentinel
+      - leaseGeneration
+      - completedPublishRule
+      - cleanupReason
+    forbidden:
+      - failureKind unknown when localFailureClass starts with durable_
+      - deriving durable classification only from raw stderr when envelope exists
+      - replacing command name with internal stack frame or repository method name
+  requiredStatusJsonFields:
+    - runId
+    - coordinatorSessionId
+    - bookConcurrency
+    - providerConcurrency
+    - totalItems
+    - completedItems
+    - pendingItems
+    - runningItems
+    - failedItems
+    - retryableItemCount
+    - stoppedReason
+    - activeWorkers
+    - activeProviderSlots
+    - nextRetryAt
+    - queueDepth
+    - writerLaneQueues
+    - items
+    - stages
+    - leases
+    - providerSlots
+    - retryBudgetRemaining
+    - failedStage
+    - activeCommand
+    - failureKind
+    - localFailureClass
+    - recoveryDecision
+    - durableStateFailures
+    - durableTempDiagnostics
+    - durableLockDiagnostics
+    - producerLineage
+    - dotenvSourceDiagnostics
+  statusJsonDurableFailureEntryFields:
+    requiredForLocalStateFailures:
+      - itemId
+      - bookId
+      - failureKind
+      - localFailureClass
+      - recoveryDecision
+      - failedStage
+      - activeCommand
+      - retryable
+      - targetLocator or redactedEvidenceLocator
+      - directoryTargetLocator when localFailureClass is durable_directory_*
+      - primaryTargetLocator or sidecarTargetLocator when localFailureClass is
+        durable_directory_*
+      - sidecarKind when parent directory fsync follows sidecar write
+      - tempId
+      - operationId
+      - completedPublishRule
+      - cleanupReason
+      - repairAllowed
+    requiredForRenameEnoent:
+      - failedSyscall
+      - errno
+      - renameCause
+      - lane
+      - targetMappingOwner
+      - directoryDurableKind when localFailureClass is durable_directory_*
+      - primaryDurableKind when primary or sidecar target is visible
+      - leaseGeneration
+    requiredForFsyncBoundary:
+      - directoryTargetLocator
+      - primaryTargetLocator or sidecarTargetLocator
+      - sidecarKind when parent directory fsync follows sidecar write
+      - lane
+      - targetMappingOwner
+      - directoryDurableKind
+      - primaryDurableKind when primary or sidecar target is visible
+      - fsyncTarget
+      - fsyncPlatform
+      - fsyncErrno when fsync fails
+      - completedPublishRule
+      - unavailableFieldSentinels when fsyncErrno is sentinel
+    incompleteEnvelopeFields:
+      - evidenceIncomplete
+      - evidenceIncompleteReason
+      - redactedEvidenceLocator
+      - unavailableFieldSentinels
+  statusJsonReadOnlyContract:
+    mode: observer
+    mutationPolicy: no_state_root_mutation
+    rule: >
+      --status-json 是严格只读观测入口。它只能读取 target、checksum、
+      checksum meta、lock owner record、events、manifest、checkpoint 与 provider
+      slot projection，并把 durable gap 投影为 redacted diagnostics。它不得执行
+      repair、writable reconcile、quarantine、event append、manifest rebuild、
+      status cache 写入或 recovery summary 写入。
+    providerRequestProjectionRule: >
+      --status-json 必须能对 graph_vault/catalog/provider-requests/*.json 执行
+      read-only capped scan，使用与 runner_start 相同的 family policy，但不得
+      mutate stateRoot。输出必须包含 scannedTargetCount、degradedTargetCount、
+      sampleTargetLocators、diagnosticClass 与 normalRunnerAction。若目录过大，
+      只扫描设计上限内的 targets 并报告 scanTruncated true。
+    forbiddenOperations:
+      - acquire exclusive durable write lock or per-target lock
+      - create or delete .lock files
+      - create, rename or delete .tmp-* files
+      - create or delete .owner.json files
+      - write .sha256 files
+      - write .sha256.meta.json files
+      - quarantine or rename primary targets
+      - append events.jsonl
+      - write manifest.json, status.json or recovery-summary.json
+    readOnlyDiagnostics:
+      - diagnosticClass: checksum_meta_missing
+        condition: target valid and checksum sidecar matches but checksum meta missing
+        statusJsonDecision: read_only_degraded
+        checksumRecoveryDecision: metadata_missing_read_only
+        recoveryAction: run normal resume, migrate-only, or explicit repair
+      - diagnosticClass: checksum_mismatch
+        condition: target checksum does not match sidecar or trusted meta
+        statusJsonDecision: fail_closed_projection
+        recoveryDecision: stop_until_fixed
+      - diagnosticClass: provider_request_durable_degraded
+        condition: >
+          provider request target has checksum missing, checksum mismatch,
+          checksum meta missing, invalid target, live temp or unresolved lock
+        statusJsonDecision: read_only_capped_diagnostic
+        recoveryDecision: continue_with_diagnostic_unless_catalog_blocked
+        normalRunnerAction: no_primary_quarantine
+      - diagnosticClass: unresolved_temp_or_lock
+        condition: live temp, unresolved temp, or live lock blocks durable confidence
+        statusJsonDecision: fail_closed_projection
+        recoveryDecision: stop_until_fixed
+    selfFailureProjection: >
+      若 status-json 自身读取 durable target 时发现 fail-closed durable failure，
+      命令应尽量输出可解析 JSON，包含 failureKind、localFailureClass、
+      recoveryDecision、failedStage、targetLocator、tempId、operationId、
+      failedSyscall、errno、renameCause、directoryTargetLocator、
+      primaryTargetLocator 或 sidecarTargetLocator、sidecarKind、lane、
+      targetMappingOwner、directoryDurableKind、primaryDurableKind、
+      fsyncTarget、fsyncPlatform、fsyncErrno、completedPublishRule 与
+      unavailableFieldSentinels when fsyncErrno is sentinel。对 directory fsync
+      boundary，self failure JSON 必须复用
+      statusJsonDurableFailureEntryFields.requiredForFsyncBoundary 的完整字段集，
+      且不得因为不能写 checkpoint、event、status.json 或 recovery-summary.json
+      而降级或省略 sentinel 字段。
+    directoryFsyncProjection: >
+      read-only 诊断不得执行 fsyncDirectory，但若报告 primary、checksum sidecar
+      或 checksum meta sidecar 的问题，必须保留可推导的
+      directoryTargetLocator，并按 directoryFsyncRule 投影 lane、
+      targetMappingOwner、directoryDurableKind 与 primaryDurableKind。repair
+      writer 后续执行 checksum meta backfill 时，必须使用相同映射完成 parent
+      directory fsync。
+  recoverySummaryRequiredFields:
+    - failureKind
+    - itemId
+    - bookId
+    - workerId
+    - retryable
+    - localFailureClass
+    - recoveryDecision
+    - failedStage
+    - targetLocator
+    - directoryTargetLocator when localFailureClass is durable_directory_*
+    - primaryTargetLocator or sidecarTargetLocator when localFailureClass is
+      durable_directory_*
+    - sidecarKind when parent directory fsync follows sidecar write
+    - tempId
+    - operationId
+    - redactedEvidenceLocator
+    - lockOwnerEvidence
+    - checksumRecoveryDecision
+    - lane
+    - targetMappingOwner
+    - directoryDurableKind when localFailureClass is durable_directory_*
+    - primaryDurableKind when primary or sidecar target is visible
+    - fsyncTarget when localFailureClass is durable_directory_*
+    - fsyncPlatform when localFailureClass is durable_directory_*
+    - fsyncErrno when localFailureClass is durable_directory_*
+    - unavailableFieldSentinels when fsyncErrno is sentinel
+    - leaseGeneration
+    - failedSyscall
+    - errno
+    - renameCause
+    - completedPublishRule
+    - cleanupReason
+    - evidenceIncomplete
+    - evidenceIncompleteReason
+    - unavailableFieldSentinels
+  logRequirements:
+    - 每本书必须有独立 log root。
+    - 每个 GraphRAG stage 必须保留 indexing-engine.log 或等价 provider 日志。
+    - status-json 不得读取或输出 provider secrets。
+
+auditStateContract:
+  storageRoot: audits
+  directoryNamePattern: "{TASK_ID}-run_{RUN_ID}__{STATUS}"
+  lifecycle:
+    singleOpenInvariant: >
+      任一真实 Runner 阻塞修复时，audits 根目录只能保留当前阻塞项的一个
+      __open 目录。已通过设计审计与实施审计的历史目录必须迁移为 __closed，
+      且 reports/status.json 内的 status 必须为 closed。
+    statusSuffixConsistency: >
+      reports/status.json 的 status 字段必须与目录后缀一致。status 为 open
+      的目录必须以 __open 结尾；status 为 closed 的目录必须以 __closed
+      结尾。发现不一致时必须先执行 audit state reconciliation，不能继续
+      开发、审计或恢复真实 Runner。
+    partialAuditRule: >
+      三代理设计审计或实施审计中，任一 agent fail、aborted、no_report 或
+      缺少报告时，本轮不得记为 passed。状态必须标记为 failed、blocked 或
+      aborted_after_partial_fail，并保持 realRunner.resumeAllowed false。
+  implementationBaseline:
+    freezePoint: >
+      实施审计的 10 条固定基准必须在对应开发实施开始前写入各 agent 目录。
+      后续返修和重审必须复用同一组 criteria 文件，不得为了通过审计新增、
+      删除或改写基准。
+    driftRule: >
+      若 Type DD 在返修期间发生实质设计变更，必须回到设计审计循环，形成新
+      设计通过记录后，再开启新的实施轮次。不得把设计变更伪装为实施审计
+      基准更新。
+    violationRule: >
+      若发现 criteria 在实现之后才创建，或重审时 criteria 内容变化，本轮
+      实施审计无效。状态必须记录 baselineIntegrity.status: violated，
+      realRunner.resumeAllowed 必须为 false，并先完成状态归一。
+  auditReports:
+    required:
+      - fixed criteria file per agent
+      - design audit report per agent and round
+      - implementation audit report per agent and round
+      - reports/status.json with phase, round, agent statuses and runner gate
+    forbidden:
+      - overwriting previous round reports
+      - counting a partial audit as passed
+      - leaving passed tasks under __open directories
+      - resuming real EPUB processing while any current open audit is blocked
+
+configurationContract:
+  cli:
+    required:
+      - --run-id
+      - --source-dir
+      - --state-root
+      - --qmd-index-path
+      - --config
+      - --project-dotenv
+      - --log-root
+    parallelOptions:
+      "--book-concurrency": >
+        同一 coordinator 内可并行处理的书本数。默认 2。值为 1 时必须保持
+        与旧顺序 runner 行为兼容。
+      "--openai-provider-concurrency": >
+        OpenAI-compatible provider 全局请求并发上限。
+      "--jina-provider-concurrency": >
+        Jina provider 全局请求并发上限。
+      "--local-cpu-concurrency": >
+        本地 CPU/文件扫描类任务并发上限。
+  environment:
+    resolutionTable:
+      - setting: bookConcurrency
+        precedence: CLI > environment > config > default
+        default: 2
+        validation: integer between 1 and configured maximum
+      - setting: openaiProviderConcurrency
+        precedence: CLI > environment > config > default
+        default: 1
+        validation: integer >= 1
+      - setting: jinaProviderConcurrency
+        precedence: CLI > environment > config > default
+        default: 2
+        validation: integer >= 1
+      - setting: localCpuConcurrency
+        precedence: CLI > environment > config > default
+        default: 2
+        validation: integer >= 1
+      - setting: providerSecrets
+        precedence: shell environment > project dotenv > graph_vault dotenv
+        default: none
+        validation: required for stages that call the provider
+    dotenvPrecedence: >
+      Provider secret 读取顺序必须可观测。项目级 .env 与 graph_vault/.env 的
+      选择规则必须写入启动事件，但不得输出 secret 值。
+    secretHandling:
+      - events、status-json、logs 不得输出 API key。
+      - 子进程环境只传递必要 provider 变量。
+      - shell 环境覆盖 dotenv 时必须在 doctor/status 中可诊断。
+      - 子进程 env 必须使用 allowlist，禁止传递无关 secret。
+      - 诊断只能输出 source、presence、redacted hash 和 validation error code。
+
+validationRequirements:
+  unit:
+    - worker queue 不重复 claim 同一 itemId。
+    - duplicate bookId 不会被两个 worker 同时写入。
+    - expired lease 可恢复，未过期 lease 不可抢占。
+    - manifest 从 checkpoint 派生后与事件流一致。
+    - writer lanes 串行化 catalog 与 qmd index 写入。
+  integration:
+    - >-
+      --book-concurrency 1 与现有顺序行为兼容。
+    - >-
+      --book-concurrency 2 可同时推进两本不同书。
+    - OpenAI 等待时，Jina 或本地阶段的其他书可以继续推进。
+    - Jina 等待时，OpenAI 或本地阶段的其他书可以继续推进。
+    - transient provider failure 记录 nextRetryAt 后不阻塞其他可运行书。
+    - INVALID_API_KEY 类失败必须停止 coordinator，不能无限 pending。
+    - provider 子进程未获得 slot lease 时不得启动。
+    - qmd SQLite locked 会进入 bounded retry 并暴露 sqliteRetryCount。
+  faultInjection:
+    - worker crash with active GraphRAG subprocess.
+    - coordinator crash during terminal completed commit.
+    - process group kill during provider request.
+    - runner_start with many historical provider request checksum mismatches.
+    - partial JSONL tail and manifest generation mismatch.
+    - checkpoint temp file left behind before rename.
+    - same pid and same millisecond durable YAML temp writes from multiple workers.
+    - same target concurrent durable YAML writes under one coordinator.
+    - durable temp create collision using forced temp id.
+    - active temp present while reconcile runs before stale TTL.
+    - stale temp whose owner pid is still alive.
+    - stale temp whose owner pid is dead and target generation did not advance.
+    - atomic rename ENOENT after temp owner evidence was created.
+    - target-new/checksum-old crash window.
+    - target-new/checksum-missing crash window.
+    - checksum sidecar partial write.
+    - resume-book restart with orphan durable temp and live subprocess registry.
+    - SQLite database locked and busy_timeout exhaustion.
+    - provider slot lease leaked after child process exit.
+    - retry budget exhausted after repeated transient provider failure.
+    - stale worker attempts to commit with old fencing token.
+    - artifact exists without producer run record.
+  durableStateAcceptanceMatrix:
+    - case: same_ms_temp_collision
+      evidence:
+        - no rename ENOENT
+        - final target checksum matches content
+        - no lost catalog/capability entries
+        - durable_temp_created events have unique tempId
+    - case: active_temp_reconcile
+      evidence:
+        - temp remains when owner live or age below stale TTL
+        - no target mutation
+        - durable_temp_reconciled event absent for live temp
+    - case: orphan_temp_reconcile
+      evidence:
+        - temp removed only after stale TTL and owner-dead proof
+        - durable_temp_reconciled records tempId, owner evidence and cleanupReason
+    - case: rename_enoent
+      evidence:
+        - item checkpoint failureKind is local_state_integrity
+        - item checkpoint localFailureClass is durable_temp_rename_enoent
+        - item checkpoint includes renameCause
+        - item checkpoint includes redactedEvidenceLocator or targetLocator
+        - item checkpoint includes tempId and operationId
+        - durable_replace_failed event includes failureKind, localFailureClass,
+          recoveryDecision, failedStage and redactedEvidenceLocator
+        - item_failed event includes failureKind, localFailureClass,
+          recoveryDecision, failedStage and redactedEvidenceLocator
+        - recoveryDecision is stop_until_fixed
+        - status-json and recovery summary include targetLocator and tempId
+        - item is not completed
+    - case: subprocess_command_check_durable_schema
+      evidence:
+        - resume-book child emits QMD_GRAPHRAG_DURABLE_FAILURE JSON envelope
+        - envelope includes schemaVersion, marker, status and durable fields
+        - parent runner parses typed envelope before legacy stderr classifier
+        - commandCheck is the first-hop durable evidence carrier
+        - commandCheck failureKind is local_state_integrity
+        - commandCheck localFailureClass is durable_temp_rename_enoent
+        - commandCheck recoveryDecision is stop_until_fixed and retryable false
+        - missing or partial envelope fails closed with evidenceIncomplete
+        - incomplete envelope uses durable_subprocess_evidence_incomplete
+        - incomplete envelope sets completedPublishRule forbidden
+        - unavailable targetLocator, tempId, operationId, failedSyscall, errno
+          or renameCause are explicit sentinels, not omitted fields
+        - commandCheck name remains resume-book-N
+        - no durable subprocess failure is reported as unknown
+    - case: book_scoped_yaml_rename_enoent_resume_child
+      evidence:
+        - injected rename ENOENT targets graph_vault/books/{bookId}/job.yaml
+        - injected rename ENOENT targets graph_vault/books/{bookId}/checkpoints.yaml
+        - injected rename ENOENT targets graph_vault/books/{bookId}/artifacts.yaml
+        - injected rename ENOENT targets primary YAML, not .sha256 sidecars
+        - failure occurs inside resume-book-* child process
+        - commandCheck includes failedSyscall rename and errno ENOENT
+        - commandCheck includes tempId, operationId, targetLocator and renameCause
+        - item checkpoint projects the same localFailureClass and recoveryDecision
+        - command_failed and item_failed events include failedSyscall, errno,
+          renameCause, lane, targetMappingOwner, leaseGeneration and
+          redactedEvidenceLocator
+        - status-json and recovery summary include targetLocator, tempId,
+          operationId, failedSyscall, errno, renameCause and completedPublishRule
+        - completed is not published and batch stops until fixed
+    - case: lock_timeout_live_owner
+      evidence:
+        - lock is not deleted while owner pid is live
+        - failureKind is local_state_lock_timeout after wait timeout
+        - item checkpoint includes localFailureClass, lockOwnerEvidence,
+          recoveryDecision, failedStage and redactedEvidenceLocator
+        - durable_lock_timeout event includes failureKind, localFailureClass,
+          recoveryDecision, failedStage and redactedEvidenceLocator
+    - case: live_temp_deleted
+      evidence:
+        - item checkpoint failureKind is local_state_integrity
+        - item checkpoint localFailureClass is durable_live_temp_deleted
+        - item checkpoint includes targetLocator, tempId, operationId and
+          cleanupReason
+        - abnormal durable_temp_reconciled event includes failureKind,
+          localFailureClass, recoveryDecision, failedStage and
+          redactedEvidenceLocator
+        - status-json and recovery summary include redactedEvidenceLocator
+        - completed is not published
+    - case: shared_store_stale_lock_recovery_record
+      evidence:
+        - shared durable store stale lock recovery writes .durable-recovery.jsonl
+        - event is durable_lock_recovered
+        - record includes targetLocator, lockPath, operationId, lockOwnerEvidence
+          and recoveryDecision
+    - case: shared_store_quarantine_rename_enoent
+      evidence:
+        - invalid or checksum-mismatch quarantine uses evidence rename
+        - injected quarantine rename ENOENT is durable_temp_rename_enoent
+        - failure includes failedSyscall, errno, renameCause, targetLocator,
+          tempId and operationId
+    - case: runner_yaml_reader_preflight_fault
+      evidence:
+        - runner YAML reader path holds per-target lock across reconcile/read/parse
+        - checksum crash window or live temp in YAML target fails stop_until_fixed
+          before claim/resume publishes completed
+        - event, status-json or recovery summary contains durable diagnostics
+    - case: status_json_catalog_missing_checksum_meta
+      evidence:
+        - books.yaml is read through durable validation without writable reconcile
+        - missing books.yaml.sha256.meta.json is reported as
+          metadata_missing_read_only
+        - no lock, temp, checksum, checksum meta, event, checkpoint, status or
+          recovery-summary file is created, deleted or renamed
+        - status-json includes durableStateFailures or durable diagnostics entry
+          with repairAllowed false
+    - case: status_json_checksum_meta_backfill_rename_enoent
+      evidence:
+        - status-json does not attempt checksum meta backfill and therefore does
+          not trigger rename ENOENT for books.yaml.sha256.meta.json
+        - repair writer rename ENOENT on checksum meta sidecar is classified as
+          durable_temp_rename_enoent and stop_until_fixed
+        - diagnostics include primaryTargetLocator, sidecarTargetLocator,
+          sidecarKind, tempId, operationId, failedSyscall, errno and renameCause
+    - case: catalog_checksum_meta_backfill_parent_directory_fsync
+      evidence:
+        - books.yaml checksum meta backfill writes sidecar, then fsyncs
+          graph_vault/catalog as a derived directory fsync operation
+        - directory fsync evidence includes directoryTargetLocator
+          graph_vault/catalog and primaryTargetLocator graph_vault/catalog/books.yaml
+        - directory fsync evidence includes sidecarTargetLocator
+          graph_vault/catalog/books.yaml.sha256.meta.json, sidecarKind checksum_meta,
+          directoryDurableKind directory, primaryDurableKind yaml and
+          completedPublishRule forbidden on failure
+        - directory fsync mapping resolves to catalogWriterLane and repository
+          without durable_target_mapping_missing
+        - status-json reports missing checksum meta read-only and does not create
+          checksum meta or perform directory fsync
+    - case: directory_fsync_scope_closure_non_catalog_targets
+      evidence:
+        - graph_vault/settings.yaml parent directory fsync maps graph_vault to
+          catalogWriterLane and settingsProjection
+        - graph_vault/catalog/provider-requests/*.json parent directory fsync maps
+          provider-requests to catalogWriterLane and providerRequestFingerprint
+        - provider-requests directory fsync mapping does not imply runner_start
+          primary quarantine authority for historical provider request targets
+        - graph_vault/catalog/batch-runs/{runId}/book-leases/*.json maps both
+          target write and parent directory fsync to checkpointWriterLane
+        - graph_vault/books/{bookId}/output/lancedb/*.lance/qmd_row_count.json
+          parent directory fsync is covered by recursive book output scope
+        - graph_vault/output/lancedb/*.lance/qmd_row_count.json parent directory
+          fsync maps to checkpointWriterLane and artifactValidation
+    - case: directory_fsync_read_only_projection_fail_closed
+      evidence:
+        - status-json read-only reports missing checksum meta with
+          directoryTargetLocator but creates no lock, temp, checksum meta, event,
+          status or recovery-summary file
+        - if read-only cannot derive a unique directory scope, diagnostic is
+          fail_closed_projection with recoveryDecision stop_until_fixed
+        - read-only diagnostics include directoryDurableKind, primaryDurableKind,
+          lane, targetMappingOwner and repairAllowed false
+    - case: provider_requests_runner_start_read_only_capped
+      evidence:
+        - fixture creates multiple historical provider-requests JSON targets with
+          checksum mismatch or missing checksum metadata
+        - runner_start creates or loads startup recovery manifest before any
+          writable recovery
+        - runner_start reports provider_request_durable_degraded with capped
+          scannedTargetCount, degradedTargetCount and sampleTargetLocators
+        - runner_start does not rename provider request primary targets to
+          .corrupt-* and does not create provider request lock, temp, checksum
+          or checksum meta files
+        - status-json reports the same provider request diagnostic class with
+          read_only_capped_diagnostic and no stateRoot mutation
+        - normal runner can proceed to manifest creation unless a critical
+          catalog target is also blocked
+    - case: provider_requests_explicit_repair_bounded
+      evidence:
+        - explicit repair or migrate-only mode is required before provider request
+          primary quarantine is allowed
+        - explicit repair has max target count, max event count and summary file
+          evidence before mutation
+        - repair summary records first and last target sample, mutationCount,
+          quarantineCount and operator-visible repair decision
+    - case: book_scoped_status_json_checksum_meta_read_only
+      evidence:
+        - job.yaml.sha256.meta.json missing is reported read-only
+        - checkpoints.yaml.sha256.meta.json missing is reported read-only
+        - artifacts.yaml.sha256.meta.json missing is reported read-only
+        - no lock, temp, checksum, checksum meta, event, manifest, status or
+          recovery-summary file is created, deleted or renamed
+        - status-json reports metadata_missing_read_only or fail-closed durable
+          diagnostic without mutating state root
+    - case: before_resume_book_book_yaml_preflight_reconcile
+      evidence:
+        - beforeResumeBook derives scan scope from targetMapping
+        - job.yaml, checkpoints.yaml, artifacts.yaml and runs/*.yaml are scanned
+        - primary YAML checksum sidecars and checksum meta sidecars are scanned
+        - unresolved temp, live lock, checksum mismatch and checksum meta conflict
+          block completed publication
+        - diagnostics include targetLocator and owner evidence
+    - case: sidecar_only_quarantine_boundary
+      evidence:
+        - target valid and checksum matches but meta invalid or conflicting keeps
+          primary target and checksum sidecar in place
+        - only checksum meta sidecar is quarantined before repair writer backfills
+          committed meta
+        - invalid checksum sidecar with valid target quarantines checksum and meta
+          sidecars only, then backfills both sidecars
+        - target invalid or target checksum mismatch quarantines primary bundle
+        - event, status-json or recovery summary names the quarantine object as
+          sidecar or primary_bundle
+    - case: checksum_crash_window
+      evidence:
+        - target/checksum mismatch follows checksumCommit window matrix
+        - item checkpoint includes localFailureClass, checksumRecoveryDecision,
+          targetLocator or redactedEvidenceLocator
+        - durable_replace_failed or durable_checksum_backfilled event includes
+          failureKind, localFailureClass, recoveryDecision, failedStage and
+          redactedEvidenceLocator when recovery is not committed
+        - completed is not published from event alone
+    - case: directory_fsync_boundary_uncertain
+      evidence:
+        - item checkpoint localFailureClass is durable_directory_fsync_uncertain
+          or durable_directory_fsync_unsupported
+        - completedPublishRule is forbidden
+        - durable_replace_failed event includes failureKind, localFailureClass,
+          recoveryDecision, failedStage, redactedEvidenceLocator,
+          directoryTargetLocator, primaryTargetLocator or sidecarTargetLocator,
+          directoryDurableKind, primaryDurableKind, fsyncTarget, fsyncPlatform,
+          fsyncErrno and completedPublishRule
+        - status-json and recovery summary include directoryTargetLocator,
+          lane, targetMappingOwner, directoryDurableKind, primaryDurableKind,
+          fsyncTarget, fsyncPlatform and fsyncErrno
+        - completed is not published
+  productionDryRun:
     requirement: >
-      Worker events must append atomically or flow through a coordinator.
-      manifest counters must be derived from item checkpoints, not from
-      unsynchronized in-memory counters.
-  fencing:
-    requirement: >
-      Every checkpoint/catalog write must prove the writer still owns the
-      current lease token. Stale writers must fail before writing.
-implementationStages:
-  - id: stage-1-single-process-worker-pool
-    status: recommended_first
-    description: >
-      Keep one coordinator process and add an internal worker pool with shared
-      semaphores and single writer lanes.
-  - id: stage-2-multiprocess-workers
-    status: later
-    description: >
-      Introduce durable lease files or SQLite-backed leases with fencing tokens
-      before allowing multiple OS processes.
-  - id: stage-3-distributed-runners
-    status: future
-    description: >
-      Requires host-aware leases, clock/TTL policy, and remote heartbeat
-      semantics.
-nonGoals:
-  - Enable multiple uncoordinated batch-epub-workflow writers for the same runId.
-  - Parallelize stages within the same book before producer lineage is stable.
-  - Share graph_vault/output as a cross-book GraphRAG output directory.
+      使用真实 EPUB、真实 qmd 命令与真实 GraphRAG 构建验证。dry run 只能验证
+      调度与状态，不得作为 completed 证据。
+    realEpubRecoveryGate:
+      evidence:
+        - real EPUB failure in resume-book-* can stop the batch until fixed
+        - failed item status exposes local_state_integrity durable evidence
+        - repair or explicit resume is required before continuing the same item
+        - final completion includes qmd command checks
+        - final completion includes GraphRAG producer lineage
+        - final completion includes query-ready evidence
+
+acceptanceCriteria:
+  - 同一 runId 任意时刻只有一个 coordinator 写入共享状态。
+  - bookConcurrency 大于 1 时，事件流能显示多个不同 item 同时处于 running。
+  - 同一本书不会出现两个 live worker 或两个 live GraphRAG producer。
+  - catalog、manifest、checkpoint 和 .qmd/index.sqlite 无并发写入损坏。
+  - provider transient failure 不会使全部资源闲置，其他可运行书继续推进。
+  - provider auth failure 会明确 stop_until_fixed，并保留可恢复状态。
+  - status-json 能准确展示 qmd、GraphRAG、worker、provider slot 与 retry 状态。
+  - 重启后可从磁盘状态恢复，不依赖中断前内存计数。
+  - 每本 completed 图书都有 qmd 与 GraphRAG 完整闭环证据。
+  - 并行执行不得降低 GraphRAG 产物隔离和阶段门控强度。
+  - provider semaphore 可通过 event/status 证明真实子进程请求受到全局 slot 控制。
+  - 崩溃恢复可处理 orphan subprocess、partial JSONL、checkpoint temp file 与
+    manifest mismatch。
+  - retry budget exhausted 有确定终态，不会无限 pending 或无限 retry。
+  - 每条验收标准都能绑定到事件、status-json 字段、checkpoint、producer
+    record、artifact 或 qmd 命令输出证据。
