@@ -1,0 +1,162 @@
+{
+  "schemaVersion": "1.0.0",
+  "taskId": "graphrag-runner-start-book-state-repair-boundary",
+  "runId": "20260529_r1",
+  "status": "closed",
+  "phase": "implementation_audit_passed",
+  "triggeredBy": {
+    "batchRunId": "epub-batch-20260529-after-audit-close-1",
+    "failedStage": "runner_start",
+    "failure": "durable preflight blocked runner_start on book-scoped durable checksum mismatch",
+    "primaryTarget": "graph_vault/books/book-9f587b71073a-ad95ce2f/job.yaml"
+  },
+  "observedAt": "2026-05-29T11:11:34.120Z",
+  "observedEvidence": {
+    "manifest": "graph_vault/catalog/batch-runs/epub-batch-20260529-after-audit-close-1/manifest.json",
+    "events": "graph_vault/catalog/batch-runs/epub-batch-20260529-after-audit-close-1/events.jsonl",
+    "stderr": "/tmp/qmd-epub-batch-20260529-after-audit-close-1/logs/runner.err",
+    "stdout": "/tmp/qmd-epub-batch-20260529-after-audit-close-1/logs/runner.out"
+  },
+  "observedCounts": {
+    "totalItems": 38,
+    "itemCheckpointFiles": 0,
+    "eventLines": 1422,
+    "durableChecksumMetaBackfilled": 198,
+    "durableYamlTargetQuarantined": 1137,
+    "durableJsonTargetQuarantined": 86,
+    "durablePreflightBlocked": 1,
+    "affectedBooks": 38
+  },
+  "designAnchor": {
+    "path": "docs/architecture/graphrag-parallel-runner.type-dd.yaml",
+    "relevantRules": [
+      "durableStatePreflight.runnerStart bounded writable repair",
+      "provider_request_fingerprint historical observation exception",
+      "stopUntilFixedResumePolicy",
+      "targetMapping and preflight scope derivation",
+      "failureRecovery.durableStatePreflight.beforeClaim and beforeResumeBook"
+    ]
+  },
+  "requiredLoop": {
+    "designAuditAgents": 3,
+    "fixedAuditScope": "runner_start book-scoped durable checksum mismatch repair boundary",
+    "nextStep": "implement runner_start read-only blocking diagnostic for book-scoped durable targets"
+  },
+  "createdAt": "2026-05-29T11:15:00.000Z",
+  "designAudit": {
+    "status": "passed",
+    "round": "r2",
+    "reports": {
+      "agentA": "agent-a/design-audit-r2.md",
+      "agentB": "agent-b/design-audit-r2.md",
+      "agentC": "agent-c/design-audit-r2.md"
+    },
+    "roundResults": {
+      "agentA": "PASS",
+      "agentB": "PASS",
+      "agentC": "PASS"
+    },
+    "blockingFindings": [
+      "normal runner_start book-scoped durable writable repair boundary is not closed",
+      "startupRecovery targetCount and mutationCount do not reflect actual backfill/quarantine events",
+      "bounded repair lacks configurable limits and manifest/recovery-summary projection",
+      "runner_start failure can leave an ambiguous running manifest before item checkpoints exist",
+      "next operator action is not field-structured enough for recovery automation"
+    ],
+    "failedAt": "2026-05-29T11:20:00.000Z",
+    "passedAt": "2026-05-29T11:35:00.000Z"
+  },
+  "designFix": {
+    "updated": [
+      "docs/architecture/graphrag-parallel-runner.type-dd.yaml"
+    ],
+    "summary": [
+      "Constrained normal runner_start book-scoped durable preflight to read-only blocking diagnostics.",
+      "Reserved book-scoped quarantine/backfill/temp cleanup for explicit repair or migrate-only boundaries.",
+      "Added startupRecovery targetCount, degradedTargetCount and mutationCount accounting rules.",
+      "Required failed blocked_before_claim manifest/recovery-summary state before item checkpoints exist.",
+      "Added structured nextOperatorAction values for blocked startup recovery."
+    ],
+    "updatedAt": "2026-05-29T11:25:00.000Z"
+  },
+  "implementationFix": {
+    "updated": [
+      "docs/architecture/graphrag-parallel-runner.type-dd.yaml",
+      "docs/records/2026-05-29-runner-start-preflight-module-plan.md",
+      "scripts/graphrag/batch-epub-workflow.mjs",
+      "scripts/graphrag/runner-startup-preflight.mjs",
+      "src/contracts/batch-run.ts",
+      "test/graphrag-runner-durable-preflight.test.ts",
+      "test/graphrag-runner-durable-state.test.ts",
+      "test/graphrag-runner-status-json-readonly.test.ts",
+      "test/integrations/contracts.test.ts"
+    ],
+    "summary": [
+      "Extracted runner-start read-only preflight helpers into a dedicated module.",
+      "Made normal runner_start block book-scoped primary, temp, and lock anomalies without mutation.",
+      "Preserved firstBlocker durableMode as read_only_blocking_diagnostic.",
+      "Projected blocked_before_claim startupRecovery into failed manifest and recovery summary.",
+      "Kept repair writer behavior inside migrate-only or explicit repair boundaries."
+    ],
+    "updatedAt": "2026-05-29T12:40:00.000Z"
+  },
+  "implementationAudit": {
+    "status": "passed",
+    "round": "r2",
+    "criteriaFrozen": true,
+    "criteriaCountPerAgent": 10,
+    "reports": {
+      "agentA": "agent-a/implementation-audit-r2.md",
+      "agentB": "agent-b/implementation-audit-r2.md",
+      "agentC": "agent-c/implementation-audit-r2.md"
+    },
+    "roundResults": {
+      "agentA": "PASS",
+      "agentB": "PASS",
+      "agentC": "PASS"
+    },
+    "passedAt": "2026-05-29T12:44:26.000Z"
+  },
+  "validation": {
+    "status": "passed",
+    "commands": [
+      {
+        "command": "node --check scripts/graphrag/batch-epub-workflow.mjs",
+        "result": "PASS"
+      },
+      {
+        "command": "node --check scripts/graphrag/runner-startup-preflight.mjs",
+        "result": "PASS"
+      },
+      {
+        "command": "npm run test:types",
+        "result": "PASS"
+      },
+      {
+        "command": "CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/graphrag-runner-durable-preflight.test.ts",
+        "result": "PASS",
+        "tests": "4 passed"
+      },
+      {
+        "command": "CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/graphrag-runner-status-json-readonly.test.ts",
+        "result": "PASS",
+        "tests": "8 passed"
+      },
+      {
+        "command": "CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/graphrag-runner-status-json-readonly.test.ts test/graphrag-runner-durable-state.test.ts",
+        "result": "PASS",
+        "tests": "19 passed"
+      },
+      {
+        "command": "CI=true node --max-old-space-size=4096 ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 240000 --pool=forks --maxWorkers=1 --minWorkers=1 test/integrations/contracts.test.ts",
+        "result": "PASS",
+        "tests": "72 passed"
+      }
+    ],
+    "residualOpenTestProcesses": 0,
+    "passedAt": "2026-05-29T12:44:26.000Z"
+  },
+  "finalReport": "reports/final-implementation-audit-report.md",
+  "closedAt": "2026-05-29T12:44:26.000Z",
+  "stopReason": "implementation audit closed; user requested stop when audit final close completes"
+}
