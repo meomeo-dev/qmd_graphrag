@@ -8,6 +8,7 @@ import {
   mkdir,
   mkdtemp,
   rm,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
@@ -108,6 +109,7 @@ async function runBatch(input: {
   logRoot: string;
   configDir: string;
   runId: string;
+  extraArgs?: string[];
 }): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   return new Promise((resolveResult) => {
     const proc = spawn(process.execPath, [
@@ -131,6 +133,7 @@ async function runBatch(input: {
       "1",
       "--max-resume-passes",
       "1",
+      ...(input.extraArgs ?? []),
     ], {
       cwd: input.tmpRoot,
       env: {
@@ -151,7 +154,7 @@ async function runBatch(input: {
 }
 
 describe("GraphRAG runner durable preflight", () => {
-  test("runner-start preflight blocks mapped book run YAML checksum fault",
+  test("runner-start blocks mapped book YAML checksum fault read-only",
     async () => {
       const tmpRoot = await mkProjectTmpDir("qmd-runner-yaml-preflight-");
       const sourceDir = join(tmpRoot, "source");
@@ -218,6 +221,12 @@ describe("GraphRAG runner durable preflight", () => {
         );
         const quarantineEntry = readdirSync(dirname(mappedYamlPath))
           .find((entry) => entry.startsWith("legacy.yaml.corrupt-"));
+        const manifest = JSON.parse(
+          readFileSync(join(runRoot, "manifest.json"), "utf8"),
+        );
+        const recovery = JSON.parse(
+          readFileSync(join(runRoot, "recovery-summary.json"), "utf8"),
+        );
 
         expect(result.exitCode).not.toBe(0);
         expect(result.stdout).toContain("durable_preflight_blocked");
@@ -231,8 +240,48 @@ describe("GraphRAG runner durable preflight", () => {
         });
         expect(preflight?.targetLocator).toContain("books/");
         expect(preflight?.targetLocator).toContain("runs/legacy.yaml");
-        expect(eventRaw).toContain("durable_yaml_target_quarantined");
-        expect(quarantineEntry).toBeDefined();
+        expect(eventRaw).not.toContain("durable_yaml_target_quarantined");
+        expect(eventRaw).not.toContain("durable_yaml_checksum_backfilled");
+        expect(eventRaw).not.toContain("durable_checksum_meta_backfilled");
+        expect(quarantineEntry).toBeUndefined();
+        expect(manifest).toMatchObject({
+          status: "failed",
+          runningItems: 0,
+          failedItems: 0,
+          activeProviderSlots: 0,
+          activeSubprocesses: 0,
+          activeBookLeases: 0,
+        });
+        expect(manifest.failedAt).toEqual(expect.any(String));
+        expect(manifest.metadata.startupRecovery).toMatchObject({
+          runId,
+          stage: "runner_start",
+          decision: "blocked_before_claim",
+          recoveryDecision: "stop_until_fixed",
+          mutationCount: 0,
+          degradedTargetCount: 1,
+          nextOperatorAction: "run_explicit_repair",
+        });
+        expect(manifest.metadata.startupRecovery.targetCount).toBeGreaterThan(0);
+        expect(manifest.metadata.startupRecovery.firstBlocker).toMatchObject({
+          localFailureClass: "durable_checksum_mismatch",
+          targetLocator: expect.stringContaining("books/"),
+          durableMode: "read_only_blocking_diagnostic",
+          normalRunnerAction: "no_book_scoped_mutation",
+          maxRunnerStartMutationCount: 0,
+        });
+        expect(recovery).toMatchObject({
+          recoveryDecision: "stop_until_fixed",
+          startupRecovery: {
+            decision: "blocked_before_claim",
+            mutationCount: 0,
+            nextOperatorAction: "run_explicit_repair",
+          },
+        });
+        expect(recovery.startupRecovery.firstBlocker.targetLocator)
+          .toContain("runs/legacy.yaml");
+        expect(recovery.startupRecovery.firstBlocker.durableMode)
+          .toBe("read_only_blocking_diagnostic");
       } finally {
         await rm(tmpRoot, { recursive: true, force: true });
       }
@@ -272,6 +321,7 @@ describe("GraphRAG runner durable preflight", () => {
           logRoot,
           configDir,
           runId,
+          extraArgs: ["--migrate-only"],
         });
         const providerRequestEntries = readdirSync(providerRequestDir);
         const eventRaw = readFileSync(join(fixture.runRoot, "events.jsonl"), "utf8");
@@ -281,6 +331,7 @@ describe("GraphRAG runner durable preflight", () => {
         const diagnostic =
           manifest.metadata?.startupRecovery?.providerRequestDiagnostics?.[0];
 
+        expect(result.exitCode).toBe(0);
         expect(result.stdout).not.toContain("durable_json_target_quarantined");
         expect(eventRaw).not.toContain("durable_json_target_quarantined");
         expect(providerRequestEntries.some((entry) =>
@@ -298,6 +349,164 @@ describe("GraphRAG runner durable preflight", () => {
         expect(diagnostic.sampleTargetLocators[0]).toContain(
           "catalog/provider-requests/request-a.json",
         );
+      } finally {
+        await rm(tmpRoot, { recursive: true, force: true });
+      }
+    },
+    30000);
+
+  test("runner-start blocks mapped book temp read-only without cleanup",
+    async () => {
+      const tmpRoot = await mkProjectTmpDir("qmd-runner-temp-preflight-");
+      const sourceDir = join(tmpRoot, "source");
+      const stateRoot = join(tmpRoot, "graph_vault");
+      const logRoot = join(tmpRoot, "logs");
+      const configDir = join(tmpRoot, "config");
+      const runId = "runner-temp-preflight-fixture";
+      const sourceName = "Book-Temp.epub";
+      try {
+        const fixture = await writeMinimalBatchFixture({
+          tmpRoot,
+          sourceDir,
+          stateRoot,
+          configDir,
+          runId,
+          sourceName,
+        });
+        const sourceBytes = readFileSync(fixture.sourcePath);
+        const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+        const sourceRelativePath = relative(projectRoot, fixture.sourcePath);
+        const bookId = batchBookId(sourceHash, sourceRelativePath);
+        const targetPath = join(stateRoot, "books", bookId, "runs", "temp.yaml");
+        await writeDurableTextFixture(targetPath, "stage: ingest\n");
+        const tempPath = `${targetPath}.tmp-startup-readonly`;
+        await writeFile(tempPath, "stale temp\n", "utf8");
+        await writeFile(`${tempPath}.owner.json`, `${JSON.stringify({
+          tempId: "startup-readonly",
+          targetLocator: relative(projectRoot, targetPath),
+          absoluteTargetLocator: targetPath,
+          lane: "bookStateWriterLane",
+          targetMappingOwner: "bookRunState",
+          operationId: "startup-readonly-op",
+          ownerPid: 999999,
+          ownerHost: "fixture-host",
+          createdAt: "2026-05-23T00:00:00.000Z",
+          expiresAt: "2026-05-23T00:00:01.000Z",
+          leaseGeneration: 1,
+          targetGeneration: 1,
+          targetChecksumBefore: sha256Text("stage: ingest\n"),
+          fencingTokenHash: sha256Text("startup-readonly-fence"),
+          durableMode: "strict",
+        }, null, 2)}\n`, "utf8");
+        const staleDate = new Date("2026-05-23T00:00:00.000Z");
+        await utimes(tempPath, staleDate, staleDate);
+        await utimes(`${tempPath}.owner.json`, staleDate, staleDate);
+
+        const result = await runBatch({
+          tmpRoot,
+          sourceDir,
+          stateRoot,
+          logRoot,
+          configDir,
+          runId,
+        });
+        const eventRaw = readFileSync(join(fixture.runRoot, "events.jsonl"), "utf8");
+        const manifest = JSON.parse(
+          readFileSync(join(fixture.runRoot, "manifest.json"), "utf8"),
+        );
+
+        expect(result.exitCode).not.toBe(0);
+        expect(eventRaw).toContain("durable_preflight_blocked");
+        expect(eventRaw).not.toContain("durable_yaml_temp_reconciled");
+        expect(manifest.metadata.startupRecovery).toMatchObject({
+          decision: "blocked_before_claim",
+          mutationCount: 0,
+          degradedTargetCount: 1,
+        });
+        expect(manifest.metadata.startupRecovery.firstBlocker).toMatchObject({
+          localFailureClass: "durable_preflight_unresolved_temp",
+          cleanupReason: "owner_lease_expired",
+          durableMode: "read_only_blocking_diagnostic",
+          normalRunnerAction: "no_book_scoped_mutation",
+          maxRunnerStartMutationCount: 0,
+        });
+        expect(manifest.metadata.startupRecovery.firstBlocker.targetLocator)
+          .toContain("books/");
+        expect(readdirSync(dirname(tempPath))).toContain("temp.yaml.tmp-startup-readonly");
+      } finally {
+        await rm(tmpRoot, { recursive: true, force: true });
+      }
+    },
+    30000);
+
+  test("runner-start blocks mapped book lock read-only and fail-fast",
+    async () => {
+      const tmpRoot = await mkProjectTmpDir("qmd-runner-lock-preflight-");
+      const sourceDir = join(tmpRoot, "source");
+      const stateRoot = join(tmpRoot, "graph_vault");
+      const logRoot = join(tmpRoot, "logs");
+      const configDir = join(tmpRoot, "config");
+      const runId = "runner-lock-preflight-fixture";
+      const sourceName = "Book-Lock.epub";
+      try {
+        const fixture = await writeMinimalBatchFixture({
+          tmpRoot,
+          sourceDir,
+          stateRoot,
+          configDir,
+          runId,
+          sourceName,
+        });
+        const sourceBytes = readFileSync(fixture.sourcePath);
+        const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+        const sourceRelativePath = relative(projectRoot, fixture.sourcePath);
+        const bookId = batchBookId(sourceHash, sourceRelativePath);
+        const firstPath = join(stateRoot, "books", bookId, "runs", "a.yaml");
+        const secondPath = join(stateRoot, "books", bookId, "runs", "b.yaml");
+        await writeDurableTextFixture(firstPath, "stage: a\n");
+        await writeDurableTextFixture(secondPath, "stage: b\n");
+        await writeFile(`${firstPath}.lock`, `${JSON.stringify({
+          targetLocator: relative(projectRoot, firstPath),
+          lane: "bookStateWriterLane",
+          targetMappingOwner: "bookRunState",
+          laneTimeoutMs: 120000,
+          releaseOn: ["process_exit"],
+          operationId: "first-lock-op",
+          pid: 999999,
+          expiresAt: "2999-01-01T00:00:00.000Z",
+        }, null, 2)}\n`, "utf8");
+        await writeFile(`${secondPath}.sha256`, `${"0".repeat(64)}\n`, "utf8");
+
+        const result = await runBatch({
+          tmpRoot,
+          sourceDir,
+          stateRoot,
+          logRoot,
+          configDir,
+          runId,
+        });
+        const eventRaw = readFileSync(join(fixture.runRoot, "events.jsonl"), "utf8");
+        const manifest = JSON.parse(
+          readFileSync(join(fixture.runRoot, "manifest.json"), "utf8"),
+        );
+
+        expect(result.exitCode).not.toBe(0);
+        expect(eventRaw).toContain("durable_preflight_blocked");
+        expect(manifest.metadata.startupRecovery).toMatchObject({
+          decision: "blocked_before_claim",
+          mutationCount: 0,
+          degradedTargetCount: 1,
+        });
+        expect(manifest.metadata.startupRecovery.firstBlocker).toMatchObject({
+          localFailureClass: "durable_preflight_live_lock",
+          durableMode: "read_only_blocking_diagnostic",
+          normalRunnerAction: "no_book_scoped_mutation",
+          maxRunnerStartMutationCount: 0,
+        });
+        expect(manifest.metadata.startupRecovery.firstBlocker.targetLocator)
+          .toContain("runs/a.yaml");
+        expect(manifest.metadata.startupRecovery.firstBlocker.targetLocator)
+          .not.toContain("runs/b.yaml");
       } finally {
         await rm(tmpRoot, { recursive: true, force: true });
       }

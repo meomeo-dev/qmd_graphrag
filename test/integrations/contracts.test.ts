@@ -405,6 +405,14 @@ function durableEvidenceFixture(
     repairAllowed: true,
     statusJsonDecision: "metadata_missing_read_only",
     diagnosticClass: "checksum_meta_missing",
+    normalRunnerAction: "no_book_scoped_mutation",
+    scannedTargetCount: 1,
+    degradedTargetCount: 1,
+    sampleTargetLocators: ["graph_vault/books/book-fixture/job.yaml"],
+    scanTruncated: false,
+    maxRunnerStartScannedTargets: 200,
+    maxRunnerStartReportedSamples: 10,
+    maxRunnerStartMutationCount: 0,
     evidenceIncomplete: true,
     evidenceIncompleteReason: "subprocess_envelope_missing_fields",
     unavailableFieldSentinels: ["targetLocator", "operationId"],
@@ -1863,6 +1871,21 @@ describe("Data bus contracts", () => {
       durableLockDiagnostics: [
         DurableStateDiagnosticSchema.parse(durableNull),
       ],
+      startupRecovery: {
+        runId: "run-fixture",
+        stage: "runner_start",
+        scopeCount: 1,
+        targetCount: 1,
+        degradedTargetCount: 1,
+        mutationCount: 0,
+        firstSample: "graph_vault/books/book-fixture/job.yaml",
+        lastSample: "graph_vault/books/book-fixture/job.yaml",
+        firstBlocker: DurableStateDiagnosticSchema.parse(durableNull),
+        decision: "blocked_before_claim",
+        recoveryDecision: "stop_until_fixed",
+        nextOperatorAction: "run_explicit_repair",
+        explicitRepairHint: "run explicit repair or migrate-only",
+      },
       items: [{
         ...batchRecoverySummaryEnvelopeFixture().payload.items[0],
         ...durableNull,
@@ -1886,6 +1909,9 @@ describe("Data bus contracts", () => {
       .toBe("metadata_missing_read_only");
     expect(recovery.durableTempDiagnostics?.[0]?.checksumExpected)
       .toBe("expected-checksum");
+    expect(recovery.startupRecovery?.nextOperatorAction)
+      .toBe("run_explicit_repair");
+    expect(recovery.startupRecovery?.mutationCount).toBe(0);
     expect(recovery.items[0]?.unavailableFieldSentinels)
       .toEqual(["targetLocator", "operationId"]);
     expect(envelopes.map((item) => item.kind)).toEqual([

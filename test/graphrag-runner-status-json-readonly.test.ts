@@ -114,6 +114,7 @@ function runBatch(input: {
   configDir: string;
   runId: string;
   statusJson?: boolean;
+  extraArgs?: string[];
   env?: Record<string, string>;
   timeoutMs?: number;
 }): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
@@ -142,6 +143,7 @@ function runBatch(input: {
       "--max-resume-passes",
       "1",
       ...(input.statusJson === true ? ["--status-json"] : []),
+      ...(input.extraArgs ?? []),
     ], {
       cwd: input.tmpRoot,
       env: {
@@ -263,6 +265,7 @@ describe("GraphRAG runner status-json durable read-only", () => {
           stateRoot,
           configDir,
           runId,
+          extraArgs: ["--migrate-only"],
         });
         await unlink(`${fixture.booksPath}.sha256.meta.json`);
         const before = catalogSnapshot(fixture.catalogDir);
@@ -407,6 +410,7 @@ describe("GraphRAG runner status-json durable read-only", () => {
           logRoot,
           configDir,
           runId,
+          extraArgs: ["--migrate-only"],
         });
         const events = readFileSync(
           join(stateRoot, "catalog", "batch-runs", runId, "events.jsonl"),
@@ -417,7 +421,7 @@ describe("GraphRAG runner status-json durable read-only", () => {
           event.checksumRecoveryDecision === "metadata_backfilled"
         );
 
-        expect(result.exitCode).not.toBe(0);
+        expect(result.exitCode).toBe(0);
         expect(backfillEvent).toMatchObject({
           status: "pending",
           primaryTargetLocator: expect.stringContaining("catalog/books.yaml"),
@@ -463,6 +467,7 @@ describe("GraphRAG runner status-json durable read-only", () => {
           logRoot,
           configDir,
           runId,
+          extraArgs: ["--migrate-only"],
           env: {
             QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
             QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_PATTERN:
@@ -539,6 +544,7 @@ describe("GraphRAG runner status-json durable read-only", () => {
           logRoot,
           configDir,
           runId,
+          extraArgs: ["--migrate-only"],
           env: {
             QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
             QMD_GRAPHRAG_TEST_DIRECTORY_FSYNC_FAILURE_PATTERN:
@@ -591,6 +597,7 @@ describe("GraphRAG runner status-json durable read-only", () => {
           stateRoot,
           configDir,
           runId,
+          extraArgs: ["--migrate-only"],
         });
         const primaryBefore = readFileSync(fixture.booksPath, "utf8");
         const actual = sha256Text(primaryBefore);
@@ -688,6 +695,7 @@ describe("GraphRAG runner status-json durable read-only", () => {
           logRoot,
           configDir,
           runId,
+          extraArgs: ["--migrate-only"],
           timeoutMs: 90_000,
         });
         const events = readFileSync(
@@ -703,7 +711,7 @@ describe("GraphRAG runner status-json durable read-only", () => {
         );
         const catalogNames = readdirSync(fixture.catalogDir);
 
-        expect(result.exitCode).not.toBe(0);
+        expect(result.exitCode).toBe(0);
         expect(readFileSync(fixture.booksPath, "utf8")).toBe(primaryBefore);
         expect(catalogNames.some((name) =>
           name.startsWith("books.yaml.corrupt-")
@@ -758,6 +766,7 @@ describe("GraphRAG runner status-json durable read-only", () => {
           logRoot,
           configDir,
           runId,
+          extraArgs: ["--migrate-only"],
           env: {
             QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
             QMD_GRAPHRAG_TEST_RENAME_ENOENT_ONCE_PATTERN:

@@ -40,6 +40,15 @@ export const BatchRecoveryDecisionSchema = z.enum([
 export const StatusJsonDiagnosticRecoveryDecisionSchema = z.union([
   BatchRecoveryDecisionSchema,
   z.literal("metadata_missing_read_only"),
+  z.literal("continue_with_diagnostic_unless_catalog_blocked"),
+]);
+
+export const StartupNextOperatorActionSchema = z.enum([
+  "run_status_json",
+  "run_explicit_repair",
+  "run_migrate_only",
+  "start_new_run_after_repair",
+  "inspect_manual_state",
 ]);
 
 export const DurableStateDiagnosticSchema = z.object({
@@ -82,12 +91,38 @@ export const DurableStateDiagnosticSchema = z.object({
   repairAllowed: z.boolean().optional(),
   statusJsonDecision: z.string().min(1).optional(),
   diagnosticClass: z.string().min(1).optional(),
+  normalRunnerAction: z.string().min(1).optional(),
+  scannedTargetCount: z.number().int().nonnegative().optional(),
+  degradedTargetCount: z.number().int().nonnegative().optional(),
+  sampleTargetLocators: z.array(z.string().min(1)).optional(),
+  scanTruncated: z.boolean().optional(),
+  maxRunnerStartScannedTargets: z.number().int().positive().optional(),
+  maxRunnerStartReportedSamples: z.number().int().positive().optional(),
+  maxRunnerStartMutationCount: z.number().int().nonnegative().optional(),
   evidenceIncomplete: z.boolean().optional(),
   evidenceIncompleteReason: z.string().min(1).optional(),
   unavailableFieldSentinels: z.array(z.string().min(1)).optional(),
   leaseGeneration: z.number().int().positive().optional(),
   bookLeaseGeneration: z.number().int().positive().optional(),
 });
+
+export const StartupRecoverySchema = z.object({
+  runId: z.string().min(1).optional(),
+  stage: z.string().min(1).optional(),
+  scopeCount: z.number().int().nonnegative().optional(),
+  targetCount: z.number().int().nonnegative().optional(),
+  degradedTargetCount: z.number().int().nonnegative().optional(),
+  mutationCount: z.number().int().nonnegative().optional(),
+  firstSample: z.string().min(1).optional(),
+  lastSample: z.string().min(1).optional(),
+  firstBlocker: DurableStateDiagnosticSchema.optional(),
+  decision: z.string().min(1).optional(),
+  recoveryDecision: BatchRecoveryDecisionSchema.optional(),
+  nextOperatorAction: StartupNextOperatorActionSchema.optional(),
+  explicitRepairHint: z.string().min(1).optional(),
+  providerRequestDiagnostics: z.array(DurableStateDiagnosticSchema).optional(),
+  updatedAt: z.string().datetime().optional(),
+}).passthrough();
 
 export const BatchProjectRelativeLocatorSchema = z.string().min(1).refine(
   (value) => {
@@ -694,6 +729,7 @@ export const BatchRecoverySummarySchema = z.object({
   durableStateFailures: z.array(DurableStateDiagnosticSchema).optional(),
   durableTempDiagnostics: z.array(DurableStateDiagnosticSchema).optional(),
   durableLockDiagnostics: z.array(DurableStateDiagnosticSchema).optional(),
+  startupRecovery: StartupRecoverySchema.optional(),
   items: z.array(BatchRecoverySummaryItemSchema),
 });
 

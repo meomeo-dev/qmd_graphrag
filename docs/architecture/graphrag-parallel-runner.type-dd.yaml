@@ -1270,10 +1270,25 @@ failureRecovery:
         runner-start recovery。该 manifest 至少包含 runId、stage、scopeCount、
         targetCount、mutationCount、firstSample、lastSample、decision 与
         explicitRepairHint。
-      - 对 critical catalog、current run、book-scoped target，runner_start 可执行
-        bounded writable repair，并在首次 blocker 后 fail fast。每个目录默认
-        最多扫描 200 个 primary targets、报告 10 个样本、执行 1 个 writable
-        quarantine；超过任一上限必须 stop_until_fixed。
+      - normal runner_start 的可写范围只包含当前 runId 的最小启动状态
+        与 manifest 派生缓存。它不得对既有 book-scoped durable target 执行
+        checksum backfill、checksum meta backfill、temp cleanup、primary
+        quarantine、sidecar quarantine 或 corrupt rename。book-scoped 目标在
+        normal runner_start 中必须使用 read-only blocking diagnostic；发现
+        checksum mismatch、checksum missing、checksum meta conflict、invalid
+        target、unknown temp 或 lock owner 不可判定时，必须在第一个 blocker
+        后 fail fast，并把 decision 写为 blocked_before_claim。
+      - 对 critical catalog 与 current run target，runner_start 可执行 bounded
+        writable repair；默认全局 mutation budget 为 1，默认每个目录最多扫描
+        200 个 primary targets、报告 10 个样本。book-scoped target 的
+        normal runner_start mutation budget 固定为 0。超过任一上限必须
+        stop_until_fixed，且不得继续扫描产生额外 quarantine/backfill。
+      - book-scoped durable repair 只能通过 explicit repair 或 migrate-only
+        边界执行。该边界必须显式声明 repairScope、maxScannedTargets、
+        maxReportedSamples、maxMutationCount、firstSample、lastSample、
+        mutationCount、limitHit 与 nextOperatorAction，并把 summary 写入
+        manifest、status.json 或 recovery-summary。normal runner_start 只能
+        复用这些 summary 作为只读证据，不能自行补写或扩大修复。
       - 对 provider_request_fingerprint 等 historical_observation target，
         runner_start 只能执行 read-only capped diagnostic，mutationCount 必须为
         0。不得创建 lock、temp、checksum、checksum meta、corrupt target 或
@@ -1283,6 +1298,24 @@ failureRecovery:
       - normal runner 不得把历史 provider request checksum mismatch 作为阻止
         38 本 EPUB 重新发现与 manifest 创建的唯一原因；该风险应作为 startup
         diagnostic 暴露，除非它同时破坏 critical catalog authority。
+      - startupRecovery 的 targetCount 与 mutationCount 必须从同一 preflight
+        scan result 派生。targetCount 统计已检查 primary target 数；
+        degradedTargetCount 统计异常 target 数；mutationCount 统计实际发生的
+        lock/temp/checksum/meta/backfill/quarantine/delete/rename 写操作。若任何
+        durable_*_target_quarantined、durable_*_checksum_backfilled、
+        durable_checksum_meta_backfilled 或 durable_*_temp_reconciled event
+        发生，mutationCount 必须同步递增，不能保持 0。
+      - runner_start 在 item checkpoint 创建前失败时，manifest 不得停留在
+        ambiguous running。必须写入 status failed、failedAt、
+        recoveryDecision stop_until_fixed、startupRecovery.decision
+        blocked_before_claim、startupRecovery.firstBlocker、
+        startupRecovery.nextOperatorAction，并保证 activeProviderSlots、
+        activeSubprocesses 与 activeBookLeases 均为 0。recovery-summary 必须
+        记录同一 firstBlocker 与下一步动作。
+      - nextOperatorAction 必须是字段化值，不得只写自然语言 hint。允许值为
+        run_status_json、run_explicit_repair、run_migrate_only、
+        start_new_run_after_repair、inspect_manual_state。blocked book-scoped
+        durable mismatch 的默认值为 run_explicit_repair。
     beforeClaim:
       - 扫描 durable YAML/JSON lock owner records。
       - 扫描未过期 temp 与超过 stale TTL 的 orphan temp。
@@ -1347,6 +1380,30 @@ failureRecovery:
           quarantine，并必须先写 startup/repair summary。
         - normal runner_start 不得对 provider-requests primary target 执行
           primary bundle quarantine。
+    bookScopedDurableState:
+      authority: production_state
+      storage:
+        - graph_vault/books/{bookId}/job.yaml
+        - graph_vault/books/{bookId}/artifacts.yaml
+        - graph_vault/books/{bookId}/checkpoints.yaml
+        - graph_vault/books/{bookId}/runs/*.yaml
+        - graph_vault/books/{bookId}/output/*.json
+        - graph_vault/books/{bookId}/output/lancedb/*.lance/qmd_row_count.json
+      normalRunnerStartRecovery: read_only_blocking_diagnostic
+      explicitRepairRecovery: bounded_repair_or_quarantine
+      rules:
+        - normal runner_start 发现 book-scoped checksum mismatch、checksum
+          missing、checksum meta conflict、invalid target、unknown temp 或
+          unresolved lock 时，只能记录 first blocker summary 并停止在
+          blocked_before_claim。
+        - normal runner_start 不得修改任何既有 book-scoped primary target、
+          checksum sidecar、meta sidecar、temp、owner、lock 或 corrupt target。
+        - explicit repair 或 migrate-only 必须按 bookId 和 target family
+          bounded 执行，默认 maxMutationCount 为 1，超过上限必须停止并保留
+          nextOperatorAction。
+        - 修复后恢复真实 EPUB 处理时，必须重新执行 status-json 或正常
+          runner_start read-only preflight，确认 mutationCount 为 0 且
+          degradedTargetCount 为 0，才能 claim item。
 
 recoveryReconciliation:
   authorityOrder:

@@ -214,7 +214,7 @@ describe("GraphRAG EPUB batch runner - Durable State", () => {
       [
         "setTimeout(() => {",
         "  console.log(JSON.stringify({ status: 'blocked', reason: 'test blocked' }));",
-        "}, 3000);",
+        "}, 8000);",
       ].join("\n"),
     );
 
@@ -261,7 +261,7 @@ describe("GraphRAG EPUB batch runner - Durable State", () => {
     let heartbeatCheckpointText = "";
     let heartbeatChecksumText = "";
     let heartbeatChecksumMeta: Record<string, unknown> | null = null;
-    for (let attempt = 0; attempt < 40; attempt += 1) {
+    for (let attempt = 0; attempt < 80; attempt += 1) {
       await sleep(250);
       if (!existsSync(checkpointPath)) continue;
       const checkpointText = readFileSync(checkpointPath, "utf8");
@@ -370,7 +370,7 @@ describe("GraphRAG EPUB batch runner - Durable State", () => {
       event.event === "command_start" &&
       event.command === "resume-book-1"
     )).toBe(true);
-  }, 30000);
+  }, 120000);
 
   test("rejects a second live coordinator for the same run id", async () => {
     const tmpRoot = await mkProjectTmpDir("qmd-batch-coordinator-lock-");

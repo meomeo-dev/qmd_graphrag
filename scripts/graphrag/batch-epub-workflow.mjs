@@ -40,6 +40,21 @@ import {
   isLocalArtifactGateFailureText,
 } from "./batch-failure-classifier.mjs";
 import { hydrateBatchCheckpoint } from "./batch-checkpoint-hydration.mjs";
+import {
+  buildStartupPreflightFailureManifest,
+  createStartupRecoverySchema,
+  createStartupScanStats,
+  durableReadOnlyLockDiagnostic,
+  durableReadOnlyPrimaryDiagnostic,
+  durableReadOnlyTempDiagnostic,
+  isBookScopedDurablePreflightMapping,
+  isStartupPreflightMutationEvent,
+  noteProviderRequestStartupScan,
+  noteStartupDegradedTarget,
+  noteStartupPrimaryTarget,
+  recoveryDecisionForStartupSummary,
+  startupRecoveryFromStats,
+} from "./runner-startup-preflight.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const defaultSourceDir = join(root, "inbox", "软件工程与系统设计经典著作指南");
@@ -248,6 +263,7 @@ let batchStopReason = null;
 let terminationSignalHandling = false;
 const activeChildProcesses = new Map();
 let durableOperationContext = null;
+let durablePreflightMutationStats = null;
 const heldJsonFileLocks = new Map();
 
 const durableTargetMappingTable = [
@@ -779,6 +795,10 @@ const DurableStateDiagnosticSchema = z.object({
   unavailableFieldSentinels: z.array(z.string().min(1)).optional(),
   leaseGeneration: z.number().int().positive().optional(),
   bookLeaseGeneration: z.number().int().positive().optional(),
+});
+const StartupRecoverySchema = createStartupRecoverySchema({
+  DurableStateDiagnosticSchema,
+  BatchRecoveryDecisionSchema,
 });
 const BatchStopInterruptErrorName = "BatchStopInterruptError";
 const DurableFailureEnvelopeMarker = "QMD_GRAPHRAG_DURABLE_FAILURE";
@@ -1497,6 +1517,7 @@ const BatchRecoverySummarySchema = z.object({
   durableStateFailures: z.array(DurableStateDiagnosticSchema).optional(),
   durableTempDiagnostics: z.array(DurableStateDiagnosticSchema).optional(),
   durableLockDiagnostics: z.array(DurableStateDiagnosticSchema).optional(),
+  startupRecovery: StartupRecoverySchema.optional(),
   items: z.array(BatchRecoverySummaryItemSchema),
 });
 
@@ -4563,6 +4584,10 @@ function event(payload) {
     at: now(),
     ...withoutUndefined(sanitizedPayload),
   });
+  if (durablePreflightMutationStats != null &&
+    isStartupPreflightMutationEvent(item.event)) {
+    durablePreflightMutationStats.mutationCount += 1;
+  }
   if (statusJson) return item;
   withJsonFileLock(eventsPath, () => {
     withDurableOperationContext(durableContextFromValue(item), () => {
@@ -5521,6 +5546,21 @@ function durablePreflightDecisionForTemp(temporaryPath) {
   };
 }
 
+function durableReadOnlyPreflightDecisionForTemp(temporaryPath) {
+  let temporaryStat;
+  try {
+    temporaryStat = statSync(temporaryPath);
+  } catch {
+    return null;
+  }
+  const decision = durableTempCleanupDecision(temporaryPath, temporaryStat);
+  return durableReadOnlyTempDiagnostic(temporaryPath, {
+    context: startupPreflightDiagnosticContext,
+    decision,
+    ownerProjection: tempOwnerProjection(temporaryPath),
+  });
+}
+
 function durablePreflightDecisionForLock(lockPath) {
   try {
     const entry = statSync(lockPath);
@@ -5542,6 +5582,26 @@ function durablePreflightDecisionForLock(lockPath) {
       operationId: owner.operationId,
       lockOwnerEvidence: redactJsonValue(owner),
     };
+  } catch {
+    return null;
+  }
+}
+
+function durableReadOnlyPreflightDecisionForLock(lockPath) {
+  try {
+    const entry = statSync(lockPath);
+    const owner = readJsonLockOwner(lockPath);
+    const expiredAndDead = jsonLockOwnerExpired(owner, entry) &&
+      !processAlive(owner.pid);
+    const reason = expiredAndDead
+      ? "stale_lock_recovery_fence_missing"
+      : "lock_owner_live_or_unexpired";
+    return durableReadOnlyLockDiagnostic(lockPath, {
+      context: startupPreflightDiagnosticContext,
+      owner,
+      reason,
+      lockOwnerEvidence: redactJsonValue(owner),
+    });
   } catch {
     return null;
   }
@@ -5597,6 +5657,18 @@ function durablePreflightDecisionForPrimaryYaml(path) {
       checksumRecoveryDecision: "stop_until_fixed",
     };
   }
+}
+
+function durablePreflightDecisionForPrimary(path, kind, options = {}) {
+  if (options.bookScopedReadOnly === true) {
+    return durableReadOnlyPrimaryDiagnostic(
+      path,
+      kind,
+      startupPreflightDiagnosticContext,
+    );
+  }
+  if (kind === "json") return durablePreflightDecisionForPrimaryJson(path);
+  return durablePreflightDecisionForPrimaryYaml(path);
 }
 
 function providerRequestDiagnosticBase(path) {
@@ -5730,6 +5802,16 @@ function scanProviderRequestDiagnostics(directory) {
   };
 }
 
+const startupPreflightDiagnosticContext = {
+  root,
+  durableChecksumPath,
+  durableChecksumMetaPath,
+  durableTargetMapping,
+  readChecksumMetaState,
+  checksumMetaIsInvalid,
+  sha256Text,
+};
+
 function durablePreflightDecisionForQmdIndexLock() {
   const lockPath = qmdIndexFileLockPath();
   try {
@@ -5759,8 +5841,10 @@ function durablePreflightDecisionForQmdIndexLock() {
 
 function durablePreflightScanDirectory(directory, options = {}, depth = 0) {
   const blockers = [];
+  const scanStats = options.scanStats;
   if (options.providerRequestReadOnly === true) {
     const scan = scanProviderRequestDiagnostics(directory);
+    noteProviderRequestStartupScan(scanStats, scan);
     const summary = providerRequestSummaryDiagnostic(
       scan.diagnostics,
       scan.scanned,
@@ -5782,32 +5866,56 @@ function durablePreflightScanDirectory(directory, options = {}, depth = 0) {
   }
   for (const entry of entries.filter((entry) => entry.name.endsWith(".lock"))) {
     const path = join(directory, entry.name);
-    const blocker = durablePreflightDecisionForLock(path);
-    if (blocker != null) blockers.push(blocker);
+    const blocker = options.bookScopedReadOnly === true
+      ? durableReadOnlyPreflightDecisionForLock(path)
+      : durablePreflightDecisionForLock(path);
+    if (blocker != null) {
+      noteStartupDegradedTarget(scanStats);
+      blockers.push(blocker);
+      if (options.failFast === true) return blockers;
+    }
   }
   for (const entry of entries) {
     const path = join(directory, entry.name);
     if (entry.isDirectory()) {
       if (recursive && depth < maxDepth && !entry.name.includes(".corrupt-")) {
         blockers.push(...durablePreflightScanDirectory(path, options, depth + 1));
+        if (options.failFast === true && blockers.length > 0) break;
       }
       continue;
     }
     if (entry.name.endsWith(".owner.json") || entry.name.endsWith(".lock")) continue;
     if (includeTemps && entry.name.includes(".tmp-")) {
-      const blocker = durablePreflightDecisionForTemp(path);
-      if (blocker != null) blockers.push(blocker);
+      const blocker = options.bookScopedReadOnly === true
+        ? durableReadOnlyPreflightDecisionForTemp(path)
+        : durablePreflightDecisionForTemp(path);
+      if (blocker != null) {
+        noteStartupDegradedTarget(scanStats);
+        blockers.push(blocker);
+        if (options.failFast === true) return blockers;
+      }
       continue;
     }
     if (isDurablePrimaryJsonEntry(entry.name)) {
-      const blocker = durablePreflightDecisionForPrimaryJson(path);
-      if (blocker != null) blockers.push(blocker);
+      noteStartupPrimaryTarget(scanStats, relative(root, path));
+      const blocker = durablePreflightDecisionForPrimary(path, "json", options);
+      if (blocker != null) {
+        noteStartupDegradedTarget(scanStats);
+        blockers.push(blocker);
+        if (options.failFast === true) return blockers;
+      }
       continue;
     }
     if (isDurablePrimaryYamlEntry(entry.name)) {
-      const blocker = durablePreflightDecisionForPrimaryYaml(path);
-      if (blocker != null) blockers.push(blocker);
+      noteStartupPrimaryTarget(scanStats, relative(root, path));
+      const blocker = durablePreflightDecisionForPrimary(path, "yaml", options);
+      if (blocker != null) {
+        noteStartupDegradedTarget(scanStats);
+        blockers.push(blocker);
+        if (options.failFast === true) return blockers;
+      }
     }
+    if (options.failFast === true && blockers.length > 0) break;
   }
   return blockers;
 }
@@ -5840,6 +5948,9 @@ function durablePreflightTargets(item = undefined) {
       const entry = durablePreflightTargetFromScope(scope, item);
       if (entry != null && isProviderRequestPreflightMapping(mapping)) {
         entry.providerRequestReadOnly = true;
+      }
+      if (entry != null && isBookScopedDurablePreflightMapping(mapping)) {
+        entry.bookScoped = true;
       }
       if (entry != null) targets.push(entry);
     }
@@ -5902,6 +6013,7 @@ function durablePreflightScopeDirectory(scopePath) {
 function durablePreflight(stage, item = undefined, options = {}) {
   if (statusJson) return;
   const blockers = [];
+  const scanStats = options.scanStats;
   const targets = Array.isArray(options.targets)
     ? options.targets
     : durablePreflightTargets(item);
@@ -5912,11 +6024,21 @@ function durablePreflight(stage, item = undefined, options = {}) {
       providerRequestReadOnly: Boolean(
         options.providerRequestReadOnly || target.providerRequestReadOnly
       ),
+      bookScopedReadOnly: Boolean(
+        options.bookScopedReadOnly || target.bookScoped
+      ),
       providerRequestDiagnostics: options.providerRequestDiagnostics,
+      scanStats,
     }));
+    if (options.failFast === true && blockers.length > 0) break;
   }
-  const qmdIndexLockBlocker = durablePreflightDecisionForQmdIndexLock();
-  if (qmdIndexLockBlocker != null) blockers.push(qmdIndexLockBlocker);
+  if (!(options.failFast === true && blockers.length > 0)) {
+    const qmdIndexLockBlocker = durablePreflightDecisionForQmdIndexLock();
+    if (qmdIndexLockBlocker != null) {
+      noteStartupDegradedTarget(scanStats);
+      blockers.push(qmdIndexLockBlocker);
+    }
+  }
   if (blockers.length === 0) return;
   const first = blockers[0];
   const durableError = new DurableStateError(
@@ -5926,7 +6048,7 @@ function durablePreflight(stage, item = undefined, options = {}) {
       evidence: {
         ...first,
         failedStage: stage,
-        durableMode: "strict",
+        durableMode: first.durableMode ?? "strict",
         completedPublishRule: "forbidden",
       },
     },
@@ -7334,22 +7456,28 @@ function loadManifest(items) {
 function writeStartupRecoveryManifest(manifest, update = {}) {
   if (statusJson) return manifest;
   const current = manifest.metadata?.startupRecovery ?? {};
-  const startupRecovery = withoutUndefined({
+  const startupRecovery = StartupRecoverySchema.parse(withoutUndefined({
     ...current,
     runId,
     stage: "runner_start",
     scopeCount: update.scopeCount ?? current.scopeCount ?? 0,
     targetCount: update.targetCount ?? current.targetCount ?? 0,
+    degradedTargetCount:
+      update.degradedTargetCount ?? current.degradedTargetCount ?? 0,
     mutationCount: update.mutationCount ?? current.mutationCount ?? 0,
     firstSample: update.firstSample ?? current.firstSample,
     lastSample: update.lastSample ?? current.lastSample,
+    firstBlocker: update.firstBlocker ?? current.firstBlocker,
     decision: update.decision ?? current.decision ?? "created_before_preflight",
+    recoveryDecision: update.recoveryDecision ?? current.recoveryDecision,
+    nextOperatorAction:
+      update.nextOperatorAction ?? current.nextOperatorAction,
     explicitRepairHint: update.explicitRepairHint ?? current.explicitRepairHint ??
       "use explicit repair or migrate-only for provider request durable repairs",
     providerRequestDiagnostics: update.providerRequestDiagnostics ??
       current.providerRequestDiagnostics,
     updatedAt: now(),
-  });
+  }));
   const next = {
     ...manifest,
     updatedAt: now(),
@@ -7369,6 +7497,10 @@ function updateManifestWithProviderRequestDiagnostics(manifest, diagnostics) {
       (total, item) => Math.max(total, item.scannedTargetCount ?? 0),
       0,
     ),
+    degradedTargetCount: diagnostics.reduce(
+      (total, item) => total + (item.degradedTargetCount ?? 0),
+      0,
+    ),
     mutationCount: 0,
     firstSample: samples[0],
     lastSample: samples.at(-1),
@@ -7377,6 +7509,23 @@ function updateManifestWithProviderRequestDiagnostics(manifest, diagnostics) {
       DurableStateDiagnosticSchema.parse(withoutUndefined(item))
     ),
   });
+}
+
+function persistStartupPreflightFailure(manifest, durableError, stats) {
+  const failed = buildStartupPreflightFailureManifest({
+    manifest,
+    durableError,
+    stats,
+    DurableStateDiagnosticSchema,
+    BatchRunManifestSchema,
+    StartupRecoverySchema,
+    durableProjection,
+    withoutUndefined,
+    now,
+  });
+  writeTypedJson(manifestPath, BatchRunManifestSchema, failed);
+  writeRecoverySummary(failed, []);
+  return failed;
 }
 
 function itemPath(item) {
@@ -9601,7 +9750,7 @@ function buildRecoverySummary(manifest, checkpoints) {
       commandTimeoutSeconds,
       heartbeatIntervalSeconds,
     },
-    recoveryDecision: recoveryDecisionForBatch(checkpoints),
+    recoveryDecision: recoveryDecisionForSummary(manifest, checkpoints),
     retryableItemCount: retryableItems.length,
     nextRetryAt: retryableItems
       .map((item) => item.nextRetryAt)
@@ -9614,6 +9763,9 @@ function buildRecoverySummary(manifest, checkpoints) {
       .filter((item) => String(item.localFailureClass ?? "").includes("temp")),
     durableLockDiagnostics: durableStateFailures
       .filter((item) => String(item.localFailureClass ?? "").includes("lock")),
+    startupRecovery: manifest.metadata?.startupRecovery == null
+      ? undefined
+      : StartupRecoverySchema.parse(manifest.metadata.startupRecovery),
     items,
   }));
 }
@@ -9653,6 +9805,11 @@ function recoveryDecisionForBatch(checkpoints) {
     return "stop_until_fixed";
   }
   return "none";
+}
+
+function recoveryDecisionForSummary(manifest, checkpoints) {
+  return recoveryDecisionForStartupSummary(manifest) ??
+    recoveryDecisionForBatch(checkpoints);
 }
 
 function migrateEventLog(checkpoints) {
@@ -11933,21 +12090,48 @@ async function main() {
   if (!statusJson) {
     acquireCoordinatorLock();
     manifest = loadManifest(items);
+    const runnerStartTargets = durablePreflightTargetsForItems(items);
+    const startupScanStats = createStartupScanStats(runnerStartTargets.length);
     manifest = writeStartupRecoveryManifest(manifest, {
-      scopeCount: durablePreflightTargetsForItems(items).length,
+      scopeCount: startupScanStats.scopeCount,
       targetCount: 0,
+      degradedTargetCount: 0,
       mutationCount: 0,
       decision: "created_before_preflight",
     });
     if (!testSkipRunnerStartPreflight) {
       const providerRequestDiagnostics = [];
-      durablePreflight("runner_start", undefined, {
-        targets: durablePreflightTargetsForItems(items),
-        providerRequestDiagnostics,
-      });
+      try {
+        durablePreflightMutationStats = startupScanStats;
+        durablePreflight("runner_start", undefined, {
+          targets: runnerStartTargets,
+          providerRequestDiagnostics,
+          scanStats: startupScanStats,
+          failFast: true,
+        });
+      } catch (error) {
+        if (error instanceof DurableStateError) {
+          manifest = persistStartupPreflightFailure(
+            manifest,
+            error,
+            startupScanStats,
+          );
+        }
+        throw error;
+      } finally {
+        durablePreflightMutationStats = null;
+      }
       manifest = updateManifestWithProviderRequestDiagnostics(
         manifest,
         providerRequestDiagnostics,
+      );
+      manifest = writeStartupRecoveryManifest(
+        manifest,
+        startupRecoveryFromStats(startupScanStats, {
+          decision: providerRequestDiagnostics.length > 0
+            ? "continue_with_provider_request_diagnostic"
+            : "startup_preflight_passed",
+        }),
       );
     }
     reconcileDurableRunFiles();
