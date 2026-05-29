@@ -1,0 +1,118 @@
+agent_id: dev-agent-b
+reaudit_round: 5
+status: fail
+criteria_file: "/Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-b/criteria.md"
+criteria_version:
+  source: "dev-agent-b/criteria.md"
+  fixed_criteria_count: 10
+findings_file: "/Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-b/reaudit_5_findings.md"
+review_date: "2026-05-27"
+scope:
+  - "current_worktree"
+  - "read_only_source_and_tests"
+blocking_findings_count: 3
+nonblocking_findings_count: 2
+blocking_findings:
+  - id: R5-B01
+    title: "runner terminal evidence 读路径绕过 durable checksum/reconcile"
+    criteria: [4, 7, 10]
+    files:
+      - "scripts/graphrag/batch-epub-workflow.mjs:4305"
+      - "scripts/graphrag/batch-epub-workflow.mjs:4321"
+      - "scripts/graphrag/batch-epub-workflow.mjs:4442"
+      - "scripts/graphrag/batch-epub-workflow.mjs:4973"
+      - "scripts/graphrag/batch-epub-workflow.mjs:7315"
+    behavior: "terminal GraphRAG evidence gate 直接读取 book-state YAML、producer manifest 和 LanceDB row-count sidecar，未校验 checksum，也不执行 corrupt target quarantine。"
+    must_fix: "让 batch runner 的 YAML/producer/row-count evidence readers 使用 durable read helper；checksum mismatch 或 invalid target 必须 fail closed，并阻止 completed checkpoint 与 item_completed event。"
+  - id: R5-B02
+    title: "graph capability catalog 发布不是 durable/fenced catalog commit"
+    criteria: [2, 4, 7, 9]
+    files:
+      - "src/job-state/repository.ts:3151"
+      - "src/job-state/repository.ts:3230"
+      - "src/graphrag/capability-catalog.ts:721"
+      - "src/graphrag/capability-catalog.ts:744"
+    behavior: "query_ready 后 recordGraphCapability() 直接 writeFile graph-capabilities.yaml，且没有 current batch book lease/fencing recheck。"
+    must_fix: "将 graph capability publication 纳入 repository durable YAML writer，并在每次 catalog commit 前校验 current batch book lease/fencing。"
+  - id: R5-B03
+    title: "第 10 条行为测试仍未覆盖剩余生产缺口"
+    criteria: [10]
+    files:
+      - "test/book-job-state.test.ts:1351"
+      - "test/graphrag-book-state.test.ts:3051"
+      - "test/cli.test.ts:2516"
+      - "test/cli.test.ts:3035"
+      - "src/graphrag/capability-catalog.ts:721"
+    behavior: "新增测试覆盖多项重点，但 durable sidecar 测试主要覆盖库层 helper；缺 batch runner terminal evidence corrupt/checksum negative 和 graph capability catalog stale/durable negative tests。"
+    must_fix: "补齐 runner 黑盒测试，证明 corrupted sidecar/YAML 和 stale capability publication 不会产生 completed checkpoint、item_completed event 或 capability catalog side effect。"
+nonblocking_findings:
+  - id: R5-N01
+    title: "provider stale release negative test 可继续加强"
+    detail: "实现比较 runnerSessionId/generation/fencingToken；现有测试主要断言正常 release metadata，未构造 stale token/generation release。"
+    files:
+      - "scripts/graphrag/batch-epub-workflow.mjs:2624"
+      - "test/cli.test.ts:3013"
+  - id: R5-N02
+    title: "runner 与 library 存在不等价 evidence readers"
+    detail: "src/job-state durable helpers 已增强，但 scripts/graphrag/batch-epub-workflow.mjs 仍保留直接 YAML/JSON readers，后续维护风险较高。"
+    files:
+      - "scripts/graphrag/batch-epub-workflow.mjs:4305"
+      - "src/job-state/durable-json.ts:18"
+criteria_results:
+  - criterion: 1
+    verdict: pass
+    blocking_findings: []
+  - criterion: 2
+    verdict: fail
+    blocking_findings: [R5-B02]
+  - criterion: 3
+    verdict: pass
+    blocking_findings: []
+  - criterion: 4
+    verdict: fail
+    blocking_findings: [R5-B01, R5-B02]
+  - criterion: 5
+    verdict: pass
+    blocking_findings: []
+  - criterion: 6
+    verdict: pass
+    blocking_findings: []
+  - criterion: 7
+    verdict: fail
+    blocking_findings: [R5-B01, R5-B02]
+  - criterion: 8
+    verdict: pass
+    blocking_findings: []
+  - criterion: 9
+    verdict: fail
+    blocking_findings: [R5-B02]
+  - criterion: 10
+    verdict: fail
+    blocking_findings: [R5-B01, R5-B03]
+evidence_files:
+  - "scripts/graphrag/batch-epub-workflow.mjs"
+  - "scripts/graphrag/resume-book-workspace.mjs"
+  - "src/job-state/repository.ts"
+  - "src/job-state/graphrag-book.ts"
+  - "src/job-state/durable-json.ts"
+  - "src/job-state/artifact-validation.ts"
+  - "src/graphrag/capability-catalog.ts"
+  - "test/cli.test.ts"
+  - "test/book-job-state.test.ts"
+  - "test/graphrag-book-state.test.ts"
+evidence_commands:
+  - command: "node --check scripts/graphrag/batch-epub-workflow.mjs && node --check scripts/graphrag/resume-book-workspace.mjs && node --check scripts/graphrag/batch-failure-classifier.mjs"
+    result: "reported_passed_by_controller"
+  - command: "npm run test:types -- --pretty false"
+    result: "reported_passed_by_controller"
+  - command: "CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 180000 test/cli.test.ts -t \"book worker pool defers duplicate canonical books|stale item checkpoint ownership rejects terminal event writes|parallel non-transient failure quiesces sibling workers|restart terminates same-host live orphan subprocess records\""
+    result: "reported_passed_by_controller"
+  - command: "CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 180000 test/book-job-state.test.ts -t \"recovers book job YAML checksums and quarantines corrupt targets|validates LanceDB row-count sidecars through durable checksums\""
+    result: "reported_passed_by_controller"
+  - command: "CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 180000 test/graphrag-book-state.test.ts -t \"recovers GraphRAG identity sidecar checksums and quarantines invalid targets|recovers producer manifest checksum and quarantines corrupt targets\""
+    result: "reported_passed_by_controller"
+review_notes:
+  source_modifications: "none"
+  criteria_modified: false
+  audit_directory_created: false
+  env_or_secret_files_read: false

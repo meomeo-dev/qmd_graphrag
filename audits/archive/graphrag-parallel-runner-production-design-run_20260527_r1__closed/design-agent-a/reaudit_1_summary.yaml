@@ -1,0 +1,18 @@
+decision: pass
+remaining_must_fix: []
+remaining_should_fix: []
+notes:
+  - >
+    C04 must-fix resolved. The design now gives manifest/status writes a single
+    manifestWriterLane owner, defines writer lane acquisition order, and states
+    durable write rules for JSONL append, YAML/JSON replace, and SQLite writes.
+  - >
+    C08 must-fix resolved. The design now specifies subprocess ownership,
+    process group cleanup, stale artifact quarantine, orphan recovery, fencing
+    rejection after takeover, and retry budget exhaustion as a terminal state.
+  - >
+    The prior C01, C02, and C10 should-fix items are also addressed through the
+    run-lock primitive, expanded fencing requirements, fault-injection tests,
+    and evidence-bound acceptance criteria.
+  - >
+    Reaudit result: all ten fixed criteria are PASS at the design level.

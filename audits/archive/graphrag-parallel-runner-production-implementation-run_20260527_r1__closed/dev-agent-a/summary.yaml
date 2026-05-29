@@ -1,0 +1,21 @@
+agent_id: dev-agent-a
+decision: fail
+blocking_findings_count: 7
+nonblocking_findings_count: 1
+audited_files:
+  - docs/architecture/graphrag-parallel-runner.type-dd.yaml
+  - scripts/graphrag/batch-epub-workflow.mjs
+  - src/job-state/graphrag-book.ts
+  - src/job-state/repository.ts
+  - test/cli.test.ts
+criteria_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/criteria.md
+findings_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/findings.md
+top_blocking_findings:
+  - 缺少同 runId 单 coordinator 持久锁与接管流程。
+  - item claim 与 book 互斥没有 durable lease/fencing。
+  - provider semaphore 只是进程内计数器，不是可恢复 slot lease。
+  - event log 没有 eventId/sequence，也没有 partial-tail 恢复。
+  - qmd index 写入缺少跨进程 file lock 覆盖与 SQLite bounded retry。
+review_scope: >
+  只读审计当前代码，并仅写入本 agent 审计目录。未读取或输出 .env、API key
+  或 secret。

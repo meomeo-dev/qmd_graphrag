@@ -1,0 +1,119 @@
+agent_id: dev-agent-b
+reaudit_round: 1
+status: fail
+criteria_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-b/criteria.md
+findings_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-b/reaudit_1_findings.md
+audited_files:
+  - docs/architecture/graphrag-parallel-runner.type-dd.yaml
+  - scripts/graphrag/batch-epub-workflow.mjs
+  - scripts/graphrag/resume-book-workspace.mjs
+  - src/contracts/batch-run.ts
+  - src/job-state/graphrag-book.ts
+  - src/job-state/repository.ts
+  - test/cli.test.ts
+  - test/book-job-state.test.ts
+  - test/integrations/contracts.test.ts
+criteria_results:
+  - criterion: 1
+    title: Single coordinator ownership is durable
+    verdict: fail
+    blocking_findings:
+      - B-01
+  - criterion: 2
+    title: Item and book ownership use lease fencing
+    verdict: fail
+    blocking_findings:
+      - B-02
+  - criterion: 3
+    title: Provider concurrency is enforced at the child-process boundary
+    verdict: fail
+    blocking_findings:
+      - B-03
+  - criterion: 4
+    title: Durable writes are crash recoverable
+    verdict: fail
+    blocking_findings:
+      - B-04
+  - criterion: 5
+    title: Event logs are authoritative audit trails
+    verdict: fail
+    blocking_findings:
+      - B-05
+  - criterion: 6
+    title: Manifest and status are derived caches
+    verdict: fail
+    blocking_findings:
+      - B-04
+      - B-05
+  - criterion: 7
+    title: Terminal completion is evidence gated
+    verdict: fail
+    blocking_findings:
+      - B-06
+  - criterion: 8
+    title: Failure classification leads to stable terminal or retry states
+    verdict: fail
+    blocking_findings:
+      - B-07
+  - criterion: 9
+    title: Crash and restart recovery handles live subprocess risk
+    verdict: fail
+    blocking_findings:
+      - B-01
+      - B-02
+      - B-08
+  - criterion: 10
+    title: Tests exercise state and recovery behavior, not only token presence
+    verdict: fail
+    blocking_findings:
+      - B-09
+blocking_findings:
+  - id: B-01
+    title: Expired coordinator lock can be taken over while old writer is alive
+    criteria:
+      - 1
+      - 9
+  - id: B-02
+    title: Fencing is not enforced on all item/book-scoped commits
+    criteria:
+      - 2
+      - 7
+      - 9
+  - id: B-03
+    title: Provider slot lease files are observability records, not the durable limiter
+    criteria:
+      - 3
+      - 9
+  - id: B-04
+    title: Durable write contract remains incomplete across state surfaces
+    criteria:
+      - 4
+      - 5
+      - 6
+  - id: B-05
+    title: Event log recovery lacks duplicate-id/sequence reconciliation
+    criteria:
+      - 5
+      - 6
+  - id: B-06
+    title: Terminal completion is not a fenced multi-surface commit
+    criteria:
+      - 7
+  - id: B-07
+    title: Retry exhaustion still cycles as pending retryable work
+    criteria:
+      - 8
+      - 10
+  - id: B-08
+    title: Crash/restart recovery does not cancel or quarantine live orphan risk
+    criteria:
+      - 9
+  - id: B-09
+    title: Test coverage is still below behavior-level production baseline
+    criteria:
+      - 10
+nonblocking_observations:
+  - Coordinator lock, book lease, provider slot lease, subprocess registry, eventId/sequence,
+    and fsync helpers are now present.
+  - qmd, GraphRAG stage, producer lineage, and query_ready evidence gates remain present.
+  - Several new tests validate behavior, but they do not cover the fixed recovery baseline.

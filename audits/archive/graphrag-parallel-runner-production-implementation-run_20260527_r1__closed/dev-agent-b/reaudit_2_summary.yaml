@@ -1,0 +1,131 @@
+agent_id: dev-agent-b
+reaudit_round: 2
+status: fail
+criteria_file: "audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-b/criteria.md"
+findings_file: "audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-b/reaudit_2_findings.md"
+review_date: "2026-05-27"
+scope:
+  - "current_worktree"
+  - "criteria.md fixed 10 criteria only"
+criteria_results:
+  - criterion: 1
+    title: "Single coordinator ownership is durable"
+    verdict: pass
+    blocking_findings: []
+    notes: "同机 live pid 过期锁接管缺口已闭合；远端过期锁仍列为残余风险。"
+  - criterion: 2
+    title: "Item and book ownership use lease fencing"
+    verdict: fail
+    blocking_findings:
+      - R2-B01
+  - criterion: 3
+    title: "Provider concurrency is enforced at the child-process boundary"
+    verdict: pass
+    blocking_findings: []
+    notes: "durable provider slot lease 已作为容量门，release 已验证 generation/fencing。"
+  - criterion: 4
+    title: "Durable writes are crash recoverable"
+    verdict: fail
+    blocking_findings:
+      - R2-B02
+  - criterion: 5
+    title: "Event logs are authoritative audit trails"
+    verdict: fail
+    blocking_findings:
+      - R2-B05
+  - criterion: 6
+    title: "Manifest and status are derived caches"
+    verdict: fail
+    blocking_findings:
+      - R2-B02
+      - R2-B06
+  - criterion: 7
+    title: "Terminal completion is evidence gated"
+    verdict: fail
+    blocking_findings:
+      - R2-B01
+  - criterion: 8
+    title: "Failure classification leads to stable terminal or retry states"
+    verdict: fail
+    blocking_findings:
+      - R2-B03
+  - criterion: 9
+    title: "Crash and restart recovery handles live subprocess risk"
+    verdict: fail
+    blocking_findings:
+      - R2-B01
+      - R2-B04
+  - criterion: 10
+    title: "Tests exercise state and recovery behavior"
+    verdict: fail
+    blocking_findings:
+      - R2-B03
+      - R2-B04
+      - R2-B06
+      - R2-B07
+blocking_findings:
+  - id: R2-B01
+    title: "所有提交面尚未统一执行当前 fencing 校验"
+    criteria:
+      - 2
+      - 7
+      - 9
+    required_fix: "checkpoint、event、catalog、manifest、qmd index、book artifact 与 terminal item_completed 写入前都必须验证当前 item/book/provider fencing。"
+  - id: R2-B02
+    title: "Durable write 协议仍缺 generation/checksum 与重启协调"
+    criteria:
+      - 4
+      - 6
+    required_fix: "为 JSON/YAML/manifest/catalog/lock/book state 写入增加 generation 或 checksum validation，并在 restart 时协调 temp leftovers 与 invalid targets。"
+  - id: R2-B03
+    title: "Transient retry exhaustion 仍会停留在 pending retryable"
+    criteria:
+      - 8
+      - 10
+    required_fix: "retry budget/wait limit 耗尽后必须进入 deterministic excluded/terminal state，且不可再次作为 runnable pending work 被调度。"
+  - id: R2-B04
+    title: "Crash/restart 对 live orphan subprocess 的处理仍不安全"
+    criteria:
+      - 9
+      - 10
+    required_fix: "parent dead takeover 时必须 kill 或 quarantine 同机 live child；远端 unknown subprocess 不得标记为已 killed；stale child commit 必须被 fencing 拒绝。"
+  - id: R2-B05
+    title: "Event log duplicate recovery 不是确定性恢复"
+    criteria:
+      - 5
+    required_fix: "duplicate/missing event id 恢复必须使用稳定派生规则，并为恢复结果写入可审计 diagnostic event。"
+  - id: R2-B06
+    title: "Manifest/status 仍不是完整 derived cache"
+    criteria:
+      - 6
+      - 10
+    required_fix: "manifest/status 必须从 durable checkpoints 与 normalized event evidence 重建；mismatch 或 invalid manifest 必须 rebuild 或 fail closed。"
+  - id: R2-B07
+    title: "行为级测试仍低于固定第 10 条基准"
+    criteria:
+      - 10
+    required_fix: "补齐 duplicate book ids、provider release fencing、manifest mismatch rebuild、SQLite busy、stale worker commit rejection、retry exhaustion、crash/restart 和 durable write recovery 测试。"
+residual_risks:
+  - id: R2-R01
+    description: "远端 coordinator lock 过期后的接管仍依赖 expiry，无法验证远端 pid 活性；多主机共享 state root 需要额外 quarantine/fencing 策略。"
+  - id: R2-R02
+    description: "qmd index file lock 已串行化 writer commands，但未发现 SQLite busy/backoff 行为级覆盖。"
+  - id: R2-R03
+    description: "status-json recovery projection 是只读内存态，不持久化 event log；需避免被误认为已修复 durable state。"
+evidence_commands:
+  - command: "node --check scripts/graphrag/batch-epub-workflow.mjs"
+    result: "reported_passed_by_controller"
+  - command: "npm run test:types -- --pretty false"
+    result: "reported_passed_by_controller"
+  - command: "focused CLI tests: rejects a second live coordinator|rejects coordinator takeover when expired lock pid is still alive|recovers stale provider slot leases|durable provider slots gate capacity|book-concurrency 2 runs multiple books through the worker pool|book-concurrency 1 preserves sequential book execution|migrate-only recovers a partial event log tail|migrate-only normalizes duplicate event ids"
+    result: "reported_passed_by_controller"
+  - command: "book-state tests: rejects stage checkpoint writes with stale batch book lease fencing|rejects artifact and run catalog writes with stale batch book lease fencing"
+    result: "reported_passed_by_controller"
+  - command: "contracts test: accepts batch execution bus envelopes"
+    result: "reported_passed_by_controller"
+  - command: "focused CLI test: qmd writer commands acquire the qmd index file lock"
+    result: "reported_passed_by_controller"
+review_notes:
+  source_modifications: "none"
+  audit_directory_created: false
+  env_or_secret_files_read: false

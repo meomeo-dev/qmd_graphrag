@@ -1,0 +1,114 @@
+schemaVersion: "1.0.0"
+auditId: graphrag-durable-yaml-temp-collision-agent-a
+criteriaSetId: durable-yaml-temp-rename-enoent-production-design
+status: fixed
+scope:
+  batchRunId: epub-batch-20260527-real-resume-1
+  itemId: item-45c6c3f72a50-f5252de5
+  failedStage: resume-book-2
+  failureClass: durable YAML temp file rename ENOENT
+reviewPolicy:
+  fixedAcrossFollowUpReviews: true
+  language: Chinese-first
+  note: 后续复审必须使用同一 criteria 列表，不得因实现方案改变而删减基准。
+criteria:
+  - id: C01_same_target_exclusive_writer
+    title: 同一目标文件写入排他性
+    requirement: >
+      每个 durable YAML 目标文件在任一时刻只能有一个有效写入者
+      （exclusive writer）。读、写、修复、清理 temp 的路径必须共享同一
+      排他边界，不能存在绕过锁或绕过 fencing 的同目标操作。
+    requiredEvidence:
+      - 目标路径到锁或 writer lane 的确定性映射。
+      - 所有同目标 YAML 读写和 reconcile 路径均受该映射约束。
+
+  - id: C02_collision_resistant_temp_identity
+    title: 临时文件身份抗碰撞
+    requirement: >
+      durable YAML temp 文件名必须在同进程多 worker、同毫秒多次写入、
+      resume takeover 与多进程误启动场景下抗碰撞（collision-resistant）。
+      temp 创建必须使用独占创建语义，禁止可被并发写入截断或复用。
+    requiredEvidence:
+      - temp 名包含足够熵或单调序列，例如 runnerSessionId、workerId、
+        operationId、counter 或 random id。
+      - temp 文件以 exclusive create 打开，碰撞时重试或失败为明确诊断。
+
+  - id: C03_active_temp_reconciliation_safety
+    title: 活跃临时文件清理安全
+    requirement: >
+      reconcile 只能删除已证明失效的 temp 文件，不能删除仍可能被活跃写入者
+      rename 的 temp。temp 所有权、创建时间、目标 generation 与写入状态必须
+      可验证。
+    requiredEvidence:
+      - temp 文件或 sidecar 记录 owner、target、generation、createdAt。
+      - 清理规则区分 active、stale、orphan 与 unknown temp。
+
+  - id: C04_atomic_replace_durability
+    title: 原子替换持久化契约
+    requirement: >
+      YAML 替换必须使用同目录 temp、fsync temp、atomic rename、fsync 父目录。
+      checksum 或 generation 的提交顺序必须保证恢复时不会把半写入状态当成
+      已提交状态。
+    requiredEvidence:
+      - 写入步骤顺序固定且可测试。
+      - target 与 checksum 或 generation 的一致性校验有恢复规则。
+
+  - id: C05_lock_freshness_and_fencing
+    title: 锁新鲜度与 fencing
+    requirement: >
+      durable YAML 文件锁必须包含 owner、generation 与 freshness 证据。清除
+      stale lock 前必须证明 owner 已失效或 lease 已安全过期；活跃 owner 不能
+      因静态 mtime 超时被抢占。提交前后必须验证 fencing token。
+    requiredEvidence:
+      - 锁心跳或短临界区上限约束。
+      - lock break、takeover 与 stale-owner 判断规则。
+
+  - id: C06_single_durable_yaml_boundary
+    title: 单一 durable YAML 边界
+    requirement: >
+      生产设计必须定义一个共享 durable YAML API 边界，所有 catalog、
+      checkpoint、manifest、run record 与 capability YAML 的读、写、reconcile
+      都通过该边界。禁止重复实现同名协议或裸读写 durable YAML。
+    requiredEvidence:
+      - 模块所有权清晰。
+      - 禁止清单列出不得使用的裸 YAML I/O 形式。
+
+  - id: C07_writer_lane_integration
+    title: writer lane 与文件锁集成
+    requirement: >
+      catalogWriterLane、checkpointWriterLane、manifestWriterLane 与 durable
+      YAML 文件锁必须有明确组合规则。设计必须定义获取顺序、timeout、
+      release-on-error 和禁止嵌套条件。
+    requiredEvidence:
+      - lane 到文件类型的映射表。
+      - 多 lane 操作的顺序、超时和错误释放规则。
+
+  - id: C08_resume_takeover_partial_write_recovery
+    title: resume 接管与半写恢复
+    requirement: >
+      resume 必须在 claim 新工作前扫描 durable YAML lock、temp、checksum、
+      generation 与 subprocess registry。对半写入状态只能进入 repair、
+      retry 或 stop_until_fixed，不能直接派生 completed。
+    requiredEvidence:
+      - resume-book 阶段的恢复前置检查。
+      - old generation 提交拒绝规则和 orphan temp 处置规则。
+
+  - id: C09_rename_enoent_error_classification
+    title: rename ENOENT 错误分类
+    requirement: >
+      temp rename ENOENT 必须被分类为 durable state integrity 事件，而不是普通
+      provider 或业务失败。错误记录必须包含 target、temp identity、owner、
+      generation、operationId 与恢复决策，且不得泄露秘密。
+    requiredEvidence:
+      - 状态机中存在专门 failureKind 或 recoveryDecision。
+      - 事件、status 与 checkpoint 中保留可复审证据。
+
+  - id: C10_concurrency_regression_evidence
+    title: 并发回归证据
+    requirement: >
+      设计必须要求可重复的并发回归验证，覆盖同进程同毫秒 temp 名碰撞、
+      stale lock 抢占、active temp 被 reconcile 删除、resume-book 重入与
+      多 worker catalog/capability 写入。
+    requiredEvidence:
+      - 单元、集成或压力测试的场景清单。
+      - 观测字段能证明没有发生 temp collision、lost write 或错误 completed。

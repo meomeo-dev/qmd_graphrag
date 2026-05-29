@@ -1,0 +1,59 @@
+task_id: graphrag-parallel-runner-production-implementation
+run_id: 20260527_r1
+audit_status: pass
+audit_round: 6
+audit_directory: /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open
+design_audit_directory: /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-design-run_20260527_r1__closed
+design_document: /Users/jin/projects/qmd_graphrag/docs/architecture/graphrag-parallel-runner.type-dd.yaml
+criteria_locked: true
+criteria_files:
+  - agent_id: dev-agent-a
+    path: /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/criteria.md
+    sha256: e763182a90d9aeeeafa11f21379473a3a8e2218dc5d81bbbe9fef6625d9281ca
+    result: pass
+  - agent_id: dev-agent-b
+    path: /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-b/criteria.md
+    sha256: 2762b387b28308c03db246222d798538e232b56e4f1ae96b2c1bc3dfc8ea9aaf
+    result: pass
+  - agent_id: dev-agent-c
+    path: /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/criteria.md
+    sha256: 44829b40c6d6373b6bed0b93051a776627b4020b70070dcde1cd39f46fa04b0c
+    result: pass
+blocking_findings_count: 0
+closed_previous_blocking_themes:
+  - durable terminal evidence checksum and quarantine
+  - graph capability durable/fenced catalog commit
+  - qmd index lock coverage
+  - Python bridge subprocess registry and process group boundary
+  - subprocess provider slot fence metadata
+  - GraphRAG provider request and cost catalog durable recovery
+  - status-json worker and provider wait observability
+  - focused behavioral recovery coverage
+verification:
+  syntax:
+    - command: node --check scripts/graphrag/batch-epub-workflow.mjs
+      result: pass
+    - command: node --check scripts/graphrag/resume-book-workspace.mjs
+      result: pass
+    - command: node --check scripts/graphrag/batch-failure-classifier.mjs
+      result: pass
+  types:
+    - command: npm run test:types -- --pretty false
+      result: pass
+  focused_tests:
+    - file: test/cli.test.ts
+      pattern: all batch qmd commands acquire the qmd index file lock|book-concurrency 2 runs multiple books through the worker pool|parallel non-transient failure quiesces sibling workers|restart terminates same-host live orphan subprocess records|durable provider slots gate capacity across concurrent workers|provider slot stale release cannot delete the current durable slot|migrate-only reopens completed item when terminal evidence checksum is corrupt|migrate-only rejects corrupt LanceDB row-count durable checksum
+      result: pass
+    - file: test/integrations/python-bridge-early-stop.test.ts
+      pattern: registers batch subprocess records with provider slot fencing
+      result: pass
+    - file: test/integrations/graphrag-cost.test.ts
+      pattern: records query artifactIds from GraphRAG evidence|records index lineage only from explicit index scope|recovers corrupt cost ledger tail
+      result: pass
+    - file: test/book-job-state.test.ts
+      pattern: publishes graph capabilities after query-ready checkpoint validates|recovers and quarantines graph capability catalog durable checksum state|rejects stale book lease before graph capability catalog commit|fences durable graph capability catalog commits
+      result: pass
+next_gate:
+  action: close_implementation_audit
+  prerequisite: yaml_summaries_parse
+  after_close: resume_real_epub_processing

@@ -1,0 +1,120 @@
+{
+  "taskId": "graphrag-catalog-yaml-status-meta-rename-enoent",
+  "runId": "20260528_r1",
+  "status": "closed",
+  "phase": "implementation_audit_passed",
+  "currentRound": "implementation-r2",
+  "triggeredBy": {
+    "batchRunId": "epub-batch-20260527-real-resume-1",
+    "failedStage": "status-json",
+    "failure": "rename ENOENT during books.yaml.sha256.meta.json durable metadata backfill",
+    "command": [
+      "node",
+      "scripts/graphrag/batch-epub-workflow.mjs",
+      "--source-dir",
+      "inbox/软件工程与系统设计经典著作指南",
+      "--state-root",
+      "graph_vault",
+      "--log-root",
+      "/tmp/qmd-epub-batch-20260527-real-resume-1",
+      "--config",
+      ".qmd/index.yml",
+      "--qmd-index-path",
+      ".qmd/index.sqlite",
+      "--run-id",
+      "epub-batch-20260527-real-resume-1",
+      "--skip-dotenv",
+      "--status-json"
+    ],
+    "errorClass": "DurableStateError",
+    "localFailureClass": "durable_temp_rename_enoent",
+    "target": "graph_vault/catalog/books.yaml.sha256.meta.json"
+  },
+  "designAudit": {
+    "status": "passed",
+    "agents": {
+      "agent-a": "pass",
+      "agent-b": "pass",
+      "agent-c": "pass"
+    },
+    "round": "r3",
+    "blockingFindings": [
+      "none"
+    ],
+    "history": [
+      {
+        "round": "r1",
+        "status": "failed",
+        "agents": {
+          "agent-a": "fail",
+          "agent-b": "fail",
+          "agent-c": "fail"
+        }
+      },
+      {
+        "round": "r2",
+        "status": "failed",
+        "agents": {
+          "agent-a": "pass",
+          "agent-b": "fail",
+          "agent-c": "pass"
+        }
+      },
+      {
+        "round": "r3",
+        "status": "passed",
+        "agents": {
+          "agent-a": "pass",
+          "agent-b": "pass",
+          "agent-c": "pass"
+        }
+      }
+    ]
+  },
+  "implementationAudit": {
+    "status": "passed",
+    "round": "r2",
+    "criteriaFixed": true,
+    "criteriaFiles": {
+      "agent-a": "agent-a/implementation-criteria-r1.md",
+      "agent-b": "agent-b/implementation-criteria-r1.md",
+      "agent-c": "agent-c/implementation-criteria-r1.md"
+    },
+    "agents": {
+      "agent-a": "pass",
+      "agent-b": "pass",
+      "agent-c": "pass"
+    },
+    "previousRound": {
+      "round": "r1",
+      "status": "failed",
+      "agents": {
+        "agent-a": "fail",
+        "agent-b": "pass",
+        "agent-c": "fail"
+      },
+      "blockingFindings": [
+        "status-json catalog snapshot test is not recursive or content-addressed",
+        "repairWriter successful checksum meta backfill lacks durable event or summary evidence",
+        "invalid checksum meta sidecar can still quarantine primary YAML"
+      ]
+    },
+    "blockingFindings": [
+      "none"
+    ],
+    "verificationBeforeAudit": [
+      "node --check scripts/graphrag/batch-epub-workflow.mjs",
+      "npm run test:types",
+      "npx vitest run test/graphrag-runner-status-json-readonly.test.ts",
+      "npx vitest run test/graphrag-runner-durable-preflight.test.ts",
+      "npx vitest run test/cli.test.ts -t \"durable state classifier preserves local failure classes|rename ENOENT during durable checkpoint write is stop-until-fixed\"",
+      "YAML.parse docs/architecture/graphrag-parallel-runner.type-dd.yaml"
+    ]
+  },
+  "realRunner": {
+    "resumeAllowed": true,
+    "reason": "design audit r3 and implementation audit r2 passed"
+  },
+  "closedAt": "2026-05-29T02:28:21Z",
+  "closureReason": "design and implementation audits passed; directory was left with __open suffix"
+}

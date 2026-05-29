@@ -1,0 +1,12 @@
+agent_id: dev-agent-b
+decision: fail
+blocking_findings_count: 7
+nonblocking_findings_count: 4
+audited_files:
+  - docs/architecture/graphrag-parallel-runner.type-dd.yaml
+  - scripts/graphrag/batch-epub-workflow.mjs
+  - src/job-state/graphrag-book.ts
+  - src/job-state/repository.ts
+  - test/cli.test.ts
+criteria_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-b/criteria.md
+findings_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-b/findings.md

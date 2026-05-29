@@ -1,0 +1,136 @@
+{
+  "taskId": "graphrag-catalog-dir-target-mapping",
+  "runId": "20260529_r1",
+  "status": "closed",
+  "phase": "closed",
+  "currentRound": "implementation-audit-r3",
+  "closedAt": "2026-05-29T04:25:59Z",
+  "triggeredBy": {
+    "batchRunId": "epub-batch-20260529-after-r6-audit",
+    "failedStage": "runner_start_discover_items",
+    "failure": "durable target mapping missing for graph_vault/catalog when writeJsonAtomicSidecar fsyncs checksum meta parent directory during catalog books.yaml reconciliation",
+    "observedStack": [
+      "durableTargetMapping",
+      "durableOperationEvidence",
+      "fsyncDirectory",
+      "writeJsonAtomicSidecar",
+      "writeCommittedChecksumMeta",
+      "reconcileDurableYamlTargetUnlocked",
+      "readDurableYamlAfterReconcileUnlocked",
+      "loadCatalogBySourceHash",
+      "discoverItemsWithDurableFailureEvent"
+    ],
+    "expectedDesignQuestion": "Should durable target mapping include directory fsync targets such as graph_vault/catalog and batch-run directories, or should fsyncDirectory use a parent-file mapping fallback?"
+  },
+  "designAudit": {
+    "status": "passed",
+    "round": "r5",
+    "agents": {
+      "agent-a": "passed",
+      "agent-b": "passed",
+      "agent-c": "passed"
+    },
+    "reports": {
+      "agent-a-r1": "agent-a/design-audit-r1.md",
+      "agent-b-r1": "agent-b/design-audit-r1.md",
+      "agent-c-r1": "agent-c/design-audit-r1.md",
+      "agent-a-r2": "agent-a/design-audit-r2.md",
+      "agent-b-r2": "agent-b/design-audit-r2.md",
+      "agent-c-r2": "agent-c/design-audit-r2.md",
+      "agent-a-r3": "agent-a/design-audit-r3.md",
+      "agent-b-r3": "agent-b/design-audit-r3.md",
+      "agent-c-r3": "agent-c/design-audit-r3.md",
+      "agent-a-r4": "agent-a/design-audit-r4.md",
+      "agent-b-r4": "agent-b/design-audit-r4.md",
+      "agent-c-r4": "agent-c/design-audit-r4.md",
+      "agent-a-r5": "agent-a/design-audit-r5.md",
+      "agent-b-r5": "agent-b/design-audit-r5.md",
+      "agent-c-r5": "agent-c/design-audit-r5.md"
+    },
+    "r2RequiredDesignActions": [
+      "complete directory fsync scopes for graph_vault settings, provider-requests, book output lancedb and shared output lancedb targets",
+      "remove the book-leases lane ownership conflict between manifestWriterLane and checkpointWriterLane",
+      "separate directoryDurableKind from primaryDurableKind in directory fsync evidence",
+      "project directory fsync evidence fields across events, command checks, status-json and recovery summary contracts",
+      "extend acceptance coverage for non-catalog directory fsync and read-only projection cases"
+    ],
+    "r3RequiredDesignActions": [
+      "project fsyncTarget, fsyncPlatform and fsyncErrno across command checks, status-json entries, recovery summary and item checkpoint failure evidence",
+      "add directory fsync conditional fields to subprocess durable failure projection and generic event schema",
+      "define explicit unavailable sentinels for directory fsync failures without platform errno",
+      "mark graph_vault/dspy directory fsync scope as recursive for deep DSPy policy targets"
+    ],
+    "r4RequiredDesignActions": [
+      "make status-json self failure projection reuse the complete requiredForFsyncBoundary field set",
+      "require sidecarKind, lane, targetMappingOwner, directoryDurableKind, primaryDurableKind and unavailableFieldSentinels in status-json self failure output for directory fsync boundaries"
+    ],
+    "r1RequiredDesignActions": [
+      "define directory fsync as a derived durable operation of the primary or sidecar write target",
+      "add directory fsync mapping rules for catalog, batch-run, book-scoped, dspy, output and qmd index parent directories",
+      "require directory fsync evidence fields including directoryTargetLocator, primaryTargetLocator, targetMappingOwner, lane and durableKind",
+      "state that status-json read-only and repair writer use the same directory fsync mapping without writing state in read-only mode",
+      "add acceptance coverage for catalog books.yaml checksum meta repair triggering parent directory fsync"
+    ]
+  },
+  "implementationAudit": {
+    "status": "passed",
+    "round": "r3",
+    "agents": {
+      "agent-a": "passed",
+      "agent-b": "passed",
+      "agent-c": "passed"
+    },
+    "baselineIntegrity": {
+      "status": "r1_r2_violated_r3_frozen",
+      "reason": "implementation criteria were created after implementation had already been applied; no further criteria changes are allowed before this run is reconciled",
+      "frozenAuthoritativeBaseline": "docs/architecture/graphrag-parallel-runner.type-dd.yaml design audit r5 acceptance cases",
+      "invalidatedAction": "do not treat implementation-audit-r1 as a valid three-agent fixed-baseline audit",
+      "r2InvalidatedAction": "implementation-r2 criteria were also created after a partial code edit; do not use implementation-r2 as a valid fixed-baseline audit",
+      "r3FreezePoint": "before implementation-r3 code edits",
+      "r3CriteriaPolicy": "criteria-r3 files are frozen and must not be modified during implementation-r3 repair or audit"
+    },
+    "criteria": {
+      "agent-a-r1": "agent-a/implementation-criteria-r1.md",
+      "agent-b-r1": "agent-b/implementation-criteria-r1.md",
+      "agent-c-r1": "agent-c/implementation-criteria-r1.md",
+      "agent-a-r2": "agent-a/implementation-criteria-r2.md",
+      "agent-b-r2": "agent-b/implementation-criteria-r2.md",
+      "agent-c-r2": "agent-c/implementation-criteria-r2.md",
+      "agent-a-r3": "agent-a/implementation-criteria-r3.md",
+      "agent-b-r3": "agent-b/implementation-criteria-r3.md",
+      "agent-c-r3": "agent-c/implementation-criteria-r3.md"
+    },
+    "reports": {
+      "agent-a-r1": "agent-a/implementation-audit-r1.md",
+      "agent-b-r1": "agent-b/implementation-audit-r1.md",
+      "agent-c-r1": "agent-c/implementation-audit-r1.md",
+      "agent-a-r2": "agent-a/implementation-audit-r2.md",
+      "agent-b-r2": "agent-b/implementation-audit-r2.md",
+      "agent-c-r2": "agent-c/implementation-audit-r2.md",
+      "agent-a-r3": "agent-a/implementation-audit-r3.md",
+      "agent-b-r3": "agent-b/implementation-audit-r3.md",
+      "agent-c-r3": "agent-c/implementation-audit-r3.md"
+    },
+    "verification": {
+      "status": "passed",
+      "commands": [
+        "node --check scripts/graphrag/batch-epub-workflow.mjs",
+        "node --check scripts/graphrag/resume-book-workspace.mjs",
+        "node --check scripts/graphrag/batch-failure-classifier.mjs",
+        "npm run test:types -- --pretty false",
+        "YAML.parse docs/architecture/graphrag-parallel-runner.type-dd.yaml",
+        "npx vitest run test/graphrag-runner-durable-preflight.test.ts",
+        "npx vitest run test/graphrag-runner-status-json-readonly.test.ts",
+        "npx vitest run test/integrations/contracts.test.ts -t durable schema closure",
+        "npx vitest run test/book-job-state.test.ts -t shared durable publish reports checksum sidecar directory fsync evidence|qmd index lock release reports directory fsync evidence",
+        "npx vitest run test/cli.test.ts -t durable directory fsync subset",
+        "npx vitest run test/cli.test.ts -t before-claim preflight blocks nested book output durable sidecar temp",
+        "npx vitest run test/cli.test.ts -t all batch qmd commands acquire the qmd index file lock"
+      ]
+    }
+  },
+  "realRunner": {
+    "resumeAllowed": false,
+    "reason": "implementation-r3 fixed-baseline audit passed and the latest user instruction requires stopping after audit close"
+  }
+}

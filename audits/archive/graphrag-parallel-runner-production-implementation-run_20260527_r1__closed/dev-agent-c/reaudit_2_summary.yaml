@@ -1,0 +1,147 @@
+agent_id: dev-agent-c
+reaudit: 2
+status: fail
+criteria_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/criteria.md
+findings_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/reaudit_2_findings.md
+scope:
+  mode: read_only_product_code_and_tests
+  wrote_only:
+    - audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/reaudit_2_findings.md
+    - audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/reaudit_2_summary.yaml
+  secrets_policy: ".env, secrets, and credentials were not read or output"
+  production_code_modified: false
+  audit_directory_created: false
+  tests_run_by_reaudit: false
+  tests_run_by_controller_reported_passed:
+    - node --check scripts/graphrag/batch-epub-workflow.mjs
+    - npm run test:types -- --pretty false
+    - focused CLI coordinator/provider/worker/event/qmd-lock tests
+    - book-state stale fencing tests
+    - contracts batch execution bus envelope test
+audited_files:
+  - scripts/graphrag/batch-epub-workflow.mjs
+  - scripts/graphrag/resume-book-workspace.mjs
+  - src/job-state/repository.ts
+  - src/job-state/graphrag-book.ts
+  - src/integrations/python-bridge.ts
+  - src/store.ts
+  - src/contracts/batch-run.ts
+  - test/cli.test.ts
+  - test/book-job-state.test.ts
+  - test/graphrag-book-state.test.ts
+  - test/integrations/contracts.test.ts
+criteria_results:
+  - id: 1
+    name: coordinator_exclusivity
+    result: pass
+    notes: >
+      Persistent coordinator lock contains required lease fields and rejects an
+      expired lock whose same-host pid is still alive.
+  - id: 2
+    name: item_book_lease_fencing
+    result: fail
+    blocking_findings: [R2-C01]
+  - id: 3
+    name: provider_semaphore_durable_lease
+    result: fail
+    blocking_findings: [R2-C02]
+  - id: 4
+    name: qmd_index_writer_lane_file_lock
+    result: fail
+    blocking_findings: [R2-C03]
+  - id: 5
+    name: subprocess_process_group_recovery
+    result: fail
+    blocking_findings: [R2-C04]
+  - id: 6
+    name: durable_write_contract
+    result: fail
+    blocking_findings: [R2-C05]
+  - id: 7
+    name: terminal_commit_order
+    result: fail
+    blocking_findings: [R2-C01, R2-C02, R2-C06]
+  - id: 8
+    name: manifest_status_projection
+    result: fail
+    blocking_findings: [R2-C07]
+  - id: 9
+    name: worker_pool_bounded_parallelism
+    result: partial_pass
+    blocking_findings: [R2-C08]
+    notes: >
+      Bounded overlap and sequential execution have evidence, but fail-fast
+      sibling cancellation and no-starvation invariants still lack full tests.
+  - id: 10
+    name: behavioral_evidence
+    result: fail
+    blocking_findings: [R2-C08]
+blocking_findings:
+  - id: R2-C01
+    title: item/book fencing does not cover all persistent writes
+    criteria: [2, 7, 8, 10]
+  - id: R2-C02
+    title: provider slot lease is not an end-to-end fenced provider boundary
+    criteria: [3, 7, 8, 10]
+  - id: R2-C03
+    title: qmd index file lock does not cover all index.sqlite writes
+    criteria: [4, 6, 10]
+  - id: R2-C04
+    title: subprocess recovery and process-group boundary are incomplete
+    criteria: [1, 3, 5, 10]
+  - id: R2-C05
+    title: manifest durable write contract still has a migration-path gap
+    criteria: [6]
+  - id: R2-C06
+    title: terminal commit is not a fixed fenced finalization critical section
+    criteria: [7]
+  - id: R2-C07
+    title: manifest/status-json are not fully derived from durable checkpoints and events
+    criteria: [8]
+  - id: R2-C08
+    title: behavioral tests still miss key production races and crash recovery
+    criteria: [9, 10]
+blocking_findings_count: 8
+residual_risks:
+  - >
+    Repository book-state fencing is improved, but event, manifest, qmd build
+    manifest, producer manifest, and qmd index write paths still need the same
+    current generation/token enforcement.
+  - >
+    Provider slot capacity is now durable-gated, but provider slot identity is
+    not verified inside child/provider adapters and is not recorded fully in
+    subprocess registry records.
+  - >
+    qmd writer command lock evidence does not prove all SQLite write paths are
+    locked, especially createStore initialization and query/rerank cache writes.
+  - >
+    Existing fail-fast tests show a single recoverable checkpoint path, not
+    multi-worker sibling cancellation, quiesce, and lease cleanup.
+evidence_commands:
+  static_review:
+    - sed -n '1,220p' audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/criteria.md
+    - rg -n "coordinatorLock|providerSlot|qmdIndex|recoverEventLogTail|spawnCommand|failFast" scripts/graphrag/batch-epub-workflow.mjs
+    - rg -n "assertBatchBookLease|writeYamlFile|recordArtifacts|appendRunRecord" src/job-state/repository.ts src/job-state/graphrag-book.ts
+    - rg -n "withQmdIndexFileLock|QMD_GRAPHRAG_PROVIDER_SLOT|python-bridge|createStore|setCachedResult" src scripts test
+    - rg -n "rejects coordinator takeover|durable provider slots|qmd writer commands acquire|migrate-only normalizes|rejects stage checkpoint" test
+  controller_reported_passed:
+    - node --check scripts/graphrag/batch-epub-workflow.mjs
+    - npm run test:types -- --pretty false
+    - rejects a second live coordinator
+    - rejects coordinator takeover when expired lock pid is still alive
+    - recovers stale provider slot leases
+    - durable provider slots gate capacity
+    - book-concurrency 2 runs multiple books through the worker pool
+    - book-concurrency 1 preserves sequential book execution
+    - migrate-only recovers a partial event log tail
+    - migrate-only normalizes duplicate event ids
+    - rejects stage checkpoint writes with stale batch book lease fencing
+    - rejects artifact and run catalog writes with stale batch book lease fencing
+    - accepts batch execution bus envelopes
+    - qmd writer commands acquire the qmd index file lock
+overall_notes: >
+  Reaudit 2 confirms meaningful fixes since reaudit 1, but the implementation
+  still fails the fixed production baseline because the remaining invariants are
+  cross-boundary: fencing must cover every durable write, provider/qmd/subprocess
+  controls must be enforced inside child and SQLite layers, and crash/race tests
+  must prove recovery semantics rather than only wrapper events.

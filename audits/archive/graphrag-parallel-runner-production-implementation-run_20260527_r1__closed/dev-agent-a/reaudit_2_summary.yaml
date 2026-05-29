@@ -1,0 +1,155 @@
+agent_id: dev-agent-a
+reaudit_round: 2
+status: fail
+criteria_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/criteria.md
+findings_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/reaudit_2_findings.md
+review_scope: >
+  Read-only re-audit of the current GraphRAG multi-book parallel runner
+  implementation and tests against the 10 fixed criteria in criteria.md. No new
+  audit directory was created. criteria.md was not modified. No .env, secrets,
+  keys, or credentials were read or output. Production source code was not
+  modified.
+blocking_findings:
+  - id: RA2-B1
+    criteria: [2, 3, 9]
+    title: qmd corpus and producer manifest write paths still lack pre-write book fencing
+    required_fix: >
+      Validate current batch book lease generation/token before qmd SQLite/corpus
+      mutation and before writing qmd_output_manifest.json; apply item/book
+      fencing consistently to terminal checkpoint/event/manifest writes.
+  - id: RA2-B2
+    criteria: [7, 10]
+    title: qmd SQLite busy/locked bounded retry and observable retry metrics remain missing
+    required_fix: >
+      Classify SQLITE_BUSY/SQLITE_LOCKED/database-locked failures, retry them
+      within a bounded local budget, expose retry count/wait metrics, and cover
+      contention with focused tests.
+  - id: RA2-B3
+    criteria: [1, 8, 10]
+    title: coordinator takeover reconciliation does not kill live orphan subprocess process groups
+    required_fix: >
+      During coordinator recovery, terminate same-host live subprocess records
+      from the old runner session with bounded SIGTERM/SIGKILL before new claim,
+      then update subprocess/provider/book lease records.
+  - id: RA2-B4
+    criteria: [10]
+    title: production test coverage still misses mandatory residual concurrency and recovery cases
+    required_fix: >
+      Add tests for duplicate book exclusion, stale item claim fencing, SQLite
+      busy/locked contention and metrics, takeover live subprocess kill, temp
+      file recovery, and fail-fast sibling cancellation/quiesce.
+criteria_results:
+  - criterion: 1
+    name: same runId single coordinator
+    result: partial
+    notes: >
+      Durable lock, heartbeat, live coordinator rejection, and live PID takeover
+      rejection are present. Live orphan subprocess/process-group termination
+      during takeover is still missing.
+  - criterion: 2
+    name: item claim and fencing
+    result: partial
+    notes: >
+      Running item claims carry runner session, worker identity, lease
+      generation, expiresAt, and fencing token. Some qmd/producer write paths
+      still lack pre-write fencing.
+  - criterion: 3
+    name: book-scoped mutual exclusion
+    result: partial
+    notes: >
+      Durable book leases and repository-level fencing exist, but qmd corpus and
+      producer manifest writes are not fully fenced before mutation.
+  - criterion: 4
+    name: sequential compatibility
+    result: pass
+    notes: >
+      Focused CLI evidence covers --book-concurrency 1 preserving sequential
+      execution.
+  - criterion: 5
+    name: manifest and event consistency
+    result: partial
+    notes: >
+      eventId/sequence normalization, partial JSONL tail recovery, and duplicate
+      event handling are implemented and tested; temp file recovery coverage is
+      not yet sufficient.
+  - criterion: 6
+    name: provider slot governance
+    result: pass
+    notes: >
+      Provider slot leases are durable, generationed, released, recovered, and
+      visible through events/status summary; durable capacity gate tests exist.
+  - criterion: 7
+    name: qmd index write safety
+    result: fail
+    notes: >
+      qmd writer lane and file lock are present, but SQLite busy/locked bounded
+      retry classification and observable metrics are absent.
+  - criterion: 8
+    name: failure and wait semantics
+    result: partial
+    notes: >
+      fail-fast, transient retry, provider recovery wait, provider auth, and
+      non-transient stop are distinguished; takeover live subprocess quiesce is
+      still incomplete.
+  - criterion: 9
+    name: GraphRAG closed-loop gate
+    result: partial
+    notes: >
+      qmd build evidence, producer lineage, book-scoped artifacts, qmd corpus
+      registration, query-ready validation, and graph query checks are
+      strengthened; fencing gaps still weaken closed-loop publication.
+  - criterion: 10
+    name: production test coverage
+    result: fail
+    notes: >
+      New focused tests close several prior gaps, but duplicate book exclusion,
+      stale item fencing, SQLite contention metrics, takeover orphan kill, temp
+      file recovery, and cancellation/quiesce remain insufficient.
+closed_from_reaudit_1:
+  - provider slot leases now act as durable capacity gate with recovery and
+    acquire/release evidence
+  - qmd writer commands now acquire and release qmd index file lock
+  - same-run live coordinator and expired-lock-live-PID takeover rejection have
+    focused CLI tests
+  - partial event tail and duplicate event id normalization have focused tests
+  - repository book-state writes now reject stale batch book lease fencing for
+    stage checkpoints, artifacts, and run records
+residual_risks:
+  - >
+    qmd SQLite/corpus mutation may occur before repository-level book fencing
+    rejects stale lease state.
+  - >
+    GraphRAG producer manifest can be overwritten by a stale child before
+    fenced stage completion fails.
+  - >
+    A newly acquired coordinator may leave same-host orphan child process groups
+    alive after old coordinator death.
+  - >
+    SQLite lock contention behavior depends on external file lock discipline
+    rather than bounded database-level retry and metrics.
+evidence_commands:
+  - node --check scripts/graphrag/batch-epub-workflow.mjs
+  - npm run test:types -- --pretty false
+  - >
+    focused CLI tests: rejects a second live coordinator|rejects coordinator
+    takeover when expired lock pid is still alive|recovers stale provider slot
+    leases|durable provider slots gate capacity|book-concurrency 2 runs
+    multiple books through the worker pool|book-concurrency 1 preserves
+    sequential book execution|migrate-only recovers a partial event log
+    tail|migrate-only normalizes duplicate event ids|qmd writer commands
+    acquire the qmd index file lock
+  - >
+    book-state tests: rejects stage checkpoint writes with stale batch book
+    lease fencing|rejects artifact and run catalog writes with stale batch book
+    lease fencing
+  - "contracts test: accepts batch execution bus envelopes"
+audited_files:
+  - scripts/graphrag/batch-epub-workflow.mjs
+  - scripts/graphrag/resume-book-workspace.mjs
+  - src/contracts/batch-run.ts
+  - src/job-state/graphrag-book.ts
+  - src/job-state/repository.ts
+  - src/store.ts
+  - test/cli.test.ts
+  - test/book-job-state.test.ts
+  - test/integrations/contracts.test.ts

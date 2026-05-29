@@ -1,0 +1,143 @@
+agent_id: dev-agent-b
+reaudit_round: 3
+status: fail
+criteria_version:
+  file: "audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-b/criteria.md"
+  fixed_criteria_count: 10
+findings_file: "audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-b/reaudit_3_findings.md"
+review_date: "2026-05-27"
+scope:
+  - "current_worktree"
+  - "read_only_source_and_tests"
+blocking_findings:
+  - id: R3-B01
+    title: "terminal completion 仍不是完整 fenced commit"
+    criteria:
+      - 2
+      - 7
+      - 9
+    locations:
+      - "scripts/graphrag/batch-epub-workflow.mjs:2843"
+      - "scripts/graphrag/batch-epub-workflow.mjs:2880"
+      - "scripts/graphrag/batch-epub-workflow.mjs:7263"
+      - "scripts/graphrag/batch-epub-workflow.mjs:7285"
+    why_blocking: "item_completed event 在 completed checkpoint 写入后追加；event fence 在 current checkpoint 非 running 时返回，且 terminal 前未验证 current provider lease。"
+    fix_direction: "把 terminal evidence validation、completed checkpoint、item_completed event 纳入同一 finalization fence，并显式校验 item/book/provider generation 与 fencing token。"
+  - id: R3-B02
+    title: "qmd index DB 写入前仍未验证 batch book lease/fencing"
+    criteria:
+      - 2
+      - 7
+      - 9
+    locations:
+      - "src/job-state/graphrag-book.ts:1015"
+      - "src/job-state/graphrag-book.ts:1030"
+      - "src/job-state/graphrag-book.ts:1040"
+      - "src/job-state/repository.ts:1144"
+    why_blocking: "qmd index DB mutation 发生在 repository qmd corpus registration 的 book lease 检查之前；file lock 只提供互斥，不提供 batch ownership fencing。"
+    fix_direction: "在任何 qmd index DB mutation 前执行 current batch book lease/fencing 校验，并增加 stale lease 下 index 未变更的负向测试。"
+  - id: R3-B03
+    title: "durable write 协议未覆盖 repository YAML/book state 与 GraphRAG sidecar"
+    criteria:
+      - 4
+      - 6
+    locations:
+      - "src/job-state/repository.ts:324"
+      - "src/job-state/repository.ts:388"
+      - "src/job-state/graphrag-book.ts:1429"
+      - "scripts/graphrag/batch-epub-workflow.mjs:5020"
+    why_blocking: "runner JSON 有 checksum/reconcile，但 catalog/book state YAML 与 GraphRAG sidecar JSON 缺 checksum/generation validation 和 restart temp/invalid target reconciliation。"
+    fix_direction: "为 YAML/book state/sidecar JSON 增加 checksum 或 generation sidecar、启动/读取前 reconciliation、invalid target quarantine，并替换直接 writeFileSync。"
+  - id: R3-B04
+    title: "固定第 10 条行为级测试仍未完全覆盖"
+    criteria:
+      - 10
+    locations:
+      - "test/cli.test.ts:2653"
+      - "test/cli.test.ts:2675"
+      - "test/cli.test.ts:4657"
+      - "test/cli.test.ts:13134"
+    why_blocking: "已有 focused tests 覆盖多项修复，但缺 SQLite busy、stale worker commit rejection、durable write recovery；provider release fencing 测试未构造 stale token/generation 负向路径。"
+    fix_direction: "补齐 SQLite busy/qmd index contention、stale worker checkpoint/event/qmd-index/catalog rejection、provider stale release negative、durable temp/checksum/invalid target recovery 测试。"
+criteria_results:
+  - criterion: 1
+    title: "Single coordinator ownership is durable"
+    verdict: pass
+    blocking_findings: []
+  - criterion: 2
+    title: "Item and book ownership use lease fencing"
+    verdict: fail
+    blocking_findings:
+      - R3-B01
+      - R3-B02
+  - criterion: 3
+    title: "Provider concurrency is enforced at the child-process boundary"
+    verdict: pass
+    blocking_findings: []
+  - criterion: 4
+    title: "Durable writes are crash recoverable"
+    verdict: fail
+    blocking_findings:
+      - R3-B03
+  - criterion: 5
+    title: "Event logs are authoritative audit trails"
+    verdict: pass
+    blocking_findings: []
+  - criterion: 6
+    title: "Manifest and status are derived caches"
+    verdict: pass
+    blocking_findings: []
+  - criterion: 7
+    title: "Terminal completion is evidence gated"
+    verdict: fail
+    blocking_findings:
+      - R3-B01
+      - R3-B02
+  - criterion: 8
+    title: "Failure classification leads to stable terminal or retry states"
+    verdict: pass
+    blocking_findings: []
+  - criterion: 9
+    title: "Crash and restart recovery handles live subprocess risk"
+    verdict: fail
+    blocking_findings:
+      - R3-B01
+      - R3-B02
+  - criterion: 10
+    title: "Tests exercise state and recovery behavior"
+    verdict: fail
+    blocking_findings:
+      - R3-B04
+residual_risks:
+  - id: R3-R01
+    description: "status-json 对 legacy exhausted transient 仍投影为 pending/retryable；正常运行会持久化 failed/stop_until_fixed，因此列为只读 projection 风险。"
+  - id: R3-R02
+    description: "远端 coordinator 活性无法本机验证；当前依赖 expiry 接管加 remote subprocess quarantine，多主机共享 state root 仍需外部 fencing 约束。"
+  - id: R3-R03
+    description: "qmd index file lock 已串行化 writer commands，但不等同 SQLite busy/backoff 策略；非 batch 外部写入仍需额外防护。"
+verified_coverage:
+  - "single coordinator lock with fail-closed second coordinator rejection"
+  - "book-concurrency worker pool and sequential fallback"
+  - "durable provider slot capacity gate, stale recovery, and release metadata"
+  - "book lease and item checkpoint CAS/fencing for main checkpoint writes"
+  - "qmd writer command file lock"
+  - "deterministic event log normalization for partial tail and duplicate ids"
+  - "manifest mismatch rebuild from durable checkpoints"
+  - "normal-run provider recovery exhaustion as failed stop_until_fixed"
+  - "remote orphan subprocess quarantine"
+evidence_commands:
+  - command: "node --check scripts/graphrag/batch-epub-workflow.mjs"
+    result: "reported_passed_by_controller"
+  - command: "npm run test:types -- --pretty false"
+    result: "reported_passed_by_controller"
+  - command: "CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/cli.test.ts -t \"rejects a second live coordinator|rejects coordinator takeover when expired lock pid is still alive|recovers stale provider slot leases|durable provider slots gate capacity|provider slot stale release|book-concurrency 2 runs multiple books through the worker pool|book-concurrency 1 preserves sequential book execution|migrate-only recovers a partial event log tail|migrate-only normalizes duplicate event ids|qmd writer commands acquire the qmd index file lock|normal run exits after provider recovery wait limit|provider recovery wait limit preserves checkpoint identity during catalog drift|restart quarantines remote orphan subprocess records|rebuilds manifest mismatched with durable checkpoints\""
+    result: "reported_passed_by_controller"
+  - command: "CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000 test/book-job-state.test.ts -t \"rejects stage checkpoint writes with stale batch book lease fencing|rejects artifact and run catalog writes with stale batch book lease fencing\""
+    result: "reported_passed_by_controller"
+  - command: "CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000 test/integrations/contracts.test.ts -t \"accepts batch execution bus envelopes\""
+    result: "reported_passed_by_controller"
+review_notes:
+  source_modifications: "none"
+  audit_directory_created: false
+  criteria_modified: false
+  env_or_secret_files_read: false

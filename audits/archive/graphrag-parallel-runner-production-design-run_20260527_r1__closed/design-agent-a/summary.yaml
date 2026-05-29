@@ -1,0 +1,64 @@
+decision: fail
+must_fix:
+  - id: C04
+    title: Clarify serialized durable write ownership.
+    finding: >
+      The design names a manifestWriterLane in the global-write invariant but
+      does not define that lane under resourceControls.writerLanes, while
+      catalogWriterLane also protects manifest.json.
+    required_change: >
+      Give manifest writes exactly one owner, define the lane ordering for
+      checkpoint, event, and manifest commits, and state the atomic durable
+      write contract for file replacement, event append, and SQLite writes.
+  - id: C08
+    title: Define crash-safe handling for in-flight external commands.
+    finding: >
+      Worker and coordinator crash recovery relies on fencing tokens, but the
+      design does not define how running qmd or GraphRAG subprocesses are
+      cancelled, fenced, quarantined, or prevented from committing stale
+      persistent state after lease loss.
+    required_change: >
+      Add a subprocess ownership and cleanup contract, including process group
+      termination, stale artifact quarantine, qmd index write protection,
+      commit-time fencing for every durable output, and retry-budget exhaustion
+      mapping to a terminal state.
+should_fix:
+  - id: C01
+    title: Specify the run-lock atomicity primitive.
+    recommendation: >
+      State whether the coordinator lock uses atomic file creation, SQLite
+      compare-and-swap, advisory locking with durable metadata, or another
+      concrete mechanism for acquire, heartbeat refresh, expiry, and takeover.
+  - id: C02
+    title: Extend item fencing beyond checkpoint writes.
+    recommendation: >
+      Require current fencing authority before catalog, event, qmd index,
+      manifest, and book-scoped artifact commits, or route those commits through
+      a coordinator-mediated protocol that performs the check.
+  - id: C10
+    title: Add explicit crash and production evidence tests.
+    recommendation: >
+      Add validation cases for worker crash with an active subprocess,
+      coordinator crash during terminal commit, stale lease write rejection,
+      retry budget exhaustion, and a real two-book acceptance run with durable
+      qmd and GraphRAG evidence.
+doc_change_recommendations:
+  - >
+    Normalize writer lane terminology so the invariant, resourceControls, and
+    acceptance criteria use the same lane names and protected path ownership.
+  - >
+    Add a concise commit protocol section for terminal item transitions:
+    validate lease and book lease, commit checkpoint, append event, derive and
+    replace manifest, then release leases.
+  - >
+    Add a subprocess lifecycle section covering process group IDs, cancellation
+    on lease loss, orphan detection on resume, and rules for ignoring or
+    deleting artifacts from stale producer runs.
+  - >
+    Add a retry budget rule that converts exhausted transient failures to a
+    specific durable state and explains whether the coordinator continues other
+    books or stops.
+  - >
+    Add a production acceptance evidence requirement for at least one real
+    multi-book run showing overlapping running items, provider backpressure,
+    per-book GraphRAG lineage, qmd validation, and query_ready success.

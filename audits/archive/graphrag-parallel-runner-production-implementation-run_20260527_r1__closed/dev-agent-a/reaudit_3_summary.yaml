@@ -1,0 +1,239 @@
+agent_id: dev-agent-a
+reaudit_round: 3
+status: fail
+criteria_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/criteria.md
+criteria_version: sha256:e763182a90d9aeeeafa11f21379473a3a8e2218dc5d81bbbe9fef6625d9281ca
+findings_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/reaudit_3_findings.md
+review_scope: >
+  Read-only implementation re-audit of the current GraphRAG multi-book parallel
+  runner worktree against the 10 fixed criteria in criteria.md. No new audit
+  directory was created. criteria.md was not modified. No .env, secrets, keys,
+  or credentials were read or output. Production source code was not modified.
+blocking_findings:
+  - id: RA3-B1
+    criteria: [2, 3, 9]
+    title: qmd corpus and producer manifest writes still occur before book fencing
+    locations:
+      - src/job-state/graphrag-book.ts:1016
+      - src/job-state/graphrag-book.ts:1040
+      - src/job-state/graphrag-book.ts:1384
+      - src/job-state/graphrag-book.ts:1423
+      - scripts/graphrag/resume-book-workspace.mjs:1192
+      - scripts/graphrag/resume-book-workspace.mjs:1208
+      - scripts/graphrag/resume-book-workspace.mjs:1341
+      - scripts/graphrag/resume-book-workspace.mjs:1370
+    why_blocking: >
+      The fixed criteria require item/book fencing before qmd, manifest,
+      checkpoint, catalog, artifact, or producer writes. registerQmdCorpusDocument
+      mutates the qmd SQLite/corpus before the fenced repository registration,
+      and writeGraphRagOutputProducerManifest writes qmd_output_manifest.json
+      before the fenced repo.completeStage paths. A stale child can therefore
+      publish qmd or GraphRAG producer state before the lease rejection occurs.
+    required_fix: >
+      Validate the current batch book lease generation/token before qmd SQLite
+      mutation and before qmd_output_manifest.json writes, preferably through a
+      shared fenced pre-write API. Add stale child tests proving stale leases
+      cannot modify .qmd/index.sqlite, qmd corpus registration, producer
+      manifests, or closed-loop publication.
+  - id: RA3-B2
+    criteria: [7, 10]
+    title: SQLite busy/locked bounded retry and observable retry metrics remain missing
+    locations:
+      - src/store.ts:855
+      - src/store.ts:867
+      - src/job-state/graphrag-book.ts:1089
+      - src/job-state/graphrag-book.ts:1115
+      - scripts/graphrag/batch-epub-workflow.mjs:2377
+      - scripts/graphrag/batch-epub-workflow.mjs:2445
+      - test/cli.test.ts:2759
+    why_blocking: >
+      qmd writer lane and file locks exist, but SQLite-level SQLITE_BUSY,
+      SQLITE_LOCKED, and database-is-locked failures are not classified, retried
+      under a bounded local budget, or exposed through a retry metric. Existing
+      tests only prove file lock acquisition and release, not SQLite contention
+      behavior.
+    required_fix: >
+      Add SQLite busy/locked classification, bounded local retry and wait budget
+      around qmd index/corpus writes, expose retry count/wait/classification in
+      events or recovery/status JSON, and add a contention test that asserts the
+      metric and final consistency.
+  - id: RA3-B3
+    criteria: [10]
+    title: mandatory production concurrency and recovery tests are still incomplete
+    locations:
+      - test/cli.test.ts:2141
+      - test/cli.test.ts:2446
+      - test/cli.test.ts:2675
+      - test/cli.test.ts:2759
+      - test/book-job-state.test.ts:1059
+      - test/book-job-state.test.ts:1152
+      - scripts/graphrag/batch-epub-workflow.mjs:3269
+      - scripts/graphrag/batch-epub-workflow.mjs:3272
+      - scripts/graphrag/batch-epub-workflow.mjs:8066
+      - scripts/graphrag/batch-epub-workflow.mjs:8574
+    why_blocking: >
+      The new tests cover several previous gaps, but criteria.md requires
+      production coverage for duplicate book exclusion, stale claim fencing,
+      qmd SQLite lock contention, event/manifest reconciliation, coordinator
+      recovery, and fail-fast/transient/provider wait durable evidence. Current
+      tests do not directly cover duplicate canonical book exclusion, stale item
+      checkpoint/event fencing, SQLite contention metrics, same-host live orphan
+      termination, durable JSON temp/checksum reconciliation, or parallel
+      fail-fast sibling quiesce.
+    required_fix: >
+      Add focused tests for duplicate same-book workers, stale item claim/event
+      writes, SQLite busy/locked retry metrics, same-host live orphan process
+      group termination, durable JSON temp/checksum recovery, and non-transient
+      parallel quiesce with durable registry/event assertions.
+criteria_results:
+  - criterion: 1
+    name: same runId single coordinator
+    result: partial
+    notes: >
+      Durable lock, heartbeat, fail-closed live lock rejection, expired live PID
+      rejection, and subprocess registry reconciliation are implemented.
+      Same-host live orphan termination exists but lacks focused production
+      coverage.
+  - criterion: 2
+    name: item claim and fencing
+    result: partial
+    notes: >
+      Running item claims carry runner session, worker identity, lease
+      generation, expiresAt, and fencing token. Event and checkpoint fencing are
+      partially implemented, but qmd corpus and producer manifest pre-write
+      fencing remain missing.
+  - criterion: 3
+    name: book-scoped mutual exclusion
+    result: partial
+    notes: >
+      Durable book leases and repository book fencing are present. qmd corpus
+      and producer manifest writes still have pre-write fencing gaps, and
+      duplicate canonical book exclusion lacks direct test coverage.
+  - criterion: 4
+    name: sequential compatibility
+    result: pass
+    notes: >
+      Focused CLI evidence covers --book-concurrency 1 preserving sequential
+      execution, while the worker pool is only used for higher concurrency.
+  - criterion: 5
+    name: manifest and event consistency
+    result: partial
+    notes: >
+      eventId/sequence normalization, partial tail recovery, duplicate event id
+      handling, and manifest rebuild from checkpoints are implemented and
+      tested. Durable JSON temp/checksum reconciliation lacks focused tests.
+  - criterion: 6
+    name: provider slot governance
+    result: pass
+    notes: >
+      Provider slots are durable leases with generation, wait metric, release
+      events, stale recovery, release fencing, capacity gate behavior, and
+      status/recovery visibility.
+  - criterion: 7
+    name: qmd index write safety
+    result: fail
+    notes: >
+      qmd index writer lane and file lock exist, but SQLite busy/locked bounded
+      local retry and observable retry metrics are not implemented.
+  - criterion: 8
+    name: failure and wait semantics
+    result: partial
+    notes: >
+      Provider wait exhaustion is converted to failed/stop_until_fixed and
+      stop paths request active subprocess termination. End-to-end parallel
+      sibling quiesce coverage remains missing.
+  - criterion: 9
+    name: GraphRAG closed-loop gate
+    result: partial
+    notes: >
+      qmd build evidence, producer lineage, artifact validation, qmd corpus
+      registration, query-ready checkpoint validation, and graph query checks
+      are strengthened. Pre-write fencing gaps still weaken publication trust.
+  - criterion: 10
+    name: production test coverage
+    result: fail
+    notes: >
+      New tests close several prior gaps, but mandatory coverage for duplicate
+      book exclusion, stale item fencing, SQLite contention metrics, same-host
+      live orphan kill, durable JSON temp/checksum reconciliation, and parallel
+      quiesce remains incomplete.
+closed_from_reaudit_2:
+  - Coordinator live-lock rejection is fail-closed and tests assert no events
+    file or coordinator checksum is written on rejection.
+  - Durable provider slot capacity gate, stale recovery, release fencing, and
+    status visibility are implemented and tested.
+  - qmd writer commands acquire and release the qmd index file lock.
+  - Same-host live orphan subprocess termination and remote orphan quarantine
+    are implemented; remote quarantine has focused test coverage.
+  - Partial event tail recovery, duplicate event id normalization, and manifest
+    rebuild from durable checkpoints have focused tests.
+  - Provider recovery wait exhaustion no longer leaves the item runnable
+    pending and preserves checkpoint identity during catalog drift.
+residual_risks:
+  - >
+    A stale child can still mutate qmd SQLite/corpus or overwrite
+    qmd_output_manifest.json before repository-level book lease rejection.
+  - >
+    SQLite lock behavior still depends on external file-lock discipline and
+    lacks database-level bounded retry, classification, and metric visibility.
+  - >
+    Same-host live orphan termination, duplicate book exclusion, stale item
+    fencing, durable JSON temp/checksum recovery, and parallel quiesce could
+    regress without focused production tests.
+verified_coverage:
+  - single coordinator lock and heartbeat with fail-closed live rejection
+  - single-process coordinator with --book-concurrency worker pool
+  - durable provider slot capacity gate, stale recovery, wait metric, and release event
+  - qmd index writer lane plus file lock acquire/release events
+  - deterministic event log normalization for partial tail and duplicate event ids
+  - manifest/status projection from durable checkpoints and manifest rebuild
+  - provider recovery wait limit changes exhausted transient items to failed stop_until_fixed
+  - repository-level book lease fencing for stage checkpoints, artifacts, and run records
+evidence_commands:
+  - node --check scripts/graphrag/batch-epub-workflow.mjs
+  - npm run test:types -- --pretty false
+  - >
+    CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose
+    --testTimeout 120000 test/cli.test.ts -t "rejects a second live
+    coordinator|rejects coordinator takeover when expired lock pid is still
+    alive|recovers stale provider slot leases|durable provider slots gate
+    capacity|provider slot stale release|book-concurrency 2 runs multiple books
+    through the worker pool|book-concurrency 1 preserves sequential book
+    execution|migrate-only recovers a partial event log tail|migrate-only
+    normalizes duplicate event ids|qmd writer commands acquire the qmd index
+    file lock|normal run exits after provider recovery wait limit|provider
+    recovery wait limit preserves checkpoint identity during catalog
+    drift|restart quarantines remote orphan subprocess records|rebuilds
+    manifest mismatched with durable checkpoints"
+  - >
+    CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose
+    --testTimeout 60000 test/book-job-state.test.ts -t "rejects stage
+    checkpoint writes with stale batch book lease fencing|rejects artifact and
+    run catalog writes with stale batch book lease fencing"
+  - >
+    CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose
+    --testTimeout 60000 test/integrations/contracts.test.ts -t "accepts batch
+    execution bus envelopes"
+  - >
+    rg -n "SQLITE_BUSY|SQLITE_LOCKED|database is locked|busy_timeout|sqlite.*retry|contention"
+    src/store.ts src/db.ts src/job-state/graphrag-book.ts
+    scripts/graphrag/batch-epub-workflow.mjs test/cli.test.ts
+    test/book-job-state.test.ts
+  - >
+    rg -n "recordQmdCorpusRegistration|qmd_output_manifest|stale.*item|duplicate book|book_running_observed"
+    test/cli.test.ts test/book-job-state.test.ts
+    scripts/graphrag/resume-book-workspace.mjs src/job-state/graphrag-book.ts
+audited_files:
+  - audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/criteria.md
+  - audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/reaudit_2_findings.md
+  - audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/reaudit_2_summary.yaml
+  - scripts/graphrag/batch-epub-workflow.mjs
+  - scripts/graphrag/resume-book-workspace.mjs
+  - src/contracts/batch-run.ts
+  - src/job-state/graphrag-book.ts
+  - src/job-state/repository.ts
+  - src/store.ts
+  - src/db.ts
+  - test/cli.test.ts
+  - test/book-job-state.test.ts
+  - test/integrations/contracts.test.ts

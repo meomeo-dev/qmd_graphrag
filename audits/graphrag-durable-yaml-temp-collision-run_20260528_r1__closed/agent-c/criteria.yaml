@@ -1,0 +1,92 @@
+schemaVersion: "1.0.0"
+auditId: graphrag-durable-yaml-temp-collision
+agent: agent-c
+criteriaVersion: "2026-05-28.fixed-10"
+stability: "后续复审必须沿用本文件 10 条基准，不得增删或改义。"
+scope:
+  batchRunId: epub-batch-20260527-real-resume-1
+  itemId: item-45c6c3f72a50-f5252de5
+  failedStage: resume-book-2
+  failure: durable YAML temp rename ENOENT
+criteria:
+  - id: C01_failure_scope_preservation
+    title: 失败范围保持
+    requirement: >
+      设计审计必须只判断当前 durable YAML rename ENOENT 失败链路，不把
+      provider、数据兼容性、查询质量或无关 runner 问题纳入结论。
+    passCondition: >
+      报告中的结论、证据和修正项均可回溯到 durable YAML 本地持久化
+      (local persistence) 失败。
+  - id: C02_temp_name_uniqueness
+    title: 临时文件名唯一性
+    requirement: >
+      durable YAML 写入的 temp 名必须在同一进程、同一 pid、同一毫秒、
+      多 worker、多目标文件与同一目标文件重入场景下保持唯一。
+    passCondition: >
+      temp 名包含不可预测随机量或单调 attempt id，并通过独占创建
+      (exclusive create) 验证；不得只依赖 process.pid 与 Date.now()。
+  - id: C03_same_target_serialization
+    title: 同目标写入串行化
+    requirement: >
+      同一 YAML target 的所有写入、读前 reconcile、checksum backfill、
+      quarantine 与 evidence reader 必须共享同一互斥协议。
+    passCondition: >
+      不存在绕过 per-target lock 的读写或清理路径；锁覆盖
+      temp write 到 rename、checksum commit 与 parent fsync 的完整区间。
+  - id: C04_live_temp_ownership
+    title: live temp 所有权保护
+    requirement: >
+      reconcile 只能清理可证明已遗留的 temp，不能删除其他 live writer
+      正在写入或等待 rename 的 temp。
+    passCondition: >
+      temp 文件带 writerSessionId、attemptId、target、createdAt 与可验证状态；
+      清理前必须确认 owner lease 过期或进程不可存活，并有最小年龄阈值。
+  - id: C05_lock_staleness_safety
+    title: stale lock 安全性
+    requirement: >
+      stale lock 删除必须避免把仍持有 critical section 的 live writer 误判为
+      过期 writer。
+    passCondition: >
+      lock 文件包含 session、pid、host、generation 与 heartbeat；删除前校验
+      TTL、owner liveness、generation fencing，并记录可审计事件。
+  - id: C06_checksum_commit_atomicity
+    title: checksum 提交原子性
+    requirement: >
+      target YAML 与 checksum/generation 的提交顺序必须能区分旧 target、
+      新 target、旧 checksum、新 checksum 与 crash 中间态。
+    passCondition: >
+      crash recovery 不会把已完整 rename 的新 target 因旧 checksum 误隔离；
+      checksum sidecar 自身采用 durable replace 或被嵌入同一提交记录。
+  - id: C07_fsync_recovery_contract
+    title: fsync 恢复契约
+    requirement: >
+      设计必须明确 temp fsync、target rename、checksum fsync、parent directory
+      fsync 的顺序、失败处理与平台边界。
+    passCondition: >
+      每个 crash window 都有确定恢复动作；best-effort directory fsync 的残余
+      风险被声明，并不会导致 completed 状态被错误发布。
+  - id: C08_single_durable_yaml_abstraction
+    title: 单一 durable YAML 抽象
+    requirement: >
+      repository、capability catalog、settings projection、batch evidence reader
+      与其他 YAML 写入点必须复用同一 durable YAML 协议或适配同一契约。
+    passCondition: >
+      不存在各自实现的 temp 命名、lock、reconcile、checksum 或 fsync 语义漂移。
+  - id: C09_observable_local_defect_classification
+    title: 本地缺陷可观测分类
+    requirement: >
+      durable YAML temp collision、rename ENOENT、checksum crash-window mismatch
+      与 live temp deletion 必须在状态中分类为可修复代码缺陷
+      (fixable code defect)。
+    passCondition: >
+      item checkpoint、event、status-json 与 recovery summary 包含稳定
+      failureKind、localFailureClass、recoveryDecision、failedStage 与 redacted
+      locator；不得降级为 unknown 或 provider transient。
+  - id: C10_fault_injection_acceptance
+    title: 故障注入验收
+    requirement: >
+      设计必须绑定可执行验收，覆盖同 pid 同毫秒写入、同目标并发、
+      reconcile 清理 live temp、target/checksum crash window 与分类输出。
+    passCondition: >
+      测试能稳定复现本次 ENOENT 失败形态，并证明修正后不会误删 live temp、
+      不会发布错误 completed，且能给出本地代码缺陷诊断。

@@ -1,0 +1,26 @@
+decision: pass
+
+remaining_must_fix: []
+
+remaining_should_fix: []
+
+notes:
+  - >
+    Reaudit verified the same ten fixed criteria from criteria.md without
+    modifying criteria.md, docs, or code.
+  - >
+    First-round must-fix C02 is resolved: book lease now has equal-strength
+    schema, heartbeat/expiry, CAS claim and takeover, fencing, duplicate
+    bookId handling, and book-scoped write validation.
+  - >
+    First-round must-fix C07 is resolved: retry budget exhaustion now enters
+    failed_retry_exhausted, emits retry_budget_exhausted, leaves the coordinator
+    running for other books, and requires explicit reset before retry.
+  - >
+    First-round must-fix C10 is resolved: recovery reconciliation now defines
+    authority order and actions across checkpoints, events, producer records,
+    artifacts, graph capability projection, manifest/status, leases, and
+    orphan subprocess state.
+  - >
+    This reaudit did not read .env secret files and did not start the batch
+    runner.

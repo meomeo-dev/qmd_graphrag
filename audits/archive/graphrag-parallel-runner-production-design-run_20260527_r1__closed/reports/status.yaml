@@ -1,0 +1,48 @@
+taskId: graphrag-parallel-runner-production-design
+runId: "20260527_r1"
+status: closed
+phase: design_audit
+decision: pass
+designDocument: docs/architecture/graphrag-parallel-runner.type-dd.yaml
+openedAt: "2026-05-27"
+closedAt: "2026-05-27"
+initialAudit:
+  decision: fail
+  agents:
+    - design-agent-a
+    - design-agent-b
+    - design-agent-c
+  blockingThemes:
+    - provider semaphore subprocess boundary
+    - book lease recovery contract
+    - writer lane and manifest ownership
+    - durable event/checkpoint/manifest persistence
+    - retry budget exhausted terminal state
+    - crash recovery and disk-state reconciliation
+fixSummary: reports/design_fix_summary.yaml
+reaudit:
+  decision: pass
+  agents:
+    design-agent-a:
+      summary: design-agent-a/reaudit_1_summary.yaml
+      remainingMustFix: 0
+    design-agent-b:
+      summary: design-agent-b/reaudit_1_summary.yaml
+      remainingMustFix: 0
+    design-agent-c:
+      summary: design-agent-c/reaudit_1_summary.yaml
+      remainingMustFix: 0
+remainingDesignMustFix: []
+remainingDesignShouldFix:
+  - provider_slot_metric_semantics
+  - qmd_command_envelope_inventory
+  - subprocess_env_allowlist_inventory
+nextPhase: implementation
+notes:
+  - >
+    Design audit is closed because all three reaudit summaries report
+    decision: pass and remaining_must_fix is empty.
+  - >
+    Implementation must keep one coordinator per runId and implement
+    --book-concurrency through an in-process worker pool, not through multiple
+    uncoordinated OS-level batch runners.

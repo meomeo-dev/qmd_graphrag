@@ -1,0 +1,166 @@
+{
+  "taskId": "graphrag-book-yaml-rename-enoent",
+  "runId": "20260528_r1",
+  "status": "closed",
+  "phase": "implementation_audit",
+  "currentRound": "implementation-r6-passed",
+  "triggeredBy": {
+    "batchRunId": "epub-batch-20260527-real-resume-1",
+    "failedItemId": "item-45c6c3f72a50-f5252de5",
+    "failedBookId": "book-45c6c3f72a50-2eb89128",
+    "failedSourceName": "Continuous Delivery Reliable Software Releases Through Build, Test, and Deployment Automation ) (Farley, DavidHumble, Jez).epub",
+    "failedStage": "resume-book-2",
+    "failure": "book-scoped durable YAML rename ENOENT surfaced from resume-book child process as unknown stop_until_fixed",
+    "observedStack": [
+      "writeYamlFileUnlocked",
+      "withDurableYamlFileLock",
+      "FileBookJobStateRepository.upsertBookJob",
+      "FileBookJobStateRepository.writeStageCheckpoint",
+      "bootstrapRecoveredStages",
+      "syncGraphRagBookWorkspace",
+      "resume-book-workspace syncCurrentBook"
+    ],
+    "trueLocalFailureClassExpected": "durable_temp_rename_enoent",
+    "currentObservedFailureKind": "unknown",
+    "currentObservedRecoveryDecision": "stop_until_fixed"
+  },
+  "designAudit": {
+    "status": "passed",
+    "round": "r5",
+    "agents": {
+      "agent-a": "passed",
+      "agent-b": "passed",
+      "agent-c": "passed"
+    },
+    "reports": {
+      "agent-a-r1": "agent-a/design-audit-r1.md",
+      "agent-b-r1": "agent-b/design-audit-r1.md",
+      "agent-c-r1": "agent-c/design-audit-r1.md",
+      "agent-a-r2": "agent-a/design-audit-r2.md",
+      "agent-b-r2": "agent-b/design-audit-r2.md",
+      "agent-c-r2": "agent-c/design-audit-r2.md",
+      "agent-a-r3": "agent-a/design-audit-r3.md",
+      "agent-b-r3": "agent-b/design-audit-r3.md",
+      "agent-c-r3": "agent-c/design-audit-r3.md",
+      "agent-a-r4": "agent-a/design-audit-r4.md",
+      "agent-b-r4": "agent-b/design-audit-r4.md",
+      "agent-c-r4": "agent-c/design-audit-r4.md",
+      "agent-a-r5": "agent-a/design-audit-r5.md",
+      "agent-b-r5": "agent-b/design-audit-r5.md",
+      "agent-c-r5": "agent-c/design-audit-r5.md"
+    },
+    "r1RequiredDesignActions": [
+      "add subprocess durable failure envelope contract",
+      "make BatchCommandCheck the first-hop durable evidence carrier",
+      "define parent runner typed-envelope parsing precedence",
+      "add fail-closed rule for missing or partial subprocess evidence",
+      "add book-scoped YAML resume-child rename ENOENT acceptance cases"
+    ],
+    "r2Focus": [
+      "subprocess durable failure envelope contract",
+      "BatchCommandCheck first-hop durable evidence carrier",
+      "parent runner typed-envelope parsing precedence",
+      "fail-closed subprocess evidence rule",
+      "book-scoped YAML resume-child rename ENOENT acceptance cases"
+    ],
+    "r2RequiredDesignActions": [
+      "add failedSyscall and errno to rename ENOENT event required fields",
+      "define per-entry status-json durable failure fields",
+      "add failedSyscall, errno, renameCause and completedPublishRule to recovery summary fields",
+      "define fallback localFailureClass and unavailable evidence sentinels for incomplete subprocess envelopes",
+      "strengthen book-scoped resume-child acceptance evidence across all observation surfaces"
+    ],
+    "r3Focus": [
+      "event required fields include failedSyscall and errno for rename ENOENT",
+      "status-json durable failure entries preserve envelope fields",
+      "recovery summary fields preserve ENOENT root-cause evidence",
+      "incomplete subprocess envelope has fail-closed localFailureClass and sentinel fields",
+      "book-scoped resume-child acceptance covers all observation surfaces"
+    ],
+    "r3RequiredDesignActions": [
+      "add failedSyscall, errno and targetMappingOwner to eventSchema conditional fields"
+    ],
+    "r4Focus": [
+      "eventSchema conditional fields close durableFailureEventEvidence requirements",
+      "no R2/R3 projection gap remains",
+      "design can proceed to implementation"
+    ],
+    "r4RequiredDesignActions": [
+      "add cleanupReason, checksumRecoveryDecision, evidenceIncomplete, evidenceIncompleteReason, unavailableFieldSentinels and sidecar fields to eventSchema",
+      "add incomplete envelope fields to durableFailureEventEvidence",
+      "add lane, targetMappingOwner and leaseGeneration to commandCheckDurableEvidence required fields",
+      "add retryable, lane, targetMappingOwner, itemId, bookId, workerId, leaseGeneration and incomplete envelope fields to recoverySummaryRequiredFields",
+      "add repairAllowed to statusJsonDurableFailureEntryFields"
+    ],
+    "r5Focus": [
+      "schema field closure across event, commandCheck, status-json and recovery summary",
+      "no unimplemented design gap remains before development"
+    ]
+  },
+  "implementationAudit": {
+    "status": "passed",
+    "round": "r6",
+    "agents": {
+      "agent-a": "passed",
+      "agent-b": "passed",
+      "agent-c": "passed"
+    },
+    "reports": {
+      "agent-a-r1": "agent-a/implementation-audit-r1.md",
+      "agent-b-r1": "agent-b/implementation-audit-r1.md",
+      "agent-c-r1": "agent-c/implementation-audit-r1.md",
+      "agent-a-r2": "agent-a/implementation-audit-r2.md",
+      "agent-b-r2": "agent-b/implementation-audit-r2.md",
+      "agent-c-r2": "agent-c/implementation-audit-r2.md",
+      "agent-a-r3": "agent-a/implementation-audit-r3.md",
+      "agent-b-r3": "agent-b/implementation-audit-r3.md",
+      "agent-c-r3": "agent-c/implementation-audit-r3.md",
+      "agent-a-r4": "agent-a/implementation-audit-r4.md",
+      "agent-c-r4": "agent-c/implementation-audit-r4.md",
+      "agent-b-r4": "agent-b/implementation-audit-r4.md",
+      "agent-a-r5": "agent-a/implementation-audit-r5.md",
+      "agent-b-r5": "agent-b/implementation-audit-r5.md",
+      "agent-c-r5": "agent-c/implementation-audit-r5.md",
+      "agent-a-r6": "agent-a/implementation-audit-r6.md",
+      "agent-b-r6": "agent-b/implementation-audit-r6.md",
+      "agent-c-r6": "agent-c/implementation-audit-r6.md"
+    },
+    "r2RequiredImplementationActions": [
+      "fail closed missing durable subprocess envelopes for confirmed durable local state failures",
+      "add malformed and missing envelope regression coverage",
+      "make runner-start preflight scan temps and item-derived book-scoped targetMapping scopes",
+      "add runner-start book-scoped YAML temp regression coverage",
+      "add settings projection first-missing managed creation regression coverage"
+    ],
+    "r3RequiredImplementationActions": [
+      "stabilize envelope fail-closed tests with explicit subprocess cleanup or higher deterministic timeout",
+      "separate checksum meta missing, invalid and conflict states in shared durable store",
+      "quarantine invalid or conflicting checksum meta sidecars without moving primary targets",
+      "add sidecar-only checksum meta invalid and conflict regression coverage"
+    ],
+    "r4RequiredImplementationActions": [
+      "add full checksum sidecar repair evidence to checksum meta writer and rename ENOENT paths",
+      "include checksumExpected, checksumActual, checksumRecoveryDecision and repairAllowed in runner and shared durable store sidecar write evidence",
+      "add checksum meta conflict regression coverage",
+      "assert sidecar rename ENOENT projection preserves checksum and repair fields",
+      "stabilize real child book-scoped YAML rename ENOENT tests and subprocess cleanup",
+      "align settings projection rejection summary activeCommand assertion with resume-book boundary",
+      "stabilize status-json repair-writer regression tests or split their timeout budget"
+    ],
+    "r5RequiredImplementationActions": [
+      "add runner-level SIGTERM and SIGINT cleanup for active subprocess groups",
+      "preserve no-orphan timeout behavior when test helpers stop the batch runner",
+      "add durable payload schema-closure regression for command checks, checkpoints, events, manifests and recovery summaries"
+    ],
+    "r6Focus": [
+      "verify R5 signal cleanup and durable schema-closure fixes against fixed criteria",
+      "confirm implementation audit can pass before real EPUB runner resumes"
+    ]
+  },
+  "realRunner": {
+    "resumeAllowed": true,
+    "reason": "implementation audit r6 passed; resume real EPUB runner"
+  },
+  "closedAt": "2026-05-29T02:28:21Z",
+  "closureReason": "design and implementation audits passed; directory was left with __open suffix"
+}

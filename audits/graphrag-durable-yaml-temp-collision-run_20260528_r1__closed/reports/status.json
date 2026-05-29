@@ -1,0 +1,219 @@
+{
+  "schemaVersion": "1.0.0",
+  "taskId": "graphrag-durable-yaml-temp-collision",
+  "runId": "20260528_r1",
+  "status": "closed",
+  "phase": "implementation_audit_passed",
+  "triggeredBy": {
+    "batchRunId": "epub-batch-20260527-real-resume-1",
+    "itemId": "item-45c6c3f72a50-f5252de5",
+    "failedStage": "resume-book-2",
+    "failure": "ENOENT during durable YAML temp file rename under parallel runner"
+  },
+  "createdAt": "2026-05-28T07:06:54.572Z",
+  "designFix": {
+    "updated": [
+      "docs/architecture/graphrag-parallel-runner.type-dd.yaml"
+    ],
+    "summary": [
+      "Added collision-resistant durable temp identity contract.",
+      "Added temp lifecycle and stale cleanup contract.",
+      "Added durable YAML lock owner freshness contract.",
+      "Added durable replace failure classification for rename ENOENT."
+    ],
+    "updatedAt": "2026-05-28T07:24:13.311Z"
+  },
+  "designFixR2": {
+    "updated": [
+      "docs/architecture/graphrag-parallel-runner.type-dd.yaml"
+    ],
+    "summary": [
+      "Added full durable target-to-lane mapping.",
+      "Added single durable boundary and forbidden bypass list.",
+      "Added exclusive temp create, temp owner evidence, cleanup decision rules.",
+      "Added lock generation/fencing/heartbeat contract.",
+      "Added checksum crash-window matrix and local failure policy.",
+      "Added durable preflight, observability, and fault-injection acceptance matrix."
+    ],
+    "updatedAt": "2026-05-28T07:32:49.858Z"
+  },
+  "designAudit": {
+    "status": "passed",
+    "passedAt": "2026-05-28T07:49:48.047Z",
+    "reviews": {
+      "agentA": "agent-a/review-after-design-fix-r3.md",
+      "agentB": "agent-b/review-after-design-fix-r3.md",
+      "agentC": "agent-c/review-after-design-fix-r4.md"
+    }
+  },
+  "implementationAudit": {
+    "status": "passed",
+    "phase": "implementation_audit_passed",
+    "requestedAt": "2026-05-28T19:59:35Z",
+    "fixedCriteria": [
+      "agent-a/implementation-criteria.yaml",
+      "agent-b/implementation-criteria.yaml",
+      "agent-c/implementation-criteria.yaml"
+    ],
+    "currentRound": "r10",
+    "reports": {
+      "agentA": "agent-a/implementation-audit-r10.md",
+      "agentB": "agent-b/implementation-audit-r10.md",
+      "agentC": "agent-c/implementation-audit-r10.md"
+    },
+    "roundResults": {
+      "agentA": "PASS",
+      "agentB": "PASS",
+      "agentC": "PASS"
+    },
+    "passedAt": "2026-05-28T20:12:00Z",
+    "blockingFindings": [
+      {
+        "agent": "agent-a",
+        "summary": "beforeClaim/beforeResumeBook preflight does not cover nested production durable targets such as LanceDB qmd_row_count.json sidecars."
+      },
+      {
+        "agent": "agent-b",
+        "summary": "rename ENOENT cause matrix does not distinguish the fixed temp collision, reconciler mistaken deletion, concurrent takeover, generation advanced, and filesystem/external mutation taxonomy."
+      },
+      {
+        "agent": "agent-c",
+        "summary": "fault injection evidence is missing for shared stale lock recovery records, shared quarantine rename ENOENT, and runner YAML reader regression coverage."
+      }
+    ],
+    "failedAt": "2026-05-28T19:08:58Z",
+    "r9FailedAt": "2026-05-28T19:44:39Z",
+    "r9BlockingFindings": [
+      {
+        "agent": "agent-a",
+        "summary": "beforeClaim/beforeResumeBook preflight now scans book output recursively, but scan roots are still hand-written and not derived from durableTargetMappingTable."
+      },
+      {
+        "agent": "agent-c",
+        "summary": "shared-store stale lock and quarantine rename ENOENT fault evidence passed, but runner YAML reader/preflight fault coverage is still missing for YAML targets."
+      }
+    ],
+    "r10PreAuditVerification": [
+      {
+        "command": "node --check scripts/graphrag/batch-epub-workflow.mjs",
+        "status": "passed"
+      },
+      {
+        "command": "npm run test:types",
+        "status": "passed"
+      },
+      {
+        "command": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000 test/graphrag-runner-durable-preflight.test.ts",
+        "status": "passed",
+        "summary": "1 passed"
+      },
+      {
+        "command": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 180000 test/cli.test.ts -t \"durable preflight blocks partial checksum sidecar crash window|durable preflight blocks unresolved stale lock without fencing evidence|before-claim preflight blocks nested book output durable sidecar temp|rename ENOENT during durable checkpoint write is stop-until-fixed\"",
+        "status": "passed",
+        "summary": "4 passed, 244 skipped"
+      },
+      {
+        "command": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 180000 test/cli.test.ts -t \"durable JSON lock timeout is stop-until-fixed with owner evidence|forced durable temp collision is stop-until-fixed before overwrite|directory fsync failure blocks completed publication with evidence|durable reconcile preserves fresh temps and cleans stale temps with owner evidence|durable reconcile preserves stale temps without complete owner evidence|durable reconcile preserves stale temps when target generation advanced|durable reconcile commits matching pending checksum metadata|durable preflight blocks partial checksum sidecar crash window|durable preflight blocks unresolved stale lock without fencing evidence|before-claim preflight blocks nested book output durable sidecar temp|rename ENOENT during durable checkpoint write is stop-until-fixed|all batch qmd commands acquire the qmd index file lock\"",
+        "status": "passed",
+        "summary": "12 passed, 236 skipped"
+      }
+    ],
+    "r9PreAuditVerification": [
+      {
+        "command": "ps -eo pid,ppid,etime,command | rg 'batch-epub-workflow|vitest|epub-batch-20260527-real-resume-1|qmd-epub' || true",
+        "status": "passed",
+        "summary": "No live runner or vitest process remained before verification."
+      },
+      {
+        "command": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 180000 test/cli.test.ts -t \"durable JSON lock timeout is stop-until-fixed with owner evidence|forced durable temp collision is stop-until-fixed before overwrite|directory fsync failure blocks completed publication with evidence|durable reconcile preserves fresh temps and cleans stale temps with owner evidence|durable reconcile preserves stale temps without complete owner evidence|durable reconcile preserves stale temps when target generation advanced|durable reconcile commits matching pending checksum metadata|durable preflight blocks partial checksum sidecar crash window|durable preflight blocks unresolved stale lock without fencing evidence|before-claim preflight blocks nested book output durable sidecar temp|rename ENOENT during durable checkpoint write is stop-until-fixed|all batch qmd commands acquire the qmd index file lock\"",
+        "status": "passed",
+        "summary": "12 passed, 236 skipped"
+      },
+      {
+        "command": "node --check scripts/graphrag/batch-epub-workflow.mjs",
+        "status": "passed"
+      },
+      {
+        "command": "node --check scripts/graphrag/batch-failure-classifier.mjs",
+        "status": "passed"
+      },
+      {
+        "command": "node --check scripts/graphrag/resume-book-workspace.mjs",
+        "status": "passed"
+      },
+      {
+        "command": "npm run test:types",
+        "status": "passed"
+      },
+      {
+        "command": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/book-job-state.test.ts -t \"durable|checksum|LanceDB row-count|producer manifest|quarantine rename ENOENT|stale durable temps\"",
+        "status": "passed",
+        "summary": "12 passed, 54 skipped"
+      },
+      {
+        "command": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/graphrag-book-state.test.ts -t \"producer manifest|qmd_graph_text_unit_identity|qmd_row_count|durable checksum\"",
+        "status": "passed",
+        "summary": "4 passed, 41 skipped"
+      },
+      {
+        "command": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/llm.test.ts -t \"provider request|cost\"",
+        "status": "passed",
+        "summary": "1 passed, 80 skipped"
+      },
+      {
+        "command": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/integrations/graphrag-cost.test.ts",
+        "status": "passed",
+        "summary": "6 passed"
+      },
+      {
+        "command": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/integrations/contracts.test.ts -t \"BatchRunManifest|batch run|recovery summary|durable|provider request\"",
+        "status": "passed",
+        "summary": "2 passed, 69 skipped"
+      }
+    ],
+    "preAuditVerification": [
+      {
+        "command": "node --check scripts/graphrag/batch-epub-workflow.mjs && node --check scripts/graphrag/batch-failure-classifier.mjs && node --check scripts/graphrag/resume-book-workspace.mjs",
+        "status": "passed"
+      },
+      {
+        "command": "npm run test:types",
+        "status": "passed"
+      },
+      {
+        "command": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/graphrag-book-state.test.ts -t \"producer manifest|qmd_graph_text_unit_identity|qmd_row_count|durable checksum\"",
+        "status": "passed",
+        "summary": "4 passed, 41 skipped"
+      },
+      {
+        "command": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/llm.test.ts -t \"provider request|cost\"",
+        "status": "passed",
+        "summary": "1 passed, 80 skipped"
+      },
+      {
+        "command": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/integrations/graphrag-cost.test.ts",
+        "status": "passed",
+        "summary": "6 passed"
+      },
+      {
+        "command": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/book-job-state.test.ts -t \"durable|checksum|LanceDB row-count|producer manifest\"",
+        "status": "passed",
+        "summary": "11 passed, 54 skipped"
+      },
+      {
+        "command": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 180000 test/cli.test.ts -t \"durable JSON lock timeout is stop-until-fixed with owner evidence|forced durable temp collision is stop-until-fixed before overwrite|directory fsync failure blocks completed publication with evidence|durable reconcile preserves fresh temps and cleans stale temps with owner evidence|durable reconcile preserves stale temps without complete owner evidence|durable reconcile preserves stale temps when target generation advanced|durable reconcile commits matching pending checksum metadata|durable preflight blocks partial checksum sidecar crash window|durable preflight blocks unresolved stale lock without fencing evidence|before-resume preflight blocks orphan durable temp instead of launching worker|rename ENOENT during durable checkpoint write is stop-until-fixed|all batch qmd commands acquire the qmd index file lock\"",
+        "status": "passed",
+        "summary": "12 passed, 236 skipped"
+      },
+      {
+        "command": "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/integrations/contracts.test.ts -t \"BatchRunManifest|batch run|recovery summary|durable|provider request\"",
+        "status": "passed",
+        "summary": "2 passed, 69 skipped"
+      }
+    ],
+    "notes": [
+      "Real EPUB runner remains paused until all three implementation audits pass.",
+      "Fixed criteria files were not modified."
+    ]
+  }
+}

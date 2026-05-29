@@ -1,0 +1,65 @@
+decision: fail
+
+must_fix:
+  - id: C02
+    title: 补全 book lease 的可恢复互斥契约
+    detail: >
+      book lease 需要与 item lease 等强度的 schema、TTL、heartbeat、原子
+      claim、fencing token、过期回收和 book-scoped 写入前校验。否则同一
+      bookId 在崩溃恢复后无法证明只有一个 writer。
+  - id: C07
+    title: 定义 retry budget 耗尽后的确定状态迁移
+    detail: >
+      transient retry 已覆盖 nextRetryAt 和 retry budget 记录，但缺少预算耗尽
+      后的状态、事件和 coordinator 行为，可能导致无限 retry、无限 pending 或
+      不一致恢复。
+  - id: C10
+    title: 补充重启恢复的磁盘状态调和矩阵
+    detail: >
+      需要定义 checkpoint、events、producer run record、parquet artifact、
+      query_ready projection 与 leases 不一致时的恢复优先级、复用条件、
+      重建条件和拒绝条件。
+
+should_fix:
+  - id: C01
+    title: 细化 run lock 原子持久化规则
+    detail: >
+      补充 run lock 存储位置、原子创建/替换、续租 CAS 条件、pid 复用防护和
+      coordinator fencing 规则。
+  - id: C04
+    title: 扩展 checkpoint schema 与幂等字段
+    detail: >
+      补充 stage-level producer run id、input fingerprint、command idempotency
+      key、原子写入与 fsync 边界。
+  - id: C08
+    title: 明确 stop-until-fixed 的 quiesce 顺序
+    detail: >
+      规定非 transient 失败后阻止新 claim、处理已运行 worker、取消 provider
+      调用和持久化 running item 的顺序。
+  - id: C09
+    title: 扩展 status-json 的阶段级观测字段
+    detail: >
+      增加 per-item/per-stage 状态、failedStage、activeCommand、lease expiry、
+      fencing/session 标识、producer lineage 和 retry budget remaining。
+
+doc_change_recommendations:
+  - >
+    在 hardInvariants 或 scheduler.workerLifecycle 下新增 book lease schema：
+    runnerSessionId、workerId、bookId、fencingToken、heartbeatAt、expiresAt、
+    producerScope 与 reclaim evidence，并要求所有 book-scoped artifact、
+    producer record 和 catalog 写入前校验该 token。
+  - >
+    在 failureRecovery.transientProviderFailures 下增加 retry budget exhausted
+    分支，定义状态名、事件名、manifest 计数、是否停止 batch，以及恢复后是否
+    允许人工重置 attempts。
+  - >
+    新增 recoveryReconciliation 章节，列出 checkpoint、events、producer run
+    records、parquet artifacts、graph capabilities、item lease 与 book lease 的
+    冲突优先级和处理动作。
+  - >
+    在 observability.requiredStatusJsonFields 中增加阶段级与 lease 级字段，
+    使验收条件中的 qmd、GraphRAG、worker、provider slot 和 retry 状态可由
+    status-json 直接验证。
+  - >
+    在 run lock 条款中补充 lock 文件或记录路径、原子写入协议、续租 CAS 条件、
+    lock 过期接管事件和 stale coordinator 防写机制。

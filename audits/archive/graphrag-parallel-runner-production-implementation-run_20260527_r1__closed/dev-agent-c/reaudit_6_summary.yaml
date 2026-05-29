@@ -1,0 +1,86 @@
+agent_id: dev-agent-c
+reaudit_round: 6
+status: pass
+criteria_file: /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/criteria.md
+criteria_version: sha256:44829b40c6d6373b6bed0b93051a776627b4020b70070dcde1cd39f46fa04b0c
+findings_file: /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/reaudit_6_findings.md
+review_scope:
+  - current_worktree
+  - fixed_criteria
+  - focused_behavior_verification
+blocking_findings_count: 0
+nonblocking_findings_count: 1
+closed_previous_blocking_findings:
+  - id: R5-B01
+    status: closed
+    title: qmd index file lock coverage
+  - id: R5-B02
+    status: closed
+    title: Python bridge subprocess registry
+  - id: R5-B03
+    status: closed
+    title: subprocess registry provider slot fence
+  - id: R5-B04
+    status: closed
+    title: GraphRAG catalog durable write
+  - id: R5-B05
+    status: closed
+    title: status-json worker and provider wait observability
+  - id: R5-B06
+    status: closed
+    title: behavior coverage
+criteria_results:
+  - criterion: 1
+    name: coordinator exclusivity
+    result: pass
+  - criterion: 2
+    name: item/book lease fencing
+    result: pass
+  - criterion: 3
+    name: provider durable semaphore
+    result: pass
+  - criterion: 4
+    name: qmd index writer lane/file lock
+    result: pass
+  - criterion: 5
+    name: subprocess process-group recovery
+    result: pass
+  - criterion: 6
+    name: durable write contract
+    result: pass
+  - criterion: 7
+    name: terminal commit order
+    result: pass
+  - criterion: 8
+    name: manifest/status-json projection
+    result: pass
+  - criterion: 9
+    name: bounded worker pool
+    result: pass
+  - criterion: 10
+    name: behavioral evidence
+    result: pass
+nonblocking_findings:
+  - id: R6-N01
+    title: full suite not rerun
+    detail: >
+      Focused behavior tests, syntax checks, and type checks passed. Full
+      repository suite execution remains optional pre-commit regression
+      evidence.
+verification_commands:
+  - command: node --check scripts/graphrag/batch-epub-workflow.mjs
+    result: pass
+  - command: node --check scripts/graphrag/resume-book-workspace.mjs
+    result: pass
+  - command: node --check scripts/graphrag/batch-failure-classifier.mjs
+    result: pass
+  - command: npm run test:types -- --pretty false
+    result: pass
+  - command: focused CLI parallel/fencing/provider/durable evidence tests
+    result: pass
+  - command: focused Python bridge provider slot fencing test
+    result: pass
+  - command: focused GraphRAG cost durable recovery tests
+    result: pass
+  - command: focused book job state graph capability tests
+    result: pass

@@ -1,0 +1,119 @@
+schemaVersion: "1.0.0"
+auditId: graphrag-durable-yaml-temp-collision-agent-a-implementation
+criteriaSetId: durable-yaml-json-temp-collision-local-state-implementation
+status: fixed
+scope:
+  auditDirectory: audits/graphrag-durable-yaml-temp-collision-run_20260528_r1__open
+  failureClass: durable YAML/JSON temp collision and local state integrity
+  referenceDesign: docs/architecture/graphrag-parallel-runner.type-dd.yaml
+reviewPolicy:
+  fixedAcrossFollowUpReviews: true
+  language: Chinese-first
+  note: 后续实施复审必须使用同一 criteria 列表，不得因代码方案改变而删减基准。
+criteria:
+  - id: I01_single_durable_state_boundary
+    title: 单一 durable state 边界
+    requirement: >
+      YAML/JSON durable replace、read-before-reconcile、checksum/generation
+      backfill、temp cleanup、quarantine 与 lock recovery 必须通过共享实现或
+      明确等价 adapter。不得存在重复且语义不一致的 temp、lock、checksum、
+      fsync、failure classification 实现。
+    evidence:
+      - 共享模块或等价 adapter 的调用点清单。
+      - 指定范围内没有绕过该边界的 durable YAML/JSON 读写提交路径。
+
+  - id: I02_target_mapping_and_lane_enforcement
+    title: target mapping 与 lane 执行
+    requirement: >
+      每个生产 durable YAML/JSON/SQLite 目标必须按设计映射到唯一 writer lane、
+      owner、timeout 与 release-on-error 规则。写入、reconcile、checksum
+      backfill 与 lock recovery 必须在对应 lane/per-target lock 内执行。
+    evidence:
+      - 目标路径到 lane/owner 的代码路径。
+      - timeout、finally release 和 lease-loss/cancellation 释放证据。
+
+  - id: I03_collision_resistant_temp_creation
+    title: temp 身份与独占创建
+    requirement: >
+      durable temp path 必须包含抗碰撞身份，并以 exclusive create 或等价机制
+      创建。碰撞必须在写入前被检测并 bounded retry 或分类为 local state
+      integrity，禁止覆盖、截断或复用其他 writer 的 temp。
+    evidence:
+      - tempId 包含 operationId/uuid/nonce/session 或等价熵。
+      - 文件创建使用 wx/O_EXCL 或等价机制。
+
+  - id: I04_owner_evidence_and_cleanup_safety
+    title: owner evidence 与 temp 清理安全
+    requirement: >
+      temp 创建后必须持久化可恢复的 owner evidence。reconcile 只能在读取并
+      验证 owner、target、generation、createdAt、stale TTL、owner-dead 或
+      lease-expired 证据后删除 temp；不得按 basename 前缀无条件删除 active temp。
+    evidence:
+      - owner evidence 字段写入与读取位置。
+      - cleanup decision 事件或诊断字段。
+
+  - id: I05_lock_freshness_fencing_and_takeover
+    title: lock freshness、fencing 与 takeover
+    requirement: >
+      durable YAML/JSON lock 必须记录 owner、generation、fencing hash、
+      heartbeat/expiry 和 operationId。锁清理必须证明 owner 失效或 fencing
+      失效；提交前后必须验证当前 fencing，旧 generation 写入必须被拒绝。
+    evidence:
+      - lock owner schema 与 heartbeat/expiry 维护。
+      - stale lock break、wait timeout 与 stale writer rejection 路径。
+
+  - id: I06_atomic_replace_and_fsync_boundary
+    title: 原子替换与 fsync 平台边界
+    requirement: >
+      durable replace 必须按 temp write/fsync、atomic rename、
+      checksum/generation durable commit、parent directory fsync 顺序执行。
+      file fsync 或 directory fsync 失败、unsupported、uncertain 时必须分类为
+      local state integrity，并禁止发布 completed。
+    evidence:
+      - fsync 调用及错误传播。
+      - directory fsync 平台边界分类与 checkpoint/status 诊断字段。
+
+  - id: I07_checksum_generation_crash_window_recovery
+    title: checksum/generation crash window 恢复
+    requirement: >
+      target 与 checksum/generation sidecar 不一致时，代码必须按 crash window
+      区分 old target、new target old checksum、missing checksum、partial
+      sidecar 等状态，收敛到 committed、repair 或 stop_until_fixed，不能用
+      event 或 manifest 单独证明 completed。
+    evidence:
+      - checksum/generation mismatch 恢复分支。
+      - backfill、quarantine、stop_until_fixed 的状态写入。
+
+  - id: I08_rename_enoent_failure_classification
+    title: rename ENOENT 分类与证据
+    requirement: >
+      temp rename ENOENT 必须分类为 local_state_integrity /
+      durable_temp_rename_enoent，并记录 cause、target、tempId、operationId、
+      owner、generation、failedSyscall、errno、recoveryDecision。不得降级为
+      provider transient、unknown 或普通业务失败。
+    evidence:
+      - rename ENOENT 捕获与 cause matrix。
+      - item checkpoint、event、status 或 recovery summary 证据字段。
+
+  - id: I09_resume_preflight_and_runner_recovery
+    title: resume preflight 与 runner 恢复阻断
+    requirement: >
+      batch runner 在 claim 新 item 与 resume-book 子进程前必须扫描 durable
+      lock、temp、checksum/generation、subprocess registry、provider slot 与
+      book lease。发现 unknown/live temp、不可收敛 checksum、不可判定 lock
+      owner 或 local state integrity 失败时，必须 stop_until_fixed，不能继续
+      claim 或发布 completed。
+    evidence:
+      - beforeClaim 与 beforeResumeBook preflight 调用。
+      - stop_until_fixed 写入和 runner 停止路径。
+
+  - id: I10_regression_tests_and_observability
+    title: 回归测试与可观测性
+    requirement: >
+      测试必须覆盖同毫秒 temp 碰撞、forced temp id collision、active temp
+      reconcile、stale lock live owner、rename ENOENT、directory fsync 边界、
+      checksum crash window、resume-book orphan temp。运行状态必须暴露足以
+      复审的 checkpoint、event、status、recovery summary 字段。
+    evidence:
+      - 单元/集成/fault injection 测试名称或断言。
+      - status/event/checkpoint schema 与 failure classifier 字段。

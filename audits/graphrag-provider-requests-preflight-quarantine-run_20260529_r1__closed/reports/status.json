@@ -1,0 +1,67 @@
+{
+  "schemaVersion": "1.0.0",
+  "taskId": "graphrag-provider-requests-preflight-quarantine",
+  "runId": "20260529_r1",
+  "status": "closed",
+  "phase": "implementation_audit_r1_passed",
+  "createdAt": "2026-05-29T04:45:00.000Z",
+  "realRunner": {
+    "runId": "epub-batch-20260529-post-r3-real-1",
+    "sourceDir": "inbox/软件工程与系统设计经典著作指南",
+    "epubCount": 38,
+    "processState": "stopped_by_operator_after_startup_quarantine_loop",
+    "resumeAllowed": false,
+    "reason": "runner_start preflight quarantined provider request targets before manifest creation"
+  },
+  "failure": {
+    "stage": "runner_start_preflight",
+    "eventLog": "graph_vault/catalog/batch-runs/epub-batch-20260529-post-r3-real-1/events.jsonl",
+    "eventCount": 739,
+    "durableJsonTargetQuarantined": 731,
+    "durableYamlTargetQuarantined": 1,
+    "durableChecksumMetaBackfilled": 7,
+    "firstQuarantineTarget": "graph_vault/catalog/provider-requests/00259bf677daf4d66d1f150de1c8900bd3dd7f6241c8330c774bd63b6b2b95bc.json",
+    "lastObservedQuarantineTarget": "graph_vault/catalog/provider-requests/be314a0de6b18590e9af05a334fe758bb5dbc4c56e3008bdffc2f4a0bbf28451.json",
+    "localFailureClass": "durable_checksum_mismatch",
+    "recoveryDecision": "stop_until_fixed",
+    "manifestCreated": false
+  },
+  "auditControl": {
+    "openAuditDirectoryPolicy": "single_open_directory_for_this_failure",
+    "designScopeFile": "reports/design-audit-scope-r1.md",
+    "criteriaFrozen": true,
+    "movingBaselineAllowed": false,
+    "nextStep": "closed_stop"
+  },
+  "designRevision": {
+    "revisionId": "r1",
+    "typeDdPath": "docs/architecture/graphrag-parallel-runner.type-dd.yaml",
+    "yamlParseStatus": "passed",
+    "tabIndentationStatus": "passed",
+    "summary": [
+      "provider-requests classified as historical observation",
+      "runner-start provider request policy changed to read-only capped diagnostic",
+      "normal runner primary quarantine forbidden for provider request fingerprints",
+      "explicit repair and migrate-only remain the writable repair boundary",
+      "status-json provider request projection specified as read-only",
+      "provider request acceptance cases added"
+    ]
+  },
+  "designAuditAgents": {
+    "agent-a": "r2_pass",
+    "agent-b": "r2_pass",
+    "agent-c": "r2_pass"
+  },
+  "implementationAuditAgents": {
+    "agent-a": "r1_pass",
+    "agent-b": "r1_pass",
+    "agent-c": "r1_pass"
+  },
+  "implementationVerification": {
+    "nodeSyntax": "passed",
+    "yamlParse": "passed",
+    "typecheck": "passed",
+    "focusedVitest": "passed",
+    "focusedVitestCommand": "CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/graphrag-runner-durable-preflight.test.ts test/graphrag-runner-status-json-readonly.test.ts"
+  }
+}

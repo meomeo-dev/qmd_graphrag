@@ -1,0 +1,138 @@
+agent_id: dev-agent-a
+reaudit_round: 4
+status: fail
+criteria_file: /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/criteria.md
+criteria_version: sha256:e763182a90d9aeeeafa11f21379473a3a8e2218dc5d81bbbe9fef6625d9281ca
+findings_file: /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/reaudit_4_findings.md
+review_scope: >
+  Read-only implementation re-audit of the current GraphRAG multi-book parallel
+  runner worktree against the 10 fixed criteria in criteria.md. No new audit
+  directory was created. criteria.md was not modified. No .env, secrets, keys,
+  or credentials were read or output. Production source code and tests were not
+  modified.
+blocking_findings:
+  - id: RA4-B1
+    criteria: [5, 9]
+    title: durable checksum/reconcile is not applied to all book-state and
+      GraphRAG sidecar read paths
+    locations:
+      - src/job-state/repository.ts:1844
+      - src/job-state/graphrag-book.ts:915
+      - src/job-state/artifact-validation.ts:177
+      - test/graphrag-book-state.test.ts:3041
+    why_blocking: >
+      Generic repository YAML and GraphRAG JSON durable helpers now write
+      checksum files and quarantine corrupt targets, but getBookJob still reads
+      book-state YAML directly, graph text-unit identity sidecar fallback reads
+      JSON directly, and qmd row-count sidecar validation accepts JSON directly.
+      These paths bypass checksum verification, temp reconciliation, missing
+      checksum backfill, and invalid/checksum-mismatch quarantine. The closed
+      loop can therefore ignore or accept stale/corrupt sidecar or book-state
+      evidence.
+    required_fix: >
+      Route all book-state YAML and GraphRAG sidecar JSON reads through durable
+      reconcile helpers. Add checksum mismatch, invalid target quarantine,
+      missing checksum backfill, and status-json boundary tests for book job
+      YAML, qmd_graph_text_unit_identity.json, and qmd_row_count.json.
+  - id: RA4-B2
+    criteria: [10]
+    title: mandatory production concurrency and recovery test coverage remains
+      incomplete
+    locations:
+      - test/cli.test.ts:2141
+      - test/cli.test.ts:2446
+      - test/cli.test.ts:2516
+      - test/cli.test.ts:2724
+      - test/cli.test.ts:13023
+      - scripts/graphrag/batch-epub-workflow.mjs:2880
+      - scripts/graphrag/batch-epub-workflow.mjs:3360
+      - scripts/graphrag/batch-epub-workflow.mjs:4007
+      - scripts/graphrag/batch-epub-workflow.mjs:8131
+      - scripts/graphrag/batch-epub-workflow.mjs:8180
+      - scripts/graphrag/batch-epub-workflow.mjs:8632
+      - scripts/graphrag/batch-epub-workflow.mjs:8688
+    why_blocking: >
+      Tests now cover parallel and sequential workers, coordinator live-lock
+      rejection, provider slot recovery/capacity, qmd file lock, SQLite
+      contention retry metrics, terminal finalization fence, event recovery and
+      manifest rebuild. However criteria.md requires direct production coverage
+      for duplicate book exclusion, stale claim fencing, coordinator recovery,
+      and fail-fast/transient/provider wait durable evidence. Missing direct
+      cases remain for duplicate canonical book exclusion, stale item
+      checkpoint/event negative rejection, same-host live orphan subprocess
+      termination, parallel non-transient quiesce with sibling subprocess kill,
+      and durable JSON/YAML sidecar recovery.
+    required_fix: >
+      Add focused behavior tests for duplicate same-book workers, stale item
+      claim/event writes, same-host live orphan process group termination,
+      parallel fail-fast/non-transient quiesce, and durable JSON/YAML sidecar
+      recovery with temp, checksum backfill, checksum mismatch quarantine, and
+      invalid JSON quarantine.
+criteria_results:
+  - criterion: 1
+    name: same runId single coordinator
+    result: pass
+  - criterion: 2
+    name: item claim and fencing
+    result: pass
+  - criterion: 3
+    name: book-scoped mutual exclusion
+    result: pass
+  - criterion: 4
+    name: sequential compatibility
+    result: pass
+  - criterion: 5
+    name: manifest and event consistency
+    result: partial
+  - criterion: 6
+    name: provider slot governance
+    result: pass
+  - criterion: 7
+    name: qmd index write safety
+    result: pass
+  - criterion: 8
+    name: failure and wait semantics
+    result: pass
+  - criterion: 9
+    name: GraphRAG closed-loop gate
+    result: partial
+  - criterion: 10
+    name: production test coverage
+    result: fail
+reaudit_3_blocking_closure:
+  RA3-B1: closed
+  RA3-B2: closed
+  RA3-B3: partially_closed_still_blocking_as_RA4-B2
+residual_risks:
+  - >
+    Same-host live orphan termination, stale item fencing rejection, duplicate
+    canonical book exclusion, and parallel sibling quiesce have implementation
+    evidence but still lack direct production behavior tests.
+  - >
+    Producer manifest checksum/quarantine is tested, but identity and row-count
+    GraphRAG sidecars and book job YAML still need durable read-path tests and
+    implementation unification.
+  - >
+    The review relied on read-only source/test inspection plus controller-
+    reported focused test passes; the full suite was not rerun in this reaudit.
+evidence_commands:
+  - command: shasum -a 256 audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/criteria.md
+    result: e763182a90d9aeeeafa11f21379473a3a8e2218dc5d81bbbe9fef6625d9281ca
+  - command: git status --short
+    result: inspected current dirty worktree without modifying production code
+  - command: rg -n "activeRunningBookCheckpoint|acquireBookLease|assertEventItemFence|assertItemCheckpointFence|terminalFinalization" scripts/graphrag/batch-epub-workflow.mjs test/cli.test.ts
+    result: inspected item/book fencing, terminal fence, and duplicate-book deferral paths
+  - command: rg -n "registerQmdCorpusDocument|writeGraphRagOutputProducerManifest|SQLITE_BUSY|SQLITE_LOCKED|qmd-sqlite-retry" src/job-state/graphrag-book.ts test/graphrag-book-state.test.ts
+    result: inspected qmd corpus fencing, producer manifest fencing, and SQLite retry metrics
+  - command: rg -n "qmd_graph_text_unit_identity|qmd_row_count|reconcileDurableJsonFile|checksum" src/job-state test
+    result: inspected GraphRAG sidecar durable write/read and test coverage
+  - command: node --check scripts/graphrag/batch-epub-workflow.mjs
+    result: controller reported pass
+  - command: node --check scripts/graphrag/resume-book-workspace.mjs
+    result: controller reported pass
+  - command: node --check scripts/graphrag/batch-failure-classifier.mjs
+    result: controller reported pass
+  - command: npm run test:types -- --pretty false
+    result: controller reported pass
+  - command: focused vitest CLI, book-state, graphrag-book-state, and contracts tests
+    result: controller reported pass for the focused patterns listed in the task

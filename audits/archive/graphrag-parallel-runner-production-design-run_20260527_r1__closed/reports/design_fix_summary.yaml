@@ -1,0 +1,41 @@
+taskId: graphrag-parallel-runner-production-design
+runId: "20260527_r1"
+status: fixed_pending_reaudit
+designDocument: docs/architecture/graphrag-parallel-runner.type-dd.yaml
+initialAuditDecision: fail
+agents:
+  design-agent-a:
+    decision: fail
+    mustFixAddressed:
+      - manifest writer lane ownership and durable commit ordering.
+      - external qmd/GraphRAG subprocess crash handling and fencing.
+  design-agent-b:
+    decision: fail
+    mustFixAddressed:
+      - book lease schema, TTL, heartbeat, CAS, fencing and reclaim.
+      - retry budget exhausted terminal state and coordinator behavior.
+      - disk-state reconciliation matrix across checkpoints, events, producer
+        records, artifacts, projections and leases.
+  design-agent-c:
+    decision: fail
+    mustFixAddressed:
+      - provider semaphore enforcement across qmd/GraphRAG subprocesses.
+      - JSONL, checkpoint, manifest and SQLite durable write rules.
+      - writer lane ownership and acquisition ordering.
+documentChanges:
+  - Added run lock acquire, heartbeat and takeover primitives.
+  - Strengthened item and book fencing requirements for all durable commits.
+  - Added provider slot lease contract for subprocess-level and proxy-level
+    enforcement.
+  - Added manifestWriterLane and explicit writer lane acquisition order.
+  - Added durable write contract for JSONL, YAML/JSON replace and SQLite.
+  - Added terminal commit protocol for completed and failed item states.
+  - Added subprocess ownership registry and process group cleanup rules.
+  - Added failed_retry_exhausted state and retry_budget_exhausted event.
+  - Added partial write recovery and recovery reconciliation matrix.
+  - Added event schema, status-json fields, configuration resolution table,
+    fault-injection tests and evidence-bound acceptance criteria.
+nextAction: >
+  Re-run the same three design agents in the same open audit directory using
+  their fixed criteria. Close the audit only when all three summaries report
+  decision: pass.

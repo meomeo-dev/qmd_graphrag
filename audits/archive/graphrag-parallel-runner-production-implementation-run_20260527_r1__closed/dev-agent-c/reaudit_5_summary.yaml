@@ -1,0 +1,182 @@
+agent_id: dev-agent-c
+reaudit_round: 5
+status: fail
+criteria_file: /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/criteria.md
+criteria_version: "sha256:44829b40c6d6373b6bed0b93051a776627b4020b70070dcde1cd39f46fa04b0c"
+findings_file: /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/reaudit_5_findings.md
+blocking_findings: 6
+nonblocking_findings: 3
+blocking_finding_details:
+  - id: R5-B01
+    criteria: [2, 4, 10]
+    title: qmd index file lock does not cover all .qmd/index.sqlite write paths
+    files:
+      - scripts/graphrag/batch-epub-workflow.mjs:258
+      - scripts/graphrag/batch-epub-workflow.mjs:6689
+      - scripts/graphrag/batch-epub-workflow.mjs:6690
+      - src/cli/qmd.ts:198
+      - src/cli/qmd.ts:200
+      - src/cli/qmd.ts:205
+      - src/store.ts:855
+      - src/store.ts:867
+      - src/store.ts:1001
+      - src/store.ts:2097
+    required_fix: >
+      Move qmd index locking to the store/SQLite boundary or wrap every qmd
+      command that can open/write INDEX_PATH, including implicit
+      createStore/syncConfigToDb paths.
+  - id: R5-B02
+    criteria: [5, 10]
+    title: GraphRAG Python bridge child process is not durable-registered
+    files:
+      - src/integrations/python-bridge.ts:193
+      - src/integrations/python-bridge.ts:194
+      - src/integrations/python-bridge.ts:229
+      - src/integrations/python-bridge.ts:231
+      - src/integrations/python-bridge.ts:234
+      - scripts/graphrag/batch-epub-workflow.mjs:3360
+      - scripts/graphrag/batch-epub-workflow.mjs:3365
+      - scripts/graphrag/batch-epub-workflow.mjs:3397
+    required_fix: >
+      Register GraphRAG bridge subprocesses in the durable subprocess registry,
+      record pid/pgid, use process-group termination, and add orphan/grandchild
+      recovery tests.
+  - id: R5-B03
+    criteria: [3, 5, 8, 10]
+    title: subprocess registry lacks provider slot generation and fencing token
+    files:
+      - scripts/graphrag/batch-epub-workflow.mjs:352
+      - scripts/graphrag/batch-epub-workflow.mjs:364
+      - scripts/graphrag/batch-epub-workflow.mjs:6371
+      - scripts/graphrag/batch-epub-workflow.mjs:6383
+      - scripts/graphrag/batch-epub-workflow.mjs:6512
+      - scripts/graphrag/batch-epub-workflow.mjs:6513
+      - scripts/graphrag/batch-epub-workflow.mjs:6517
+    required_fix: >
+      Persist provider, slot id, generation, and fencing token on every
+      subprocess record and assert them during release/recovery.
+  - id: R5-B04
+    criteria: [6, 10]
+    title: GraphRAG catalog writes bypass durable write contract
+    files:
+      - src/integrations/graphrag.ts:162
+      - src/integrations/graphrag.ts:163
+      - src/provider/cost-accounting.ts:29
+      - src/provider/cost-accounting.ts:30
+      - src/provider/cost-accounting.ts:31
+    required_fix: >
+      Use durable JSON writes for provider request artifacts and fsync/tail
+      recovery for cost-accounting JSONL catalog writes.
+  - id: R5-B05
+    criteria: [8, 10]
+    title: status-json lacks worker field and real provider wait-time projection
+    files:
+      - src/contracts/batch-run.ts:299
+      - src/contracts/batch-run.ts:331
+      - src/contracts/batch-run.ts:332
+      - src/contracts/batch-run.ts:333
+      - scripts/graphrag/batch-epub-workflow.mjs:5865
+      - scripts/graphrag/batch-epub-workflow.mjs:5871
+      - scripts/graphrag/batch-epub-workflow.mjs:5872
+      - scripts/graphrag/batch-epub-workflow.mjs:5942
+      - scripts/graphrag/batch-epub-workflow.mjs:5943
+    required_fix: >
+      Project workerId and provider wait time from durable checkpoints,
+      provider leases/events, or subprocess registry, and test status-json
+      output.
+  - id: R5-B06
+    criteria: [10]
+    title: behavioral tests still do not prove unresolved production invariants
+    files:
+      - test/cli.test.ts:3013
+      - test/cli.test.ts:3383
+      - test/graphrag-book-state.test.ts:2875
+      - test/graphrag-book-state.test.ts:3051
+      - test/book-job-state.test.ts:1316
+      - test/book-job-state.test.ts:1351
+    required_fix: >
+      Add black-box tests for qmd implicit SQLite writes under lock, GraphRAG
+      bridge process-group recovery, provider stale release with wrong fence,
+      durable catalog crash recovery, and status-json worker/wait fields.
+criteria_results:
+  - criterion: 1
+    name: coordinator exclusivity
+    result: pass
+  - criterion: 2
+    name: item and book lease fencing
+    result: partial
+    blocking_findings: [R5-B01, R5-B04]
+  - criterion: 3
+    name: provider durable semaphore
+    result: fail
+    blocking_findings: [R5-B03]
+  - criterion: 4
+    name: qmd index writer lane and file lock
+    result: fail
+    blocking_findings: [R5-B01]
+  - criterion: 5
+    name: recoverable subprocess process-group boundary
+    result: fail
+    blocking_findings: [R5-B02, R5-B03]
+  - criterion: 6
+    name: durable write contract
+    result: fail
+    blocking_findings: [R5-B04]
+  - criterion: 7
+    name: terminal commit order
+    result: partial
+  - criterion: 8
+    name: manifest and status-json projection
+    result: fail
+    blocking_findings: [R5-B03, R5-B05]
+  - criterion: 9
+    name: bounded worker pool
+    result: pass
+  - criterion: 10
+    name: behavioral evidence
+    result: fail
+    blocking_findings: [R5-B01, R5-B02, R5-B03, R5-B04, R5-B05, R5-B06]
+evidence_files:
+  - /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/criteria.md
+  - /Users/jin/projects/qmd_graphrag/scripts/graphrag/batch-epub-workflow.mjs
+  - /Users/jin/projects/qmd_graphrag/scripts/graphrag/resume-book-workspace.mjs
+  - /Users/jin/projects/qmd_graphrag/src/job-state/durable-json.ts
+  - /Users/jin/projects/qmd_graphrag/src/job-state/repository.ts
+  - /Users/jin/projects/qmd_graphrag/src/job-state/graphrag-book.ts
+  - /Users/jin/projects/qmd_graphrag/src/job-state/artifact-validation.ts
+  - /Users/jin/projects/qmd_graphrag/src/integrations/python-bridge.ts
+  - /Users/jin/projects/qmd_graphrag/src/integrations/graphrag.ts
+  - /Users/jin/projects/qmd_graphrag/src/provider/cost-accounting.ts
+  - /Users/jin/projects/qmd_graphrag/src/store.ts
+  - /Users/jin/projects/qmd_graphrag/src/cli/qmd.ts
+  - /Users/jin/projects/qmd_graphrag/src/contracts/batch-run.ts
+  - /Users/jin/projects/qmd_graphrag/test/cli.test.ts
+  - /Users/jin/projects/qmd_graphrag/test/book-job-state.test.ts
+  - /Users/jin/projects/qmd_graphrag/test/graphrag-book-state.test.ts
+  - /Users/jin/projects/qmd_graphrag/test/integrations/contracts.test.ts
+residual_risks:
+  - >
+    Terminal completion has a finalization fence, but the implementation still
+    lacks a single explicit book-checkpoint to item-checkpoint to event to
+    manifest critical section.
+  - >
+    qmd index locking exists in both runner script and GraphRAG book-state code;
+    future qmd commands can bypass it unless the lock is centralized.
+  - >
+    status-json projection needs an explicit source-of-truth policy for fields
+    derived from checkpoint, event log, provider lease, and subprocess registry.
+evidence_commands:
+  - shasum -a 256 audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/criteria.md
+  - git status --short --untracked-files=no
+  - rg -n "checksum|reconcile|quarantine|sidecar" src/job-state test
+  - rg -n "duplicate canonical|stale item checkpoint|same-host live orphan|parallel non-transient" test
+  - rg -n "SubprocessRecord|providerSlot|spawnCommand|detached|orphan" scripts/graphrag src test
+  - rg -n "qmdWriterCommandNames|withQmdIndexFileLock|createStore|initializeDatabase|syncConfigToDb" scripts/graphrag src test
+reported_passed_commands:
+  - node --check scripts/graphrag/batch-epub-workflow.mjs
+  - node --check scripts/graphrag/resume-book-workspace.mjs
+  - node --check scripts/graphrag/batch-failure-classifier.mjs
+  - npm run test:types -- --pretty false
+  - CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 180000 test/cli.test.ts -t "book worker pool defers duplicate canonical books|stale item checkpoint ownership rejects terminal event writes|parallel non-transient failure quiesces sibling workers|restart terminates same-host live orphan subprocess records"
+  - CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 180000 test/book-job-state.test.ts -t "recovers book job YAML checksums and quarantines corrupt targets|validates LanceDB row-count sidecars through durable checksums"
+  - CI=true node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 180000 test/graphrag-book-state.test.ts -t "recovers GraphRAG identity sidecar checksums and quarantines invalid targets|recovers producer manifest checksum and quarantines corrupt targets"

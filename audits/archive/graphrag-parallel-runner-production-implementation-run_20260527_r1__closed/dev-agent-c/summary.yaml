@@ -1,0 +1,32 @@
+agent_id: dev-agent-c
+decision: fail
+blocking_findings_count: 7
+nonblocking_findings_count: 2
+audited_files:
+  - docs/architecture/graphrag-parallel-runner.type-dd.yaml
+  - scripts/graphrag/batch-epub-workflow.mjs
+  - src/job-state/graphrag-book.ts
+  - src/contracts/batch-run.ts
+  - test/cli.test.ts
+criteria_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/criteria.md
+findings_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/findings.md
+scope:
+  mode: read_only_product_code
+  focus:
+    - run_id_coordinator_lock
+    - provider_semaphore_child_boundary
+    - qmd_index_writer_lane_and_file_lock
+    - child_process_timeout_kill_close
+    - event_manifest_atomicity
+    - single_process_worker_pool_evidence
+blocking_findings:
+  - C-01
+  - C-02
+  - C-03
+  - C-04
+  - C-05
+  - C-06
+  - C-07
+nonblocking_findings:
+  - C-08
+  - C-09

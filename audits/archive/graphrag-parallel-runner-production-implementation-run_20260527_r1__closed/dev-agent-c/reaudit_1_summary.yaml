@@ -1,0 +1,104 @@
+agent_id: dev-agent-c
+reaudit: 1
+status: fail
+criteria_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/criteria.md
+findings_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/reaudit_1_findings.md
+scope:
+  mode: read_only_product_code
+  wrote_only:
+    - audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/reaudit_1_findings.md
+    - audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-c/reaudit_1_summary.yaml
+  secrets_policy: ".env and secrets were not read or output"
+  tests_run: false
+  tests_run_reason: >
+    The task only allowed writing the two reaudit files under the dev-agent-c
+    audit directory; behavioral tests would create temporary runtime artifacts.
+audited_files:
+  - scripts/graphrag/batch-epub-workflow.mjs
+  - scripts/graphrag/resume-book-workspace.mjs
+  - src/contracts/batch-run.ts
+  - src/job-state/repository.ts
+  - src/job-state/graphrag-book.ts
+  - src/integrations/python-bridge.ts
+  - src/provider/cost-accounting.ts
+  - src/store.ts
+  - test/cli.test.ts
+  - test/book-job-state.test.ts
+criteria_results:
+  - id: 1
+    name: coordinator_exclusivity
+    result: partial_pass
+    notes: >
+      coordinator-lock.json exists with lease fields and live same-run rejection
+      test evidence, but takeover/process recovery remains incomplete.
+  - id: 2
+    name: item_book_lease_fencing
+    result: fail
+    blocking_findings: [C-01]
+  - id: 3
+    name: provider_semaphore_durable_lease
+    result: fail
+    blocking_findings: [C-02]
+  - id: 4
+    name: qmd_index_writer_lane
+    result: fail
+    blocking_findings: [C-03]
+  - id: 5
+    name: subprocess_process_group_recovery
+    result: fail
+    blocking_findings: [C-04]
+  - id: 6
+    name: durable_write_contract
+    result: fail
+    blocking_findings: [C-05]
+  - id: 7
+    name: terminal_commit_order
+    result: fail
+    blocking_findings: [C-01, C-02, C-06]
+  - id: 8
+    name: manifest_status_projection
+    result: fail
+    blocking_findings: [C-07]
+  - id: 9
+    name: worker_pool_bounded_parallelism
+    result: partial_pass
+    notes: >
+      Single-coordinator bounded overlap has implementation and behavior tests,
+      but full safety depends on unresolved fencing and retry/fail-fast coverage.
+  - id: 10
+    name: behavioral_evidence
+    result: fail
+    blocking_findings: [C-08]
+blocking_findings:
+  - id: C-01
+    title: item/book fencing does not cover all persistent writes
+    criteria: [2, 7]
+  - id: C-02
+    title: provider semaphore is not a complete durable semaphore
+    criteria: [3, 7, 8, 10]
+  - id: C-03
+    title: qmd index writer lane does not cover all index.sqlite write paths
+    criteria: [4, 10]
+  - id: C-04
+    title: subprocess boundary is still not fully recoverable
+    criteria: [1, 3, 5, 10]
+  - id: C-05
+    title: durable write contract does not cover catalog, artifacts, and migrations
+    criteria: [6]
+  - id: C-06
+    title: terminal commit does not follow fixed fenced finalization order
+    criteria: [7]
+  - id: C-07
+    title: manifest/status projection is still not fully durable-derived
+    criteria: [8]
+  - id: C-08
+    title: behavioral tests miss critical production races and crash recovery
+    criteria: [10]
+blocking_findings_count: 8
+overall_notes: >
+  Current code has meaningful new structure compared with prior audit findings,
+  especially coordinator lock, book lease, provider slot sidecars, subprocess
+  records, event sequencing, and worker-pool tests. It still fails the fixed
+  production audit baseline because the invariants are not enforced across all
+  writes, subprocess layers, provider calls, qmd index writes, durable recovery
+  projections, and behavioral evidence.

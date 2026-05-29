@@ -1,0 +1,108 @@
+schemaVersion: "1.0.0"
+auditId: graphrag-durable-yaml-temp-collision
+agent: agent-c
+criteriaVersion: "2026-05-28.implementation.fixed-10"
+stability: "后续实施复审必须沿用本文件 10 条基准，不得增删或改义。"
+scope:
+  batchRunId: epub-batch-20260527-real-resume-1
+  itemId: item-45c6c3f72a50-f5252de5
+  failedStage: resume-book-2
+  failure: durable YAML temp rename ENOENT
+  files:
+    - src/job-state/repository.ts
+    - src/graphrag/capability-catalog.ts
+    - src/job-state/durable-json.ts
+    - scripts/graphrag/batch-epub-workflow.mjs
+    - scripts/graphrag/batch-failure-classifier.mjs
+    - src/contracts/batch-run.ts
+    - src/graphrag/settings-projection.ts
+    - src/integrations/python-bridge.ts
+    - src/dspy/policy-store.ts
+    - test/book-job-state.test.ts
+    - test/cli.test.ts
+    - docs/architecture/graphrag-parallel-runner.type-dd.yaml
+criteria:
+  - id: I01_temp_identity_exclusive_create
+    title: temp 身份与独占创建
+    requirement: >
+      所有受审 durable YAML/JSON replace 写入必须使用同目录、全局唯一 temp
+      名，并用 exclusive create 或等价机制在写入前检测碰撞。
+    passCondition: >
+      temp 名至少含 target 语义、pid、timestamp 与 high-entropy nonce 或
+      operationId；碰撞不得覆盖或截断其他 writer 的 temp。
+  - id: I02_single_durable_boundary
+    title: 单一 durable 边界
+    requirement: >
+      repository、capability catalog、settings projection、batch runner evidence
+      reader、python bridge、DSPy policy store 与 durable-json 必须复用同一
+      durable 契约，或实现同等 adapter。
+    passCondition: >
+      不存在未声明的裸 rename/writeFile/YAML parse 旁路；每条旁路都具备同等
+      temp identity、lock、checksum、fsync、reconcile 与分类语义。
+  - id: I03_lock_owner_fencing
+    title: lock owner 与 fencing
+    requirement: >
+      per-target lock 必须记录 pid、host、runnerSessionId、generation、
+      fencingTokenHash、targetLocator、operationId、heartbeatAt 与 expiresAt。
+    passCondition: >
+      stale lock 删除前校验 TTL、owner liveness、generation/fencing，并记录
+      durable_lock_recovered 或 local_state_lock_timeout 证据。
+  - id: I04_live_temp_cleanup_safety
+    title: live temp 清理安全性
+    requirement: >
+      reconcile 清理 temp 前必须验证 temp owner evidence、最小年龄、
+      owner-dead 或 lease-expired、target generation 未推进，并持有 per-target
+      lock。
+    passCondition: >
+      未过期或 owner 仍存活的 temp 不被删除；异常删除进入
+      local_state_integrity，不会继续发布 completed。
+  - id: I05_checksum_commit_recovery
+    title: checksum 提交与恢复
+    requirement: >
+      target 与 checksum/generation 提交必须能恢复 target-new/checksum-old、
+      target-new/checksum-missing、checksum partial write 与 checksum mismatch。
+    passCondition: >
+      新 target 不因旧 checksum 被误隔离；无法收敛时 fail closed 到
+      stop_until_fixed，并保留 checksumRecoveryDecision。
+  - id: I06_fsync_platform_failure
+    title: fsync 平台失败处理
+    requirement: >
+      文件 fsync 与 parent directory fsync 的失败、unsupported 或 uncertain
+      状态必须被分类为本地 durable state 失败。
+    passCondition: >
+      不吞掉权威状态写入的 fsync 失败；记录 fsyncTarget、fsyncErrno、
+      fsyncPlatform、durableMode 与 completedPublishRule=forbidden。
+  - id: I07_batch_observability_schema
+    title: batch 观测 schema
+    requirement: >
+      item checkpoint、event、status-json 与 recovery summary 必须承载
+      failureKind、localFailureClass、recoveryDecision、failedStage 与
+      redactedEvidenceLocator。
+    passCondition: >
+      rename ENOENT、live temp deletion、checksum crash-window mismatch 与 lock
+      timeout 不会降级为 unknown/provider transient，并能被恢复摘要稳定呈现。
+  - id: I08_failure_classifier_mapping
+    title: failure classifier 映射
+    requirement: >
+      batch failure classifier 必须识别 durable temp rename ENOENT、live temp
+      deletion、checksum crash-window mismatch、fsync failure 与 lock timeout。
+    passCondition: >
+      分类输出稳定 failureKind、localFailureClass、retryable=false 与
+      stop_until_fixed 语义，且不被 provider transient 规则抢先匹配。
+  - id: I09_direct_call_chain_coverage
+    title: 直接调用链覆盖
+    requirement: >
+      batch runner、repository、capability catalog、settings projection、
+      durable-json、python bridge 与 DSPy policy store 的直接 durable 写入路径
+      必须全部纳入修复。
+    passCondition: >
+      任一受审文件中的 durable YAML/JSON 写入都不会复现同 pid/同毫秒 temp
+      collision、live temp deletion 或未分类 local state integrity 失败。
+  - id: I10_fault_injection_tests
+    title: fault injection 测试
+    requirement: >
+      测试必须覆盖同 pid 同毫秒、多 worker 同目标、reconcile 遇 live temp、
+      rename ENOENT、checksum crash window、directory fsync boundary 与事件字段。
+    passCondition: >
+      测试能证明真实 runner 不发布错误 completed，并在所有本地 durable state
+      失败中写出稳定 item checkpoint、event、status-json 与 recovery summary。

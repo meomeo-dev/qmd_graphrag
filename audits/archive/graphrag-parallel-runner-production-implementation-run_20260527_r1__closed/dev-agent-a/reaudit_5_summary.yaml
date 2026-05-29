@@ -1,0 +1,125 @@
+agent_id: dev-agent-a
+reaudit_round: 5
+status: fail
+criteria_file: /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/criteria.md
+criteria_version: sha256:e763182a90d9aeeeafa11f21379473a3a8e2218dc5d81bbbe9fef6625d9281ca
+findings_file: /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/reaudit_5_findings.md
+review_scope: >
+  Read-only implementation reaudit of the current GraphRAG multi-book parallel
+  runner worktree against the 10 fixed criteria in criteria.md. No new audit
+  directory was created. criteria.md was not modified. No .env, secrets, keys,
+  or credentials were read or output. Production source and tests were not
+  modified.
+blocking_findings_count: 1
+nonblocking_findings_count: 2
+blocking_findings:
+  - id: RA5-B1
+    criteria: [5, 9, 10]
+    title: batch runner production evidence reads bypass durable checksum and
+      reconcile
+    locations:
+      - scripts/graphrag/batch-epub-workflow.mjs:4305
+      - scripts/graphrag/batch-epub-workflow.mjs:4310
+      - scripts/graphrag/batch-epub-workflow.mjs:4321
+      - scripts/graphrag/batch-epub-workflow.mjs:4710
+      - scripts/graphrag/batch-epub-workflow.mjs:4973
+      - scripts/graphrag/batch-epub-workflow.mjs:4992
+      - scripts/graphrag/batch-epub-workflow.mjs:5090
+      - scripts/graphrag/batch-epub-workflow.mjs:3088
+    required_fix: >
+      Route batch runner reads for catalog/books.yaml,
+      books/<bookId>/checkpoints.yaml, books/<bookId>/artifacts.yaml, and
+      books/<bookId>/output/qmd_output_manifest.json through durable
+      checksum/reconcile helpers. On checksum mismatch, invalid target, or
+      unreconciled temp state, normal run and migrate-only must fail closed,
+      quarantine corrupt targets, and avoid terminal completion or manifest
+      migration writes.
+    required_tests: >
+      Add production black-box tests that tamper valid YAML/JSON evidence while
+      retaining the old .sha256 and verify the batch runner does not emit
+      item_completed or item_worker_completed, does not migrate the producer
+      manifest, records stop_until_fixed/quarantine evidence, and preserves the
+      durable gate.
+nonblocking_findings:
+  - id: RA5-N1
+    title: full suite was not rerun by this auditor
+    detail: >
+      This reaudit used read-only source/test inspection and the controller
+      reported focused test pass list. The complete repository test suite was
+      not rerun by dev-agent-a.
+  - id: RA5-N2
+    title: LanceDB row-count mismatch is surfaced through artifact validation
+    detail: >
+      qmd_row_count.json checksum mismatch is reconciled/quarantined by the
+      durable JSON helper, then exposed as a missing positive row-count gate.
+      This blocks query-ready publication, but a status-json level assertion
+      would improve observability.
+criteria_results:
+  - criterion: 1
+    name: same runId single coordinator
+    result: pass
+  - criterion: 2
+    name: item claim and fencing
+    result: pass
+  - criterion: 3
+    name: book-scoped mutual exclusion
+    result: pass
+  - criterion: 4
+    name: sequential compatibility
+    result: pass
+  - criterion: 5
+    name: manifest and event consistency
+    result: fail
+    blocking_findings: [RA5-B1]
+  - criterion: 6
+    name: provider slot governance
+    result: pass
+  - criterion: 7
+    name: qmd index write safety
+    result: pass
+  - criterion: 8
+    name: failure and wait semantics
+    result: pass
+  - criterion: 9
+    name: GraphRAG closed-loop gate
+    result: fail
+    blocking_findings: [RA5-B1]
+  - criterion: 10
+    name: production test coverage
+    result: fail
+    blocking_findings: [RA5-B1]
+ra4_blocking_closure:
+  RA4-B1: partially_closed_still_blocking_as_RA5-B1
+  RA4-B2: mostly_closed_with_residual_test_gap_tied_to_RA5-B1
+evidence_files:
+  - /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/criteria.md
+  - /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/reaudit_4_summary.yaml
+  - scripts/graphrag/batch-epub-workflow.mjs
+  - scripts/graphrag/resume-book-workspace.mjs
+  - scripts/graphrag/batch-failure-classifier.mjs
+  - src/job-state/durable-json.ts
+  - src/job-state/repository.ts
+  - src/job-state/graphrag-book.ts
+  - src/job-state/artifact-validation.ts
+  - src/db.ts
+  - test/cli.test.ts
+  - test/book-job-state.test.ts
+  - test/graphrag-book-state.test.ts
+  - test/integrations/contracts.test.ts
+evidence_commands:
+  - command: "shasum -a 256 audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/criteria.md"
+    result: e763182a90d9aeeeafa11f21379473a3a8e2218dc5d81bbbe9fef6625d9281ca
+  - command: "git status --short"
+    result: inspected current dirty worktree without modifying production code
+  - command: "rg -n \"readYamlFileIfExists|readGraphOutputProducerManifest|graphBuildEvidence|migrateGraphOutputProducerManifests\" scripts/graphrag/batch-epub-workflow.mjs"
+    result: found direct YAML/JSON production evidence reads that bypass durable helpers
+  - command: "rg -n \"qmd_graph_text_unit_identity|qmd_output_manifest|qmd_row_count|readJsonFileDurable|writeJsonFileDurable\" src/job-state test/book-job-state.test.ts test/graphrag-book-state.test.ts"
+    result: inspected durable JSON helper adoption and sidecar recovery tests
+  - command: "rg -n \"book worker pool defers duplicate canonical books|stale item checkpoint ownership rejects terminal event writes|parallel non-transient failure quiesces sibling workers|restart terminates same-host live orphan subprocess records\" test/cli.test.ts"
+    result: verified new production behavior tests for previous concurrency and quiesce gaps
+  - command: "node --check scripts/graphrag/batch-epub-workflow.mjs && node --check scripts/graphrag/resume-book-workspace.mjs && node --check scripts/graphrag/batch-failure-classifier.mjs"
+    result: controller reported pass
+  - command: "npm run test:types -- --pretty false"
+    result: controller reported pass
+  - command: "focused vitest CLI, book-state, and graphrag-book-state tests listed in the reaudit_5 request"
+    result: controller reported pass

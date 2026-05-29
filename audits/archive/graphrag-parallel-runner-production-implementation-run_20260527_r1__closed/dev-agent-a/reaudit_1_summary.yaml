@@ -1,0 +1,73 @@
+agent_id: dev-agent-a
+reaudit_round: 1
+status: fail
+criteria_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/criteria.md
+findings_file: audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/reaudit_1_findings.md
+review_scope: >
+  Read-only re-audit of the current GraphRAG multi-book parallel runner
+  implementation against the 10 fixed criteria. No source code was modified.
+  No .env or secrets were read or output. Only the requested re-audit artifacts
+  were written under the dev-agent-a audit directory.
+blocking_findings:
+  - id: P0-1
+    criteria: [2, 3, 9]
+    title: item/book fencing does not cover all shared checkpoint, catalog, artifact, producer manifest, and qmd corpus writes
+  - id: P0-2
+    criteria: [6]
+    title: provider slot leases are observable records but not the durable global capacity arbiter
+  - id: P0-3
+    criteria: [7]
+    title: qmd SQLite writer safety lacks file-lock coverage for qmd subprocesses and bounded busy/locked retry metrics
+  - id: P0-4
+    criteria: [5]
+    title: event and manifest recovery do not handle duplicate events, manifest drift, checkpoint temp files, or durable migration writes
+  - id: P0-5
+    criteria: [1, 8]
+    title: fail-fast, non-transient stop, lease loss, and takeover do not quiesce active workers or kill live subprocess groups
+  - id: P0-6
+    criteria: [10]
+    title: production tests still miss duplicate book exclusion, stale item fencing, durable slot contention, SQLite contention, reconciliation, and cancellation cases
+criteria_results:
+  - criterion: 1
+    name: same runId single coordinator
+    result: partial
+  - criterion: 2
+    name: item claim and fencing
+    result: fail
+  - criterion: 3
+    name: book-scoped mutual exclusion
+    result: fail
+  - criterion: 4
+    name: sequential compatibility
+    result: partial
+  - criterion: 5
+    name: manifest and event consistency
+    result: fail
+  - criterion: 6
+    name: provider slot governance
+    result: fail
+  - criterion: 7
+    name: qmd index write safety
+    result: fail
+  - criterion: 8
+    name: failure and wait semantics
+    result: fail
+  - criterion: 9
+    name: GraphRAG closed-loop gate
+    result: pass_with_fencing_caveat
+  - criterion: 10
+    name: production test coverage
+    result: fail
+positive_observations:
+  - coordinator lock, heartbeat, event identity, partial tail recovery, provider slot records, book lease records, and subprocess registry now exist
+  - ordinary duplicate coordinator startup is rejected by a black-box test
+  - query-ready closed-loop evidence checks are substantially implemented
+audited_files:
+  - scripts/graphrag/batch-epub-workflow.mjs
+  - scripts/graphrag/resume-book-workspace.mjs
+  - src/job-state/graphrag-book.ts
+  - src/job-state/repository.ts
+  - src/store.ts
+  - test/cli.test.ts
+  - test/book-job-state.test.ts
+  - test/integrations/contracts.test.ts

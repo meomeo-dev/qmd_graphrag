@@ -1,0 +1,126 @@
+agent_id: dev-agent-b
+reaudit_round: 6
+status: fail
+criteria_file: "/Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__closed/dev-agent-b/criteria.md"
+requested_criteria_file: "/Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-b/criteria.md"
+requested_directory_present: false
+criteria_version: "sha256:2762b387b28308c03db246222d798538e232b56e4f1ae96b2c1bc3dfc8ea9aaf"
+findings_file: "/Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__closed/dev-agent-b/reaudit_6_findings.md"
+blocking_findings_count: 3
+nonblocking_findings_count: 1
+blocking_findings:
+  - id: R6-B01
+    title: "graph-capabilities.yaml lacks cross-process locked/CAS catalog commit"
+    criteria:
+      - 2
+      - 4
+      - 10
+    evidence:
+      - "src/graphrag/capability-catalog.ts:820"
+      - "src/graphrag/capability-catalog.ts:832"
+      - "src/job-state/repository.ts:3190"
+      - "src/job-state/repository.ts:3241"
+    required_fix: >
+      Add a durable same-file lock or CAS generation around graph capability
+      catalog reconcile/read/merge/write, or publish per-book capability files
+      and derive the aggregate catalog.
+  - id: R6-B02
+    title: "batch runner startup catalog/books.yaml bypasses durable reconcile"
+    criteria:
+      - 4
+      - 6
+      - 10
+    evidence:
+      - "scripts/graphrag/batch-epub-workflow.mjs:3650"
+      - "scripts/graphrag/batch-epub-workflow.mjs:3701"
+      - "scripts/graphrag/batch-epub-workflow.mjs:8353"
+    required_fix: >
+      Reuse durable YAML checksum/reconcile/quarantine for
+      loadCatalogBySourceHash and add startup black-box corrupt catalog tests.
+  - id: R6-B03
+    title: "black-box negative tests still miss remaining production boundaries"
+    criteria:
+      - 10
+    evidence:
+      - "test/cli.test.ts:12123"
+      - "test/cli.test.ts:12181"
+      - "test/book-job-state.test.ts:3023"
+      - "test/book-job-state.test.ts:3064"
+      - "test/book-job-state.test.ts:3146"
+    required_fix: >
+      Add behavior tests for terminal checkpoints/artifacts YAML checksum
+      corruption, startup books.yaml durable recovery, and parallel graph
+      capability no-lost-update publication.
+nonblocking_findings:
+  - id: R6-N01
+    title: "full suite not rerun by dev-agent-b"
+    detail: >
+      Dev-agent-b reran syntax checks only. Type tests and focused Vitest
+      commands are recorded as controller-reported evidence.
+criteria_results:
+  - criterion: 1
+    name: "Durable single coordinator ownership"
+    result: pass
+  - criterion: 2
+    name: "Item and book ownership use lease fencing"
+    result: fail
+  - criterion: 3
+    name: "Provider concurrency at child boundary"
+    result: pass
+  - criterion: 4
+    name: "Durable writes are crash recoverable"
+    result: fail
+  - criterion: 5
+    name: "Event logs authoritative audit trails"
+    result: pass
+  - criterion: 6
+    name: "Manifest and status derived caches"
+    result: pass
+  - criterion: 7
+    name: "Terminal completion evidence gated"
+    result: pass
+  - criterion: 8
+    name: "Stable terminal or retry states"
+    result: pass
+  - criterion: 9
+    name: "Crash and restart live subprocess recovery"
+    result: pass
+  - criterion: 10
+    name: "Behavioral recovery tests"
+    result: fail
+evidence_files:
+  - "scripts/graphrag/batch-epub-workflow.mjs"
+  - "scripts/graphrag/resume-book-workspace.mjs"
+  - "src/graphrag/capability-catalog.ts"
+  - "src/job-state/repository.ts"
+  - "src/job-state/graphrag-book.ts"
+  - "src/job-state/durable-json.ts"
+  - "src/job-state/artifact-validation.ts"
+  - "test/cli.test.ts"
+  - "test/book-job-state.test.ts"
+  - "test/graphrag-book-state.test.ts"
+verification_commands:
+  - command: "node --check scripts/graphrag/batch-epub-workflow.mjs"
+    result: pass
+    executed_by: dev-agent-b
+  - command: "node --check scripts/graphrag/resume-book-workspace.mjs"
+    result: pass
+    executed_by: dev-agent-b
+  - command: "node --check scripts/graphrag/batch-failure-classifier.mjs"
+    result: pass
+    executed_by: dev-agent-b
+  - command: "npm run test:types -- --pretty false"
+    result: reported_pass
+    executed_by: controller
+  - command: "focused CLI durable/fencing/provider tests"
+    result: reported_pass
+    executed_by: controller
+  - command: "focused book-job-state and graphrag-book-state tests"
+    result: reported_pass
+    executed_by: controller
+review_notes:
+  source_modifications: "none"
+  tests_modified: false
+  criteria_modified: false
+  audit_directory_created: false
+  env_or_secret_files_read: false

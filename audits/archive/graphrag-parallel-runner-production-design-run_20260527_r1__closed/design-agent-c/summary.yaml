@@ -1,0 +1,69 @@
+decision: fail
+must_fix:
+  - id: provider_semaphore_subprocess_boundary
+    title: 明确 provider semaphore 与 GraphRAG/qmd 子进程边界
+    reason: >
+      当前设计要求所有 OpenAI/Jina 请求共享 semaphore，但没有说明子进程内部
+      provider call 如何受 coordinator 控制，无法证明真实 API call 全局限流。
+    required_change: >
+      定义按请求限流、按子进程限流或本地 proxy/adapter 限流的实施模型，并为
+      GraphRAG/qmd 子进程配置、观测和测试提供可执行契约。
+  - id: event_checkpoint_atomicity
+    title: 补充事件与 checkpoint 原子持久化规则
+    reason: >
+      writer lane 只能串行化写入意图，不能单独保证 crash 中的 JSONL append、
+      checkpoint replace 与 manifest refresh 原子性。
+    required_change: >
+      定义 JSONL append 的 single-write/newline/flush/fsync/partial-tail recovery
+      规则，以及 checkpoint/manifest 的 temp-file rename、generation 或 checksum
+      规则。
+  - id: writer_lane_ordering
+    title: 统一 writer lane 职责并规定获取顺序
+    reason: >
+      文档同时出现 manifestWriterLane 与 catalogWriterLane 保护 manifest 的表述，
+      且未定义多 lane 获取顺序，存在实现歧义和 deadlock 风险。
+    required_change: >
+      明确 manifest 写入由哪个 lane 保护，并定义固定 lane acquisition order、
+      禁止嵌套或 timeout/release 规则。
+should_fix:
+  - id: qmd_sqlite_lock_contract
+    title: 完善 qmd SQLite 写锁契约
+    recommendation: >
+      定义所有 qmd 写命令必须经 qmdIndexWriterLane 调度，补充 SQLite busy_timeout、
+      locked error 分类、retry 上限、WAL/rollback expectation 与一致性检查。
+  - id: cli_env_resolution
+    title: 补充 CLI/env resolution 与 secret redaction 表
+    recommendation: >
+      明确 CLI、env、config/default 的优先级、非法值处理、并发范围、redacted
+      diagnostic format 与子进程 env allowlist。
+  - id: fault_injection_acceptance
+    title: 扩展 fault-injection 与量化验收
+    recommendation: >
+      增加 worker crash、coordinator crash、partial JSONL、SQLite locked、
+      GraphRAG 子进程 kill、磁盘写失败与 provider semaphore 跨进程验证。
+  - id: production_observability_metrics
+    title: 增加生产指标与关联字段
+    recommendation: >
+      在 events/status-json 中加入 itemId、bookId、workerId、stage、commandId、
+      producerRunId、fencingToken、durations、provider wait、writer lane wait、
+      queue depth、retry budget remaining 与 SQLite retry count。
+doc_change_recommendations:
+  - >
+    在 resourceControls.providerSemaphores 下新增 subprocess enforcement 小节，
+    明确 GraphRAG/qmd 子进程如何接受并遵守全局 provider 并发限制。
+  - >
+    在 resourceControls.writerLanes 下新增 lane acquisition order、critical
+    section boundary、timeout、cancellation 与 release-on-error 规则。
+  - >
+    在 stateModel 或 observability 下新增 event schema，包含 eventId、sequence、
+    timestamp、runId、itemId、bookId、workerId、stage、commandId 与 idempotency
+    key。
+  - >
+    在 failureRecovery 下新增 partial-write recovery，覆盖 events.jsonl 尾行、
+    checkpoint 临时文件、manifest generation mismatch 与 SQLite locked database。
+  - >
+    在 configurationContract 下新增 config resolution table，覆盖 CLI/env/config
+    优先级、默认值、范围校验、冲突处理、dotenv source 诊断与 secret redaction。
+  - >
+    在 validationRequirements 下新增 faultInjection 分组，并把 acceptanceCriteria
+    逐条绑定到可检查事件、文件、命令输出或状态字段。

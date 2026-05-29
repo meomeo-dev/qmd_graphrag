@@ -1,0 +1,125 @@
+schemaVersion: "1.0.0"
+auditId: graphrag-durable-yaml-temp-collision-run_20260528_r1
+agent: agent-b
+fixedCriteria: true
+changeControl: >
+  后续实施复审保持本文件 10 条基准的编号、语义和通过条件不变。
+  若发现新风险，另行记录补充项，不改写本轮固定基准。
+scope:
+  failureMode: durable YAML/JSON temp collision and local state integrity
+  designReference: docs/architecture/graphrag-parallel-runner.type-dd.yaml
+  codeUnderAudit:
+    - src/job-state/repository.ts
+    - src/graphrag/capability-catalog.ts
+    - src/job-state/durable-json.ts
+    - scripts/graphrag/batch-epub-workflow.mjs
+    - scripts/graphrag/batch-failure-classifier.mjs
+    - src/contracts/batch-run.ts
+    - src/graphrag/settings-projection.ts
+    - src/integrations/python-bridge.ts
+    - src/dspy/policy-store.ts
+    - test/book-job-state.test.ts
+    - test/cli.test.ts
+criteria:
+  - id: I01_single_durable_boundary
+    title: 统一 durable 写入边界
+    requirement: >
+      生产路径中的 YAML/JSON durable replace、checksum backfill、temp cleanup、
+      quarantine 和 lock recovery 必须通过共享 durableStateStore 或声明等价
+      adapter；不得保留互相不一致的私有 helper。
+    passCondition: >
+      指定范围内每个 durable YAML/JSON 写入点都能追溯到同一语义：temp identity、
+      exclusive create、owner evidence、checksum/generation、fsync、lock、
+      failure classification 和 recovery。
+
+  - id: I02_target_mapping_enforcement
+    title: targetMapping 执行约束
+    requirement: >
+      并行 runner 写入的每个生产目标必须匹配设计 targetMapping 的唯一
+      lane、owner、durableKind、laneTimeoutMs 和 releaseOn。
+    passCondition: >
+      对 catalog、book-scoped YAML、item checkpoint、manifest、status、run lock、
+      provider slot、subprocess registry、book lease、settings 和 qmd index 等目标，
+      代码有明确 lane/lock 进入点、timeout、release-on-error 和诊断证据。
+
+  - id: I03_temp_identity_exclusive_create
+    title: Temp 唯一性与独占创建
+    requirement: >
+      所有 durable temp 名称必须包含随机 UUID 或等价熵源，并使用 exclusive
+      create；不得只依赖 pid 和 Date.now，不得覆盖或截断其他 writer 的 temp。
+    passCondition: >
+      同一进程同一毫秒并发写入同一目标时不会复用 temp path；EEXIST 会被分类
+      为 bounded retry 或 local_state_integrity，且不会破坏 target。
+
+  - id: I04_temp_owner_evidence
+    title: Temp owner evidence
+    requirement: >
+      temp 创建后必须有可恢复读取的 owner evidence，至少包含 tempId、
+      targetLocator、operationId、runnerSessionId、worker/coordinator id、
+      item/book scope、leaseGeneration、fencingTokenHash、ownerPid、ownerHost
+      和 createdAt 中适用字段。
+    passCondition: >
+      恢复、cleanup、rename ENOENT 分类和 status/recovery summary 都能引用
+      该 owner evidence；证据不得只存在于不可恢复的内存变量。
+
+  - id: I05_inflight_cleanup_safety
+    title: In-flight temp 清理安全
+    requirement: >
+      temp cleanup 必须同时检查 stale age、owner 存活或 lease 失效、
+      target generation 未推进、且 cleaner 持有 per-target lock。
+    passCondition: >
+      cleanup 不会删除活跃 writer 尚未 rename 的 temp；删除时必须事件化并包含
+      tempId、operationId、owner、staleAgeMs 和 cleanupReason。
+
+  - id: I06_atomic_commit_and_checksum_recovery
+    title: Atomic commit 与 checksum 窗口
+    requirement: >
+      写入顺序必须覆盖 temp fsync、atomic rename、checksum/generation durable
+      replace、父目录 fsync，并处理 target-new/checksum-old、
+      target-new/checksum-missing、checksum partial write 和 parent fsync 不确定。
+    passCondition: >
+      任一 crash window 恢复后收敛到 committed、retryable repair 或
+      stop_until_fixed；不得错误隔离有效 target，也不得只凭 event 发布完成。
+
+  - id: I07_rename_enoent_classification
+    title: Rename ENOENT 分类
+    requirement: >
+      temp rename ENOENT 必须分类为 local_state_integrity，retryable=false，
+      recoveryDecision=stop_until_fixed，并区分 temp 碰撞、调和误删、并发接管、
+      generation 更新和底层文件系统或外部修改。
+    passCondition: >
+      item checkpoint、event、status-json 或 recovery summary 持久化
+      localFailureClass、renameCause、targetLocator、tempId、operationId、
+      leaseGeneration、failedSyscall 和 errno。
+
+  - id: I08_status_event_schema_observability
+    title: 状态与事件观测
+    requirement: >
+      contracts、runner event、item checkpoint、manifest/status-json 与 recovery
+      summary 必须能表达 durable write failure 所需诊断字段。
+    passCondition: >
+      诊断字段包括 lane、targetLocator、tempId、operationId、runnerSessionId、
+      workerId、leaseGeneration、failureKind、localFailureClass、retryable、
+      recoveryDecision、renameCause、lock owner evidence 和 checksum recovery
+      decision，且输出经过 redaction。
+
+  - id: I09_direct_call_chain_coverage
+    title: 直接调用链覆盖
+    requirement: >
+      repository、capability catalog、durable-json、batch runner、settings
+      projection、python bridge 和 dspy policy store 的直接 durable 写入链必须
+      满足同一修复语义，或被明确排除在本生产 runner 路径之外。
+    passCondition: >
+      任一被 targetMapping 或当前 runner 恢复路径覆盖的写入链，不得保留缺少
+      owner evidence、checksum recovery、ENOENT classification 或 parent fsync
+      语义的私有 durable replace。
+
+  - id: I10_fault_injection_tests
+    title: 故障注入测试覆盖
+    requirement: >
+      测试必须覆盖同毫秒 temp 碰撞、forced temp collision、活跃 temp 调和、
+      owner-dead stale temp、rename ENOENT、checksum crash windows、lock timeout
+      和恢复重启。
+    passCondition: >
+      测试断言事件、status-json/recovery summary、checkpoint 和目标文件状态，
+      证明不会丢失已提交状态，也不会把未提交状态标记为完成。

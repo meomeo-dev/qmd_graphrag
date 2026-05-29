@@ -1,0 +1,106 @@
+schemaVersion: "1.0.0"
+auditId: graphrag-durable-yaml-temp-collision-run_20260528_r1
+agent: agent-b
+fixedCriteria: true
+changeControl: >
+  后续复审保持本文件 10 条基准的编号、语义和通过条件不变。
+  若发现新风险，另行记录补充项，不改写本轮固定基准。
+scope:
+  batchRunId: epub-batch-20260527-real-resume-1
+  itemId: item-45c6c3f72a50-f5252de5
+  failedStage: resume-book-2
+  failureMode: durable YAML temp file rename ENOENT
+  designUnderAudit: docs/architecture/graphrag-parallel-runner.type-dd.yaml
+criteria:
+  - id: C01_writer_lane_target_coverage
+    title: Writer lane 目标覆盖
+    requirement: >
+      设计必须列出并行 runner 会写入或替换的全部 durable YAML/JSON
+      目标，并把每个目标映射到唯一 writer lane。
+      范围包括 catalog、book job、book checkpoints、artifact manifest、
+      producer run record、graph capability、item checkpoint、manifest、
+      status 和 run lock。
+    passCondition: >
+      任意生产写入路径都能从目标路径追溯到唯一 lane、持有者、
+      超时策略和释放规则。
+
+  - id: C02_writer_lane_enforcement_boundary
+    title: Writer lane 执行边界
+    requirement: >
+      设计必须要求所有 durable writer 通过 coordinator 管理的 lane
+      进入 critical section，禁止模块私有锁绕过 lane。
+    passCondition: >
+      repository、capability catalog、batch manifest、run lock 和脚本入口
+      使用同一 lane 协议，且嵌套获取只按全局 acquisition order 执行。
+
+  - id: C03_fencing_before_durable_commit
+    title: Fencing 前置校验
+    requirement: >
+      每次 temp 创建、rename、checksum/generation 写入和父目录 fsync 前，
+      必须验证当前 item lease、book lease 或 coordinator generation。
+    passCondition: >
+      旧 runner、旧 worker 或旧 book lease 无法执行任何 durable commit
+      阶段；失败必须保留可诊断 evidence。
+
+  - id: C04_temp_file_collision_resistance
+    title: Temp 文件抗碰撞
+    requirement: >
+      temp 文件名必须在同一目标、同一进程、同一毫秒、多个 async worker、
+      重试和多进程接管场景下仍然唯一。
+    passCondition: >
+      设计禁止仅使用 pid 与 Date.now；必须要求随机 UUID、单调序列、
+      runnerSessionId 或等价熵源，并说明命名组成。
+
+  - id: C05_exclusive_temp_creation_and_ownership
+    title: Temp 独占创建与归属
+    requirement: >
+      temp 文件创建必须使用 exclusive create 或等价机制，且写入者归属
+      必须可被恢复流程识别。
+    passCondition: >
+      temp 冲突在写入开始时被显式发现；恢复可判断 temp 属于活跃写入者、
+      已完成提交、陈旧孤儿文件或未知证据。
+
+  - id: C06_atomic_commit_state_contract
+    title: Atomic commit 状态契约
+    requirement: >
+      设计必须定义 temp fsync、atomic rename、父目录 fsync、
+      checksum/generation 持久化和 compare-and-swap 的顺序与失败语义。
+    passCondition: >
+      任一中断点恢复后，target、checksum/generation 和事件状态可收敛到
+      committed、retryable 或 stop_until_fixed，不能停在未知半提交状态。
+
+  - id: C07_in_flight_temp_reconciliation_safety
+    title: In-flight temp 调和安全
+    requirement: >
+      恢复和读写前调和不得删除活跃 writer 尚未 rename 的 temp 文件。
+    passCondition: >
+      temp 删除必须受 owner、stale age、lane/lock 状态和 target generation
+      共同约束；删除动作必须事件化并可追溯到具体 temp id。
+
+  - id: C08_rename_enoent_failure_policy
+    title: Rename ENOENT 策略
+    requirement: >
+      temp rename 出现 ENOENT 时，设计必须区分 temp 名碰撞、调和误删、
+      并发接管、目标已被其他 generation 更新和底层文件系统错误。
+    passCondition: >
+      ENOENT 有确定 failureKind、retryable、recoveryDecision 和重试/停止
+      规则；不得只作为普通异常导致不可恢复阻塞。
+
+  - id: C09_observability_for_durable_writes
+    title: Durable 写入观测
+    requirement: >
+      事件和 status-json 必须暴露 durable YAML/JSON 写入、temp 创建、
+      temp 调和、rename ENOENT、重试和隔离的最小诊断字段。
+    passCondition: >
+      诊断包含 lane、target locator、temp id、runnerSessionId、workerId、
+      leaseGeneration、failureKind、retryable、recoveryDecision 和时间戳，
+      且不输出 secret。
+
+  - id: C10_fault_injection_acceptance
+    title: 故障注入验收
+    requirement: >
+      设计必须把 durable temp 碰撞、活跃 temp 被调和删除、rename ENOENT、
+      checksum/generation 中断和恢复重启列入 fault injection。
+    passCondition: >
+      验收标准可用事件、status-json、checkpoint、target 文件和测试断言
+      证明系统不会丢失已提交状态，也不会把未提交状态标记为完成。

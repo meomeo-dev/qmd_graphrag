@@ -1,0 +1,42 @@
+decision: pass
+remaining_must_fix: []
+remaining_should_fix:
+  - id: provider_slot_metric_semantics
+    title: 明确 process-level provider slot 的度量语义
+    recommendation: >
+      在实现前确认 GraphRAG/qmd 黑盒子进程内部 provider 并发是否被配置为 1。
+      若无法逐 request 限流，应把 event/status 指标解释为 subprocess slot
+      concurrency；若要证明逐 HTTP request 并发，则必须使用 request-level proxy
+      或等价 provider adapter。
+  - id: qmd_command_envelope_inventory
+    title: 列出必须持有 qmdIndexWriterLane 的 qmd 子命令
+    recommendation: >
+      在实现任务中枚举 registration、embedding、cleanup、validation 等 qmd
+      子命令的读写属性，确保 provider wait 或长 CPU 阶段不会不必要地长期持有
+      SQLite writer lane。
+  - id: subprocess_env_allowlist_inventory
+    title: 固化子进程环境变量 allowlist
+    recommendation: >
+      在实现任务中列出 GraphRAG/qmd 子进程允许接收的 provider、path、diagnostic
+      环境变量名称，并为 secret redaction 与冲突诊断分配稳定 error code。
+notes:
+  - >
+    复审沿用 design-agent-c/criteria.md 的 10 条固定基准，未修改 criteria.md。
+  - >
+    首轮 must_fix provider_semaphore_subprocess_boundary 已解决。设计新增
+    coordinator_granted_provider_slots、process_level_slot、request_level_proxy、
+    provider slot lease、slot 回收与 status/event 证据。
+  - >
+    首轮 must_fix event_checkpoint_atomicity 已解决。设计新增 JSONL single append、
+    newline、flush/fsync、partial tail recovery、temp-file rename、parent fsync、
+    generation/checksum 与 duplicate event 处理。
+  - >
+    首轮 must_fix writer_lane_ordering 已解决。设计新增独立 manifestWriterLane、
+    固定 acquisitionOrder、默认禁止嵌套、timeout、writer_lane_timeout 与
+    release-on-error。
+  - >
+    qmd SQLite 写锁、CLI/env resolution、fault-injection acceptance 与生产观测
+    相关 should-fix 已在 Type DD 中补足到设计可实施水平。
+  - >
+    本次只读取审计目录、目标 Type DD 与修正摘要；未读取或输出 .env secret，
+    未启动批处理 runner。

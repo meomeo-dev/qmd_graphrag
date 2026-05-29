@@ -1,0 +1,86 @@
+agent_id: dev-agent-a
+reaudit_round: 6
+status: pass
+criteria_file: /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/criteria.md
+criteria_version: sha256:e763182a90d9aeeeafa11f21379473a3a8e2218dc5d81bbbe9fef6625d9281ca
+findings_file: /Users/jin/projects/qmd_graphrag/audits/graphrag-parallel-runner-production-implementation-run_20260527_r1__open/dev-agent-a/reaudit_6_findings.md
+review_scope: >
+  Current worktree implementation reaudit against the 10 fixed criteria in
+  criteria.md. No new audit directory was created. criteria.md was not modified.
+  No .env, secrets, keys, or credentials were read or output.
+blocking_findings_count: 0
+nonblocking_findings_count: 1
+closed_previous_blocking_findings:
+  - id: RA5-B1
+    status: closed
+    closure: >
+      Batch runner terminal evidence readers now reconcile durable YAML/JSON
+      targets before accepting catalog/books.yaml, book checkpoints/artifacts,
+      producer manifests, and LanceDB row-count sidecars. Durable checksum
+      mismatch quarantines the target and fails closed.
+nonblocking_findings:
+  - id: RA6-N1
+    title: full suite not rerun
+    detail: >
+      Focused behavior tests, syntax checks, and type checks passed. The full
+      repository test suite was not rerun in this reaudit.
+criteria_results:
+  - criterion: 1
+    name: same runId single coordinator
+    result: pass
+  - criterion: 2
+    name: item claim and fencing
+    result: pass
+  - criterion: 3
+    name: book-scoped mutual exclusion
+    result: pass
+  - criterion: 4
+    name: sequential compatibility
+    result: pass
+  - criterion: 5
+    name: manifest and event consistency
+    result: pass
+  - criterion: 6
+    name: provider slot governance
+    result: pass
+  - criterion: 7
+    name: qmd index write safety
+    result: pass
+  - criterion: 8
+    name: failure and wait semantics
+    result: pass
+  - criterion: 9
+    name: GraphRAG closed-loop gate
+    result: pass
+  - criterion: 10
+    name: production test coverage
+    result: pass
+verification_commands:
+  - command: node --check scripts/graphrag/batch-epub-workflow.mjs
+    result: pass
+  - command: node --check scripts/graphrag/resume-book-workspace.mjs
+    result: pass
+  - command: node --check scripts/graphrag/batch-failure-classifier.mjs
+    result: pass
+  - command: npm run test:types -- --pretty false
+    result: pass
+  - command: focused vitest CLI parallel/fencing/provider/durable evidence tests
+    result: pass
+  - command: focused vitest Python bridge provider slot fencing test
+    result: pass
+  - command: focused vitest GraphRAG cost durable recovery tests
+    result: pass
+  - command: focused vitest book job state capability catalog fencing tests
+    result: pass
+evidence_files:
+  - scripts/graphrag/batch-epub-workflow.mjs
+  - src/contracts/batch-run.ts
+  - src/graphrag/capability-catalog.ts
+  - src/integrations/graphrag.ts
+  - src/integrations/python-bridge.ts
+  - src/job-state/repository.ts
+  - src/provider/cost-accounting.ts
+  - test/cli.test.ts
+  - test/book-job-state.test.ts
+  - test/integrations/graphrag-cost.test.ts
+  - test/integrations/python-bridge-early-stop.test.ts
