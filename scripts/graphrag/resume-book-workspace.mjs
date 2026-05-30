@@ -151,6 +151,8 @@ function durableFailureEnvelope(runtimeApi, error) {
     fsyncPlatform: evidence.fsyncPlatform,
     durableMode: evidence.durableMode,
     primaryTargetLocator: evidence.primaryTargetLocator,
+    auxiliaryTargetLocator: evidence.auxiliaryTargetLocator,
+    auxiliarySidecarKind: evidence.auxiliarySidecarKind,
     sidecarTargetLocator: evidence.sidecarTargetLocator,
     sidecarKind: evidence.sidecarKind,
     checksumExpected: evidence.checksumExpected,

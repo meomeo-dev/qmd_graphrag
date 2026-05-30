@@ -41,6 +41,10 @@ import {
 } from "./batch-failure-classifier.mjs";
 import { hydrateBatchCheckpoint } from "./batch-checkpoint-hydration.mjs";
 import {
+  durableTargetNormalizationEvidence,
+  normalizeDurableTargetForMapping,
+} from "./durable-target-normalizer.mjs";
+import {
   buildStartupPreflightFailureManifest,
   createStartupRecoverySchema,
   createStartupScanStats,
@@ -774,6 +778,8 @@ const DurableStateDiagnosticSchema = z.object({
   primaryDurableKind: z.string().min(1).optional(),
   durableMode: z.string().min(1).optional(),
   primaryTargetLocator: z.string().min(1).optional(),
+  auxiliaryTargetLocator: z.string().min(1).optional(),
+  auxiliarySidecarKind: z.string().min(1).optional(),
   sidecarTargetLocator: z.string().min(1).optional(),
   sidecarKind: z.string().min(1).optional(),
   checksumExpected: z.string().min(1).nullable().optional(),
@@ -918,6 +924,8 @@ const BatchCommandCheckSchema = z.object({
   primaryDurableKind: z.string().min(1).optional(),
   durableMode: z.string().min(1).optional(),
   primaryTargetLocator: z.string().min(1).optional(),
+  auxiliaryTargetLocator: z.string().min(1).optional(),
+  auxiliarySidecarKind: z.string().min(1).optional(),
   sidecarTargetLocator: z.string().min(1).optional(),
   sidecarKind: z.string().min(1).optional(),
   checksumExpected: z.string().min(1).nullable().optional(),
@@ -1140,6 +1148,8 @@ const BatchItemCheckpointBaseSchema = z.object({
   primaryDurableKind: z.string().min(1).optional(),
   durableMode: z.string().min(1).optional(),
   primaryTargetLocator: z.string().min(1).optional(),
+  auxiliaryTargetLocator: z.string().min(1).optional(),
+  auxiliarySidecarKind: z.string().min(1).optional(),
   sidecarTargetLocator: z.string().min(1).optional(),
   sidecarKind: z.string().min(1).optional(),
   checksumExpected: z.string().min(1).nullable().optional(),
@@ -1266,6 +1276,8 @@ const BatchRunManifestSchema = z.object({
     primaryDurableKind: z.string().min(1).optional(),
     durableMode: z.string().min(1).optional(),
     primaryTargetLocator: z.string().min(1).optional(),
+    auxiliaryTargetLocator: z.string().min(1).optional(),
+    auxiliarySidecarKind: z.string().min(1).optional(),
     sidecarTargetLocator: z.string().min(1).optional(),
     sidecarKind: z.string().min(1).optional(),
     checksumExpected: z.string().min(1).nullable().optional(),
@@ -1318,6 +1330,8 @@ const BatchEventLogSchema = z.object({
   primaryDurableKind: z.string().min(1).optional(),
   durableMode: z.string().min(1).optional(),
   primaryTargetLocator: z.string().min(1).optional(),
+  auxiliaryTargetLocator: z.string().min(1).optional(),
+  auxiliarySidecarKind: z.string().min(1).optional(),
   sidecarTargetLocator: z.string().min(1).optional(),
   sidecarKind: z.string().min(1).optional(),
   checksumExpected: z.string().min(1).nullable().optional(),
@@ -1385,6 +1399,8 @@ const BatchRecoverySummaryItemSchema = z.object({
   primaryDurableKind: z.string().min(1).optional(),
   durableMode: z.string().min(1).optional(),
   primaryTargetLocator: z.string().min(1).optional(),
+  auxiliaryTargetLocator: z.string().min(1).optional(),
+  auxiliarySidecarKind: z.string().min(1).optional(),
   sidecarTargetLocator: z.string().min(1).optional(),
   sidecarKind: z.string().min(1).optional(),
   checksumExpected: z.string().min(1).nullable().optional(),
@@ -2845,7 +2861,8 @@ function durableTargetMapping(path, kind) {
   if (kind === "directory-fsync") {
     return durableDirectoryFsyncMapping(relativePath, path);
   }
-  const mappingPath = primaryTargetRelativePathForMapping(relativePath);
+  const normalization = normalizeDurableTargetForMapping(relativePath);
+  const mappingPath = normalization.primaryTargetLocator;
   const mapped = durableTargetMappingTable.find(({ pattern }) =>
     pattern.test(mappingPath)
   );
@@ -2856,6 +2873,7 @@ function durableTargetMapping(path, kind) {
         localFailureClass: "durable_target_mapping_missing",
         evidence: {
           targetLocator: relativePath,
+          ...durableTargetNormalizationEvidence(normalization),
           durableKind: kind,
           durableMode: "strict",
           completedPublishRule: "forbidden",
@@ -2872,6 +2890,7 @@ function durableTargetMapping(path, kind) {
   return withoutUndefined({
     targetMappingRule: mapped == null ? "nonProductionDefault" : "explicit",
     targetMappingPattern: mapped?.pattern.source,
+    ...durableTargetNormalizationEvidence(normalization),
     lane: mapped?.lane ?? inferDurableLane(relativePath),
     targetMappingOwner:
       mapped?.targetMappingOwner ?? inferDurableOwner(relativePath),
@@ -2926,16 +2945,6 @@ function isProductionDurableTarget(relativePath, kind) {
   return kind === "sqlite-lock" ||
     relativePath.endsWith("index.sqlite") ||
     relativePath.endsWith("index.sqlite.lock");
-}
-
-function primaryTargetRelativePathForMapping(relativePath) {
-  if (relativePath.endsWith(".sha256.meta.json")) {
-    return relativePath.slice(0, -".sha256.meta.json".length);
-  }
-  if (relativePath.endsWith(".sha256")) {
-    return relativePath.slice(0, -".sha256".length);
-  }
-  return relativePath;
 }
 
 function inferDurableLane(relativePath) {
@@ -3001,6 +3010,8 @@ function localDurableEvidence(input) {
     primaryDurableKind: input.primaryDurableKind,
     durableMode: input.durableMode,
     primaryTargetLocator: input.primaryTargetLocator,
+    auxiliaryTargetLocator: input.auxiliaryTargetLocator,
+    auxiliarySidecarKind: input.auxiliarySidecarKind,
     sidecarTargetLocator: input.sidecarTargetLocator,
     sidecarKind: input.sidecarKind,
     checksumExpected: input.checksumExpected,
@@ -3116,6 +3127,10 @@ function durableProjection(source) {
     durableMode: field("durableMode"),
     primaryTargetLocator:
       field("primaryTargetLocator"),
+    auxiliaryTargetLocator:
+      field("auxiliaryTargetLocator"),
+    auxiliarySidecarKind:
+      field("auxiliarySidecarKind"),
     sidecarTargetLocator:
       field("sidecarTargetLocator"),
     sidecarKind: field("sidecarKind"),
@@ -3264,6 +3279,8 @@ function normalizeDurableFailureEnvelope(payload, commandName, item) {
     primaryDurableKind: source.primaryDurableKind,
     durableMode: source.durableMode,
     primaryTargetLocator: source.primaryTargetLocator,
+    auxiliaryTargetLocator: source.auxiliaryTargetLocator,
+    auxiliarySidecarKind: source.auxiliarySidecarKind,
     sidecarTargetLocator: source.sidecarTargetLocator,
     sidecarKind: source.sidecarKind,
     checksumExpected: source.checksumExpected,

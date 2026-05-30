@@ -27,6 +27,7 @@
     "scripts/graphrag/batch-checkpoint-hydration.mjs",
     "scripts/graphrag/batch-epub-workflow.mjs",
     "scripts/graphrag/batch-failure-classifier.mjs",
+    "scripts/graphrag/durable-target-normalizer.mjs",
     "scripts/graphrag/resume-book-workspace.mjs",
     "scripts/graphrag/smoke-book-workflow.mjs",
     "scripts/package-smoke.mjs",

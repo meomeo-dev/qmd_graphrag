@@ -28,6 +28,10 @@ import { hostname } from "node:os";
 
 import YAML from "yaml";
 
+import {
+  durableTargetNormalizationEvidence,
+  normalizeDurableTargetForMapping,
+} from "./durable-target-normalizer.js";
 import { hashText } from "./fingerprint.js";
 
 const DurableLockStaleMs = 120_000;
@@ -446,7 +450,7 @@ function writeOpaqueFileDurableUncheckedSync(
     const tempPath = `${path}.tmp-${operation.tempId}`;
     const ownerPath = `${tempPath}.owner.json`;
     try {
-      writeJsonSidecarSync(ownerPath, operation);
+      writeJsonSidecarSync(ownerPath, operation, operation);
       writeFileDurableSync(tempPath, content, "wx", operation);
       renameWithEvidenceSync(tempPath, path, operation);
       rmSync(ownerPath, { force: true });
@@ -2000,12 +2004,15 @@ function newOperationEvidence(
   const operationId = randomUUID();
   const tempId = `${process.pid}-${Date.now()}-${operationId}`;
   const mapping = durableTargetMapping(path, kind);
+  const normalization = normalizeDurableTargetForMapping(path);
   return {
     tempId,
     operationId,
     targetLocator: path,
     kind,
     ...mapping,
+    primaryTargetLocator:
+      mapping.primaryTargetLocator ?? normalization.primaryTargetLocator,
     ...extra,
     runnerSessionId: SessionId,
     runId: stringEnv("QMD_GRAPHRAG_RUN_ID"),
@@ -2186,7 +2193,8 @@ function durableTargetMapping(
   kind: string,
 ): Record<string, unknown> {
   const normalized = path.split("\\").join("/");
-  const mappingPath = primaryTargetPathForMapping(normalized);
+  const normalization = normalizeDurableTargetForMapping(normalized);
+  const mappingPath = normalization.primaryTargetLocator;
   const fileName = basename(path);
   const mapped = DurableTargetMappingTable.find(({ pattern }) =>
     pattern.test(mappingPath)
@@ -2196,6 +2204,7 @@ function durableTargetMapping(
       localFailureClass: "durable_target_mapping_missing",
       evidence: {
         targetLocator: path,
+        ...durableTargetNormalizationEvidence(normalization),
         durableKind: kind,
         durableMode: "strict",
         completedPublishRule: "forbidden",
@@ -2211,6 +2220,7 @@ function durableTargetMapping(
   return {
     targetMappingRule: mapped == null ? "nonProductionDefault" : "explicit",
     targetMappingPattern: mapped?.pattern.source,
+    ...durableTargetNormalizationEvidence(normalization),
     lane,
     targetMappingOwner: owner,
     durableKind,
@@ -2219,16 +2229,6 @@ function durableTargetMapping(
     redactedEvidenceLocator: fileName,
     durableMode: "strict",
   };
-}
-
-function primaryTargetPathForMapping(path: string): string {
-  const corruptIndex = path.indexOf(".corrupt-");
-  if (corruptIndex >= 0) return path.slice(0, corruptIndex);
-  if (path.endsWith(".sha256.meta.json")) {
-    return path.slice(0, -".sha256.meta.json".length);
-  }
-  if (path.endsWith(".sha256")) return path.slice(0, -".sha256".length);
-  return path;
 }
 
 function isProductionDurableTarget(path: string, kind: string): boolean {

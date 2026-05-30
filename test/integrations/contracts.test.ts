@@ -397,6 +397,9 @@ function durableEvidenceFixture(
     checksumRecoveryDecision: "sidecar_repaired",
     durableMode: "strict",
     primaryTargetLocator: "graph_vault/books/book-fixture/job.yaml",
+    auxiliaryTargetLocator:
+      "graph_vault/books/book-fixture/job.yaml.tmp-1.owner.json",
+    auxiliarySidecarKind: "temp_owner",
     sidecarTargetLocator: "graph_vault/books/book-fixture/job.yaml.sha256",
     sidecarKind: "checksum",
     checksumExpected: null,
@@ -1904,6 +1907,10 @@ describe("Data bus contracts", () => {
     expect(commandCheck.checksumExpected).toBeNull();
     expect(checkpoint.commandChecks[0]?.checksumExpected).toBeNull();
     expect(event.primaryTargetLocator).toBe(durableNull.primaryTargetLocator);
+    expect(commandCheck.auxiliarySidecarKind).toBe("temp_owner");
+    expect(checkpoint.commandChecks[0]?.auxiliaryTargetLocator)
+      .toBe(durableNull.auxiliaryTargetLocator);
+    expect(event.auxiliarySidecarKind).toBe(durableNull.auxiliarySidecarKind);
     expect(manifest.durableFailureSummary?.repairAllowed).toBe(true);
     expect(recovery.durableStateFailures?.[0]?.statusJsonDecision)
       .toBe("metadata_missing_read_only");
