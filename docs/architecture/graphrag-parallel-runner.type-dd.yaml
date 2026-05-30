@@ -225,7 +225,10 @@ resourceControls:
       rule: >
         每个生产持久化目标必须能从 targetMapping 追溯到唯一 lane、owner、
         durableKind、laneTimeoutMs 与 releaseOn。未列入 targetMapping 的
-        durable YAML/JSON/SQLite 目标不得由并行 runner 写入。
+        durable YAML/JSON/JSONL/SQLite primary target 不得由并行 runner 写入。
+        durable engine 为已登记 primary target 生成的 temp、owner、lock、
+        checksum、checksum meta 与 corrupt quarantine 辅助路径必须先归一回
+        primary target，再继承 primary mapping；不得被当作新的 primary target。
       defaultLaneTimeoutMs: 120000
       defaultReleaseOn:
         - commit
@@ -248,12 +251,32 @@ resourceControls:
         critical target 的 temp 扫描。historical_observation target 不得因出现在
         targetMapping 中自动升级为 runner_start 阻断性写入 preflight。
       derivedSidecarRule: >
-        每个 durable YAML/JSON primary target 隐式拥有 checksum sidecar
-        `{target}.sha256` 与 checksum meta sidecar `{target}.sha256.meta.json`。
-        sidecar 继承 primary target 的 lane、owner、laneTimeoutMs、releaseOn、
-        durableMode 与 preflight scope；sidecar 不得作为新的 primary target 递归
-        生成 `.sha256.meta.json.sha256`。sidecar failure evidence 必须同时包含
-        primaryTargetLocator、sidecarTargetLocator 与 sidecarKind。
+        每个采用 checksum policy 的 durable primary target 隐式拥有 checksum
+        sidecar `{target}.sha256` 与 checksum meta sidecar
+        `{target}.sha256.meta.json`。sidecar 继承 primary target 的 lane、owner、
+        laneTimeoutMs、releaseOn、durableMode 与 preflight scope；sidecar 不得
+        作为新的 primary target 递归生成 `.sha256.meta.json.sha256`。sidecar
+        failure evidence 必须同时包含 primaryTargetLocator、
+        sidecarTargetLocator 与 sidecarKind。当前 YAML/JSON durable replace
+        必须采用 checksum policy；JSONL target 只有在其 targetMapping 或
+        durable write mode 明确声明 checksum policy 时才生成 checksum sidecar。
+      auxiliarySidecarMappingRule: >
+        每个 production durable primary target，包括 YAML、JSON、JSONL 与
+        SQLite lock family，在使用 durable write protocol 时隐式拥有该协议生成
+        的辅助 durable paths。至少包括 `{target}.tmp-*`、
+        `{target}.tmp-*.owner.json`、`{target}.lock`、`{target}.corrupt-*`，
+        以及启用 checksum policy 时的 `{target}.sha256`、
+        `{target}.sha256.tmp-*`、`{target}.sha256.tmp-*.owner.json`、
+        `{target}.sha256.meta.json` 与
+        `{target}.sha256.meta.json.tmp-*.owner.json`。这些辅助路径必须通过
+        primary target locator 解析，并继承 primary 的 lane、owner、
+        durableKind、laneTimeoutMs、releaseOn、durableMode 与 preflight scope。
+        辅助路径不得拥有独立 targetMapping row，不得递归生成自己的 checksum、
+        checksum meta 或 owner sidecar。failure evidence 在可见失败路径为辅助
+        path 时必须包含 targetLocator、primaryTargetLocator、sidecarTargetLocator
+        或 auxiliaryTargetLocator、sidecarKind 或 auxiliarySidecarKind、tempId
+        when available、operationId、lane、targetMappingOwner、primaryDurableKind
+        与 completedPublishRule。
       directoryFsyncRule: >
         parent directory fsync 是 primary 或 sidecar durable write 的派生提交
         步骤，不是独立业务 target。实现为 directory fsync 生成 evidence 时，
@@ -492,6 +515,16 @@ resourceControls:
         owner: providerCostAccounting
         laneTimeoutMs: 120000
         releaseOn: [commit, error, cancellation, lease_loss, timeout]
+        durableWriteMode: jsonl_read_reconcile_replace
+        checksumPolicy: none_for_current_jsonl_replace
+        auxiliarySidecars: inherit_primary_mapping
+        sidecarPolicy: >
+          provider cost accounting 使用 durable opaque/replace 写入 JSONL
+          ledger，以 temp file、owner sidecar、atomic rename 与 parent directory
+          fsync 提交；本设计不因该 JSONL target 生成 checksum sidecar。其
+          `{target}.tmp-*`、`{target}.tmp-*.owner.json`、`{target}.corrupt-*`
+          与 parent directory fsync 必须继承 providerCostAccounting 的
+          eventWriterLane mapping，不得触发 durable_target_mapping_missing。
       - target: graph_vault/dspy/**/*.yaml
         lane: catalogWriterLane
         durableKind: yaml
@@ -572,6 +605,13 @@ resourceControls:
         每个 event 必须是单行 JSON、包含 eventId 与 sequence，以单次 append
         写入 newline，随后 flush/fsync。恢复时尾部非完整 JSON 行必须截断并
         记录 partial_event_tail_recovered。
+      jsonlReadReconcileReplace: >
+        对需要读取、合并、截断坏尾或重写 ledger 的 JSONL target，必须声明
+        durableWriteMode: jsonl_read_reconcile_replace。写入流程使用与 durable
+        replace 等价的 temp、owner sidecar、exclusive create、atomic rename
+        与 parent directory fsync，但 checksum sidecar 只在 targetMapping
+        显式启用 checksumPolicy 时生成。temp、owner、corrupt quarantine 与
+        directory fsync 映射必须遵守 auxiliarySidecarMappingRule。
       yamlOrJsonReplace: >
         checkpoint、manifest、lock 与 catalog 文件必须写入同目录 temp file，
         fsync 文件，atomic rename，再 fsync 父目录。文件内容必须包含 generation
@@ -647,6 +687,14 @@ resourceControls:
           若某模块因同步 API 或子进程边界不能直接调用 durableStateStore，
           其 adapter 必须实现同一 temp identity、exclusive create、owner
           evidence、checksum、fsync、lock 与 failure classification 契约。
+        mappingParityRule: >
+          durableStateStore、runner 内嵌 adapter 与 resume-book-* 子进程边界必须
+          使用同一 primary target locator 归一化规则。对同一 primary、temp、
+          temp owner、checksum、checksum meta、lock、corrupt quarantine 与
+          parent directory fsync locator，三者必须解析到相同 lane、owner、
+          primaryDurableKind、releaseOn、durableMode 与 completedPublishRule。
+          子进程 durable failure envelope 必须无损投影这些字段，不能让父 runner
+          通过 stderr 字符串重新推断 mapping。
       temporaryFileIdentity:
         rule: >
           durable replace 的 temp 文件名必须在单进程多 worker、多进程恢复与同毫秒
@@ -1325,6 +1373,10 @@ failureRecovery:
         下的嵌套 durable targets 与 sidecars，包括
         lancedb/*.lance/qmd_row_count.json、.lock、.tmp-*、.owner.json、
         .sha256 与 .sha256.meta.json。
+      - catalog 级 JSONL durable replace target 也必须扫描其
+        auxiliarySidecarMappingRule 覆盖的 temp、owner、lock 与 corrupt
+        quarantine paths；对未启用 checksumPolicy 的 JSONL target 不要求
+        checksum sidecar 存在。
       - 任一 target 出现 unknown temp、live temp 被误删证据、checksum 无法收敛
         或 lock owner 不可判定时，coordinator 必须 stop_until_fixed，不能 claim
         新 item。
@@ -2102,6 +2154,25 @@ validationRequirements:
           without durable_target_mapping_missing
         - status-json reports missing checksum meta read-only and does not create
           checksum meta or perform directory fsync
+    - case: cost_accounting_jsonl_auxiliary_sidecar_mapping
+      evidence:
+        - graph_vault/catalog/cost-accounting.jsonl maps to eventWriterLane and
+          providerCostAccounting with durableKind jsonl
+        - graph_vault/catalog/cost-accounting.jsonl.tmp-*.owner.json inherits the
+          same primary mapping and is reported as temp_owner auxiliary evidence
+        - graph_vault/catalog/cost-accounting.jsonl.corrupt-* and its temp owner
+          sidecar inherit the same primary mapping during corrupt-tail quarantine
+        - cost-accounting JSONL checksum sidecars are not required unless
+          checksumPolicy is explicitly enabled for that targetMapping entry
+        - unknown production JSONL targets and their .tmp-*.owner.json sidecars
+          still fail closed with durable_target_mapping_missing
+        - shared durableStateStore and runner adapter resolve the same auxiliary
+          locators to the same lane, owner, durableKind, releaseOn and
+          completedPublishRule
+        - resume-book-* durable failure envelope preserves targetLocator,
+          primaryTargetLocator, sidecarTargetLocator or auxiliaryTargetLocator,
+          sidecarKind or auxiliarySidecarKind, tempId, operationId, lane,
+          targetMappingOwner and primaryDurableKind
     - case: directory_fsync_scope_closure_non_catalog_targets
       evidence:
         - graph_vault/settings.yaml parent directory fsync maps graph_vault to
