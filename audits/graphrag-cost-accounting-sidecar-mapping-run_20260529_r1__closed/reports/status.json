@@ -1,0 +1,146 @@
+{
+  "schemaVersion": "1.0.0",
+  "taskId": "graphrag-cost-accounting-sidecar-mapping",
+  "runId": "20260529_r1",
+  "status": "closed",
+  "phase": "closed",
+  "triggeredBy": {
+    "batchRunId": "epub-batch-20260529-135547-full-real",
+    "failedStage": "resume-book-1",
+    "failure": "durable target mapping missing for cost-accounting jsonl temp owner sidecar",
+    "primaryTarget": "graph_vault/catalog/cost-accounting.jsonl",
+    "sidecarTarget": "graph_vault/catalog/cost-accounting.jsonl.tmp-66947-1780063310198-a9bd44c0-7fa5-4f22-af14-9f343c9f0843.owner.json"
+  },
+  "observedAt": "2026-05-29T14:02:55.763Z",
+  "observedEvidence": {
+    "manifest": "graph_vault/catalog/batch-runs/epub-batch-20260529-135547-full-real/manifest.json",
+    "recoverySummary": "graph_vault/catalog/batch-runs/epub-batch-20260529-135547-full-real/recovery-summary.json",
+    "events": "graph_vault/catalog/batch-runs/epub-batch-20260529-135547-full-real/events.jsonl",
+    "stderr": "/tmp/qmd-epub-batch-20260529-135547-full-real/item-9f587b71073a-cff9f38d-resume-book-1.err"
+  },
+  "observedCounts": {
+    "totalItems": 38,
+    "pendingItems": 36,
+    "completedItems": 0,
+    "failedItems": 2,
+    "retryableItemCount": 0,
+    "activeProviderSlots": 0,
+    "activeSubprocesses": 0,
+    "activeBookLeases": 0
+  },
+  "primaryFailure": {
+    "itemId": "item-9f587b71073a-cff9f38d",
+    "bookId": "book-9f587b71073a-ad95ce2f",
+    "sourceName": "A Philosophy of Software Design (John K. Ousterhout).epub",
+    "failureKind": "local_state_integrity",
+    "localFailureClass": "durable_target_mapping_missing",
+    "recoveryDecision": "stop_until_fixed",
+    "providerAuthReopenDecision": "blocked_provider_auth_fingerprint_unchanged",
+    "providerAuthReadinessStatus": "process_env_shadows_dotenv",
+    "providerAuthShadowedEnvNames": ["OPENAI_API_KEY"]
+  },
+  "secondaryFailure": {
+    "itemId": "item-356ff4920cdf-c7e96dce",
+    "sourceName": "Accelerate The Science of Lean Software and DevOps Building and Scaling High Performing Technology Organizations (Nicole Forsgren Jez Humble Gene Kim).epub",
+    "failedStage": "resume-book-1",
+    "errorSummary": "resume-book produced empty stdout",
+    "likelyDerivedFromBatchStop": true
+  },
+  "designAnchor": {
+    "path": "docs/architecture/graphrag-parallel-runner.type-dd.yaml",
+    "relevantRules": [
+      "durable target mapping for graph_vault/catalog/cost-accounting.jsonl",
+      "all production durable targets and auxiliary sidecars must classify with complete evidence",
+      "stopUntilFixedResumePolicy",
+      "provider cost accounting durable state"
+    ]
+  },
+  "designAuditR1": {
+    "verdict": "fail",
+    "agentReports": [
+      "agent-a/design-audit-r1.md",
+      "agent-b/design-audit-r1.md",
+      "agent-c/design-audit-r1.md"
+    ],
+    "sharedFinding": "Type DD registered the cost-accounting JSONL primary target but did not explicitly define auxiliary temp, owner, lock, corrupt quarantine and checksum sidecar mapping inheritance for JSONL durable write paths.",
+    "decision": "Patch the existing Type DD only; do not create a new design document or a new targetMapping primary row for owner sidecars."
+  },
+  "designPatchR1": {
+    "path": "docs/architecture/graphrag-parallel-runner.type-dd.yaml",
+    "summary": "Added auxiliarySidecarMappingRule, JSONL read-reconcile-replace mode, cost-accounting sidecar policy, adapter parity rule, preflight scope coverage and acceptance case for cost_accounting_jsonl_auxiliary_sidecar_mapping.",
+    "reauditRequired": true
+  },
+  "designAuditR2": {
+    "verdict": "pass",
+    "agentReports": [
+      "agent-a/design-audit-r2.md",
+      "agent-b/design-audit-r2.md",
+      "agent-c/design-audit-r2.md"
+    ],
+    "decision": "Implementation may proceed within the patched Type DD boundary: auxiliary path normalization, mapping parity and focused tests only."
+  },
+  "implementation": {
+    "summary": "Added strict durable auxiliary target normalization for shared durable store and runner adapter, reused primary operation evidence for opaque JSONL owner sidecars, preserved auxiliary evidence through runner and resume-book projections, added focused tests for normalization parity and cost-accounting durable writes, and included the new runner helper in package files.",
+    "changedFiles": [
+      "docs/architecture/graphrag-parallel-runner.type-dd.yaml",
+      "src/job-state/durable-target-normalizer.ts",
+      "src/job-state/durable-state-store.ts",
+      "scripts/graphrag/durable-target-normalizer.mjs",
+      "scripts/graphrag/batch-epub-workflow.mjs",
+      "scripts/graphrag/resume-book-workspace.mjs",
+      "src/contracts/batch-run.ts",
+      "test/durable-target-normalizer.test.ts",
+      "test/graphrag-cost-accounting-durable.test.ts",
+      "test/integrations/contracts.test.ts",
+      "package.json"
+    ],
+    "verification": [
+      "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000 test/durable-target-normalizer.test.ts",
+      "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000 test/graphrag-cost-accounting-durable.test.ts",
+      "npm run test:types",
+      "node -c scripts/graphrag/batch-epub-workflow.mjs && node -c scripts/graphrag/durable-target-normalizer.mjs",
+      "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000 test/package.test.ts",
+      "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000 test/integrations/graphrag-cost.test.ts",
+      "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000 test/graphrag-runner-durable-state.test.ts",
+      "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000 test/graphrag-runner-durable-preflight.test.ts",
+      "npm run build"
+    ],
+    "verificationReport": "reports/verification-r2.md",
+    "previousVerificationReport": "reports/verification-r1.md"
+  },
+  "implementationAuditR1": {
+    "criteriaFiles": [
+      "agent-a/implementation-audit-criteria.md",
+      "agent-b/implementation-audit-criteria.md",
+      "agent-c/implementation-audit-criteria.md"
+    ],
+    "status": "fail",
+    "agentReports": [
+      "agent-a/implementation-audit-r1.md",
+      "agent-b/implementation-audit-r1.md",
+      "agent-c/implementation-audit-r1.md"
+    ],
+    "fixSummary": "Added auditable verification report with exit-code outcomes and preserved auxiliaryTargetLocator and auxiliarySidecarKind through durable schemas, runner projection and resume-book durable failure envelope."
+  },
+  "implementationAuditR2": {
+    "criteriaFiles": [
+      "agent-a/implementation-audit-criteria.md",
+      "agent-b/implementation-audit-criteria.md",
+      "agent-c/implementation-audit-criteria.md"
+    ],
+    "status": "pass",
+    "agentReports": [
+      "agent-a/implementation-audit-r2.md",
+      "agent-b/implementation-audit-r2.md",
+      "agent-c/implementation-audit-r2.md"
+    ],
+    "decision": "All fixed implementation audit criteria passed. No remaining required fixes."
+  },
+  "finalReport": "reports/final-report.md",
+  "requiredLoop": {
+    "designAuditAgents": 3,
+    "fixedAuditScope": "cost-accounting jsonl durable temp owner sidecar mapping",
+    "nextStep": "closed; stop per user instruction"
+  },
+  "createdAt": "2026-05-29T14:05:00.000Z"
+}
