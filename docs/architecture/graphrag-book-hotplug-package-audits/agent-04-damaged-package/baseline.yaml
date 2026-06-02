@@ -1,0 +1,66 @@
+schemaVersion: "1.0.0"
+agentId: agent-04-damaged-package
+scenario: 用户复制中断导致缺文件、checksum 损坏、半包目录混入 books。
+baseline:
+  - id: incomplete_copy_detection
+    name: 复制中断缺文件识别
+    passCriteria: >
+      当书包目录缺少 BOOK_MANIFEST.json、checksum sidecar、必需目录或 manifest
+      files 中 required=true 的文件时，mount scanner 必须把该目录判为未挂载的
+      damaged candidate，不得投影 catalog、qmd index 或 GraphRAG query-ready
+      状态。
+  - id: checksum_fail_closed
+    name: Checksum 损坏 Fail Closed
+    passCriteria: >
+      BOOK_MANIFEST.json.sha256、manifestSha256、文件级 sha256 或 bytes 任一校验
+      失败时，系统必须 fail closed；失败包只能进入隔离诊断状态，不得被当作
+      部分可查询书，也不得用旧 catalog 状态掩盖损坏。
+  - id: half_package_isolation
+    name: 半包目录隔离
+    passCriteria: >
+      books/ 下出现正在复制、只有部分层级、只有旧 distribution_manifest.json、
+      临时目录名、空目录或目录结构不完整的半包时，扫描必须隔离为 mount
+      candidate diagnostics，不得删除用户文件、不得移动到 provider payload roots，
+      也不得污染 derived catalog。
+  - id: atomic_import_protocol
+    name: 原子导入协议
+    passCriteria: >
+      Type DD 必须定义直接复制与 import staging 的先后关系、完成标志、rename
+      边界或等价原子性规则，使 scanner 不会在复制过程中的非稳定目录上做成功
+      投影。
+  - id: quarantine_state_model
+    name: 隔离状态模型
+    passCriteria: >
+      缺文件、checksum mismatch、schema incompatible、identity conflict 和
+      copy-in-progress 必须有互斥且可持久化的状态、诊断位置、重试条件和清除条件；
+      quarantine 不得破坏包 checksum 闭包。
+  - id: no_partial_projection
+    name: 禁止部分投影
+    passCriteria: >
+      任何损坏包不得产生部分 catalog entry、部分 qmd projection、部分 GraphRAG
+      locator 或 stale query-ready 标志；已有投影必须在下一次扫描中失效或标记为
+      unavailable，且原因可追踪。
+  - id: recovery_repair_contract
+    name: 恢复与修复契约
+    passCriteria: >
+      Type DD 必须说明用户补齐缺文件、重新复制、重新生成 manifest 或重新导出后，
+      scanner 如何重新验证并从隔离状态恢复；不能要求读取 provider payload 或依赖
+      未声明的 batch state。
+  - id: diagnostics_without_secrets
+    name: 无敏感信息诊断
+    passCriteria: >
+      损坏包诊断必须包含缺失路径、checksum 差异类型、schema 错误和状态转移原因，
+      但不得读取或记录 provider requests、provider responses、secrets、payload
+      logs、绝对私人路径或未授权源内容。
+  - id: implementable_validator_contract
+    name: 可实施验证器契约
+    passCriteria: >
+      Type DD 必须给出足够具体的 validator 输入、输出、错误码或错误分类、路径
+      规则、遍历规则和 sidecar 校验顺序，使实现者能编写确定性的 manifest
+      validator、mount scanner 和 import staging 测试。
+  - id: damaged_package_tests
+    name: 损坏包自动化测试
+    passCriteria: >
+      测试契约必须覆盖缺 manifest、缺 sidecar、缺 required artifact、manifest
+      checksum mismatch、文件 checksum mismatch、bytes mismatch、半复制目录、
+      旧 manifest-only 目录、恢复后重新挂载和禁止 catalog 污染。

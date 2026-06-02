@@ -1,0 +1,63 @@
+schemaVersion: "1.0.0"
+agentId: agent-10-migration-cleanup
+scenario: 当前 38 本完成书与 34 个历史残留目录迁移到热插拔布局。
+baseline:
+  - id: current_vs_residue_classification
+    name: 当前书与历史残留分类
+    passCriteria: >
+      Type DD 明确定义如何从现有目录中区分 38 本完成书、34 个历史残留目录、
+      重名或同源候选，并给出可执行判定字段、优先级和失败诊断；未分类目录不得
+      被误迁移为 hot-plug authoritative package。
+  - id: migration_source_of_truth
+    name: 迁移源权威
+    passCriteria: >
+      迁移以现有 distribution_manifest.json、校验 sidecars、qmd、output、runs、
+      input 和 source closure 的一致组合为源权威，明确哪些文件缺失时禁止自动
+      生成 BOOK_MANIFEST.json。
+  - id: package_layout_transform
+    name: 包布局转换完整性
+    passCriteria: >
+      Type DD 对 source、input、qmd、graphrag/output、graphrag/runs、state 和
+      import 的迁移目标、保留方式、兼容 locator 或 symlink 生命周期有明确规则，
+      且所有目标路径均为 package-relative。
+  - id: checksum_manifest_regeneration
+    name: Manifest 与校验重建
+    passCriteria: >
+      迁移后必须重新生成 BOOK_MANIFEST.json、manifest checksum、checksum metadata
+      和 files 闭包；任何移动、复制、重命名或 redaction 后的旧 checksum 不得被
+      复用为目标布局校验。
+  - id: residue_quarantine_policy
+    name: 历史残留隔离策略
+    passCriteria: >
+      Type DD 定义历史残留目录的隔离、可见性、archive 或 repair 状态，禁止在未
+      通过 repair contract 前删除、覆盖、导出、投影为可查询或参与 catalog 权威。
+  - id: idempotent_migration
+    name: 幂等迁移
+    passCriteria: >
+      迁移脚本可重复运行，并能识别已迁移、部分迁移、失败中断和 legacy-only
+      状态；重复运行不会重复移动文件、破坏 checksum、覆盖用户新增 metadata 或
+      改变已验证 package identity。
+  - id: conflict_and_duplicate_handling
+    name: 冲突与重复处理
+    passCriteria: >
+      对 sameBookIdDifferentSourceHash、sameSourceHashDifferentBookId、同源多目录、
+      完成书与残留目录同前缀、目标目录已存在等冲突给出 fail-closed 行为、人工
+      决策入口和稳定诊断。
+  - id: rollback_and_audit_trail
+    name: 回滚与审计记录
+    passCriteria: >
+      Type DD 要求迁移产生可审计记录，包含 before/after path、hash、迁移工具
+      版本、时间、决策状态和失败原因；失败时能回滚或保留可恢复 staging，且不
+      删除 legacy evidence。
+  - id: catalog_projection_cleanup
+    name: Catalog 投影清理
+    passCriteria: >
+      迁移完成后 catalog、document identity map、graph capabilities、global qmd
+      projection 等派生状态由 mount scan 重建；旧投影中的残留书、缺失书或过期
+      路径必须被移除或标记 stale。
+  - id: executable_migration_tests
+    name: 可执行迁移测试
+    passCriteria: >
+      Type DD 足够具体，使实现者能编写 38 完成书批量迁移、34 残留目录隔离、
+      中断重试、checksum 重建、重复运行、冲突处理、catalog cleanup 和 provider
+      payload 不读取的自动化测试。

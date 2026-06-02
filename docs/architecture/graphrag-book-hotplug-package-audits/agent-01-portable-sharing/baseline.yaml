@@ -1,0 +1,63 @@
+schemaVersion: "1.0.0"
+agentId: agent-01-portable-sharing
+scenario: 用户把一本已完成书复制给另一位用户，接收方只复制目录后查询。
+baseline:
+  - id: portable_closure
+    name: 单目录可移植闭包
+    passCriteria: >
+      书包根目录包含验证、挂载、qmd 查询、GraphRAG 查询和再次导出所需的全部
+      必需文件；manifest 中所有必需文件路径均为包内相对路径，不能依赖 sibling
+      source、input、catalog、batch run 或发送方绝对路径。
+  - id: manifest_authority
+    name: Manifest 挂载权威
+    passCriteria: >
+      BOOK_MANIFEST.json 及其 checksum sidecars 是唯一挂载权威；接收方 mount
+      scanner 只从 books/*/BOOK_MANIFEST.json 推导 catalog 和索引投影，不能把旧
+      distribution_manifest.json、全局 catalog 或外部索引当作权威状态。
+  - id: receiver_empty_vault_query
+    name: 接收方空 Vault 查询
+    passCriteria: >
+      在接收方只有复制过来的单本书目录、没有发送方 catalog、sources、global
+      qmd index 或 batch records 的情况下，mount scan 后能达到明确的 mounted
+      或 visible_not_query_ready 状态，并在 queryReady 为真时可执行查询。
+  - id: identity_conflict
+    name: 身份与冲突处理
+    passCriteria: >
+      bookId、sourceHash、canonicalTitle、titleSlug 与 packageVersion 的语义明确；
+      同 bookId 不同 sourceHash 必须 fail closed，同 sourceHash 不同 bookId 必须
+      作为 duplicate candidate 报告，且不会覆盖接收方已有书。
+  - id: checksum_integrity
+    name: 完整性与篡改校验
+    passCriteria: >
+      manifest checksum、文件级 sha256、bytes 和 required 标记足以发现缺文件、
+      复制中断、被篡改文件和路径逃逸；校验失败时不得更新 derived catalog 或
+      查询索引。
+  - id: path_portability
+    name: 路径可移植性
+    passCriteria: >
+      manifest 字段清楚区分包内相对路径、vault 相对路径和 provenance-only
+      外部路径；接收方无需拥有发送方用户名、绝对路径、graph_vault/input、
+      graph_vault/sources 或 symlink 目标。
+  - id: query_readiness_gate
+    name: 查询就绪门禁
+    passCriteria: >
+      GraphRAG output、LanceDB/parquet、reports、stats、producer run evidence 与
+      qmd index policy 的最低集合明确；只有所有声明 artifact 和 schema 兼容性通过
+      后才投影为 query-ready。
+  - id: privacy_exclusion
+    name: 隐私与 Provider 排除
+    passCriteria: >
+      provider requests、provider responses、secrets、.env、logs、corrupt 文件和
+      runtime recovery payload 默认不可导出、不可列入文件闭包，mount scanner 也
+      不读取或修改 provider payload roots。
+  - id: receiver_state_isolation
+    name: 接收方运行状态隔离
+    passCriteria: >
+      默认共享包为 readonly；接收方兼容性检查、导入诊断、运行态缓存和重建索引
+      写入 import/、state/runtime 或本地投影位置，且不会破坏包校验闭包。
+  - id: implementable_tests
+    name: 可实施测试契约
+    passCriteria: >
+      Type DD 给出足够具体的模块边界、输入输出、失败状态和测试契约，使实现者可
+      编写 copy-only import、empty-vault query、checksum mismatch、conflict、
+      privacy exclusion 和 reindex_on_mount 的自动化测试。

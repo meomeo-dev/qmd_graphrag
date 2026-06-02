@@ -1,0 +1,60 @@
+schemaVersion: "1.0.0"
+auditId: graphrag-book-hotplug-package-audit-20260602-r6-after-r5-fixups
+targetDocument: ../../graphrag-book-hotplug-package.type-dd.yaml
+supplementalDocuments:
+  - ../../graphrag-book-hotplug-package-r3-fixups.type-dd.yaml
+  - ../../graphrag-book-hotplug-package-r5-fixups.type-dd.yaml
+createdAt: "2026-06-02T00:00:00-07:00"
+status: closed
+baselinePolicy:
+  mode: reuse_r1_fixed_baselines
+  rule: >
+    R6 agents must use the copied baseline.yaml in their own R6 directory.
+    They must not create new audit dimensions, remove dimensions, rename
+    dimensions, reorder dimensions, or change pass criteria. The assessment
+    must compare the current Type DD documents against the original R1 fixed
+    baseline after R5 fixups.
+outputContract:
+  requiredFilesPerAgent:
+    - baseline.yaml
+    - report.md
+  reportSections:
+    - scenario
+    - reused_fixed_baseline
+    - baseline_integrity_check
+    - findings
+    - pass_fail
+    - criteria_delta_from_previous_run
+    - required_design_changes
+    - residual_risks
+agents:
+  - id: agent-01-portable-sharing
+    scenario: 用户把一本已完成书复制给另一位用户，接收方只复制目录后查询。
+    outputDir: agent-01-portable-sharing
+  - id: agent-02-airgap-import
+    scenario: 离线机器导入书包，不能访问 provider，也不能依赖原始 batch catalog。
+    outputDir: agent-02-airgap-import
+  - id: agent-03-large-library
+    scenario: 一个 vault 同时挂载上千本书，mount scan 需要可扩展、可恢复。
+    outputDir: agent-03-large-library
+  - id: agent-04-damaged-package
+    scenario: 用户复制中断导致缺文件、checksum 损坏、半包目录混入 books。
+    outputDir: agent-04-damaged-package
+  - id: agent-05-version-upgrade
+    scenario: 旧 schema 书包跨版本升级到新 qmd/GraphRAG artifact schema。
+    outputDir: agent-05-version-upgrade
+  - id: agent-06-security-privacy
+    scenario: 用户分发书包时不能泄露 provider payload、密钥、日志和私人路径。
+    outputDir: agent-06-security-privacy
+  - id: agent-07-concurrent-runner
+    scenario: batch runner 正在构建图书时，另一个流程执行 mount scan/import。
+    outputDir: agent-07-concurrent-runner
+  - id: agent-08-qmd-index
+    scenario: 书包 qmd 索引缺失或过期，需要挂载后重建或投影。
+    outputDir: agent-08-qmd-index
+  - id: agent-09-graphrag-query
+    scenario: 挂载后直接 GraphRAG 查询，需要完整 producer lineage 和 artifact gate。
+    outputDir: agent-09-graphrag-query
+  - id: agent-10-migration-cleanup
+    scenario: 当前 38 本完成书与 34 个历史残留目录迁移到热插拔布局。
+    outputDir: agent-10-migration-cleanup

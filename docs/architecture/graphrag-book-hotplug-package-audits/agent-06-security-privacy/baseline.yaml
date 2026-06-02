@@ -1,0 +1,76 @@
+schemaVersion: "1.0.0"
+auditAgent: agent-06-security-privacy
+scenario: >
+  用户分发单本 GraphRAG 书包时，导出的 graph_vault/books/{bookId}
+  目录不得泄露 provider payload、密钥、日志、私人路径或接收方不需要的
+  本地运行状态。
+baseline:
+  - id: SP-01
+    name: Provider payload 零分发
+    passCriteria: >
+      Type DD 明确禁止 provider requests、provider responses、provider
+      cache、prompt/completion payload、token usage 明细和任何可还原 provider
+      交互内容进入导出闭包、manifest files 列表、producer evidence 或诊断。
+
+  - id: SP-02
+    name: 密钥与凭据零分发
+    passCriteria: >
+      Type DD 明确禁止 .env、密钥文件、token、API key、credential store、
+      .npmrc、.netrc、SSH/TLS 私钥、provider auth config 和相似凭据进入书包，
+      并要求导出前有 fail-closed 扫描。
+
+  - id: SP-03
+    name: 日志与恢复载荷隔离
+    passCriteria: >
+      Type DD 明确禁止运行日志、错误日志、durable recovery jsonl、corrupt
+      artifact、debug dump、trace 和包含 payload 的诊断被默认导出；只允许
+      脱敏摘要诊断作为明确 schema 的 producer evidence。
+
+  - id: SP-04
+    name: 私人路径最小化
+    passCriteria: >
+      Type DD 要求所有挂载定位字段为 package-relative 路径；绝对路径、
+      用户名路径、旧 batch root、外部 source path 和本机临时路径只能作为
+      已脱敏 provenance，且不得用于接收方定位或出现在导出 manifest 默认值中。
+
+  - id: SP-05
+    name: Manifest 敏感字段控制
+    passCriteria: >
+      BOOK_MANIFEST.json schema 对 identity、source、qmd、graphrag、
+      compatibility、producerRunIds 和 metadata 字段规定敏感信息边界，禁止
+      存放原始 payload、secret、完整命令行、环境变量、私有路径或未脱敏异常。
+
+  - id: SP-06
+    name: Producer evidence 脱敏契约
+    passCriteria: >
+      producer evidence 必须是可验证的脱敏证据，只包含 run id、artifact
+      digest、schema、时间、工具链版本和无敏感摘要；不得依赖 provider 响应
+      文件、请求日志、环境变量或外部运行目录才能判定 query-ready。
+
+  - id: SP-07
+    name: 导出前安全门禁
+    passCriteria: >
+      book-package-export 必须在产包前执行 allowlist 与 denylist 双重检查、
+      路径逃逸检查、symlink 解析检查、secret pattern 扫描和敏感 role
+      拒绝；任何命中都必须阻止导出，而不是静默忽略。
+
+  - id: SP-08
+    name: 导入与扫描不触碰敏感根
+    passCriteria: >
+      mount scanner、importer 和兼容性检查不得读取、修改或补全 provider
+      payload roots、secrets、日志目录或发送方私有路径；缺失这些材料不得成为
+      query-ready 失败原因。
+
+  - id: SP-09
+    name: 可变状态与诊断边界
+    passCriteria: >
+      接收方 import diagnostics、mount state、runtime cache 和 rebuilt index
+      与不可变分发闭包分离；若位于包根下，必须明确排除 checksum、默认不再导出，
+      且诊断内容必须脱敏。
+
+  - id: SP-10
+    name: 安全隐私测试可实施性
+    passCriteria: >
+      Type DD 提供足够具体的测试合同，覆盖 provider payload 泄露、secret
+      文件、日志目录、durable recovery、绝对路径、symlink escape、manifest
+      敏感字段、producer evidence 脱敏和导入不访问 provider 的自动化断言。

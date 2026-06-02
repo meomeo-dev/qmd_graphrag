@@ -1,0 +1,73 @@
+schemaVersion: "1.0.0"
+auditAgent: agent-03-large-library
+scenario: >
+  一个 vault 同时挂载上千本书，mount scan 需要可扩展、可恢复。
+
+dimensions:
+  - id: scale_objectives
+    name: 规模目标与资源预算
+    passCriteria: >
+      Type DD 明确声明大规模库的目标书本数量、最大文件闭包规模、扫描时间、
+      内存、I/O、并发度和退化策略，并把这些目标转化为实现约束。
+
+  - id: incremental_change_detection
+    name: 增量变更检测
+    passCriteria: >
+      mount scan 能基于 manifest digest、目录 generation、mtime/inode
+      或显式状态索引只处理新增、删除或变更的书包；未变更书包不得在每次扫描
+      中执行完整校验或重建。
+
+  - id: atomic_package_visibility
+    name: 书包原子可见性
+    passCriteria: >
+      复制、导入、构建和迁移中的半成品目录不会被 scanner 当作候选书包；
+      设计提供 staging、ready marker、manifest-last 写入或 atomic rename
+      等可实施规则。
+
+  - id: resumable_scan_state
+    name: 可恢复扫描状态
+    passCriteria: >
+      scanner 崩溃、进程中断或机器重启后，可从持久化扫描会话、cursor、
+      per-book validation cache 或 generation state 恢复，不需要重新验证
+      全库，也不会丢失上一代可查询投影。
+
+  - id: bounded_validation_io
+    name: 有界校验 I/O
+    passCriteria: >
+      设计区分快速挂载校验、首次深度校验和周期性审计；常规扫描的校验成本
+      与变更书包数量相关，而不是与所有 qmd、GraphRAG、LanceDB 文件总量
+      相关。
+
+  - id: transactional_projection
+    name: 目录与索引事务化投影
+    passCriteria: >
+      catalog、全局 qmd projection 和 retrieval projection 使用 generation、
+      临时文件、fsync/rename、rollback 或等价机制提交；失败时读者只能看到
+      完整旧版本或完整新版本。
+
+  - id: concurrency_control
+    name: 并发与锁定协议
+    passCriteria: >
+      runner、exporter、importer、scanner 和 query 进程之间的读写边界、
+      锁粒度、冲突处理和超时策略明确；scanner 不会读取正在写入的 package
+      authority 或覆盖运行态状态。
+
+  - id: conflict_indexing
+    name: 冲突与重复检测索引
+    passCriteria: >
+      same bookId、same sourceHash、schema incompatibility 和 duplicate
+      candidate 能通过可扩展索引检测，且结果稳定、可重放、不会因扫描顺序
+      不同而改变。
+
+  - id: diagnostics_quarantine_scale
+    name: 大规模诊断与隔离
+    passCriteria: >
+      诊断、quarantine、兼容性状态和失败原因以 per-book 结构保存，并有
+      总览摘要、大小上限、保留策略和恢复入口；大量坏包不会阻塞健康书包挂载。
+
+  - id: large_library_tests
+    name: 大规模测试与可观测性
+    passCriteria: >
+      Type DD 要求包含 1000 本以上 fixture 或 synthetic package 测试、
+      中断恢复测试、并发扫描测试、性能预算断言、metrics/progress 输出和
+      故障注入用例。

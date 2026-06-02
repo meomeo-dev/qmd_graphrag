@@ -1,0 +1,65 @@
+schemaVersion: "1.0.0"
+agentId: agent-08-qmd-index
+scenario: 书包 qmd 索引缺失或过期，需要挂载后重建或投影。
+baseline:
+  - id: qmd_index_presence_policy
+    name: qmd 索引存在性策略
+    passCriteria: >
+      Type DD 必须明确区分 package-bundled book-scoped qmd index、缺失索引、
+      本地重建索引和全局 qmd projection，并规定每种状态是否允许挂载、查询或
+      仅可见不可检索。
+  - id: qmd_index_freshness_contract
+    name: qmd 索引新鲜度契约
+    passCriteria: >
+      设计必须定义 qmd index 是否过期的判定输入，包括 normalized input digest、
+      qmd build manifest digest、qmdIndexSchema、tool version、index build time
+      或等价字段；过期索引不得被当作当前 projection 使用。
+  - id: rebuild_inputs_closure
+    name: 重建输入闭包
+    passCriteria: >
+      当 manifest 声明 reindex_on_mount 时，书包必须携带足够的 package-relative
+      normalized input、qmd build config、schema metadata 和 artifact checksum，
+      使接收方无需 provider payload、secrets、原始 batch catalog 或外部 source
+      root 即可重建 qmd index。
+  - id: rebuild_output_location
+    name: 重建输出位置
+    passCriteria: >
+      设计必须说明 mount-time rebuilt qmd index 写入包根 qmd/、接收方本地
+      mount state、全局 qmd projection 或其他位置；该位置必须与 readonly package
+      mode、checksum 闭包和再次导出规则一致。
+  - id: projection_atomicity
+    name: 投影原子性
+    passCriteria: >
+      qmd index 重建或全局 projection 更新必须具备 staging、临时文件、锁、原子
+      替换或等价协议；失败时不得留下部分 SQLite、部分全局 projection 或 stale
+      query-ready/qmd-ready 状态。
+  - id: qmd_query_readiness_gate
+    name: qmd 查询就绪门禁
+    passCriteria: >
+      Type DD 必须把 GraphRAG queryReady、qmd index readiness、catalog
+      projection 和 book visibility 的关系定义清楚；qmd 索引缺失或过期时不得
+      误报为可进行 qmd 检索。
+  - id: stale_projection_invalidation
+    name: 旧投影失效规则
+    passCriteria: >
+      删除书包、替换书包、sourceHash/normalizedHash 变化、qmdIndexSchema 变化或
+      checksum mismatch 时，旧全局 qmd projection 和旧 book-scoped index 必须被
+      移除、隔离或标记 unavailable，且原因可诊断。
+  - id: concurrency_and_idempotency
+    name: 并发与幂等
+    passCriteria: >
+      多个 mount scanner、importer 或 runner 同时触发 qmd reindex 时，设计必须
+      定义幂等键、锁边界、重复任务合并和中断后重试规则，保证最终 projection
+      确定且不会互相覆盖。
+  - id: diagnostics_without_payloads
+    name: 无 payload 诊断
+    passCriteria: >
+      qmd index 缺失、过期、重建失败或 schema 不兼容的诊断必须包含错误码、
+      package-relative 路径、digest 差异和恢复提示，但不得读取或记录 provider
+      requests、provider responses、secrets、logs、payload 摘要或私人绝对路径。
+  - id: qmd_index_test_matrix
+    name: qmd 索引测试矩阵
+    passCriteria: >
+      测试契约必须覆盖缺失 book-scoped index、声明 reindex_on_mount、未声明
+      reindex_on_mount、normalized input 变化、qmdIndexSchema 不兼容、重建失败、
+      projection 原子替换、删除书包后失效、readonly 包重建和并发 reindex。

@@ -1,0 +1,62 @@
+schemaVersion: "1.0.0"
+agentId: agent-05-version-upgrade
+scenario: 旧 schema 书包跨版本升级到新 qmd/GraphRAG artifact schema。
+baseline:
+  - id: legacy_version_detection
+    name: 旧版本识别
+    passCriteria: >
+      设计必须定义如何识别旧书包、旧 distribution_manifest.json、旧目录布局、
+      旧 qmd index schema 与旧 GraphRAG artifact schema，并能把 unknown、
+      unsupported、repairable、current 明确区分。
+  - id: migration_path_matrix
+    name: 升级路径矩阵
+    passCriteria: >
+      每个受支持的旧 schema version、layout version、artifact schema 和 qmd
+      index schema 都必须有明确迁移目标、前置条件、转换步骤、失败状态和不可升级
+      诊断，而不是只给单一路径描述。
+  - id: artifact_schema_conversion
+    name: Artifact schema 转换
+    passCriteria: >
+      设计必须说明 GraphRAG parquet、LanceDB、reports、stats、context 文件和
+      qmd index 在跨 schema 升级时是原样兼容、重写、重建还是失效，并定义转换后
+      的 query-ready gate。
+  - id: identity_stability
+    name: 身份稳定性
+    passCriteria: >
+      升级不得静默改变 bookId、sourceHash、canonicalTitle、normalizedHash 或
+      producerRunIds 的语义；如需重算或规范化，必须记录旧值、新值、原因和冲突
+      策略。
+  - id: checksum_reclosure
+    name: 校验闭包重建
+    passCriteria: >
+      升级完成后必须重新生成 package-relative file entries、bytes、sha256、
+      manifestSha256 和 checksum metadata；旧 checksum 只能作为 legacy evidence，
+      不能继续授权新包挂载。
+  - id: rollback_atomicity
+    name: 原子升级与回滚
+    passCriteria: >
+      升级必须通过 staging、快照或等价机制保证失败时旧书包仍可见且不被半迁移状态
+      污染；mount scanner 不得把升级中的目录投影为 query-ready。
+  - id: compatibility_diagnostics
+    name: 兼容诊断
+    passCriteria: >
+      不兼容、缺失文件、旧 schema 未支持、需要重建、重建失败和工具版本不足必须
+      产生可机器读取的诊断状态，并能保留在 import/ 或 state/runtime 等明确位置。
+  - id: producer_lineage_preservation
+    name: Producer lineage 保全
+    passCriteria: >
+      旧 run evidence、createdBy、artifact provenance、source provenance 和迁移
+      工具证据必须被保留或显式标记为缺失，升级不得伪造 producer 成功记录。
+  - id: privacy_preservation
+    name: 隐私排除保持
+    passCriteria: >
+      升级扫描和导出不得读取或复制 provider payload、secrets、logs、recovery
+      payload 和本地凭据；旧包中若存在这些路径，必须排除、隔离或报告，而不能纳入
+      新 manifest 文件闭包。
+  - id: upgrade_testability
+    name: 升级可测试性
+    passCriteria: >
+      Type DD 必须提供足够具体的模块边界、输入输出、状态机和测试契约，使实现者可
+      自动化验证 supported migration、unsupported migration、checksum mismatch、
+      rollback、rebuild qmd index、GraphRAG schema incompatible 和 privacy
+      exclusion。

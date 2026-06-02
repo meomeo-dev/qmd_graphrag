@@ -1,0 +1,466 @@
+schemaVersion: "1.0.0"
+title: GraphRAG 单本书热插拔包 R3 复审修复补充
+status: draft_r3_fixups
+owner: qmd_graphrag
+lastReviewed: "2026-06-02"
+
+purpose: >
+  补齐 R3 固定基准复审后仍未通过或部分通过的精确设计缺口，作为
+  graphrag-book-hotplug-package.type-dd.yaml 的补充 Type DD。
+
+sourceAudit:
+  report: >
+    docs/architecture/graphrag-book-hotplug-package-audits/run-20260602-r3-after-r2-repair/reports/final-summary.md
+  baselinePolicy: reuse_r1_fixed_baselines
+  remainingFailures:
+    - agent-05-version-upgrade
+  remainingPartials:
+    - agent-01-portable-sharing
+    - agent-06-security-privacy
+    - agent-08-qmd-index
+    - agent-10-migration-cleanup
+
+identityFieldSemantics:
+  principle: >
+    Identity fields have fixed stability, generation, conflict, and privacy
+    semantics. Implementations must not infer identity behavior from titles or
+    mutable display metadata.
+  fields:
+    bookId:
+      stability: stable_across_package_generations_for_same_source_identity
+      generatedFrom:
+        - sourceHash
+        - normalized identity algorithm version
+        - optional manual conflict decision
+      participatesInConflictDecision: true
+      conflictRole: primary_book_identity
+      mutability: immutable_after_publish
+    sourceHash:
+      stability: stable_for_source_content
+      generatedFrom:
+        - original source bytes or approved source surrogate
+      participatesInConflictDecision: true
+      conflictRole: content_identity
+      mutability: immutable_after_publish
+    packageVersion:
+      stability: monotonic_semver_for_package_schema_and_layout
+      generatedFrom:
+        - package schema version
+        - layout version
+        - manifest schema version
+      participatesInConflictDecision: false
+      conflictRole: compatibility_only
+      mutability: changes_only_when_package_schema_or_layout_changes
+    packageGeneration:
+      stability: unique_per_publish_of_same_bookId
+      generatedFrom:
+        - publish timestamp
+        - manifestSha256
+        - sourceHash
+        - toolVersion
+      participatesInConflictDecision: true
+      conflictRole: replacement_generation_order
+      mutability: immutable_after_publish
+    canonicalTitle:
+      stability: display_metadata
+      generatedFrom:
+        - source metadata
+        - normalized user override
+      participatesInConflictDecision: false
+      conflictRole: diagnostic_only
+      mutability: editable_by_metadata_migration
+    titleSlug:
+      stability: derived_display_locator
+      generatedFrom:
+        - canonicalTitle
+        - sourceHash prefix
+      participatesInConflictDecision: false
+      conflictRole: human_readable_locator_only
+      mutability: regenerated_when_canonicalTitle_changes
+  replacementRules:
+    sameBookIdSameSourceHashNewGeneration: replace_after_validation
+    sameBookIdDifferentSourceHash: fail_closed_manual_decision_required
+    sameSourceHashDifferentBookId: duplicate_candidate_manual_decision_required
+    sameTitleDifferentSourceHash: visible_distinct_books
+    titleChangeSameBookIdSourceHash: metadata_update_not_identity_conflict
+  auditFields:
+    required:
+      - identityAlgorithmVersion
+      - bookId
+      - sourceHash
+      - packageVersion
+      - packageGeneration
+      - canonicalTitle
+      - titleSlug
+      - identityDecisionReason
+      - manualDecisionId
+
+schemaVersionUpgradeMatrix:
+  principle: >
+    Upgrade paths are explicit by schema version, layout version, qmd index
+    schema, GraphRAG artifact schema, and producer lineage schema. A generic
+    legacy shape is not enough to pass migration review.
+  matrixKey:
+    - packageSchemaVersion
+    - layoutVersion
+    - qmdIndexSchema
+    - graphRagArtifactSchema
+    - producerLineageSchema
+  rows:
+    - id: hotplug_v1_current
+      from:
+        packageSchemaVersion: "1.0.0"
+        layoutVersion: book-hotplug-v1
+        qmdIndexSchema: qmd-book-index-v1
+        graphRagArtifactSchema: graphrag-output-v1
+        producerLineageSchema: producer-lineage-v1
+      outcome: mount_as_is
+      requiredAction: validate_current_manifest_and_projection
+      failureOutcome: quarantine_mount_candidate
+    - id: distribution_manifest_v1_to_hotplug_v1
+      from:
+        packageSchemaVersion: distribution_manifest_1.0.0
+        layoutVersion: legacy-book-root-v0
+        qmdIndexSchema: qmd-build-manifest-v1
+        graphRagArtifactSchema: qmd-output-manifest-v1
+        producerLineageSchema: producer-runs-yaml-v1
+      outcome: migrate_to_hotplug_v1
+      requiredAction: run_full_legacy_distribution_migration
+      failureOutcome: repair_required
+    - id: qmd_index_schema_v0
+      from:
+        packageSchemaVersion: distribution_manifest_1.0.0
+        layoutVersion: legacy-book-root-v0
+        qmdIndexSchema: qmd-index-unknown-or-v0
+        graphRagArtifactSchema: qmd-output-manifest-v1
+        producerLineageSchema: producer-runs-yaml-v1
+      outcome: rebuild_qmd_projection
+      requiredAction: discard_legacy_qmd_index_and_rebuild_external_projection
+      failureOutcome: visible_not_qmd_ready
+    - id: graphrag_output_schema_v0
+      from:
+        packageSchemaVersion: distribution_manifest_1.0.0
+        layoutVersion: legacy-book-root-v0
+        qmdIndexSchema: qmd-build-manifest-v1
+        graphRagArtifactSchema: graphrag-output-unknown-or-v0
+        producerLineageSchema: producer-runs-yaml-v1
+      outcome: visible_not_query_ready
+      requiredAction: preserve_as_repair_evidence_and_require_graphrag_rebuild
+      failureOutcome: repair_required
+    - id: producer_lineage_missing
+      from:
+        packageSchemaVersion: distribution_manifest_1.0.0
+        layoutVersion: legacy-book-root-v0
+        qmdIndexSchema: qmd-build-manifest-v1
+        graphRagArtifactSchema: qmd-output-manifest-v1
+        producerLineageSchema: missing
+      outcome: visible_not_query_ready
+      requiredAction: mark_producer_provenance_missing
+      failureOutcome: repair_required
+    - id: unsupported_legacy_schema
+      from:
+        packageSchemaVersion: unknown
+        layoutVersion: unknown
+        qmdIndexSchema: unknown
+        graphRagArtifactSchema: unknown
+        producerLineageSchema: unknown
+      outcome: fail_closed
+      requiredAction: emit_unsupported_legacy_schema_diagnostic
+      failureOutcome: fail_closed
+  compatibilityDiagnostics:
+    stableCodes:
+      - missing_required_file
+      - missing_source_closure
+      - missing_qmd_build_manifest
+      - missing_graphrag_output_manifest
+      - missing_producer_lineage
+      - rebuild_failed
+      - tool_version_too_old
+      - unsupported_legacy_schema
+      - unsupported_layout_version
+      - unsupported_qmd_index_schema
+      - unsupported_graphrag_artifact_schema
+      - unsupported_producer_lineage_schema
+      - artifact_schema_incompatible
+      - package_schema_incompatible
+      - manual_decision_required
+  fixtureContracts:
+    requiredFixtures:
+      - hotplug_v1_current_valid
+      - distribution_manifest_v1_complete
+      - distribution_manifest_v1_missing_source
+      - distribution_manifest_v1_missing_qmd
+      - distribution_manifest_v1_missing_graphrag
+      - qmd_index_schema_v0_rebuild
+      - graphrag_output_schema_v0_not_query_ready
+      - producer_lineage_missing
+      - duplicate_source_residue
+      - unsupported_legacy_schema
+    expectedForEachFixture:
+      - input tree shape
+      - expected matrix row id
+      - expected outcome
+      - expected diagnostics
+      - expected migration evidence
+      - expected rollback behavior
+
+migrationEvidenceSchema:
+  principle: >
+    Migration evidence must be sufficient to audit old and new identity,
+    package closure, conversion decisions, failures, and rollback without
+    reading provider payloads or absolute local paths.
+  requiredFields:
+    - migrationId
+    - migrationToolVersion
+    - migrationStartedAt
+    - migrationCompletedAt
+    - decisionStatus
+    - failureReason
+    - rollbackPlan
+    - sourceBookId
+    - targetBookId
+    - sourceHash
+    - oldNormalizedHash
+    - newNormalizedHash
+    - oldProducerRunIds
+    - newProducerRunIds
+    - oldManifestPath
+    - newManifestPath
+    - oldManifestSha256
+    - newManifestSha256
+    - beforePackageRoot
+    - afterPackageRoot
+    - beforeArtifactHashes
+    - afterArtifactHashes
+    - compatibilityMatrixRowId
+    - artifactConversionActions
+    - producerProvenanceStatus
+  producerProvenanceStatusValues:
+    - preserved_verified
+    - preserved_redacted
+    - missing_marked_not_query_ready
+    - rebuilt_by_actual_producer_run
+    - unavailable_repair_required
+  forbiddenFields:
+    - providerRequestPayload
+    - providerResponsePayload
+    - rawPrompt
+    - rawCompletion
+    - absoluteLocalPath
+    - secretValue
+
+providerSensitiveClassExtensions:
+  principle: >
+    Provider-related sensitive data includes payloads, caches, authentication
+    configuration, local credential stores, and any reversible interaction
+    material. Absence of exact path match does not make material exportable.
+  additionalForbiddenClasses:
+    providerCaches:
+      patterns:
+        - "**/provider-cache/**"
+        - "**/.cache/openai/**"
+        - "**/.cache/jina/**"
+        - "**/*provider-cache*"
+        - "**/*llm-cache*"
+    reversibleInteractions:
+      patterns:
+        - "**/*prompt*"
+        - "**/*completion*"
+        - "**/*response-body*"
+        - "**/*request-body*"
+        - "**/*conversation*"
+        - "**/*token-usage*"
+    providerAuthConfig:
+      patterns:
+        - "**/openai*.json"
+        - "**/jina*.json"
+        - "**/*provider-auth*"
+        - "**/*api-key*"
+        - "**/*bearer*"
+    credentialStores:
+      patterns:
+        - "**/keychain/**"
+        - "**/credentials.json"
+        - "**/secrets.json"
+        - "**/.aws/credentials"
+        - "**/.config/*/credentials*"
+  mountPackageRootSemantics:
+    rule: >
+      BOOK_MANIFEST.mount.packageRoot is always a package-relative locator with
+      value ".". Live vault absolute paths are scan-local state and must not
+      appear in BOOK_MANIFEST.json.
+
+scannerNoReadContracts:
+  principle: >
+    Importer, mount scanner, compatibility checker, migration scanner, and query
+    gate must be able to classify packages without reading sensitive roots.
+  actors:
+    importer:
+      mayRead:
+        - BOOK_MANIFEST.json
+        - PUBLISH_READY.json
+        - checksum sidecars
+        - allowlisted package files
+      mustNotRead:
+        - provider payload roots
+        - credential stores
+        - runtime logs
+        - raw recovery payloads
+    mountScanner:
+      mayRead:
+        - manifest and sidecars
+        - publish marker
+        - file metadata and checksums
+      mustNotRead:
+        - provider payload roots
+        - runtime diagnostic payloads
+        - credential stores
+    compatibilityChecker:
+      mayRead:
+        - schema metadata
+        - artifact metadata rows
+        - producer lineage summaries
+      mustNotRead:
+        - raw provider request or response bodies
+        - raw prompts
+        - raw completions
+        - provider auth config
+    queryGate:
+      mayRead:
+        - committed catalog projection
+        - GraphRAG artifact metadata rows
+        - qmd projection manifest
+      mustNotRead:
+        - provider payloads
+        - credentials
+        - raw logs
+      providerCallPolicy: never_on_gate_failure
+  missingSensitiveRootsRule: >
+    Missing sensitive roots are never required for query-ready. If a package
+    needs sensitive roots to prove readiness, it is invalid and must be marked
+    not_query_ready.
+
+qmdAvailabilityAndReexportPolicy:
+  principle: >
+    qmd availability, local projection, re-export, and repack have explicit
+    states. A readonly mounted package can be used locally without mutating the
+    distributed package.
+  availabilityMatrix:
+    - packageState: mounted
+      qmdState: included_index_valid
+      qmdQueryAllowed: true
+      rebuildAllowed: false
+      exportBehavior: include_existing_book_index_if_policy_allows
+    - packageState: mounted
+      qmdState: reindex_required
+      qmdQueryAllowed: false
+      rebuildAllowed: true
+      exportBehavior: export_without_local_projection_by_default
+    - packageState: mounted
+      qmdState: reindexing
+      qmdQueryAllowed: false
+      rebuildAllowed: already_running
+      exportBehavior: export_last_committed_package_only
+    - packageState: mounted
+      qmdState: projection_ready
+      qmdQueryAllowed: true
+      rebuildAllowed: false
+      exportBehavior: exclude_local_projection_unless_repack_requested
+    - packageState: mounted
+      qmdState: projection_failed
+      qmdQueryAllowed: false
+      rebuildAllowed: true
+      exportBehavior: export_package_with_repair_diagnostic_only
+    - packageState: incompatible
+      qmdState: schema_incompatible
+      qmdQueryAllowed: false
+      rebuildAllowed: false
+      exportBehavior: export_as_visible_not_qmd_ready_only
+  reexportPolicy:
+    exportBookDefault: original_package_closure_only
+    exportBookWithLocalProjection: >
+      Creates a new packageGeneration, includes qmd projection under qmd/index,
+      recalculates freshnessDigest, and writes migration evidence.
+    repackRule: >
+      Repack is a publish operation. It must use staging, regenerate manifest
+      and sidecars, and never mutate the mounted source package in place.
+  qmdIdempotencyKey:
+    fields:
+      - bookId
+      - packageGeneration
+      - freshnessDigest
+      - qmdBuildManifestSha256
+      - qmdConfigSha256
+      - metadataSchemaDigest
+      - sqliteSchemaDigest
+
+qmdDiagnosticsSchema:
+  principle: >
+    qmd diagnostics are stable, bounded, package-relative, and free of provider
+    payloads and absolute paths.
+  requiredFields:
+    - diagnosticId
+    - bookId
+    - packageGeneration
+    - qmdState
+    - errorCode
+    - severity
+    - packageRelativePath
+    - freshnessDigest
+    - rebuildId
+    - retryable
+    - repairHint
+    - createdAt
+  stableErrorCodes:
+    - qmd_index_missing
+    - qmd_index_schema_incompatible
+    - qmd_freshness_digest_mismatch
+    - qmd_rebuild_input_missing
+    - qmd_rebuild_failed_io
+    - qmd_rebuild_failed_schema
+    - qmd_sqlite_replace_failed
+    - qmd_projection_commit_failed
+    - qmd_reexport_requires_repack
+    - qmd_readonly_package_write_denied
+  tests:
+    requiredCases:
+      - included index valid
+      - reindex required
+      - rebuild success
+      - rebuild IO failure
+      - schema incompatible
+      - readonly package export default excludes local projection
+      - repack includes local projection with new generation
+      - stale idempotency key cancelled
+
+compatibilityBridgeLifecycle:
+  principle: >
+    Legacy compatibility locators and symlinks are temporary migration aids.
+    They must have explicit creation, validation, expiry, and removal rules.
+  allowedBridgeTypes:
+    - legacy_output_locator
+    - legacy_runs_locator
+    - legacy_source_locator
+    - internal_relative_symlink
+  lifecycleStates:
+    - created
+    - validated
+    - used_for_one_migration_version
+    - deprecated
+    - removed
+    - rejected
+  rules:
+    - Bridges must be package-relative and may not point outside the package.
+    - Bridges are not allowed in exported hotplug-v1 packages by default.
+    - Bridges expire after one successful BOOK_MANIFEST audit.
+    - Symlink bridges require checksum-bound target metadata.
+    - Repack removes bridge locators unless compatibility export is explicit.
+  evidenceFields:
+    - bridgeId
+    - bridgeType
+    - sourceRelativePath
+    - targetRelativePath
+    - createdAt
+    - expiresAt
+    - removalGeneration
+    - validationStatus

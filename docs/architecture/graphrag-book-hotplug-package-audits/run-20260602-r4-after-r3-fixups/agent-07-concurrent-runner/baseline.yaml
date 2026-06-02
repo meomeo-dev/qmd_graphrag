@@ -1,0 +1,74 @@
+schemaVersion: "1.0.0"
+auditAgent: agent-07-concurrent-runner
+scenario: >
+  batch runner 正在构建 graph_vault/books/{bookId} 或相邻产物时，另一个
+  进程同时执行 mount scan/import。设计必须避免半成品被投影、目录竞争、
+  catalog 覆盖、校验竞态和运行状态互相污染。
+baseline:
+  - id: CR-01
+    name: 构建中书包不可见
+    passCriteria: >
+      Type DD 明确规定 batch runner 在构建未完成前不得把
+      graph_vault/books/{bookId}/BOOK_MANIFEST.json 作为可扫描权威暴露；
+      mount scanner 只能看到已原子提交的完整包。
+
+  - id: CR-02
+    name: 原子提交协议
+    passCriteria: >
+      Type DD 定义临时构建目录、manifest 最后写入、checksum sidecar 最后
+      提交、目录 rename 或等价原子发布步骤，并要求失败构建不会留下可挂载状态。
+
+  - id: CR-03
+    name: 导入暂存隔离
+    passCriteria: >
+      import 流程必须先在 staging/quarantine 位置完成复制、校验和兼容性检查，
+      通过后再原子发布到 books/{bookId}；scanner 不得扫描半复制导入目录。
+
+  - id: CR-04
+    name: 扫描快照一致性
+    passCriteria: >
+      mount scanner 必须基于单次稳定快照或双读校验生成 catalog 投影；若扫描
+      期间 manifest、checksum、目录 mtime、generation 或文件闭包变化，必须重试
+      或跳过该候选，而不是混合新旧状态。
+
+  - id: CR-05
+    name: Catalog 原子投影
+    passCriteria: >
+      catalog/books.yaml、sources.yaml、document-identity-map.yaml、
+      graph-capabilities.yaml 和可选 qmd index projection 必须以临时文件加
+      原子替换方式提交；并发 scan 不得产生部分更新或互相覆盖。
+
+  - id: CR-06
+    name: 锁与租约边界
+    passCriteria: >
+      Type DD 规定 runner、importer、scanner 对同一 bookId 和全局 catalog
+      写入的锁、租约或 generation 规则；读者可无锁读取稳定投影，写者冲突
+      fail closed 或重试。
+
+  - id: CR-07
+    name: Query-ready 门禁抗竞态
+    passCriteria: >
+      query-ready 状态只能在 manifest、checksum、required files、GraphRAG
+      output、producer evidence 和 qmd projection 同属同一 package generation
+      且全部验证通过后设置；不得被并发构建或导入提前置真。
+
+  - id: CR-08
+    name: 可变状态互不污染
+    passCriteria: >
+      build state、import diagnostics、scanner diagnostics、runtime caches 和
+      receiver-local state 必须位于互不覆盖的路径或带 generation 的命名空间；
+      scanner/importer 不得写入 runner 正在使用的 checkpoint、artifact 或 run
+      evidence 文件。
+
+  - id: CR-09
+    name: 冲突与删除竞态可恢复
+    passCriteria: >
+      Type DD 覆盖同一 bookId 并发 build/import、删除时扫描、替换时扫描、
+      checksum mismatch 后恢复、锁过期和残留 staging 目录清理，且恢复策略不会
+      删除仍在运行的有效构建。
+
+  - id: CR-10
+    name: 并发测试可实施性
+    passCriteria: >
+      Type DD 提供可自动化测试合同，覆盖半构建扫描、半导入扫描、并发 catalog
+      写入、manifest 变化重试、删除竞态、query-ready 竞态、锁过期和失败恢复。

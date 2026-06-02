@@ -1,0 +1,64 @@
+schemaVersion: "1.0.0"
+auditAgent: agent-02-airgap-import
+scenario: >
+  离线机器导入书包，不能访问 provider，也不能依赖原始 batch catalog。
+baseline:
+  - id: AIG-01
+    name: 离线闭包完整性
+    passCriteria: >
+      Type DD 必须要求书包在 graph_vault/books/{bookId} 内包含导入、
+      校验、查询、导出和重挂载所需的全部必需文件；不得需要 sibling
+      source、global input、provider 服务、provider payload 或原始 batch
+      catalog。
+  - id: AIG-02
+    name: 挂载权威唯一性
+    passCriteria: >
+      Type DD 必须明确 BOOK_MANIFEST.json 是离线导入的唯一挂载权威；
+      catalog、全局 qmd 索引和检索索引只能是可重建投影或缓存。
+  - id: AIG-03
+    name: 原始 batch catalog 独立性
+    passCriteria: >
+      Type DD 必须定义从书包 manifest 重建 books、sources、
+      document identity 和 graph capabilities catalog 的字段和行为，
+      且导入流程不得读取原始 batch catalog 才能判定可挂载。
+  - id: AIG-04
+    name: Provider 隔离
+    passCriteria: >
+      Type DD 必须禁止离线导入访问 provider 请求、响应、密钥和日志
+      payload，并要求缺失 provider 访问不会降低已打包 GraphRAG 产物的
+      query-ready 判定。
+  - id: AIG-05
+    name: 校验与失败关闭
+    passCriteria: >
+      Type DD 必须要求在投影 catalog 或索引前验证 manifest checksum、
+      文件 sha256、required file、路径边界和身份冲突；任何失败必须
+      quarantine 或 visible_not_query_ready，而不是部分挂载。
+  - id: AIG-06
+    name: 路径可移植性
+    passCriteria: >
+      Type DD 必须要求所有可执行挂载字段使用 package-relative 路径；
+      legacy absolute path、外部 source path 和 batch run path 只能作为
+      provenance 或兼容元数据，不得参与离线定位。
+  - id: AIG-07
+    name: 离线兼容性判定
+    passCriteria: >
+      Type DD 必须定义导入机器在无网络条件下判定 package schema、qmd
+      schema、GraphRAG artifact schema 和工具链版本兼容性的输入字段与
+      决策结果。
+  - id: AIG-08
+    name: 查询就绪门槛
+    passCriteria: >
+      Type DD 必须明确离线 query-ready 需要哪些 GraphRAG artifacts、
+      qmd artifacts、producer evidence 和索引状态；缺少可本地重建的索引
+      时必须声明重建策略。
+  - id: AIG-09
+    name: 导入状态隔离
+    passCriteria: >
+      Type DD 必须将导入诊断、mount 状态和本机运行时状态隔离在 import/
+      或 state/runtime 中，并说明这些状态是否排除在包校验之外。
+  - id: AIG-10
+    name: 可实施流程与测试
+    passCriteria: >
+      Type DD 必须提供足够具体的模块职责、生命周期步骤、错误分类和测试
+      合同，使实现者可以在空 vault、无 provider、无原始 batch catalog
+      的机器上实现并验证导入。

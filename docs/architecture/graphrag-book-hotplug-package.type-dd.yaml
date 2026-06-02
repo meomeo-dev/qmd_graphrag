@@ -1,0 +1,1952 @@
+schemaVersion: "1.0.0"
+title: GraphRAG 单本书热插拔包设计定稿
+status: final
+owner: qmd_graphrag
+lastReviewed: "2026-06-02"
+
+purpose: >
+  定义单本书 qmd 与 GraphRAG 产物的独立分发、挂载与卸载边界，使一本
+  book 可以通过复制或删除目录完成安装和移除，形成热插拔
+  (hot-plug) 使用体验。
+
+scope:
+  included:
+    - graph_vault/books/{bookId} 作为单本书包的权威根目录。
+    - BOOK_MANIFEST.json 的身份、文件闭包、校验、兼容性与挂载语义。
+    - qmd、GraphRAG、source、input、state 与 producer evidence 的书级封装。
+    - catalog 与全局索引作为可重建投影，而非单本书包的权威状态。
+    - 从当前 distribution_manifest.json 迁移到 BOOK_MANIFEST.json。
+  excluded:
+    - 跨机器共享同一 graph_vault 的同步协议。
+    - 用户手工编辑 GraphRAG parquet、LanceDB 或 qmd SQLite 文件的支持。
+    - provider 请求、provider 响应、密钥、日志 payload 的分发。
+    - 对历史不完整 book 目录的自动删除策略。
+
+designAudit:
+  auditDirectory: docs/architecture/graphrag-book-hotplug-package-audits
+  finalReport: >
+    docs/architecture/graphrag-book-hotplug-package-audits/reports/final-summary.md
+  r2Report: >
+    docs/architecture/graphrag-book-hotplug-package-audits/run-20260602-r2-after-revision/reports/final-summary.md
+  r3Report: >
+    docs/architecture/graphrag-book-hotplug-package-audits/run-20260602-r3-after-r2-repair/reports/final-summary.md
+  r4Report: >
+    docs/architecture/graphrag-book-hotplug-package-audits/run-20260602-r4-after-r3-fixups/reports/final-summary.md
+  r5Report: >
+    docs/architecture/graphrag-book-hotplug-package-audits/run-20260602-r5-fixed-baseline-rerun/reports/final-summary.md
+  r6Report: >
+    docs/architecture/graphrag-book-hotplug-package-audits/run-20260602-r6-after-r5-fixups/reports/final-summary.md
+  finalContractDocument: >
+    docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml
+  status: final_design_audit_passed
+  finalAuditSummary:
+    run: run-20260602-r6-after-r5-fixups
+    baselinePolicy: reuse_r1_fixed_baselines
+    result: 10_agents_all_passed
+    conclusion: >
+      R6 fixed-baseline review passed with all 10 agents. The design audit
+      loop is closed. Implementation must use this main Type DD plus the final
+      contracts Type DD as the stable design contract.
+  historicalFixupDocuments:
+    - path: >
+        docs/architecture/graphrag-book-hotplug-package-audits/historical-design-repairs/identity-schema-runtime-repair.type-dd.yaml
+      role: audit_history_only
+      note: >
+        Historical repair document used during design audit. Do not use as the
+        public implementation entrypoint.
+    - path: >
+        docs/architecture/graphrag-book-hotplug-package-audits/historical-design-repairs/manifest-query-migration-repair.type-dd.yaml
+      role: audit_history_only
+      note: >
+        Historical repair document used during design audit. Its normative
+        content is consolidated into the final contracts Type DD.
+  fixedBaselineSummary:
+    agentCount: 10
+    result: >
+      Initial audit did not pass production design review. This revision adds
+      the missing contracts for atomic package lifecycle, transactional mount
+      scan, readiness gates, security export, version migration, and large
+      library operation.
+  r2RepairSummary:
+    fixedBlocks:
+      - catalogProjectionSchemas
+      - quarantineAndRepairStateMachine
+      - largeLibraryDegradationAndMetrics
+      - upgradePathMatrix
+      - artifactSchemaConversionMatrix
+      - lockLeaseAndStagingCleanup
+      - qmdRebuildTransaction
+      - graphRagArtifactMetadataContract
+      - sensitiveMaterialTaxonomy
+      - manualConflictDecisionWorkflow
+    baselinePolicy: reuse_r1_fixed_baselines
+  r3RepairSummary:
+    fixedByReference:
+      - identityFieldSemantics
+      - schemaVersionUpgradeMatrix
+      - migrationEvidenceSchema
+      - providerSensitiveClassExtensions
+      - scannerNoReadContracts
+      - qmdAvailabilityAndReexportPolicy
+      - qmdDiagnosticsSchema
+      - compatibilityBridgeLifecycle
+    baselinePolicy: reuse_r1_fixed_baselines
+  r5RepairSummary:
+    fixedByReference:
+      - manifestSensitivitySchema
+      - importerPrePublishValidationContract
+      - qmdAvailabilityReasonMatrix
+      - qmdCanonicalIdempotencyAndDiagnostics
+      - qmdReindexActorLockMatrix
+      - manifestFirstDirectQueryResolver
+      - graphRagArtifactGateStateMachine
+      - migrationSourceTruthFailClosedTable
+      - migrationRerunIdempotencyContract
+      - migrationConflictDecisionTable
+      - fixedBaselineTestContracts
+    baselinePolicy: reuse_r1_fixed_baselines
+
+supplementalTypeDD:
+  - path: docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml
+    role: final_implementation_contract
+    authority: >
+      This supplemental Type DD is the stable normative entrypoint for
+      implementation details that were validated by the R6 fixed-baseline
+      design review. Historical R3/R5 fixup documents remain audit evidence
+      only and must not be used as public implementation entrypoints.
+
+currentStateSnapshot:
+  observedAt: "2026-06-01"
+  vaultRoot: graph_vault
+  booksDirectory: graph_vault/books
+  observedBookDirectoryCount: 72
+  currentCompletedRun:
+    runId: epub-batch-20260530235947-full-real-env-clean
+    completedBookCount: 38
+    completedBookShape:
+      requiredDirectories:
+        - input
+        - output
+        - qmd
+        - runs
+      requiredFiles:
+        - job.yaml
+        - artifacts.yaml
+        - checkpoints.yaml
+        - distribution_manifest.json
+        - distribution_manifest.json.sha256
+        - distribution_manifest.json.sha256.meta.json
+      externalRootsReferenced:
+        - graph_vault/sources/{bookId}
+        - graph_vault/input
+        - graph_vault/catalog
+    currentLimitations:
+      - source files are outside the book root under graph_vault/sources/{bookId}.
+      - global catalog and qmd indexes remain outside the book package.
+      - distribution_manifest.json is a distribution closure record, not a mount
+        authority.
+      - quarantine and recovery artifacts can exist in current book roots and
+        must be excluded from exported packages.
+  historicalBookDirectories:
+    count: 34
+    observedPattern: >
+      Historical directories share source-hash prefixes with current books but
+      can miss qmd, output, and distribution_manifest.json. They are treated as
+      non-current build residues until an explicit archive or repair workflow is
+      designed.
+  observedDirectoryShapeCounts:
+    input: 72
+    runs: 72
+    output: 48
+    qmd: 38
+
+targetContract:
+  packageAuthority:
+    rule: >
+      graph_vault/books/{bookId}/BOOK_MANIFEST.json is the authoritative
+      description of a mounted book package.
+    implications:
+      - Copying graph_vault/books/{bookId} into a vault installs the book.
+      - Deleting graph_vault/books/{bookId} from a vault uninstalls the book.
+      - graph_vault/catalog files are derived by mount scan and can be rebuilt.
+      - Global qmd and retrieval indexes are caches or projections, not package
+        authority.
+  packageRoot:
+    path: graph_vault/books/{bookId}
+    completenessRule: >
+      A package root must contain every file needed to validate, query, export,
+      and remount the book without relying on sibling source or catalog roots.
+  mountScanner:
+    authoritativeInput:
+      - graph_vault/books/*/BOOK_MANIFEST.json
+    derivedOutputs:
+      - graph_vault/catalog/books.yaml
+      - graph_vault/catalog/sources.yaml
+      - graph_vault/catalog/document-identity-map.yaml
+      - graph_vault/catalog/graph-capabilities.yaml
+      - optional global qmd index projection
+    requiredBehavior:
+      - A missing book directory removes the book from derived catalog
+        projections during the next mount scan.
+      - A copied book directory is ignored until BOOK_MANIFEST.json and its
+        checksum sidecars pass validation.
+      - Scanner failures are reported as mount diagnostics and must not mutate
+        provider payload roots.
+
+atomicPackageLifecycle:
+  principle: >
+    A book package becomes mount-visible only after every required artifact,
+    checksum sidecar, and BOOK_MANIFEST.json sidecar has been committed through
+    an atomic publish step. Partially copied or actively built directories are
+    never projected into catalog or qmd indexes.
+  writableRoots:
+    liveRoot: graph_vault/books/{bookId}
+    importStagingRoot: graph_vault/.staging/imports/{importId}/{bookId}
+    buildStagingRoot: graph_vault/.staging/builds/{runId}/{bookId}
+    quarantineRoot: graph_vault/.quarantine/books/{reason}/{timestamp}-{bookId}
+    runtimeStateRoot: graph_vault/.local/book-runtime/{bookId}
+  publishProtocol:
+    requiredOrder:
+      - Write package files only inside importStagingRoot or buildStagingRoot.
+      - Generate file checksums for all required package files.
+      - Generate BOOK_MANIFEST.json from package-relative paths only.
+      - Generate BOOK_MANIFEST.json.sha256 and .sha256.meta.json.
+      - Write PUBLISH_READY.json with packageGeneration, manifestSha256,
+        fileCount, byteCount, createdAt, and toolVersion.
+      - fsync package files, sidecars, parent directories, and staging root.
+      - Atomically rename the completed staging book root to liveRoot.
+      - Run mount scanner against the new liveRoot generation.
+    visibilityRule: >
+      Mount scanner must ignore any directory without a valid
+      BOOK_MANIFEST.json, BOOK_MANIFEST.json.sha256,
+      BOOK_MANIFEST.json.sha256.meta.json, and PUBLISH_READY.json.
+    manifestLastWriteRule: >
+      BOOK_MANIFEST.json and its sidecars are written after all referenced
+      package files. A manifest that references a missing file is invalid.
+    checksumLastCommitRule: >
+      Manifest checksum sidecars are written after BOOK_MANIFEST.json. Any
+      sidecar mismatch fails closed and prevents projection.
+  copyInstallModel:
+    supportedModes:
+      - staged_import_command
+      - direct_directory_copy_followed_by_mount_scan
+    directCopyRule: >
+      Direct copy remains user friendly, but the copied directory is mounted
+      only if publish markers and checksums validate. A directory copied without
+      PUBLISH_READY.json is reported as incomplete_copy and is not mounted.
+    repairRule: >
+      Re-copying a complete package over an incomplete candidate must be
+      idempotent. Scanner records the new generation only after the full
+      validation succeeds.
+  incompletePackagePolicy:
+    missingManifest: ignored_with_diagnostic
+    missingPublishMarker: incomplete_copy
+    missingRequiredFile: quarantine_mount_candidate
+    checksumMismatch: quarantine_mount_candidate
+    pathTraversal: quarantine_mount_candidate
+    symlinkEscape: quarantine_mount_candidate
+    corruptSidecar: quarantine_mount_candidate
+  concurrencyBoundary:
+    lockFile: graph_vault/.locks/book-package-publish.lock
+    rule: >
+      Import, export, build publish, and mount scan acquire compatible locks.
+      Only one writer may publish or replace the same bookId at a time. Readers
+      use the last-good catalog projection until the scanner commits a new
+      generation.
+  immutablePackagePolicy:
+    defaultMode: readonly
+    rule: >
+      Shared packages are immutable after publish. Runtime writes, local query
+      caches, repair diagnostics, and import state are stored under
+      runtimeStateRoot or catalog scan state, not inside the package root.
+
+mountScanTransactionModel:
+  principle: >
+    Mount scan derives global catalog and qmd projections from package
+    manifests through a generation-based transaction. A failed scan preserves
+    the previous last-good reader view.
+  scanState:
+    root: graph_vault/catalog/mount-scans
+    files:
+      - scan-state.json
+      - generations/{scanGeneration}/candidate-set.json
+      - generations/{scanGeneration}/validation-results.json
+      - generations/{scanGeneration}/projection-plan.json
+      - generations/{scanGeneration}/commit-record.json
+  generation:
+    fields:
+      - scanGeneration
+      - startedAt
+      - completedAt
+      - inputDigest
+      - previousGeneration
+      - projectionDigest
+      - status
+    statuses:
+      - scanning
+      - validating
+      - projecting
+      - committed
+      - failed
+      - rolled_back
+  changedSetDetection:
+    digestInputs:
+      - bookId
+      - packageGeneration
+      - manifestSha256
+      - manifestBytes
+      - publishMarkerSha256
+      - rootDirectoryMtime
+    requiredBehavior: >
+      A normal scan validates unchanged packages by digest metadata only.
+      Full file checksum verification is required for new packages, changed
+      packages, suspicious metadata, explicit audit mode, and pre-export audit.
+  validationPipeline:
+    order:
+      - Enumerate candidate liveRoot directories.
+      - Read publish markers and manifest sidecars without following symlink
+        escapes.
+      - Validate manifest schema and package-relative paths.
+      - Validate required file presence and checksums as required by changed
+        set policy.
+      - Validate identity conflicts and schema compatibility.
+      - Build projection plan without mutating catalog or qmd indexes.
+      - Commit projections atomically.
+    failureRule: >
+      Any validation failure for one package marks that package as
+      not_mounted or not_query_ready. It must not corrupt projections for other
+      valid packages.
+  atomicProjectionCommit:
+    stagingRoot: graph_vault/catalog/.staging/mount-scan-{scanGeneration}
+    committedRoots:
+      - graph_vault/catalog/books.yaml
+      - graph_vault/catalog/sources.yaml
+      - graph_vault/catalog/document-identity-map.yaml
+      - graph_vault/catalog/graph-capabilities.yaml
+      - graph_vault/catalog/qmd-projection.yaml
+    commitRule: >
+      Derived files are written to stagingRoot, checksummed, fsynced, and then
+      atomically replaced. A current-generation pointer is updated last.
+    lastGoodRule: >
+      Query and list commands read the last committed generation pointer. They
+      never read a partially committed projection.
+  locks:
+    scanLock: graph_vault/.locks/mount-scan.lock
+    catalogCommitLock: graph_vault/.locks/catalog-projection.lock
+    qmdProjectionLock: graph_vault/.locks/qmd-projection.lock
+    acquisitionOrder:
+      - scanLock
+      - catalogCommitLock
+      - qmdProjectionLock
+    timeoutRule: >
+      Lock acquisition failures produce retryable diagnostics and leave the
+      last-good projection unchanged.
+  deletionAndReplacement:
+    missingBookRoot: unmount_on_next_committed_scan
+    sameBookIdNewGeneration: replace_after_full_validation
+    failedReplacement: keep_previous_generation_if_present
+    staleProjectionCleanup: >
+      Projection entries whose book root is absent in the committed candidate
+      set are removed during the same atomic commit.
+
+targetDirectoryLayout:
+  root: graph_vault/books/{bookId}
+  required:
+    - path: BOOK_MANIFEST.json
+      role: package_manifest
+      description: 单本书包的挂载权威和文件闭包声明。
+    - path: BOOK_MANIFEST.json.sha256
+      role: package_manifest_checksum
+      description: BOOK_MANIFEST.json 的内容校验。
+    - path: BOOK_MANIFEST.json.sha256.meta.json
+      role: package_manifest_checksum_metadata
+      description: 校验算法、生成时间与工具链证据。
+    - path: source/
+      role: source
+      description: 原始 EPUB、源文件校验、来源元数据与许可/备注元数据。
+    - path: input/
+      role: normalized_input
+      description: GraphRAG 与 qmd 使用的规范化 markdown 输入。
+    - path: qmd/
+      role: qmd_artifacts
+      description: qmd 建库产物、书级索引、qmd build manifest 与校验 sidecars。
+    - path: graphrag/output/
+      role: graphrag_artifacts
+      description: GraphRAG 查询所需 parquet、LanceDB、reports、stats 与上下文文件。
+    - path: graphrag/runs/
+      role: producer_evidence
+      description: graph_extract、community_report、embed、query_ready 等 producer run 证据。
+    - path: state/
+      role: runner_state
+      description: >
+        job、checkpoint、artifact 等书级构建状态。导出包只包含脱敏后的
+        final state snapshot；运行时 import 状态不写入包内。
+  optional:
+    - path: qmd/index/qmd_book_index.sqlite
+      role: book_scoped_qmd_index
+      description: 单本书 qmd 索引。若缺失，mount scanner 可触发本地重建。
+    - path: metadata/
+      role: human_metadata
+      description: 标题、作者、标签、摘要、封面引用与人工备注。
+    - path: export/
+      role: export_staging
+      description: 打包导出时产生的临时清单或压缩包，不作为挂载权威。
+
+externalRuntimeLayout:
+  roots:
+    - path: graph_vault/.local/book-runtime/{bookId}
+      role: local_runtime_state
+      description: 导入诊断、mount 状态、本地查询缓存和可写运行状态。
+    - path: graph_vault/catalog/mount-scans
+      role: scan_transaction_state
+      description: mount scan generation、checkpoint、projection plan 与提交记录。
+    - path: graph_vault/catalog/qmd-book-projections/{bookId}
+      role: qmd_projection_state
+      description: readonly 包挂载后的本地 qmd projection 与重建结果。
+  contract: >
+    These roots are local to the receiving vault and are not part of the
+    distributable book package unless an explicit debug export command produces
+    a redacted support bundle.
+
+bookManifestSchema:
+  fileName: BOOK_MANIFEST.json
+  kind: qmd_graphrag_book_package
+  schemaVersion: "1.0.0"
+  layoutVersion: book-hotplug-v1
+  requiredSections:
+    identity:
+      requiredFields:
+        - bookId
+        - sourceHash
+        - canonicalTitle
+        - titleSlug
+        - createdAt
+        - packageVersion
+        - packageGeneration
+      contract: >
+        bookId identifies the package. sourceHash identifies source content.
+        Import must fail closed when the same bookId points to a different
+        sourceHash unless an explicit conflict policy is provided.
+    mount:
+      requiredFields:
+        - packageRoot
+        - publishMarkerPath
+        - packageGeneration
+        - mountMode
+        - catalogProjectionPolicy
+        - qmdIndexPolicy
+      allowedMountModes:
+        - readonly
+        - writable_state
+      contract: >
+        The default mode is readonly for shared packages. Writable runtime state
+        must be isolated under import/ or state/runtime and excluded from package
+        checksums unless explicitly versioned.
+    source:
+      requiredFields:
+        - sourcePath
+        - sourceHash
+        - sourceBytes
+        - sourceKind
+      contract: >
+        The original EPUB or approved source surrogate must live under source/.
+        External source paths can be recorded as provenance only.
+    input:
+      requiredFields:
+        - canonicalNormalizedPath
+        - normalizedHash
+        - normalizedBytes
+      contract: >
+        canonicalNormalizedPath must be inside input/. Legacy graph_vault/input
+        paths are compatibility metadata only.
+    qmd:
+      requiredFields:
+        - buildManifestPath
+        - indexPolicy
+        - requiredArtifacts
+      contract: >
+        A package may include a book-scoped qmd index. If it does not, the
+        manifest must declare reindex_on_mount and list the normalized input
+        files required to rebuild the projection.
+    graphrag:
+      requiredFields:
+        - outputManifestPath
+        - queryReady
+        - requiredArtifacts
+        - producerRunIds
+      contract: >
+        Query readiness requires complete GraphRAG output under graphrag/output
+        and producer evidence under graphrag/runs.
+    files:
+      itemFields:
+        - path
+        - role
+        - bytes
+        - sha256
+        - required
+        - producerRunId
+        - sensitivity
+      contract: >
+        Every required package file must be listed with a package-relative path.
+        Entries must not point outside graph_vault/books/{bookId}. Required
+        GraphRAG artifacts must bind to producerRunId when they are stage
+        outputs.
+    checksums:
+      requiredFields:
+        - algorithm
+        - generatedAt
+        - manifestSha256
+        - publishMarkerSha256
+      contract: >
+        Checksum verification is mandatory before mount scan mutates derived
+        catalog projections.
+    exclusions:
+      requiredPatterns:
+        - .env
+        - "**/.env"
+        - "provider-requests/**"
+        - "provider-responses/**"
+        - "**/*.corrupt-*"
+        - "**/.durable-recovery.jsonl"
+        - "**/logs/**"
+      contract: >
+        Excluded paths are never part of a distributable package. Recovery
+        evidence can remain in the live vault but must not be exported by
+        default.
+    compatibility:
+      requiredFields:
+        - minQmdGraphRagVersion
+        - graphRagArtifactSchema
+        - qmdIndexSchema
+        - createdBy
+      contract: >
+        Incompatible packages remain visible as mount candidates but must not be
+        projected as query-ready books.
+
+readinessGates:
+  principle: >
+    A mounted book and a query-ready book are different states. Mount validates
+    identity, paths, checksums, schema, and package safety. qmd-ready and
+    GraphRAG-ready validate query surfaces and derived index projections.
+  packageStates:
+    - absent
+    - candidate
+    - mounted
+    - mounted_not_qmd_ready
+    - mounted_not_graphrag_ready
+    - query_ready
+    - quarantined
+    - incompatible
+  qmdReadyGate:
+    states:
+      - included_index_valid
+      - reindex_required
+      - reindex_pending
+      - reindexing
+      - projection_ready
+      - projection_failed
+      - schema_incompatible
+    freshnessInputs:
+      - identity.bookId
+      - identity.sourceHash
+      - input.normalizedHash
+      - qmd.buildManifestPath
+      - qmd.indexSchema
+      - qmd.toolVersion
+      - qmd.embeddingProfile
+      - qmd.chunkingConfigHash
+      - qmd.requiredArtifacts
+    validIndexRule: >
+      A book-scoped qmd index is fresh only when every freshness input matches
+      the manifest and the index metadata. Missing metadata requires reindex.
+    rebuildPolicy:
+      readonlyPackage: write_projection_outside_package
+      projectionRoot: graph_vault/catalog/qmd-book-projections/{bookId}
+      idempotencyKey: "{bookId}:{normalizedHash}:{qmd.indexSchema}:{qmd.toolVersion}"
+      concurrencyRule: >
+        Concurrent reindex requests with the same idempotencyKey must coalesce
+        into one rebuild. A newer packageGeneration cancels stale rebuilds.
+    qmdReadyRule: >
+      qmd-only queries require projection_ready or included_index_valid. A book
+      can remain GraphRAG-ready while qmd projection is rebuilding only if the
+      query path does not require qmd index lookup.
+  graphragReadyGate:
+    states:
+      - artifact_missing
+      - artifact_checksum_failed
+      - lineage_missing
+      - schema_incompatible
+      - dimension_incompatible
+      - graph_projection_ready
+      - query_ready
+    minimumArtifactClosure:
+      - graphrag/output/qmd_output_manifest.json
+      - graphrag/output/qmd_graph_text_unit_identity.json
+      - graphrag/output/context.json
+      - graphrag/output/stats.json
+      - graphrag/output/documents.parquet
+      - graphrag/output/text_units.parquet
+      - graphrag/output/entities.parquet
+      - graphrag/output/relationships.parquet
+      - graphrag/output/communities.parquet
+      - graphrag/output/community_reports.parquet
+      - graphrag/output/lancedb
+    producerLineageSchema:
+      requiredFields:
+        - producerRunId
+        - stage
+        - parentProducerRunIds
+        - inputArtifactHashes
+        - outputArtifactHashes
+        - modelProfile
+        - embeddingProfile
+        - toolVersion
+        - completedAt
+    stageOrder:
+      - graph_extract
+      - community_report
+      - embed
+      - query_ready
+    bindingRule: >
+      Each required GraphRAG artifact must be listed in files and bound to a
+      producer run output hash. Each producer run output hash must resolve to a
+      package file entry. Missing either side fails the gate.
+    compatibilityInputs:
+      - graphRagArtifactSchema
+      - parquetSchemaDigest
+      - lancedbSchemaDigest
+      - embeddingModel
+      - embeddingDimension
+      - graphProjectionVersion
+    queryEntrypoint:
+      commandContract: >
+        A query command may target bookId. It resolves bookId through the
+        committed mount projection, locates graphrag/output through the current
+        packageGeneration, validates query_ready state, and refuses stale or
+        cross-book artifacts.
+      failureMode: >
+        Gate failures return stable diagnostics and do not trigger provider
+        calls unless an explicit rebuild command is requested.
+  staleProjectionInvalidation:
+    triggers:
+      - packageGeneration changes
+      - manifestSha256 changes
+      - checksum validation fails
+      - schema compatibility changes
+      - package root is deleted
+      - qmd freshness input changes
+      - GraphRAG lineage binding changes
+    rule: >
+      Invalidation removes query-ready capability in the same projection commit
+      that observes the stale condition. The previous generation remains
+      readable only if its package root still exists and is still valid.
+
+distributionManifestMigration:
+  currentFile: distribution_manifest.json
+  currentKind: book_distribution_manifest
+  targetFile: BOOK_MANIFEST.json
+  migrationRules:
+    - Move source closure from graph_vault/sources/{bookId} into
+      graph_vault/books/{bookId}/source.
+    - Move GraphRAG output from output/ to graphrag/output, or maintain a
+      compatibility symlink/locator during one migration version.
+    - Move producer run evidence from runs/ to graphrag/runs, or maintain a
+      compatibility locator during one migration version.
+    - Move job.yaml, checkpoints.yaml, and artifacts.yaml into state/.
+    - Keep input/ as the canonical normalized input root.
+    - Regenerate package-relative file entries and checksums after all moves.
+    - Preserve distribution_manifest.json as legacy evidence until the next
+      successful BOOK_MANIFEST.json audit.
+  compatibilityBridge:
+    rule: >
+      A current completed book with distribution_manifest.json can be treated as
+      exportable but not hot-plug authoritative. The export command must build a
+      temporary BOOK_MANIFEST.json before producing a portable package.
+
+mountLifecycle:
+  installByCopy:
+    sequence:
+      - Copy a complete book package directory under graph_vault/books/{bookId}.
+      - Mount scanner validates BOOK_MANIFEST.json and checksums.
+      - Scanner projects catalog entries and qmd retrieval indexes.
+      - Book becomes query-ready only after declared GraphRAG artifacts pass
+        validation.
+  uninstallByDelete:
+    sequence:
+      - Delete graph_vault/books/{bookId}.
+      - Mount scanner removes stale derived catalog entries.
+      - Global qmd and retrieval indexes remove or invalidate the book
+        projection.
+      - Historical run records remain outside the package only as batch-level
+        audit evidence.
+  conflictHandling:
+    sameBookIdDifferentSourceHash: fail_closed
+    sameSourceHashDifferentBookId: report_duplicate_candidate
+    missingRequiredFile: quarantine_mount_candidate
+    checksumMismatch: quarantine_mount_candidate
+    incompatibleSchema: visible_not_query_ready
+
+securityExportPolicy:
+  principle: >
+    Export is allowlist-first. Denylist rules are defense in depth, not the
+    authority. Any path, symlink, manifest field, producer evidence, or
+    diagnostic entry that cannot be classified as safe must fail closed.
+  allowedPackageRoots:
+    - BOOK_MANIFEST.json
+    - BOOK_MANIFEST.json.sha256
+    - BOOK_MANIFEST.json.sha256.meta.json
+    - PUBLISH_READY.json
+    - source/**
+    - input/**
+    - qmd/**
+    - graphrag/output/**
+    - graphrag/runs/**
+    - state/job.yaml
+    - state/checkpoints.yaml
+    - state/artifacts.yaml
+    - metadata/**
+  deniedPatterns:
+    - .env
+    - "**/.env"
+    - "**/*secret*"
+    - "**/*credential*"
+    - "**/*token*"
+    - "**/*key*"
+    - "**/provider-requests/**"
+    - "**/provider-responses/**"
+    - "**/logs/**"
+    - "**/*.corrupt-*"
+    - "**/.durable-recovery.jsonl"
+    - "**/debug/**"
+    - "**/trace/**"
+    - "**/.DS_Store"
+  pathSafety:
+    packageRelativeOnly: true
+    rejectAbsolutePaths: true
+    rejectParentTraversal: true
+    rejectSymlinkEscape: true
+    rejectHardlinkOutsidePackage: true
+    rule: >
+      Export and mount validation must resolve each file without allowing it to
+      escape graph_vault/books/{bookId}. Safe internal symlinks are allowed only
+      if explicitly listed and checksum-bound; default behavior is reject.
+  manifestFieldClassification:
+    public:
+      - identity.bookId
+      - identity.sourceHash
+      - identity.canonicalTitle
+      - identity.titleSlug
+      - source.sourceKind
+      - input.canonicalNormalizedPath
+      - qmd.requiredArtifacts
+      - graphrag.requiredArtifacts
+      - compatibility
+    restricted:
+      - source.provenance
+      - producerLineage.modelProfile
+      - producerLineage.toolVersion
+      - diagnostics.errorCode
+    forbidden:
+      - absoluteLocalPath
+      - environmentVariableValue
+      - providerRequestPayload
+      - providerResponsePayload
+      - apiKey
+      - bearerToken
+      - userHomePath
+  secretScan:
+    requiredBeforeExport: true
+    failClosedOnMatch: true
+    scanScope:
+      - BOOK_MANIFEST.json
+      - source/**/*.json
+      - input/**/*.md
+      - qmd/**/*.json
+      - graphrag/output/**/*.json
+      - graphrag/runs/**/*.yaml
+      - state/**/*.yaml
+      - metadata/**/*.json
+    diagnosticRule: >
+      Secret scan diagnostics include file path, pattern id, and byte range
+      class only. They must not include matched secret text.
+  producerEvidenceRedaction:
+    allowedFields:
+      - producerRunId
+      - stage
+      - parentProducerRunIds
+      - inputArtifactHashes
+      - outputArtifactHashes
+      - modelProfile.fingerprint
+      - embeddingProfile.fingerprint
+      - toolVersion
+      - completedAt
+    forbiddenFields:
+      - prompts
+      - rawResponses
+      - providerHeaders
+      - requestBodies
+      - responseBodies
+      - environment
+      - absolutePaths
+    rule: >
+      Producer evidence exported inside graphrag/runs must be a redacted,
+      package-relative summary. Raw provider request and response evidence is
+      never part of a book package.
+  sourceRedactionModes:
+    include_source_epub:
+      rule: source/source.epub and sidecars are included.
+    normalized_input_only:
+      rule: >
+        Original EPUB is omitted. Manifest records sourceHash and redaction
+        status. Remount can query existing qmd/GraphRAG outputs but cannot
+        rebuild from source without replacement source material.
+
+versionAndMigrationModel:
+  principle: >
+    Migration from current distribution manifests to hot-plug packages must be
+    idempotent, auditable, reversible until commit, and fail-closed on ambiguous
+    identity or missing closure.
+  compatibilityMatrix:
+    dimensions:
+      - packageSchemaVersion
+      - layoutVersion
+      - qmdIndexSchema
+      - graphRagArtifactSchema
+      - parquetSchemaDigest
+      - lancedbSchemaDigest
+      - producerLineageSchema
+    outcomes:
+      - mount_as_is
+      - migrate_metadata_only
+      - rebuild_qmd_projection
+      - rebuild_graphrag_required
+      - visible_not_query_ready
+      - fail_closed
+  migrationStateMachine:
+    states:
+      - discovered
+      - classified_current
+      - classified_residue
+      - staging_created
+      - files_copied
+      - manifest_generated
+      - checksums_regenerated
+      - validated
+      - published
+      - mounted
+      - residue_quarantined
+      - repair_required
+      - migration_failed
+      - rolled_back
+    terminalStates:
+      - mounted
+      - residue_quarantined
+      - repair_required
+      - migration_failed
+  currentVsResidueClassification:
+    currentBookCriteria:
+      - distribution_manifest.json exists and checksum sidecars validate.
+      - qmd/qmd_build_manifest.json exists.
+      - output/qmd_output_manifest.json exists.
+      - input canonical normalized file exists.
+      - required producer run evidence is present or explainably compatible.
+    residueCriteria:
+      - no valid distribution_manifest.json
+      - missing qmd directory
+      - missing output manifest
+      - stale bookId for a sourceHash that has a newer completed book
+      - incomplete legacy checkpoint without completed query_ready
+    priorityRule: >
+      If multiple directories share sourceHash, the directory referenced by the
+      completed run manifest and valid distribution_manifest.json wins. Others
+      are classified as residue candidates.
+  migrationEvidence:
+    root: graph_vault/catalog/book-package-migrations
+    files:
+      - migrations/{migrationId}/plan.yaml
+      - migrations/{migrationId}/classification.yaml
+      - migrations/{migrationId}/copy-map.yaml
+      - migrations/{migrationId}/manifest-diff.yaml
+      - migrations/{migrationId}/validation.yaml
+      - migrations/{migrationId}/commit-record.yaml
+    requiredFields:
+      - migrationId
+      - sourceBookId
+      - targetBookId
+      - sourceHash
+      - oldManifestSha256
+      - newManifestSha256
+      - copiedFiles
+      - skippedFiles
+      - excludedFiles
+      - residueAction
+      - rollbackAvailable
+  rollbackContract:
+    beforePublish: delete_staging_only
+    afterPublishBeforeProjection: remove_new_live_root_and_restore_previous
+    afterProjectionCommit: restore_previous_projection_generation_if_root_valid
+    noRollbackCases:
+      - user_deleted_previous_root
+      - previous_root_checksum_invalid
+      - explicit_cleanup_confirmed
+  residuePolicy:
+    defaultAction: quarantine_without_delete
+    archiveRoot: graph_vault/.archive/book-residues
+    repairReport: graph_vault/catalog/book-package-migrations/residue-report.yaml
+    scannerRule: >
+      Residue candidates are not mounted and are ignored by normal mount scan
+      unless a repair command explicitly targets them.
+
+largeLibraryOperationalBounds:
+  targetScale:
+    mountedBooks: 1000
+    candidateDirectories: 1500
+    normalScanChangedBooks: 50
+  performanceBudgets:
+    normalScanWallClockSeconds: 60
+    unchangedBookFullChecksumReads: 0
+    changedBookValidationConcurrency: 4
+    catalogCommitSeconds: 10
+    maxMemoryMegabytes: 1024
+  boundedValidationPolicy:
+    normalMode: digest_metadata_for_unchanged_books
+    auditMode: full_checksum_for_all_books
+    suspicionTriggers:
+      - manifest mtime changes
+      - publish marker changes
+      - packageGeneration changes
+      - file count changes
+      - scanner cache missing
+      - explicit verify-all flag
+  resumability:
+    checkpointEveryCandidates: 25
+    resumeInputs:
+      - scanGeneration
+      - candidateCursor
+      - validatedCandidateDigests
+      - failedCandidateDiagnostics
+    rule: >
+      Interrupted scans resume validation from checkpoint. They do not expose a
+      partial projection and do not discard the last committed generation.
+  largeLibraryTests:
+    requiredCases:
+      - 1000 valid mounted packages with no changes completes within budget.
+      - 50 changed packages trigger bounded full validation.
+      - scan interrupted mid-validation resumes without catalog mutation.
+      - projection commit failure preserves last-good generation.
+      - concurrent query observes either old or new generation, never partial.
+      - deletion of 100 packages removes projections atomically.
+
+catalogProjectionSchemas:
+  principle: >
+    Derived catalog files are stable projections from BOOK_MANIFEST.json,
+    PUBLISH_READY.json, readiness gates, and scan validation results. They must
+    be rebuildable without reading original batch run state.
+  schemaVersion: book-catalog-projection-v1
+  projectionInputs:
+    manifestSections:
+      - identity
+      - mount
+      - source
+      - input
+      - qmd
+      - graphrag
+      - files
+      - checksums
+      - compatibility
+    scanSections:
+      - scanGeneration
+      - packageGeneration
+      - validationStatus
+      - qmdReadyState
+      - graphRagReadyState
+      - diagnosticsDigest
+    forbiddenInputs:
+      - graph_vault/catalog/batch-runs/**
+      - graph_vault/catalog/provider-requests/**
+      - graph_vault/catalog/provider-responses/**
+      - graph_vault/input/**
+      - absolute source paths
+  booksYaml:
+    path: graph_vault/catalog/books.yaml
+    recordKey: bookId
+    fields:
+      - field: bookId
+        source: BOOK_MANIFEST.identity.bookId
+      - field: sourceHash
+        source: BOOK_MANIFEST.identity.sourceHash
+      - field: canonicalTitle
+        source: BOOK_MANIFEST.identity.canonicalTitle
+      - field: titleSlug
+        source: BOOK_MANIFEST.identity.titleSlug
+      - field: packageRoot
+        source: scan.packageRootRelativePath
+      - field: packageGeneration
+        source: BOOK_MANIFEST.identity.packageGeneration
+      - field: manifestSha256
+        source: BOOK_MANIFEST.checksums.manifestSha256
+      - field: mountStatus
+        source: scan.validationStatus
+      - field: qmdReadyState
+        source: readinessGates.qmdReadyGate.state
+      - field: graphRagReadyState
+        source: readinessGates.graphragReadyGate.state
+      - field: queryReady
+        source: readinessGates.packageStates
+      - field: compatibilityStatus
+        source: BOOK_MANIFEST.compatibility
+  sourcesYaml:
+    path: graph_vault/catalog/sources.yaml
+    recordKey: sourceHash
+    fields:
+      - field: sourceHash
+        source: BOOK_MANIFEST.source.sourceHash
+      - field: sourceKind
+        source: BOOK_MANIFEST.source.sourceKind
+      - field: sourceBytes
+        source: BOOK_MANIFEST.source.sourceBytes
+      - field: sourcePath
+        source: packageRelative(BOOK_MANIFEST.source.sourcePath)
+      - field: sourceRedactionMode
+        source: BOOK_MANIFEST.source.redactionMode
+      - field: bookIds
+        source: mounted books sharing sourceHash
+      - field: duplicateStatus
+        source: conflict index
+  documentIdentityMapYaml:
+    path: graph_vault/catalog/document-identity-map.yaml
+    recordKey: documentId
+    fields:
+      - field: documentId
+        source: qmd or GraphRAG manifest document identity
+      - field: bookId
+        source: BOOK_MANIFEST.identity.bookId
+      - field: sourceHash
+        source: BOOK_MANIFEST.identity.sourceHash
+      - field: normalizedHash
+        source: BOOK_MANIFEST.input.normalizedHash
+      - field: textUnitIdentityDigest
+        source: graphrag/output/qmd_graph_text_unit_identity.json
+      - field: packageGeneration
+        source: BOOK_MANIFEST.identity.packageGeneration
+  graphCapabilitiesYaml:
+    path: graph_vault/catalog/graph-capabilities.yaml
+    recordKey: bookId
+    fields:
+      - field: bookId
+        source: BOOK_MANIFEST.identity.bookId
+      - field: queryReady
+        source: readinessGates.graphragReadyGate.state == query_ready
+      - field: graphOutputRoot
+        source: packageRelative(graphrag/output)
+      - field: outputManifestSha256
+        source: artifact metadata for qmd_output_manifest.json
+      - field: embeddingModel
+        source: readinessGates.graphragReadyGate.compatibilityInputs
+      - field: embeddingDimension
+        source: readinessGates.graphragReadyGate.compatibilityInputs
+      - field: producerRunIds
+        source: BOOK_MANIFEST.graphrag.producerRunIds
+      - field: artifactClosureDigest
+        source: graphRagArtifactMetadataContract.closureDigest
+  conflictIndex:
+    path: graph_vault/catalog/book-conflicts.yaml
+    indexes:
+      - name: byBookId
+        key: [bookId]
+      - name: bySourceHash
+        key: [sourceHash]
+      - name: byBookIdAndSourceHash
+        key: [bookId, sourceHash]
+    deterministicOrdering:
+      - sourceHash
+      - bookId
+      - packageGeneration
+      - manifestSha256
+    conflictOutcomes:
+      - same_book_id_different_source_hash_fail_closed
+      - same_source_hash_different_book_id_duplicate_candidate
+      - same_title_different_source_hash_visible_distinct
+      - manual_decision_required
+
+quarantineAndRepairStateMachine:
+  principle: >
+    Damaged, incomplete, ambiguous, or unsafe packages enter a durable
+    quarantine state with stable diagnostics. Repair must be idempotent and
+    must not mutate catalog projections until a full validation passes.
+  stateRoot: graph_vault/catalog/book-quarantine
+  states:
+    - detected
+    - quarantined
+    - repair_requested
+    - repair_staging
+    - repair_validating
+    - repair_succeeded
+    - repair_failed
+    - cleared
+    - archived
+  transitions:
+    - from: detected
+      to: quarantined
+      trigger: validation_failure
+    - from: quarantined
+      to: repair_requested
+      trigger: explicit_repair_command
+    - from: repair_requested
+      to: repair_staging
+      trigger: replacement_package_or_manifest_available
+    - from: repair_staging
+      to: repair_validating
+      trigger: staged_files_copied_and_checksummed
+    - from: repair_validating
+      to: repair_succeeded
+      trigger: full_package_validation_passed
+    - from: repair_validating
+      to: repair_failed
+      trigger: validation_failed
+    - from: repair_succeeded
+      to: cleared
+      trigger: mount_projection_committed
+    - from: quarantined
+      to: archived
+      trigger: explicit_archive_command
+  recordSchema:
+    requiredFields:
+      - quarantineId
+      - bookId
+      - sourceHash
+      - packageRoot
+      - packageGeneration
+      - firstDetectedAt
+      - lastUpdatedAt
+      - state
+      - reasonCode
+      - validatorErrorCode
+      - affectedPaths
+      - manifestSha256
+      - publishMarkerSha256
+      - repairAttempts
+      - clearCondition
+      - diagnosticDigest
+    affectedPathsRule: >
+      Paths are package-relative. Absolute paths, secret text, provider payload,
+      and raw log content are forbidden.
+  validatorContract:
+    checksumOrder:
+      - file bytes match file entry bytes.
+      - file sha256 matches file entry sha256.
+      - sidecar content matches file sha256.
+      - sidecar metadata references the same algorithm and target path.
+      - BOOK_MANIFEST.json bytes match BOOK_MANIFEST.json.sha256.
+      - PUBLISH_READY.json manifestSha256 matches manifest checksum.
+    stableErrorCodes:
+      - missing_manifest
+      - missing_publish_marker
+      - missing_manifest_sidecar
+      - missing_required_file
+      - file_bytes_mismatch
+      - file_sha256_mismatch
+      - sidecar_target_mismatch
+      - manifest_sha256_mismatch
+      - publish_marker_mismatch
+      - path_escape
+      - symlink_escape
+      - forbidden_sensitive_material
+      - incompatible_schema
+      - lineage_binding_missing
+    ioLimits:
+      maxDiagnosticBytesPerBook: 65536
+      maxAffectedPathsPerBook: 100
+      stdoutStderrCapture: redacted_bounded_summary
+  repairClosure:
+    acceptedInputs:
+      - full replacement package staged under importStagingRoot
+      - regenerated BOOK_MANIFEST.json and sidecars from current files
+      - restored missing required files with matching checksums
+      - explicit source-redacted repair policy
+    successRule: >
+      Repair succeeds only after the same validator pipeline used for fresh
+      mount passes and a new projection generation commits.
+    failureRule: >
+      Failed repair leaves the previous quarantine record active and appends a
+      bounded repair attempt record. It does not remove last-good projections.
+  damagedPackageTests:
+    requiredCases:
+      - missing BOOK_MANIFEST.json
+      - missing PUBLISH_READY.json
+      - missing manifest sidecar
+      - missing required GraphRAG artifact
+      - file bytes mismatch
+      - sha256 mismatch
+      - sidecar target mismatch
+      - corrupt YAML or JSON metadata
+      - symlink escape
+      - path traversal
+      - forbidden secret pattern
+      - failed repair keeps quarantine
+      - successful repair commits new generation
+
+largeLibraryDegradationAndMetrics:
+  scaleLimits:
+    maxMountedBooks: 1000
+    maxCandidateDirectories: 1500
+    maxFilesPerPackage: 25000
+    maxBytesPerPackage: 5000000000
+    maxTotalValidationBytesPerNormalScan: 50000000000
+    maxQuarantineRecordsRetained: 10000
+  degradationPolicy:
+    overCandidateLimit: fail_closed_without_projection_mutation
+    overFilesPerPackage: quarantine_mount_candidate
+    overBytesPerPackage: quarantine_mount_candidate
+    overValidationBudget: defer_remaining_candidates
+    lowDiskSpace: stop_before_projection_commit
+    lockContention: retry_with_backoff_then_keep_last_good
+  validationTiers:
+    metadataOnly:
+      useWhen: unchanged manifestSha256 and publishMarkerSha256
+    manifestAndSidecars:
+      useWhen: changed manifest or changed publish marker
+    fullClosure:
+      useWhen: new package, repair, audit mode, suspicious metadata, or export
+    periodicAudit:
+      cadence: every_30_days_or_100_package_changes
+      scope: bounded_full_closure_sample_plus_all_recent_changes
+  lockCompatibilityMatrix:
+    locks:
+      - publishLock
+      - scanLock
+      - catalogCommitLock
+      - qmdProjectionLock
+      - queryReadLock
+      - repairLock
+    compatibility:
+      publishLock:
+        publishLock: exclusive
+        scanLock: compatible_until_commit_then_exclusive
+        queryReadLock: compatible_with_last_good_only
+      scanLock:
+        catalogCommitLock: exclusive_during_commit
+        qmdProjectionLock: exclusive_during_projection_commit
+        queryReadLock: compatible_with_last_good_only
+      repairLock:
+        publishLock: exclusive_same_book
+        scanLock: compatible_until_repair_publish
+  metrics:
+    requiredCounters:
+      - mountedBookCount
+      - candidateDirectoryCount
+      - changedCandidateCount
+      - validatedPackageCount
+      - skippedUnchangedPackageCount
+      - quarantinedPackageCount
+      - projectionGeneration
+      - lastGoodGeneration
+      - scanDurationMs
+      - validationBytesRead
+      - catalogCommitDurationMs
+      - qmdProjectionCommitDurationMs
+      - lockWaitMs
+      - retryCount
+    progressEvents:
+      - scan_started
+      - candidate_enumerated
+      - validation_checkpoint
+      - projection_plan_built
+      - projection_commit_started
+      - projection_committed
+      - scan_failed
+  diagnosticsRetention:
+    quarantineRecords: retain_180_days_or_10000_records
+    scanGenerations: retain_last_30_successful_and_last_30_failed
+    metrics: retain_90_days
+    rule: >
+      Retention cleanup never deletes active quarantine records, current
+      last-good generation, or migration evidence referenced by mounted books.
+  faultInjectionTests:
+    requiredCases:
+      - lock contention during scan commit
+      - scan interruption after validation checkpoint
+      - projection commit fsync failure
+      - stale lock takeover success
+      - stale lock takeover failure
+      - over validation byte budget
+      - package count over limit
+      - quarantine retention cleanup with active records
+
+upgradePathMatrix:
+  principle: >
+    Every supported legacy package shape must resolve to an explicit upgrade
+    path. Unknown or unsupported shapes fail closed or become visible but not
+    query-ready with machine-readable diagnostics.
+  legacyVersionDetection:
+    states:
+      - current_hotplug_v1
+      - legacy_distribution_manifest_v1
+      - legacy_book_root_without_manifest
+      - legacy_partial_qmd_only
+      - legacy_partial_graphrag_only
+      - residue_duplicate_source
+      - unsupported_unknown
+      - repairable_incomplete
+    detectionInputs:
+      - distribution_manifest.json
+      - distribution_manifest.json.sha256
+      - job.yaml
+      - artifacts.yaml
+      - checkpoints.yaml
+      - input/**
+      - qmd/qmd_build_manifest.json
+      - output/qmd_output_manifest.json
+      - runs/*.yaml
+  pathRows:
+    - from: current_hotplug_v1
+      to: mount_as_is
+      preconditions:
+        - BOOK_MANIFEST.json and PUBLISH_READY.json validate.
+      steps:
+        - run mount scan validation
+      failureOutcome: quarantine_mount_candidate
+    - from: legacy_distribution_manifest_v1
+      to: book-hotplug-v1
+      preconditions:
+        - distribution manifest and sidecars validate.
+        - qmd build manifest exists.
+        - GraphRAG output manifest exists.
+        - canonical input exists.
+      steps:
+        - classify current versus residue.
+        - copy source closure into source/.
+        - move or copy qmd into qmd/.
+        - move or copy output into graphrag/output/.
+        - move or copy runs into graphrag/runs/.
+        - move job, checkpoints, artifacts into state/.
+        - generate BOOK_MANIFEST.json.
+        - regenerate checksums and PUBLISH_READY.json.
+        - publish through atomic lifecycle.
+      failureOutcome: repair_required
+    - from: legacy_partial_qmd_only
+      to: visible_not_query_ready
+      preconditions:
+        - qmd manifest and canonical input validate.
+      steps:
+        - package qmd and input closure.
+        - mark graphRagReadyState as artifact_missing.
+      failureOutcome: residue_quarantined
+    - from: legacy_partial_graphrag_only
+      to: repair_required
+      preconditions:
+        - GraphRAG output manifest exists but input or qmd closure is missing.
+      steps:
+        - preserve non-sensitive output as repair evidence.
+        - require source or normalized input restoration before query-ready.
+      failureOutcome: residue_quarantined
+    - from: residue_duplicate_source
+      to: residue_quarantined
+      preconditions:
+        - another valid package with same sourceHash wins priority rule.
+      steps:
+        - record duplicate candidate.
+        - require manual conflict decision for any promotion.
+      failureOutcome: residue_quarantined
+    - from: unsupported_unknown
+      to: fail_closed
+      preconditions:
+        - no known manifest or closure pattern validates.
+      steps:
+        - emit compatibility diagnostic.
+      failureOutcome: fail_closed
+  identityMigrationRecord:
+    requiredFields:
+      - oldBookId
+      - newBookId
+      - sourceHash
+      - oldIdentityAlgorithm
+      - newIdentityAlgorithm
+      - titleBefore
+      - titleAfter
+      - packageVersionBefore
+      - packageVersionAfter
+      - packageGeneration
+      - decisionReason
+      - decidedBy
+  compatibilityDiagnostics:
+    stableCodes:
+      - legacy_schema_supported
+      - legacy_schema_unknown
+      - artifact_schema_incompatible
+      - qmd_index_schema_incompatible
+      - producer_lineage_schema_missing
+      - source_closure_missing
+      - manual_decision_required
+      - rebuild_required
+      - repair_required
+      - fail_closed_unsupported
+    requiredFields:
+      - code
+      - severity
+      - packageRelativePath
+      - schemaVersionFound
+      - schemaVersionExpected
+      - action
+      - repairHint
+
+artifactSchemaConversionMatrix:
+  principle: >
+    Migration tools must not silently reinterpret GraphRAG or qmd artifacts.
+    Each artifact class has an explicit conversion, rebuild, preserve, or
+    fail-closed rule.
+  artifactClasses:
+    - name: qmd_build_manifest
+      pathPattern: qmd/qmd_build_manifest.json
+      action: preserve_if_schema_compatible_else_rebuild_qmd_projection
+      requiredMetadata:
+        - qmdBuildSchema
+        - qmdToolVersion
+        - inputNormalizedHash
+        - chunkingConfigHash
+    - name: qmd_book_index
+      pathPattern: qmd/index/qmd_book_index.sqlite
+      action: preserve_if_fresh_else_rebuild_outside_package
+      requiredMetadata:
+        - sqliteSchemaDigest
+        - qmdIndexSchema
+        - freshnessDigest
+    - name: graph_output_manifest
+      pathPattern: graphrag/output/qmd_output_manifest.json
+      action: preserve_if_schema_compatible_else_visible_not_query_ready
+      requiredMetadata:
+        - outputManifestSchema
+        - graphRagArtifactSchema
+        - artifactClosureDigest
+    - name: parquet_tables
+      pathPattern: graphrag/output/*.parquet
+      action: preserve_if_schema_digest_matches_else_rebuild_graphrag_required
+      requiredMetadata:
+        - parquetSchemaDigest
+        - rowCount
+        - sourceArtifactHash
+    - name: lancedb
+      pathPattern: graphrag/output/lancedb/**
+      action: preserve_if_embedding_profile_matches_else_rebuild_embeddings
+      requiredMetadata:
+        - lancedbSchemaDigest
+        - embeddingModel
+        - embeddingDimension
+        - vectorCount
+    - name: reports_and_stats
+      pathPattern: graphrag/output/{reports,stats,context}.json
+      action: preserve_if_bound_to_output_manifest_else_rebuild_reports_required
+      requiredMetadata:
+        - reportSchema
+        - contextSchema
+        - producerRunId
+    - name: producer_runs
+      pathPattern: graphrag/runs/*.yaml
+      action: redact_and_preserve_as_lineage_evidence
+      requiredMetadata:
+        - producerLineageSchema
+        - stage
+        - inputArtifactHashes
+        - outputArtifactHashes
+  migrationToolEvidence:
+    requiredFields:
+      - migrationToolVersion
+      - migrationStartedAt
+      - migrationCompletedAt
+      - artifactClass
+      - actionTaken
+      - inputSha256
+      - outputSha256
+      - rebuildRequired
+      - failureCode
+    rule: >
+      Migration evidence may describe conversion decisions but must not claim a
+      producer stage succeeded unless that producer stage actually ran.
+
+lockLeaseAndStagingCleanup:
+  principle: >
+    Locks and staging roots must be recoverable. Stale locks are taken over only
+    with generation checks, and stale staging roots are either resumed,
+    quarantined, or archived without affecting last-good projections.
+  leases:
+    fields:
+      - leaseId
+      - lockName
+      - holderPid
+      - holderSessionId
+      - bookId
+      - scanGeneration
+      - packageGeneration
+      - acquiredAt
+      - heartbeatAt
+      - expiresAt
+      - fencingToken
+    heartbeatIntervalSeconds: 10
+    defaultTtlSeconds: 120
+    takeoverRule: >
+      A stale lease can be taken over only if expiresAt is in the past, the
+      holder process is absent or unrelated, and the fencingToken still matches
+      the persisted lock record. Otherwise fail closed and keep last-good view.
+  scanSnapshotChangePolicy:
+    onCandidateChangesDuringScan: retry_candidate_once_then_defer
+    onManifestChangesAfterValidation: mark_candidate_changed_and_retry
+    onPublishMarkerChangesBeforeCommit: rebuild_projection_plan
+    onRootDeletedBeforeCommit: remove_from_candidate_set_if_stable
+    onRepeatedChange: defer_to_next_scan_generation
+  stagingCleanup:
+    roots:
+      - graph_vault/.staging/imports
+      - graph_vault/.staging/builds
+      - graph_vault/catalog/.staging
+    states:
+      - active
+      - stale
+      - resumable
+      - quarantine_required
+      - archived
+      - deleted
+    cleanupRules:
+      - Active staging with live lease is not touched.
+      - Staging with expired lease and valid checkpoint may resume.
+      - Staging with missing checkpoint moves to quarantine.
+      - Staging older than retention and not referenced by evidence is archived.
+      - Cleanup never deletes a live package root or last-good projection.
+  concurrentTestMatrix:
+    requiredCases:
+      - scanner sees package while publisher writes staging
+      - publisher renames during candidate enumeration
+      - manifest changes after validation before projection commit
+      - root deleted before projection commit
+      - stale publish lock takeover succeeds
+      - stale publish lock takeover fails
+      - stale catalog staging cleanup
+      - concurrent query during projection swap
+
+qmdRebuildTransaction:
+  principle: >
+    qmd rebuild is a per-book transaction that writes outside readonly packages,
+    atomically publishes rebuilt projections, and never exposes partial SQLite
+    or stale qmd-ready state.
+  freshnessDigest:
+    fields:
+      - bookId
+      - packageGeneration
+      - normalizedHash
+      - qmdBuildManifestSha256
+      - qmdToolVersion
+      - qmdIndexSchema
+      - sqliteSchemaDigest
+      - chunkingConfigHash
+      - embeddingProfileFingerprint
+      - metadataSchemaDigest
+      - buildConfigSha256
+      - createdAt
+  rebuildInputClosure:
+    requiredFiles:
+      - input canonical normalized markdown
+      - qmd/qmd_build_manifest.json
+      - metadata required by qmd build manifest
+      - qmd config snapshot
+      - package BOOK_MANIFEST.json
+    requiredHashes:
+      - normalizedHash
+      - qmdBuildManifestSha256
+      - qmdConfigSha256
+      - metadataSchemaDigest
+  transactionPaths:
+    stagingRoot: graph_vault/catalog/qmd-book-projections/.staging/{bookId}-{rebuildId}
+    liveRoot: graph_vault/catalog/qmd-book-projections/{bookId}
+    files:
+      - qmd_book_index.sqlite
+      - qmd_book_index.sqlite.sha256
+      - qmd_projection_manifest.json
+      - qmd_projection_manifest.json.sha256
+      - REBUILD_READY.json
+  protocol:
+    - acquire per-book qmd rebuild lease.
+    - write SQLite and projection manifest into stagingRoot.
+    - fsync SQLite, sidecars, staging root, and parent directory.
+    - atomically rename stagingRoot to liveRoot generation.
+    - update qmdReadyState in catalog projection generation.
+    - release lease after commit record is durable.
+  retryPolicy:
+    sameIdempotencyKey: coalesce
+    stalePackageGeneration: cancel_without_commit
+    transientIoFailure: retry_with_backoff
+    schemaIncompatible: mark_schema_incompatible
+  diagnostics:
+    stableCodes:
+      - qmd_rebuild_started
+      - qmd_rebuild_cancelled_stale_generation
+      - qmd_rebuild_failed_io
+      - qmd_rebuild_failed_schema
+      - qmd_rebuild_committed
+    payloadRule: no_provider_payloads_no_absolute_paths
+
+graphRagArtifactMetadataContract:
+  principle: >
+    GraphRAG query-ready requires a metadata row for each required artifact and
+    each row must bind file role, schema, checksum, producer lineage, and
+    validation granularity.
+  closureDigest:
+    algorithm: sha256_of_sorted_artifact_metadata_rows
+  artifactRows:
+    requiredFields:
+      - path
+      - role
+      - required
+      - bytes
+      - sha256
+      - schemaVersion
+      - schemaDigest
+      - validationGranularity
+      - producerRunId
+      - producerStage
+      - upstreamArtifactHashes
+      - outputArtifactHash
+      - compatibilityGroup
+    validationGranularityValues:
+      - file
+      - directory_manifest
+      - sqlite_database
+      - lancedb_collection
+      - parquet_table
+  requiredArtifactMetadata:
+    - path: graphrag/output/qmd_output_manifest.json
+      role: graph_output_manifest
+      validationGranularity: file
+    - path: graphrag/output/qmd_graph_text_unit_identity.json
+      role: text_unit_identity
+      validationGranularity: file
+    - path: graphrag/output/context.json
+      role: graph_context
+      validationGranularity: file
+    - path: graphrag/output/stats.json
+      role: graph_stats
+      validationGranularity: file
+    - path: graphrag/output/documents.parquet
+      role: documents_table
+      validationGranularity: parquet_table
+    - path: graphrag/output/text_units.parquet
+      role: text_units_table
+      validationGranularity: parquet_table
+    - path: graphrag/output/entities.parquet
+      role: entities_table
+      validationGranularity: parquet_table
+    - path: graphrag/output/relationships.parquet
+      role: relationships_table
+      validationGranularity: parquet_table
+    - path: graphrag/output/communities.parquet
+      role: communities_table
+      validationGranularity: parquet_table
+    - path: graphrag/output/community_reports.parquet
+      role: community_reports_table
+      validationGranularity: parquet_table
+    - path: graphrag/output/lancedb
+      role: vector_index
+      validationGranularity: directory_manifest
+  queryGateCompatibilityInputs:
+    - outputManifestSchema
+    - graphRagArtifactSchema
+    - parquetSchemaDigest
+    - lancedbSchemaDigest
+    - embeddingModel
+    - embeddingDimension
+    - graphProjectionVersion
+    - packageLayoutVersion
+    - runtimeReaderVersion
+  negativeTests:
+    requiredCases:
+      - missing required artifact metadata row
+      - artifact metadata sha mismatch
+      - producer output hash missing file entry
+      - file entry missing producer output hash
+      - lancedb embedding dimension mismatch
+      - parquet schema digest mismatch
+      - stale packageGeneration in query capability
+      - cross-book artifact path
+
+sensitiveMaterialTaxonomy:
+  principle: >
+    Security policy must classify sensitive material by category, not only by
+    path pattern. Export, import, scan, migration, and query diagnostics must
+    refuse unclassified sensitive classes.
+  forbiddenClasses:
+    providerPayloads:
+      patterns:
+        - "**/provider-requests/**"
+        - "**/provider-responses/**"
+        - "**/*completion*"
+        - "**/*prompt*"
+        - "**/*token-usage*"
+    credentials:
+      patterns:
+        - "**/.env"
+        - "**/.npmrc"
+        - "**/.netrc"
+        - "**/.pypirc"
+        - "**/id_rsa"
+        - "**/id_ed25519"
+        - "**/*.pem"
+        - "**/*.key"
+        - "**/*credential*"
+        - "**/*secret*"
+    privatePaths:
+      fields:
+        - absoluteLocalPath
+        - userHomePath
+        - originalInboxPath
+        - tempDirectoryPath
+        - shellCommandCwd
+    runtimePayloads:
+      patterns:
+        - "**/logs/**"
+        - "**/debug/**"
+        - "**/trace/**"
+        - "**/.durable-recovery.jsonl"
+        - "**/*.corrupt-*"
+  scannerReadPolicy:
+    export: allowlist_only_and_secret_scan
+    import: manifest_and_sidecars_first_no_sensitive_roots
+    mountScan: no_provider_roots_no_runtime_payload_roots
+    migration: no_raw_provider_payload_reads
+    query: no_provider_calls_on_gate_failure
+  manifestSensitiveFields:
+    forbidden:
+      - commandLineArgsWithSecrets
+      - environment
+      - providerHeaders
+      - requestBodies
+      - responseBodies
+      - rawPrompts
+      - rawCompletions
+      - tokenUsageDetails
+    restricted:
+      - runIds
+      - toolVersion
+      - modelProfileFingerprint
+      - errorCode
+      - compatibilityStatus
+    public:
+      - bookId
+      - sourceHash
+      - canonicalTitle
+      - packageGeneration
+      - packageVersion
+  tests:
+    requiredCases:
+      - provider cache path rejected
+      - .npmrc rejected
+      - .netrc rejected
+      - ssh key rejected
+      - tls private key rejected
+      - absolute path redacted
+      - importer refuses sensitive root
+      - scanner refuses provider root
+
+manualConflictDecisionWorkflow:
+  principle: >
+    Ambiguous identity, duplicate source, and migration promotion decisions must
+    be explicit, durable, auditable, and fail-closed while undecided.
+  decisionRoot: graph_vault/catalog/book-conflict-decisions
+  decisionStates:
+    - detected
+    - pending_manual_decision
+    - accepted_as_new_book
+    - merged_with_existing
+    - kept_as_duplicate
+    - quarantined
+    - rejected
+    - superseded
+  decisionRecord:
+    requiredFields:
+      - decisionId
+      - detectedAt
+      - decidedAt
+      - decidedBy
+      - conflictType
+      - candidateBookId
+      - existingBookId
+      - sourceHash
+      - candidateManifestSha256
+      - existingManifestSha256
+      - action
+      - reason
+      - rollbackPlan
+      - affectedCatalogGeneration
+      - evidencePaths
+    forbiddenFields:
+      - raw provider payload
+      - absolute local path
+      - secret value
+  conflictTypes:
+    - same_book_id_different_source_hash
+    - same_source_hash_different_book_id
+    - legacy_residue_promote_candidate
+    - title_collision_different_source_hash
+    - package_generation_replace
+  failClosedRule: >
+    A pending manual decision cannot become mounted or query-ready. It remains
+    visible only as a diagnostic candidate until a decision record validates.
+  tests:
+    requiredCases:
+      - same bookId different sourceHash stays pending and not mounted
+      - same sourceHash duplicate can be kept as duplicate with explicit record
+      - residue promotion requires manual decision
+      - rejected decision keeps quarantine
+      - superseded decision preserves audit trail
+
+implementationPlan:
+  designFirstModules:
+    - path: scripts/graphrag/book-package-manifest.mjs
+      responsibility: Build and validate BOOK_MANIFEST.json from a book root.
+    - path: scripts/graphrag/book-mount-scanner.mjs
+      responsibility: Scan books/* manifests and derive catalog projections.
+    - path: scripts/graphrag/book-package-lifecycle.mjs
+      responsibility: >
+        Manage staging, publish markers, atomic rename, quarantine, and
+        package-generation visibility.
+    - path: scripts/graphrag/book-readiness-gates.mjs
+      responsibility: >
+        Evaluate qmd-ready and GraphRAG query-ready states from manifest,
+        checksums, lineage, and projection metadata.
+    - path: scripts/graphrag/book-package-security.mjs
+      responsibility: >
+        Enforce export allowlists, denylist defense, path safety, symlink
+        policy, secret scan, and producer evidence redaction.
+    - path: scripts/graphrag/book-package-migration.mjs
+      responsibility: >
+        Migrate legacy distribution manifests into BOOK_MANIFEST packages with
+        idempotent state, migration evidence, residue quarantine, and rollback.
+    - path: scripts/graphrag/book-package-export.mjs
+      responsibility: Export a current book into the hot-plug package layout.
+    - path: scripts/graphrag/book-package-import.mjs
+      responsibility: Validate and stage copied packages before projection.
+    - path: scripts/graphrag/book-catalog-projection-schemas.mjs
+      responsibility: >
+        Materialize books.yaml, sources.yaml, document identity, graph
+        capabilities, and conflict indexes from manifest fields only.
+    - path: scripts/graphrag/book-quarantine-repair.mjs
+      responsibility: >
+        Persist quarantine states, validator diagnostics, repair attempts, and
+        clear/archive transitions.
+    - path: scripts/graphrag/book-large-library-scan-policy.mjs
+      responsibility: >
+        Enforce scale limits, validation tiers, metrics, degradation policy,
+        diagnostics retention, and fault-injection contracts.
+    - path: scripts/graphrag/book-upgrade-paths.mjs
+      responsibility: >
+        Detect legacy package shapes and apply explicit upgrade path matrix
+        rows without changing fixed audit criteria.
+    - path: scripts/graphrag/book-artifact-schema-conversion.mjs
+      responsibility: >
+        Decide preserve, rebuild, visible-not-query-ready, or fail-closed for
+        qmd, parquet, LanceDB, reports, stats, context, and producer evidence.
+    - path: scripts/graphrag/book-lock-lease-cleanup.mjs
+      responsibility: >
+        Manage lock leases, stale takeover, scan snapshot changes, and staging
+        cleanup without mutating last-good projections.
+    - path: scripts/graphrag/book-qmd-rebuild-transaction.mjs
+      responsibility: >
+        Run per-book qmd rebuild transactions with freshness digests, external
+        projection roots, atomic SQLite replacement, and bounded diagnostics.
+    - path: scripts/graphrag/book-graphrag-artifact-metadata.mjs
+      responsibility: >
+        Validate GraphRAG artifact metadata rows, closure digests, producer
+        upstream binding, and query gate negative cases.
+    - path: scripts/graphrag/book-sensitive-material-policy.mjs
+      responsibility: >
+        Classify sensitive material categories and enforce no-read/no-export
+        scanner policies for provider payloads, credentials, paths, and runtime
+        payloads.
+    - path: scripts/graphrag/book-manual-conflict-decision.mjs
+      responsibility: >
+        Persist manual identity, duplicate, migration promotion, and replacement
+        decisions with fail-closed pending states.
+    - path: scripts/graphrag/book-r3-fixup-contracts.mjs
+      responsibility: >
+        Centralize validation helpers for the supplemental R3 Type DD contracts:
+        identity field semantics, schema-version upgrade rows, migration
+        evidence, sensitive material extensions, scanner no-read checks,
+        qmd availability/re-export policy, qmd diagnostics, and compatibility
+        bridge lifecycle.
+  runnerIntegration:
+    rule: >
+      batch-epub-workflow must call small package modules and must not grow new
+      hot-plug logic inline.
+  testContracts:
+    - Copying a valid book directory into an empty vault makes it mounted after
+      mount scan.
+    - Deleting a book directory removes it from derived catalog projection.
+    - A package missing PUBLISH_READY.json is never mounted.
+    - A package copied through staging becomes visible only after atomic rename.
+    - A scanner crash preserves the previous last-good projection generation.
+    - Catalog and qmd projection commits expose old or new generations, never a
+      partial projection.
+    - Provider payloads, logs, corrupt artifacts, and runtime recovery files are
+      excluded from exported packages.
+    - Export uses allowlist first and fails closed on secret scan, path escape,
+      symlink escape, or unclassified producer evidence.
+    - Same bookId with different sourceHash fails closed.
+    - A package without a book-scoped qmd index can be reindexed on mount when
+      its manifest declares reindex_on_mount.
+    - qmd index freshness changes invalidate qmd-ready in the same projection
+      generation.
+    - GraphRAG query-ready requires minimum artifact closure and
+      artifact-lineage binding.
+    - Current distribution_manifest.json can generate a draft
+      BOOK_MANIFEST.json without rerunning GraphRAG.
+    - Legacy migration is idempotent across interruption and rerun.
+    - Current 38 completed books are classifiable separately from 34 historical
+      residue directories.
+    - Thousand-book normal scan uses changed-set validation and stays within the
+      largeLibraryOperationalBounds budgets.
+    - Derived catalog files contain only fields defined in
+      catalogProjectionSchemas and can be rebuilt without batch run state.
+    - Damaged package validator emits stable error codes for each checksum,
+      sidecar, path, symlink, sensitive material, and lineage failure.
+    - Quarantine repair succeeds only after a full validator pass and a new
+      projection generation commit.
+    - Large library scan reports required metrics and honors validation byte,
+      file count, package count, and lock contention degradation policies.
+    - Upgrade path matrix covers current hotplug, legacy distribution manifest,
+      partial qmd, partial GraphRAG, duplicate residue, and unknown legacy roots.
+    - Artifact schema conversion matrix decides preserve, rebuild,
+      visible-not-query-ready, or fail-closed for each qmd and GraphRAG artifact
+      class.
+    - Stale lock takeover and stale staging cleanup preserve last-good
+      projections under success and failure cases.
+    - qmd rebuild transaction publishes rebuilt SQLite through staging and never
+      exposes partial qmd-ready state.
+    - GraphRAG query-ready fails on missing artifact metadata row, schema
+      mismatch, producer upstream mismatch, stale generation, or cross-book path.
+    - Sensitive material taxonomy rejects provider caches, completion payloads,
+      usage details, .npmrc, .netrc, SSH keys, TLS private keys, and absolute
+      local paths.
+    - Manual conflict decisions keep ambiguous packages unmounted until a
+      durable decision record validates.
+    - R3 supplemental Type DD contracts are enforced without changing the R1
+      fixed audit baselines.
+    - Identity fields obey fixed stability and conflict semantics for bookId,
+      sourceHash, packageVersion, packageGeneration, canonicalTitle, and
+      titleSlug.
+    - Schema upgrade fixtures cover supported current, legacy, partial, missing
+      lineage, duplicate residue, and unsupported legacy package shapes.
+    - qmd default export excludes local projections unless an explicit repack
+      creates a new packageGeneration.
+    - Compatibility bridge locators expire after one successful
+      BOOK_MANIFEST audit and are removed by default during repack.
+
+openQuestions:
+  - id: qmd_book_index_format
+    question: >
+      Whether qmd_book_index.sqlite should become the default package artifact
+      or remain an optional mount-time projection.
+  - id: source_license_policy
+    question: >
+      Whether source EPUB files may be exported by default, or whether packages
+      should support source-redacted mode with normalized input only.
+  - id: writable_shared_packages
+    question: >
+      Whether mounted packages should ever allow direct writes into package
+      roots, or require all runtime mutations under a separate local state root.
