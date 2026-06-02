@@ -289,6 +289,9 @@ GraphRAG 输出生产者 manifest 必须保存在每本书的 book-scoped output
 - `--migrate-only` 会把历史 absolute `outputDir` 重写为
   `books/<bookId>/output`，只在路径解析到当前 book-scoped output 时执行。
 - `stageProducerRunIds` 记录每个高成本 stage 的真实 producer run。
+- `stats.json` 是 GraphRAG 可变观测输出。`graph_extract`、`community_report`
+  或 `embed` 成功后若该文件存在，runner 必须刷新其 durable checksum
+  sidecar，并在 evidence 中区分 `refreshStage` 与 `artifactStage`。
 - `query_ready` 阶段也会刷新 producer manifest，使恢复后的 portable manifest
   记录完整高成本 stage lineage。
 - `query_ready` 只接受 `books/<bookId>/output` 下的

@@ -1,0 +1,25 @@
+schemaVersion: "1.0.0"
+agentId: agent-command-concurrency
+auditKind: implementation
+runId: epub-batch-20260530235947-full-real-env-clean
+criteria:
+  - id: CC01
+    principle: Provider slot lease acquisition failure must release in-memory semaphore.
+  - id: CC02
+    principle: Provider slot lease release must run in finally for all command outcomes.
+  - id: CC03
+    principle: Completed-skip recovery must not acquire provider slots.
+  - id: CC04
+    principle: Completed-skip recovery must not spawn qmd validation commands.
+  - id: CC05
+    principle: Completed-skip recovery must not spawn GraphRAG resume commands.
+  - id: CC06
+    principle: Active provider slot count must be zero after completed recovery.
+  - id: CC07
+    principle: Active subprocess count must be zero after completed recovery.
+  - id: CC08
+    principle: Active book lease count must be zero after completed recovery.
+  - id: CC09
+    principle: Claim-preflight defer behavior must remain covered by tests.
+  - id: CC10
+    principle: Resume terminal status behavior must remain covered by tests.

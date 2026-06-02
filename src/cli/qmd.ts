@@ -1438,7 +1438,14 @@ function multiGet(pattern: string, maxLines?: number, maxBytes: number = DEFAULT
   const db = getDb();
 
   // Check if it's a comma-separated list or a glob pattern
-  const isCommaSeparated = pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?') && !pattern.includes('{');
+  const isExactVirtualPath = isVirtualPath(pattern) &&
+    !pattern.includes('*') &&
+    !pattern.includes('?') &&
+    !pattern.includes('{');
+  const isCommaSeparated = (
+    isExactVirtualPath ||
+    (pattern.includes(',') && !pattern.includes('*') && !pattern.includes('?') && !pattern.includes('{'))
+  );
 
   let files: { filepath: string; displayPath: string; bodyLength: number; collection?: string; path?: string }[];
 
@@ -3258,7 +3265,11 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
 }
 
-async function autoQuerySearch(query: string, opts: OutputOptions): Promise<void> {
+async function autoQuerySearch(
+  query: string,
+  opts: OutputOptions,
+  values: Record<string, unknown>,
+): Promise<void> {
   await withLLMSession(async () => {
     const config = ensureRuntimeConfigForCli();
     const graphVault = pathResolve(
@@ -3268,6 +3279,9 @@ async function autoQuerySearch(query: string, opts: OutputOptions): Promise<void
     const method = GraphRagSearchMethodSchema.parse(
       config.graphrag?.default_method ?? "local",
     );
+    const graphBookId = values["graph-book-id"] == null
+      ? null
+      : String(values["graph-book-id"]);
     const responseType =
       config.graphrag?.default_response_type ?? "multiple paragraphs";
     const answer = await routeQuery({
@@ -3290,7 +3304,11 @@ async function autoQuerySearch(query: string, opts: OutputOptions): Promise<void
         return searchResult.qmdResult;
       },
       resolveGraphCapabilities: async (candidates) =>
-        resolveCandidateGraphCapabilities({ graphVault, candidates }),
+        resolveCandidateGraphCapabilities({
+          graphVault,
+          ...(graphBookId == null ? {} : { bookIds: [graphBookId] }),
+          candidates,
+        }),
       queryGraphRag: async (request, decision) => {
         if (decision.selectedBookIds.length !== 1) {
           throw new TypedQueryErrorException(createTypedQueryError({
@@ -3389,13 +3407,20 @@ async function graphRagQuerySearch(
       },
     )).qmdResult,
     resolveGraphScopeCapabilities: async () => {
-      const capabilities = await loadGraphQueryCapabilities({ graphVault });
+      const capabilities = await loadGraphQueryCapabilities({
+        graphVault,
+        ...(graphBookId == null ? {} : { bookIds: [graphBookId] }),
+      });
       return graphBookId == null
         ? capabilities
         : capabilities.filter((capability) => capability.bookId === graphBookId);
     },
     resolveGraphCapabilities: async (candidates) =>
-      resolveCandidateGraphCapabilities({ graphVault, candidates }),
+      resolveCandidateGraphCapabilities({
+        graphVault,
+        ...(graphBookId == null ? {} : { bookIds: [graphBookId] }),
+        candidates,
+      }),
     queryGraphRag: async (request, decision) => {
       if (decision.selectedBookIds.length !== 1) {
         throw new TypedQueryErrorException(createTypedQueryError({
@@ -5659,7 +5684,7 @@ if (isMain) {
             : String(cli.values.mode);
           const route = explicitMode ?? configuredRoute;
           if (route === "auto") {
-            await autoQuerySearch(cli.query, cli.opts);
+            await autoQuerySearch(cli.query, cli.opts, cli.values);
           } else {
             await querySearch(cli.query, cli.opts);
           }

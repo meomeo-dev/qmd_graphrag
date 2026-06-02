@@ -367,7 +367,7 @@ describe("GraphRAG runner status-json durable read-only", () => {
         expect(diagnostic).toMatchObject({
           localFailureClass: "durable_checksum_mismatch",
           recoveryDecision: "continue_with_diagnostic_unless_catalog_blocked",
-          statusJsonDecision: "read_only_capped_diagnostic",
+          statusJsonDecision: "read_only_diagnostic",
           diagnosticClass: "provider_request_durable_degraded",
           normalRunnerAction: "no_primary_quarantine",
           scannedTargetCount: 1,

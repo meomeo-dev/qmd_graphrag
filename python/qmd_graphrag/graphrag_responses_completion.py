@@ -31,6 +31,12 @@ from graphrag_llm.types import (
 )
 from graphrag_llm.utils import structure_completion_response
 
+from qmd_graphrag.responses_runtime_policy import (
+    responses_max_concurrency,
+    responses_request_timeout,
+    responses_retry_policy_values,
+)
+
 
 _RESPONSE_STREAM_FAILURE_EVENT_TYPES = {
     "error",
@@ -388,32 +394,6 @@ def _raise_stream_failure(event: Any) -> None:
     if _is_transient_responses_error(error):
         raise error
     raise RuntimeError(message)
-
-
-def _positive_int(value: Any, default: int) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
-
-
-def _positive_float(value: Any, default: float) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
-
-
-def _bool_value(value: Any, default: bool) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    if isinstance(value, str):
-        return value.strip().lower() not in {"0", "false", "no", "off"}
-    return bool(value)
 
 
 class _ResponsesRetryPolicy:
@@ -953,30 +933,19 @@ class OpenAIResponsesCompletion(LLMCompletion):
 
         model_name = model_config.azure_deployment_name or model_config.model
         call_args_config = dict(model_config.call_args or {})
-        retry_policy = _ResponsesRetryPolicy(
-            max_retries=_positive_int(
-                call_args_config.get("qmd_responses_retry_max_retries"),
-                _DEFAULT_RESPONSES_RETRY_MAX_RETRIES,
-            ),
-            base_delay=_positive_float(
-                call_args_config.get("qmd_responses_retry_base_delay"),
-                _DEFAULT_RESPONSES_RETRY_BASE_DELAY,
-            ),
-            max_delay=_positive_float(
-                call_args_config.get("qmd_responses_retry_max_delay"),
-                _DEFAULT_RESPONSES_RETRY_MAX_DELAY,
-            ),
-            jitter=_bool_value(
-                call_args_config.get("qmd_responses_retry_jitter"),
-                _DEFAULT_RESPONSES_RETRY_JITTER,
-            ),
-        )
+        retry_policy = _ResponsesRetryPolicy(**responses_retry_policy_values(
+            call_args_config,
+            default_max_retries=_DEFAULT_RESPONSES_RETRY_MAX_RETRIES,
+            default_base_delay=_DEFAULT_RESPONSES_RETRY_BASE_DELAY,
+            default_max_delay=_DEFAULT_RESPONSES_RETRY_MAX_DELAY,
+            default_jitter=_DEFAULT_RESPONSES_RETRY_JITTER,
+        ))
         concurrency_gate = _responses_gate_for(
             api_base=base_url,
             model=model_name,
-            limit=_positive_int(
+            limit=responses_max_concurrency(
                 call_args_config.get("qmd_responses_max_concurrency"),
-                _DEFAULT_RESPONSES_MAX_CONCURRENCY,
+                default=_DEFAULT_RESPONSES_MAX_CONCURRENCY,
             ),
         )
 
@@ -1000,6 +969,9 @@ class OpenAIResponsesCompletion(LLMCompletion):
                 **model_config.call_args,
                 **kwargs,
             })
+            call_args["timeout"] = responses_request_timeout(
+                call_args.get("timeout"),
+            )
 
             create_args: dict[str, Any] = {
                 "model": model_name,
@@ -1057,6 +1029,9 @@ class OpenAIResponsesCompletion(LLMCompletion):
                 **model_config.call_args,
                 **kwargs,
             })
+            call_args["timeout"] = responses_request_timeout(
+                call_args.get("timeout"),
+            )
 
             create_args: dict[str, Any] = {
                 "model": model_name,

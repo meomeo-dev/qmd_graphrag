@@ -1,0 +1,33 @@
+schemaVersion: "1.0.0"
+taskId: graphrag-parallel-runner
+runId: epub-batch-20260530235947-full-real-env-clean
+status: implementation-audit-r2-closed
+createdAt: "2026-06-01T21:18:00.000Z"
+closedAt: "2026-06-01T21:32:00.000Z"
+overallResult: pass
+blockingIssues: []
+evidence:
+  runRoot: graph_vault/catalog/batch-runs/epub-batch-20260530235947-full-real-env-clean
+  statusJson: /tmp/qmd-epub-batch-20260530235947-full-real-env-clean/status-json-post-audit-fix.json
+  finalLog: /tmp/qmd-epub-batch-20260530235947-full-real-env-clean/recover-20260601-152737-retry4.log
+  completedItems: 38
+  distributionManifests: 38
+  missingDistributionManifests: 0
+  recoveryDecision: none
+  retryableItemCount: 0
+  durableFailureSummaryPresent: false
+  providerRequestDiagnostic:
+    scannedTargetCount: 855
+    degradedTargetCount: 195
+    scanTruncated: false
+verificationCommands:
+  - node --check scripts/graphrag/book-distribution-manifest.mjs
+  - node --check scripts/graphrag/batch-epub-workflow.mjs
+  - npx vitest run test/graphrag-book-distribution-manifest.test.ts test/graphrag-runner-normal-startup-lazy-completed.test.ts --testTimeout 120000
+  - npx vitest run test/graphrag-runner-durable-preflight.test.ts --testTimeout 120000
+  - npx vitest run test/graphrag-runner-durable-preflight.test.ts test/graphrag-runner-qmd-validation-policy.test.ts test/graphrag-runner-resume-terminal-status.test.ts test/graphrag-runner-claim-preflight-defer.test.ts --testTimeout 120000
+  - npx vitest run test/graphrag-runner-status-json-readonly.test.ts --testTimeout 120000
+agentResults:
+  agent-state-recovery: pass
+  agent-command-concurrency: pass
+  agent-artifact-portability: pass

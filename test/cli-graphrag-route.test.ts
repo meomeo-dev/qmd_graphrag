@@ -871,4 +871,32 @@ describe("CLI GraphRAG unified route", () => {
     });
     expect(result.stdout).toBe("");
   }, 30000);
+
+  test("qmd query --mode auto can be scoped to one graph book", async () => {
+    const workspace = await createWorkspace({ includeSecondGraphReadyBook: true });
+    const result = await runQmd(workspace, [
+      "query",
+      "--mode",
+      "auto",
+      "--graph-book-id",
+      "book-cli-second",
+      "--json",
+      "--no-rerank",
+      [
+        "intent: relationships across chapters",
+        "lex: architecture decisions relate across chapters",
+      ].join("\n"),
+    ]);
+
+    expect(result.exitCode, result.stderr).toBe(0);
+    const answer = JSON.parse(result.stdout);
+    expect(answer.routeDecision.requestedRoute).toBe("auto");
+    expect(answer.routeDecision.selectedRoute).toBe("graphrag");
+    expect(answer.routeDecision.selectedBookIds).toEqual(["book-cli-second"]);
+    expect(answer.evidence[0].bookId).toBe("book-cli-second");
+    expect(answer.routeDecision.graphCapabilityIds).toEqual([
+      "book-cli-second:graph_query",
+    ]);
+    expect(JSON.stringify(answer)).not.toContain(workspace.graphVault);
+  }, 30000);
 });

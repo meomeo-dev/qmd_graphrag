@@ -138,7 +138,7 @@ describe("GraphRAG runner signal cleanup", () => {
       runner.stdout.resume();
       runner.stderr.resume();
 
-      await waitForFile(resumeStartedPath);
+      await waitForFile(resumeStartedPath, 30000);
       const childPid = Number(readFileSync(childPidPath, "utf8"));
       expect(processAlive(childPid)).toBe(true);
       runner.kill("SIGTERM");
@@ -156,6 +156,11 @@ describe("GraphRAG runner signal cleanup", () => {
         .filter((name) => name.endsWith(".json"))
         .map((name) => JSON.parse(readFileSync(join(subprocessDir, name), "utf8")))
         .find((record) => record.pid === childPid);
+      const itemDir = join(runRoot, "items");
+      const item = readdirSync(itemDir)
+        .filter((name) => name.endsWith(".json"))
+        .map((name) => JSON.parse(readFileSync(join(itemDir, name), "utf8")))
+        .find((record) => record.sourceName === "Signal.epub");
 
       expect(result.exitCode).toBe(1);
       expect(events.some((event) =>
@@ -168,6 +173,11 @@ describe("GraphRAG runner signal cleanup", () => {
       )).toBe(true);
       expect(subprocess).toBeDefined();
       expect(["killed", "exited"]).toContain(subprocess.status);
+      expect(item).toMatchObject({
+        status: "pending",
+        recoveryDecision: "continue_pending",
+      });
+      expect(item.failureKind).toBeUndefined();
       expect(processAlive(childPid)).toBe(false);
     } finally {
       if (runner?.pid != null) {

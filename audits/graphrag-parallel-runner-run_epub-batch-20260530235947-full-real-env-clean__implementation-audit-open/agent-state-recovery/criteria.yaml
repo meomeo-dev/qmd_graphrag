@@ -1,0 +1,60 @@
+schemaVersion: "1.0.0"
+auditAgent: "agent-state-recovery"
+scope: "graphrag-parallel-runner state management and recovery loop"
+runId: "epub-batch-20260530235947-full-real-env-clean"
+criteria:
+  - id: "C01"
+    title: "same run-id resume boundary"
+    requirement: >
+      Runner resume must reuse the existing batch root for the same run-id,
+      preserve item identity, and gate writes with coordinator ownership.
+  - id: "C02"
+    title: "completed item skip"
+    requirement: >
+      Completed items must not be rerun during same run-id resume; they may
+      only be observed or reopened by an explicit validity downgrade path.
+  - id: "C03"
+    title: "checkpoint completed evidence"
+    requirement: >
+      A completed item checkpoint must include successful qmd build evidence,
+      successful GraphRAG build/query evidence, and the complete command check
+      set required by the manifest.
+  - id: "C04"
+    title: "manifest checkpoint projection"
+    requirement: >
+      Batch manifest counts and status must be derivable from item
+      checkpoints, including pending/running/completed/skipped/failed counts.
+  - id: "C05"
+    title: "status-json read-only recovery projection"
+    requirement: >
+      --status-json must project current recovery state without mutating
+      manifest, checkpoints, events, provider payloads, or command attempts.
+  - id: "C06"
+    title: "event log terminal closure"
+    requirement: >
+      The event log must contain canonical terminal events, including
+      item_completed for each completed item and one final batch_completed event.
+  - id: "C07"
+    title: "orphaned running and same-run recovery"
+    requirement: >
+      Orphaned running checkpoints must be recoverable to pending with
+      retry_same_run_id, runner ownership evidence, and an item_running_recovered
+      event.
+  - id: "C08"
+    title: "durable checksum lock temp recovery observability"
+    requirement: >
+      Durable checksum, lock, temp, and sidecar recovery state must be visible
+      in checkpoint, manifest, recovery summary, or status-json surfaces without
+      stale contradictory summaries after recovery.
+  - id: "C09"
+    title: "provider request recovery observability"
+    requirement: >
+      Provider request durable-state problems must be scanned and reported with
+      redacted diagnostics; scan limits must not silently hide remaining
+      degraded provider request records in a completed run.
+  - id: "C10"
+    title: "runner exit and batch_completed"
+    requirement: >
+      A successful runner exit must require manifest status completed,
+      zero active provider slots/subprocesses/book leases, and a terminal
+      batch_completed event.

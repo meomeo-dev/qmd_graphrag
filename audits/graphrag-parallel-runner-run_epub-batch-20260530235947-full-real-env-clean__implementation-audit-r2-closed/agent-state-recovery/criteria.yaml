@@ -1,0 +1,25 @@
+schemaVersion: "1.0.0"
+agentId: agent-state-recovery
+auditKind: implementation
+runId: epub-batch-20260530235947-full-real-env-clean
+criteria:
+  - id: SR01
+    principle: Completed batch manifest must not retain stale durableFailureSummary.
+  - id: SR02
+    principle: Normal resume must skip completed checkpoints without expensive commands.
+  - id: SR03
+    principle: Status-json must remain read-only and not mutate durable state.
+  - id: SR04
+    principle: Completed item historical metadata must not project current failure.
+  - id: SR05
+    principle: Recovery summary must report completed counts and recoveryDecision none.
+  - id: SR06
+    principle: Provider request diagnostics must scan all primary JSON targets.
+  - id: SR07
+    principle: Provider request diagnostics must not expose request or response payloads.
+  - id: SR08
+    principle: Retryable item count must be zero after completed recovery.
+  - id: SR09
+    principle: Checkpoint command checks must remain complete after resume.
+  - id: SR10
+    principle: Same run-id recovery must not create a replacement batch run.

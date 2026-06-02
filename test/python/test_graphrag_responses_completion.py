@@ -24,6 +24,12 @@ from qmd_graphrag.graphrag_responses_completion import (
     _responses_gate_for,
     _translate_call_args,
 )
+from qmd_graphrag.responses_runtime_policy import (
+    DEFAULT_RESPONSES_REQUEST_TIMEOUT_SECONDS,
+    responses_max_concurrency,
+    responses_request_timeout,
+    responses_retry_policy_values,
+)
 
 
 def _delta(text: str, sequence_number: int) -> SimpleNamespace:
@@ -417,6 +423,58 @@ def test_translate_call_args_accepts_responses_endpoint_without_v1():
     assert translated["reasoning"] == {"effort": "medium"}
 
 
+def test_responses_runtime_policy_defaults_request_timeout():
+    assert responses_request_timeout(None, env={}) == (
+        DEFAULT_RESPONSES_REQUEST_TIMEOUT_SECONDS
+    )
+
+
+def test_responses_runtime_policy_preserves_explicit_request_timeout():
+    assert responses_request_timeout(45, env={
+        "QMD_GRAPHRAG_RESPONSES_TIMEOUT_SECONDS": "10",
+    }) == 45
+
+
+def test_responses_runtime_policy_allows_env_request_timeout_override():
+    assert responses_request_timeout(None, env={
+        "QMD_GRAPHRAG_RESPONSES_TIMEOUT_SECONDS": "15",
+    }) == 15
+
+
+def test_responses_runtime_policy_defaults_invalid_concurrency():
+    assert responses_max_concurrency("not-a-number", default=5) == 5
+    assert responses_max_concurrency(0, default=5) == 5
+    assert responses_max_concurrency("2", default=5) == 2
+
+
+def test_responses_runtime_policy_allows_retry_env_overrides():
+    values = responses_retry_policy_values(
+        {
+            "qmd_responses_retry_max_retries": 12,
+            "qmd_responses_retry_base_delay": 2,
+            "qmd_responses_retry_max_delay": 120,
+            "qmd_responses_retry_jitter": True,
+        },
+        default_max_retries=12,
+        default_base_delay=2.0,
+        default_max_delay=120.0,
+        default_jitter=True,
+        env={
+            "QMD_GRAPHRAG_RESPONSES_RETRY_MAX_RETRIES": "1",
+            "QMD_GRAPHRAG_RESPONSES_RETRY_BASE_DELAY": "0.01",
+            "QMD_GRAPHRAG_RESPONSES_RETRY_MAX_DELAY": "0.02",
+            "QMD_GRAPHRAG_RESPONSES_RETRY_JITTER": "false",
+        },
+    )
+
+    assert values == {
+        "max_retries": 1,
+        "base_delay": 0.01,
+        "max_delay": 0.02,
+        "jitter": False,
+    }
+
+
 def test_translate_call_args_rejects_versioned_responses_endpoint():
     try:
         _translate_call_args({"responses_endpoint": "/v1/responses"})
@@ -684,6 +742,11 @@ if __name__ == "__main__":
     test_build_response_text_config_rejects_json_object_fallback()
     test_build_response_text_config_omits_format_for_plain_completion()
     test_translate_call_args_accepts_responses_endpoint_without_v1()
+    test_responses_runtime_policy_defaults_request_timeout()
+    test_responses_runtime_policy_preserves_explicit_request_timeout()
+    test_responses_runtime_policy_allows_env_request_timeout_override()
+    test_responses_runtime_policy_defaults_invalid_concurrency()
+    test_responses_runtime_policy_allows_retry_env_overrides()
     test_translate_call_args_rejects_versioned_responses_endpoint()
     test_translate_call_args_rejects_non_stream_responses_transport()
     test_translate_call_args_rejects_non_strict_structured_output()

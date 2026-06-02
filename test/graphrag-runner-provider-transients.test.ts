@@ -606,6 +606,123 @@ describe("GraphRAG EPUB batch runner - Provider Transients", () => {
     expect(checkpoint.retryDelaySeconds).toBeUndefined();
   });
 
+  test("normal run keeps retryable command exhaustion resumable", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-command-exhaustion-");
+    const sourceDir = join(tmpRoot, "source");
+    const stateRoot = join(tmpRoot, "graph_vault");
+    const logRoot = join(tmpRoot, "logs");
+    const configDir = join(tmpRoot, "config");
+    const runId = "command-exhaustion-remains-resumable";
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await writeFile(join(configDir, "index.yml"), "collections: {}\n");
+    await writeGraphRagPromptFixtures(stateRoot);
+    await writeMinimalEpubFixture(join(sourceDir, "Book.epub"), "Book");
+    const resumeScript = join(tmpRoot, "fake-timeout-resume.mjs");
+    await writeFile(
+      resumeScript,
+      [
+        "console.error('command timed out after 1 seconds');",
+        "process.exit(1);",
+      ].join("\n"),
+    );
+
+    const runRoot = join(stateRoot, "catalog", "batch-runs", runId);
+    const itemDir = join(runRoot, "items");
+    const env = {
+      PATH: process.env.PATH ?? "",
+      HOME: process.env.HOME ?? "",
+      QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
+      QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+      QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
+      QMD_GRAPHRAG_TEST_COMMAND_CHECK_NAMES:
+        "qmd-query-auto-json,qmd-query-graphrag-json",
+    };
+    const proc = spawn(process.execPath, [
+      join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
+      "--source-dir",
+      sourceDir,
+      "--state-root",
+      stateRoot,
+      "--log-root",
+      logRoot,
+      "--config",
+      join(configDir, "index.yml"),
+      "--qmd-index-path",
+      join(tmpRoot, "index.sqlite"),
+      "--run-id",
+      runId,
+      "--skip-dotenv",
+      "--book-concurrency",
+      "1",
+      "--max-command-attempts",
+      "1",
+      "--max-resume-passes",
+      "1",
+    ], { cwd: tmpRoot, env });
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (chunk) => { stdout += String(chunk); });
+    proc.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    await waitForFile(
+      join(runRoot, "events.jsonl"),
+      30_000,
+    );
+    await waitForPredicate(() => {
+      if (!existsSync(itemDir)) return false;
+      const itemFile = durablePrimaryJsonEntries(itemDir)[0];
+      if (itemFile == null) return false;
+      const checkpoint = JSON.parse(readFileSync(join(itemDir, itemFile), "utf8"));
+      return checkpoint.status === "pending" &&
+        checkpoint.failureKind === "transient" &&
+        checkpoint.recoveryDecision === "retry_same_run_id" &&
+        checkpoint.commandChecks?.some((check: Record<string, unknown>) =>
+          check.name === "resume-book-1" &&
+          check.status === "failed"
+        );
+    }, 45_000);
+    proc.kill("SIGTERM");
+    const result = await new Promise<{ exitCode: number | null }>((resolveResult) => {
+      proc.on("close", (exitCode) => resolveResult({ exitCode }));
+    });
+    const itemFile = durablePrimaryJsonEntries(itemDir)[0];
+    const checkpoint = JSON.parse(readFileSync(
+      join(itemDir, itemFile),
+      "utf8",
+    ));
+    const events = readFileSync(join(runRoot, "events.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    await rm(tmpRoot, { recursive: true, force: true });
+    expect(stderr).toBe("");
+    expect(stdout).toContain("item_retry_deferred");
+    expect(events.some((event) =>
+      event.event === "item_retry_deferred" &&
+      event.recoveryDecision === "retry_same_run_id"
+    )).toBe(true);
+    expect(checkpoint).toMatchObject({
+      status: "pending",
+      failureKind: "transient",
+      retryable: true,
+      retryExhausted: false,
+      recoveryDecision: "retry_same_run_id",
+      failedStage: "resume-book-1",
+      metadata: {
+        waitingForProviderRecovery: true,
+        providerRecoveryReason: "transient_failure_recovered",
+      },
+    });
+    expect(checkpoint.commandChecks.at(-1)).toMatchObject({
+      name: "resume-book-1",
+      status: "failed",
+      failureKind: "transient",
+      retryable: true,
+      attemptExhausted: false,
+      recoveryDecision: "retry_same_run_id",
+    });
+  });
+
   test("provider recovery wait limit preserves checkpoint identity during catalog drift", async () => {
     const tmpRoot = await mkProjectTmpDir("qmd-batch-provider-wait-identity-");
     const sourceDir = join(tmpRoot, "source");
@@ -1147,3 +1264,15 @@ describe("GraphRAG EPUB batch runner - Provider Transients", () => {
     });
   });
 });
+
+async function waitForPredicate(
+  predicate: () => boolean,
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await sleep(100);
+  }
+  throw new Error(`timed out waiting for predicate after ${timeoutMs}ms`);
+}

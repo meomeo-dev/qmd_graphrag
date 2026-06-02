@@ -1,0 +1,89 @@
+audit:
+  id: agent-artifact-portability
+  run_id: epub-batch-20260530235947-full-real-env-clean
+  scope: graphrag_parallel_runner_artifact_portability
+  criteria_status: frozen
+  criteria_count: 10
+
+criteria:
+  - id: C01
+    title: book_source_identity_closure
+    requirement: >-
+      每个 batch item 的 bookId、sourceHash、sourceIdentityPath、books/<bookId>
+      目录、sources/<bookId>/source.epub、catalog source entry 必须形成同一书籍
+      身份闭包 (identity closure)。
+    status_values: [PASS, FAIL, UNKNOWN]
+
+  - id: C02
+    title: qmd_input_output_runs_directory_consistency
+    requirement: >-
+      每本书的 qmd/input/output/runs 路径必须在 book scope 内自洽；qmd build
+      manifest、job.yaml、artifacts.yaml 与 item checkpoint 不得依赖
+      graph_vault 根级 input/ 作为单书可分发闭包 (distribution closure) 的
+      必需路径。
+    status_values: [PASS, FAIL, UNKNOWN]
+
+  - id: C03
+    title: graphrag_output_artifact_completeness
+    requirement: >-
+      每本完成书必须具备 book-scoped GraphRAG 输出：parquet、context/stats
+      JSON、qmd_graph_text_unit_identity.json、qmd_output_manifest.json、reports
+      数据和 LanceDB/vector 目录，且路径位于 books/<bookId>/output。
+    status_values: [PASS, FAIL, UNKNOWN]
+
+  - id: C04
+    title: artifact_id_resolvability
+    requirement: >-
+      checkpoint、artifacts.yaml、qmd_output_manifest、graph-capabilities 与
+      batch item 中的 artifactIds 必须可解析到同一 bookId 的现存 artifact
+      manifest 条目，且不得留下悬空 artifactId。
+    status_values: [PASS, FAIL, UNKNOWN]
+
+  - id: C05
+    title: book_scoped_producer_evidence
+    requirement: >-
+      GraphRAG producer evidence 必须 book-scoped；qmd_output_manifest 的
+      stageProducerRunIds、checkpoint runId、artifact producerRunId 必须有对应
+      books/<bookId>/runs/<runId>.yaml 记录或明确的可恢复替代证据。
+    status_values: [PASS, FAIL, UNKNOWN]
+
+  - id: C06
+    title: batch_manifest_terminal_state
+    requirement: >-
+      batch manifest/status/recovery summary 必须如实反映 38/38 completed、
+      terminal counts、itemIds、active lease/subprocess 状态，并只暴露运行状态与
+      redacted evidence，不暴露 provider payload。
+    status_values: [PASS, FAIL, UNKNOWN]
+
+  - id: C07
+    title: single_book_distribution_manifest
+    requirement: >-
+      单本书独立分发必须有显式 manifest，枚举 sources/<bookId>、
+      books/<bookId>/{job,artifacts,checkpoints,qmd,input,output,runs}、必要
+      catalog projections、checksums/sidecars、settings projection，并声明
+      排除 .env、provider payload、quarantine 与非本书历史目录。
+    status_values: [PASS, FAIL, UNKNOWN]
+
+  - id: C08
+    title: active_vault_history_isolation
+    requirement: >-
+      当前 run 的可分发闭包不得依赖 active graph_vault 扫描结果；active
+      books/sources/catalog 中的同源历史目录或旧身份必须被归档、过滤或由
+      manifest 显式隔离。
+    status_values: [PASS, FAIL, UNKNOWN]
+
+  - id: C09
+    title: durable_sidecar_and_quarantine_policy
+    requirement: >-
+      可分发产物必须包含有效 durable checksum sidecars，并对 corrupt/damaged/
+      quarantine 文件给出排除或恢复策略；单书包不得无说明携带大量
+      .corrupt-* 历史状态。
+    status_values: [PASS, FAIL, UNKNOWN]
+
+  - id: C10
+    title: sensitive_payload_exclusion
+    requirement: >-
+      分发 surface 必须排除 .env、API key、provider request/response payload 与
+      其他凭据材料；允许保存 providerFingerprint、hash、redacted locator 与
+      非敏感运行状态。
+    status_values: [PASS, FAIL, UNKNOWN]

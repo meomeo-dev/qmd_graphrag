@@ -1,7 +1,6 @@
 import {
   copyFile,
   mkdir,
-  readdir,
   readFile,
   rename,
   stat,
@@ -100,6 +99,10 @@ import {
   sanitizeVaultMetadata,
   sanitizeVaultText,
 } from "../vault/metadata.js";
+import {
+  isDocumentIdentityMatch,
+  selectDocumentIdentityForFencedWrite,
+} from "./document-identity-selection.js";
 
 const EMPTY_BOOK_CATALOG: BookJobCatalog = {
   schemaVersion: SchemaVersion,
@@ -321,6 +324,10 @@ type BatchBookLease = {
   runnerPid: number;
   expiresAt: string;
 };
+
+type BookJobRunCatalogEntry = BookJobRunCatalog["items"][number];
+
+const MaxAbandonRunningRunRecords = 50;
 
 function stageIndex(stage: BookStage): number {
   return BookStageOrder.indexOf(stage);
@@ -1082,6 +1089,30 @@ function sortNewestCheckpoints(
   );
 }
 
+function runCatalogEntryTimestamp(entry: BookJobRunCatalogEntry): string {
+  return entry.finishedAt ?? entry.startedAt;
+}
+
+function sortNewestRunCatalogEntries(
+  entries: readonly BookJobRunCatalogEntry[],
+): BookJobRunCatalogEntry[] {
+  return [...entries].sort((left, right) =>
+    runCatalogEntryTimestamp(right).localeCompare(runCatalogEntryTimestamp(left))
+  );
+}
+
+function checkpointRunIds(
+  checkpoints: readonly BookJobStageCheckpoint[],
+): string[] {
+  const runIds = new Set<string>();
+  for (const checkpoint of checkpoints) {
+    if (checkpoint.runId != null) {
+      runIds.add(checkpoint.runId);
+    }
+  }
+  return [...runIds];
+}
+
 function currentCheckpointBlocksRecoveredCandidate(
   checkpoint: BookJobStageCheckpoint | undefined,
 ): boolean {
@@ -1163,6 +1194,7 @@ export class FileBookJobStateRepository {
       process.env.QMD_GRAPHRAG_BOOK_LEASE_GENERATION,
     );
     const expectedToken = process.env.QMD_GRAPHRAG_BOOK_FENCING_TOKEN;
+    const currentBookId = process.env.QMD_GRAPHRAG_BOOK_ID;
     if (
       runId == null ||
       sessionId == null ||
@@ -1177,10 +1209,12 @@ export class FileBookJobStateRepository {
       DocumentIdentityCatalogSchema,
       EMPTY_DOCUMENT_IDENTITY_CATALOG,
     );
-    const identity = catalog.items.find((item) =>
-      item.documentId === documentId &&
-      (contentHash == null || item.contentHash === contentHash)
-    );
+    const identity = selectDocumentIdentityForFencedWrite({
+      catalog,
+      documentId,
+      contentHash,
+      currentBookId,
+    });
     if (identity == null || identity.canonicalBookId == null) {
       throw new Error(`document identity not found for fenced write: ${documentId}`);
     }
@@ -1604,8 +1638,17 @@ export class FileBookJobStateRepository {
       items: latestCheckpointByStage(mergedCheckpoints),
     });
 
-    await this.mergeLegacyRunRecords(oldBookId, newBookId, artifactIdMap);
-    await this.rewriteLegacyRunRecords(newBookId, artifactIdMap);
+    await this.mergeLegacyRunRecords(
+      oldBookId,
+      newBookId,
+      artifactIdMap,
+      checkpointRunIds(oldCheckpoints.items),
+    );
+    await this.rewriteLegacyRunRecords(
+      newBookId,
+      artifactIdMap,
+      checkpointRunIds(newCheckpoints.items),
+    );
   }
 
   private async archiveLegacyBookDirectory(
@@ -1666,43 +1709,33 @@ export class FileBookJobStateRepository {
     oldBookId: string,
     newBookId: string,
     artifactIdMap: Map<string, string>,
+    runIds: readonly string[],
   ): Promise<void> {
-    let entries: string[];
-    try {
-      entries = await readdir(join(this.bookDir(oldBookId), "runs"));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        return;
-      }
-      throw error;
-    }
-
+    const uniqueRunIds = [...new Set(runIds)];
+    if (uniqueRunIds.length === 0) return;
     await ensureDir(join(this.bookDir(newBookId), "runs"));
-    await Promise.all(
-      entries
-        .filter((entry) => entry.endsWith(".yaml"))
-        .map(async (entry) => {
-          const sourcePath = join(this.bookDir(oldBookId), "runs", entry);
-          const record = await readYamlFile(
-            sourcePath,
-            BookJobRunRecordSchema,
-            null,
-          );
-          if (record == null) {
-            return;
-          }
-          await writeYamlFile(join(this.bookDir(newBookId), "runs", entry), {
-            ...record,
-            bookId: newBookId,
-            artifactIds: remapArtifactIds(record.artifactIds, artifactIdMap),
-          });
-        }),
-    );
+    for (const runId of uniqueRunIds) {
+      const sourcePath = this.runRecordPath(oldBookId, runId);
+      const record = await readYamlFile(
+        sourcePath,
+        BookJobRunRecordSchema,
+        null,
+      );
+      if (record == null) {
+        continue;
+      }
+      await writeYamlFile(this.runRecordPath(newBookId, runId), {
+        ...record,
+        bookId: newBookId,
+        artifactIds: remapArtifactIds(record.artifactIds, artifactIdMap),
+      });
+    }
   }
 
   async recordDocumentChunks(input: RecordDocumentChunksInput): Promise<void> {
     await this.ensureLayout();
     await this.assertBatchBookLeaseForDocument(input.documentId, input.contentHash);
+    const currentBookId = process.env.QMD_GRAPHRAG_BOOK_ID;
     if (input.chunkIds.length === 0) {
       throw new Error(`document chunks cannot be empty: ${input.documentId}`);
     }
@@ -1713,9 +1746,11 @@ export class FileBookJobStateRepository {
       (catalog) => {
         let matched = false;
         const items = catalog.items.map((item) => {
-          const matchesIdentity =
-            item.documentId === input.documentId &&
-            item.contentHash === input.contentHash;
+          const matchesIdentity = isDocumentIdentityMatch(item, {
+            documentId: input.documentId,
+            contentHash: input.contentHash,
+            currentBookId,
+          });
           if (!matchesIdentity) return item;
           matched = true;
           return DocumentIdentityMapSchema.parse({
@@ -1741,6 +1776,7 @@ export class FileBookJobStateRepository {
   ): Promise<void> {
     await this.ensureLayout();
     await this.assertBatchBookLeaseForDocument(input.documentId, input.contentHash);
+    const currentBookId = process.env.QMD_GRAPHRAG_BOOK_ID;
     const relativePath = normalizePortableVaultRelativePath(input.relativePath);
     await updateYamlFile(
       this.documentIdentityCatalogPath(),
@@ -1749,9 +1785,11 @@ export class FileBookJobStateRepository {
       (catalog) => {
         let matched = false;
         const items = catalog.items.map((item) => {
-          const matchesIdentity =
-            item.documentId === input.documentId &&
-            item.contentHash === input.contentHash;
+          const matchesIdentity = isDocumentIdentityMatch(item, {
+            documentId: input.documentId,
+            contentHash: input.contentHash,
+            currentBookId,
+          });
           if (!matchesIdentity) return item;
           matched = true;
           return DocumentIdentityMapSchema.parse({
@@ -1935,7 +1973,6 @@ export class FileBookJobStateRepository {
         throw error;
       }
     }
-    await this.repairCheckpointRunRecordStageConsistency(bookId, list.items);
     const job = await this.getBookJob(bookId);
     return list.items.filter((checkpoint) =>
       checkpoint.bookId === bookId &&
@@ -2264,21 +2301,12 @@ export class FileBookJobStateRepository {
   }
 
   async listRunRecords(bookId: string): Promise<BookJobRunRecord[]> {
-    const catalog = await readYamlFile(
-      this.runCatalogPath(),
-      BookJobRunCatalogSchema,
-      EMPTY_RUN_CATALOG,
-    );
+    const catalog = await this.readRunCatalog();
     const runs = catalog.items.filter((item) => item.bookId === bookId);
-    const result = await Promise.all(
-      runs.map((item) =>
-        readYamlFile(
-          this.runRecordPath(bookId, item.runId),
-          BookJobRunRecordSchema,
-          null,
-        ),
-      ),
-    );
+    const result: Array<BookJobRunRecord | null> = [];
+    for (const item of runs) {
+      result.push(await this.readRunRecord(bookId, item.runId));
+    }
     return result.filter((item): item is BookJobRunRecord => item != null);
   }
 
@@ -2407,7 +2435,11 @@ export class FileBookJobStateRepository {
       })),
     });
 
-    await this.rewriteLegacyRunRecords(bookId, artifactIdMap);
+    await this.rewriteLegacyRunRecords(
+      bookId,
+      artifactIdMap,
+      checkpointRunIds(checkpoints.items),
+    );
     await this.removeLegacyBookCatalogEntries(oldBookId, bookId);
 
     await updateYamlFile(
@@ -2483,33 +2515,20 @@ export class FileBookJobStateRepository {
   private async rewriteLegacyRunRecords(
     bookId: string,
     artifactIdMap: Map<string, string>,
+    runIds: readonly string[],
   ): Promise<void> {
-    let entries: string[];
-    try {
-      entries = await readdir(join(this.bookDir(bookId), "runs"));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        return;
+    for (const runId of new Set(runIds)) {
+      const path = this.runRecordPath(bookId, runId);
+      const record = await readYamlFile(path, BookJobRunRecordSchema, null);
+      if (record == null) {
+        continue;
       }
-      throw error;
+      await writeYamlFile(path, {
+        ...record,
+        bookId,
+        artifactIds: remapArtifactIds(record.artifactIds, artifactIdMap),
+      });
     }
-
-    await Promise.all(
-      entries
-        .filter((entry) => entry.endsWith(".yaml"))
-        .map(async (entry) => {
-          const path = join(this.bookDir(bookId), "runs", entry);
-          const record = await readYamlFile(path, BookJobRunRecordSchema, null);
-          if (record == null) {
-            return;
-          }
-          await writeYamlFile(path, {
-            ...record,
-            bookId,
-            artifactIds: remapArtifactIds(record.artifactIds, artifactIdMap),
-          });
-        }),
-    );
   }
 
   private async rewriteRunCatalogBookId(
@@ -2653,7 +2672,10 @@ export class FileBookJobStateRepository {
     job: BookJob | null,
   ): Promise<BookJobStageCheckpoint[]> {
     const candidates = [...currentCheckpoints];
-    for (const run of await this.listRunRecords(bookId)) {
+    for (const run of await this.listRunRecordsByIds(
+      bookId,
+      checkpointRunIds(currentCheckpoints),
+    )) {
       if (run.bookId !== bookId) continue;
       const checkpoint = runRecordToStageCheckpoint(run, job);
       if (checkpoint != null) {
@@ -3128,23 +3150,30 @@ export class FileBookJobStateRepository {
     exceptRunId: string;
     finishedAt: string;
   }): Promise<void> {
-    const runs = await this.listRunRecords(input.bookId);
+    const runs = await this.listRunCatalogEntries(
+      input.bookId,
+      (entry) =>
+        entry.stage === input.stage &&
+        entry.status === "running" &&
+        entry.runId !== input.exceptRunId,
+      MaxAbandonRunningRunRecords,
+    );
     for (const run of runs) {
-      if (
-        run.stage !== input.stage ||
-        run.status !== "running" ||
-        run.runId === input.exceptRunId
-      ) {
-        continue;
-      }
       await this.appendRunRecord({
-        ...run,
+        schemaVersion: SchemaVersion,
+        runId: run.runId,
+        bookId: input.bookId,
+        stage: input.stage,
         status: "abandoned",
+        attemptCount: 0,
+        startedAt: run.startedAt,
         finishedAt: input.finishedAt,
+        inputFingerprint: "unknown-catalog-running-abandoned",
+        artifactIds: [],
         errorSummary: "run superseded by successful stage completion",
         metadata: {
-          ...(run.metadata ?? {}),
           supersededByRunId: input.exceptRunId,
+          abandonedFromCatalogEntry: true,
         },
       });
     }
@@ -3266,6 +3295,14 @@ export class FileBookJobStateRepository {
     return join(this.catalogDir, "runs.yaml");
   }
 
+  private async readRunCatalog(): Promise<BookJobRunCatalog> {
+    return readYamlFile(
+      this.runCatalogPath(),
+      BookJobRunCatalogSchema,
+      EMPTY_RUN_CATALOG,
+    );
+  }
+
   private bookJobPath(bookId: string): string {
     return join(this.bookDir(bookId), "job.yaml");
   }
@@ -3280,6 +3317,42 @@ export class FileBookJobStateRepository {
 
   private runRecordPath(bookId: string, runId: string): string {
     return join(this.bookDir(bookId), "runs", `${runId}.yaml`);
+  }
+
+  private async readRunRecord(
+    bookId: string,
+    runId: string,
+  ): Promise<BookJobRunRecord | null> {
+    return readYamlFile(
+      this.runRecordPath(bookId, runId),
+      BookJobRunRecordSchema,
+      null,
+    );
+  }
+
+  private async listRunRecordsByIds(
+    bookId: string,
+    runIds: readonly string[],
+  ): Promise<BookJobRunRecord[]> {
+    const result: BookJobRunRecord[] = [];
+    for (const runId of new Set(runIds)) {
+      const record = await this.readRunRecord(bookId, runId);
+      if (record?.bookId === bookId) {
+        result.push(record);
+      }
+    }
+    return result;
+  }
+
+  private async listRunCatalogEntries(
+    bookId: string,
+    predicate: (entry: BookJobRunCatalogEntry) => boolean,
+    maxRecords: number,
+  ): Promise<BookJobRunCatalogEntry[]> {
+    const catalog = await this.readRunCatalog();
+    return sortNewestRunCatalogEntries(
+      catalog.items.filter((entry) => entry.bookId === bookId && predicate(entry)),
+    ).slice(0, maxRecords);
   }
 
   private absoluteFromRoot(path: string): string {

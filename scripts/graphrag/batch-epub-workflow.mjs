@@ -41,9 +41,68 @@ import {
 } from "./batch-failure-classifier.mjs";
 import { hydrateBatchCheckpoint } from "./batch-checkpoint-hydration.mjs";
 import {
+  buildBookDistributionManifest,
+} from "./book-distribution-manifest.mjs";
+import {
+  ClaimPreflightDeferredError,
+  claimPreflightBlockerCanDefer,
+  claimPreflightDeferralKey,
+  claimPreflightDelayMs,
+} from "./claim-preflight-policy.mjs";
+import {
+  claimStartCheckpointChanged,
+  claimStartConflictMetadata,
+} from "./claim-start-policy.mjs";
+import {
+  durableChecksumReopenDecision,
+} from "./durable-checksum-reopen-policy.mjs";
+import {
+  durablePreflightDeferReopenDecision,
+} from "./durable-preflight-defer-policy.mjs";
+import {
   durableTargetNormalizationEvidence,
   normalizeDurableTargetForMapping,
 } from "./durable-target-normalizer.mjs";
+import {
+  scanEventLogRecoveryNeed,
+} from "./event-log-recovery-policy.mjs";
+import {
+  graphOutputStatsCorruptPrimaryPath,
+  graphOutputStatsCorruptSortKey,
+  graphOutputStatsRepairDecision,
+} from "./graph-output-stats-repair-policy.mjs";
+import {
+  migrateRepairLimitBlocker,
+  migrateRepairLimits,
+  migrateRepairPreflightOptions,
+  migrateRepairStartupUpdate,
+} from "./migrate-repair-boundary.mjs";
+import {
+  alreadyReopenedFingerprintCanRepeat,
+} from "./provider-auth-reopen-policy.mjs";
+import {
+  selectProviderRuntimeEnv,
+} from "./provider-env-policy.mjs";
+import {
+  qmdIndexLockedCommandNamesFor,
+  qmdMultiGetJsonArgsForNormalizedPath,
+  qmdValidationOutputMaxBufferBytes,
+} from "./qmd-validation-policy.mjs";
+import {
+  isResumeTerminalReady,
+  resumePassEventStatus,
+} from "./resume-status-policy.mjs";
+import {
+  diagnosticProjectionOnly,
+} from "./recovery-projection-policy.mjs";
+import {
+  shouldScanBookScopedStartupTarget,
+  shouldUsePersistedSummaryEvidence,
+} from "./runner-startup-scope-policy.mjs";
+import {
+  lockOwnerHasRecoveryFence,
+  staleLockRecoveryDecision,
+} from "./stale-lock-recovery-policy.mjs";
 import {
   buildStartupPreflightFailureManifest,
   createStartupRecoverySchema,
@@ -57,6 +116,7 @@ import {
   noteStartupDegradedTarget,
   noteStartupPrimaryTarget,
   recoveryDecisionForStartupSummary,
+  startupRecoveryMergePolicy,
   startupRecoveryFromStats,
 } from "./runner-startup-preflight.mjs";
 
@@ -96,6 +156,8 @@ const { values } = parseArgs({
     "jina-provider-concurrency": { type: "string", default: "2" },
     "local-cpu-concurrency": { type: "string", default: "2" },
     "migrate-only": { type: "boolean", default: false },
+    "migrate-repair-max-scanned-targets": { type: "string", default: "200" },
+    "migrate-repair-max-mutations": { type: "string", default: "1" },
     "status-json": { type: "boolean", default: false },
     "skip-dotenv": { type: "boolean", default: false },
     "fail-fast": { type: "boolean", default: false },
@@ -182,6 +244,10 @@ const configuredDurableTempStaleMs = Number.parseInt(
   process.env.QMD_GRAPHRAG_TEST_DURABLE_TEMP_STALE_MS ?? "",
   10,
 );
+const configuredProviderSlotAcquireWaitMs = Number.parseInt(
+  process.env.QMD_GRAPHRAG_TEST_PROVIDER_SLOT_ACQUIRE_WAIT_MS ?? "",
+  10,
+);
 const testHooksEnabled = process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS === "1";
 const testRenameEnoentOncePattern = testHooksEnabled
   ? process.env.QMD_GRAPHRAG_TEST_RENAME_ENOENT_ONCE_PATTERN ?? ""
@@ -216,6 +282,10 @@ const testRenameEnoentAfterMatches = testHooksEnabled
       ) || 0,
     )
   : 0;
+const testClaimStartCheckpointChangeItemId = testHooksEnabled
+  ? process.env.QMD_GRAPHRAG_TEST_CLAIM_START_CHECKPOINT_CHANGE_ITEM_ID ?? ""
+  : "";
+let testClaimStartCheckpointChangeInjected = false;
 let testRenameEnoentInjected = false;
 let testRenameEnoentMatchCount = 0;
 let testTempIdInjected = false;
@@ -249,15 +319,26 @@ const durableAdapterContract = Object.freeze({
   ],
 });
 const statusJsonDurableDiagnostics = [];
-const providerRequestStartupScanLimit = 200;
 const providerRequestStartupSampleLimit = 10;
-const providerSlotAcquireWaitMs = Math.max(jsonFileLockWaitMs, 300000);
+const providerSlotAcquireWaitMs = testHooksEnabled &&
+  Number.isInteger(configuredProviderSlotAcquireWaitMs) &&
+  configuredProviderSlotAcquireWaitMs > 0
+  ? configuredProviderSlotAcquireWaitMs
+  : Math.max(jsonFileLockWaitMs, 300000);
 const qmdIndexFileLockStaleMs = 120000;
 const qmdIndexFileLockWaitMs = Math.max(qmdIndexFileLockStaleMs * 2, 300000);
 const failFast = Boolean(values["fail-fast"]);
 const migrateOnly = Boolean(values["migrate-only"]);
+const migrateRepair = migrateRepairLimits({
+  maxScannedTargets: values["migrate-repair-max-scanned-targets"],
+  maxMutationCount: values["migrate-repair-max-mutations"],
+});
 const statusJson = Boolean(values["status-json"]);
 const initialEnvNames = new Set(Object.keys(process.env));
+let providerRuntimeEnvSelection = {
+  envPatch: {},
+  sources: {},
+};
 const extraExactRedactions = new Map();
 let coordinatorLease = null;
 let coordinatorHeartbeatTimer = null;
@@ -403,7 +484,7 @@ const durableTargetMappingTable = [
     targetMappingOwner: "providerRequestFingerprint",
     targetFamily: "provider_request_fingerprint",
     startupCriticality: "historical_observation",
-    runnerStartPreflightMode: "read_only_capped_diagnostic",
+    runnerStartPreflightMode: "read_only_full_scan_diagnostic",
     normalRunnerPrimaryQuarantine: false,
     preflightScopes: [{ path: "graph_vault/catalog/provider-requests" }],
   },
@@ -434,6 +515,13 @@ const durableTargetMappingTable = [
     durableKind: "json",
     targetMappingOwner: "qmd",
     preflightScopes: [{ path: "graph_vault/books/{bookId}/qmd" }],
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/distribution_manifest\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "bookDistribution",
+    preflightScopes: [{ path: "graph_vault/books/{bookId}" }],
   },
   {
     pattern: /^graph_vault\/books\/[^/]+\/output\/qmd_output_manifest\.json$/,
@@ -697,7 +785,9 @@ const requiredCommandCheckNames = requiredCommandCheckNamesForRuntime();
 const qmdNativeCommandCheckNames = requiredCommandCheckNames.filter(
   (name) => !graphQueryCommandCheckNames.includes(name),
 );
-const qmdIndexLockedCommandNames = new Set(requiredCommandCheckNames);
+const qmdIndexLockedCommandNames = qmdIndexLockedCommandNamesFor(
+  requiredCommandCheckNames,
+);
 const expectedCommandCheckCount = requiredCommandCheckNames.length;
 const expectedQmdNativeCommandCheckCount = qmdNativeCommandCheckNames.length;
 const requiredLanceDbTables = [
@@ -705,6 +795,10 @@ const requiredLanceDbTables = [
   "community_full_content.lance",
   "text_unit_text.lance",
 ];
+const durableGraphOutputJsonArtifactKinds = new Set([
+  "graphrag_context_json",
+  "graphrag_stats_json",
+]);
 
 const JsonPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 const JsonValueSchema = z.lazy(() =>
@@ -796,6 +890,12 @@ const DurableStateDiagnosticSchema = z.object({
   maxRunnerStartScannedTargets: z.number().int().positive().optional(),
   maxRunnerStartReportedSamples: z.number().int().positive().optional(),
   maxRunnerStartMutationCount: z.number().int().nonnegative().optional(),
+  repairBoundary: z.string().min(1).optional(),
+  repairScope: z.string().min(1).optional(),
+  repairTargetFamily: z.string().min(1).optional(),
+  maxScannedTargets: z.number().int().positive().optional(),
+  maxMutationCount: z.number().int().nonnegative().optional(),
+  limitHit: z.boolean().optional(),
   evidenceIncomplete: z.boolean().optional(),
   evidenceIncompleteReason: z.string().min(1).optional(),
   unavailableFieldSentinels: z.array(z.string().min(1)).optional(),
@@ -974,6 +1074,7 @@ const QmdBuildManifestSchema = z.object({
   sourceRelativePath: BatchProjectRelativeLocatorSchema,
   sourceHash: z.string().min(1),
   normalizedPath: BatchProjectRelativeLocatorSchema,
+  canonicalBookNormalizedPath: BatchProjectRelativeLocatorSchema.optional(),
   normalizedContentHash: z.string().min(1),
   qmdIndexLocator: BatchProjectRelativeLocatorSchema,
   qmdIndexHash: z.string().min(1),
@@ -1467,6 +1568,23 @@ const BatchRecoverySummaryItemSchema = z.object({
   settingsProjectionReason: z.string().min(1).optional(),
   localArtifactGateRepairRequiresRealRebuild: z.boolean().optional(),
   localArtifactGateRepairRebuildStage: z.string().min(1).optional(),
+  durableChecksumReopenDecision: z.string().min(1).optional(),
+  durableChecksumReopenEligible: z.boolean().optional(),
+  durableChecksumReopenReason: z.string().min(1).optional(),
+  durableChecksumReopenBlockedReason: z.string().min(1).optional(),
+  durableChecksumReopenTargetLocator: z.string().min(1).optional(),
+  durableChecksumReopenSidecarTargetLocator: z.string().min(1).optional(),
+  durableChecksumReopenChecksumMetaLocator: z.string().min(1).optional(),
+  durableChecksumReopenChecksum: z.string().min(1).optional(),
+  durableChecksumReopenChecksumRecoveryDecision: z.string().min(1).optional(),
+  durablePreflightDeferReopenDecision: z.string().min(1).optional(),
+  durablePreflightDeferReopenEligible: z.boolean().optional(),
+  durablePreflightDeferReopenReason: z.string().min(1).optional(),
+  durablePreflightDeferReopenBlockedReason: z.string().min(1).optional(),
+  durablePreflightDeferReopenTargetLocator: z.string().min(1).optional(),
+  durablePreflightDeferReopenOperationId: z.string().min(1).optional(),
+  durablePreflightDeferReopenRunnerSessionId:
+    z.string().min(1).optional(),
   providerAuthReopenDecision: z.string().min(1).optional(),
   providerAuthReopenEligible: z.boolean().optional(),
   providerAuthReopenReason: z.string().min(1).optional(),
@@ -1738,6 +1856,105 @@ function recoverLegacyResponsesOutputNoneCheckpoint(item, checkpoint) {
   };
 }
 
+function hasBatchStopEventForRunner(checkpoint) {
+  if (!existsSync(eventsPath)) return false;
+  const generation = checkpoint.leaseGeneration ??
+    checkpoint.metadata?.coordinatorGeneration;
+  const sessionIds = new Set([
+    checkpoint.runnerSessionId,
+    checkpoint.metadata?.runnerSessionId,
+  ].filter((value) => typeof value === "string" && value.length > 0));
+  const eventItems = [];
+  for (const line of readFileSync(eventsPath, "utf8").split(/\r?\n/u)) {
+    if (!line.trim()) continue;
+    try {
+      eventItems.push(JSON.parse(line));
+    } catch {
+      continue;
+    }
+  }
+  for (const eventItem of eventItems) {
+    if (
+      eventItem.event === "item_failed" &&
+      eventItem.itemId === checkpoint.itemId &&
+      eventItem.message === checkpoint.errorSummary &&
+      eventItem.failedStage === checkpoint.failedStage &&
+      eventItem.coordinatorGeneration === generation &&
+      typeof eventItem.metadata?.runnerSessionId === "string"
+    ) {
+      sessionIds.add(eventItem.metadata.runnerSessionId);
+    }
+  }
+  return eventItems.some((eventItem) =>
+    eventItem.event === "batch_stop_requested" &&
+    eventItem.metadata?.reason === "runner_signal_SIGTERM" &&
+    sessionIds.has(eventItem.runnerSessionId) &&
+    eventItem.coordinatorGeneration === generation
+  );
+}
+
+function recoverResumeEmptyStdoutAfterBatchStopCheckpoint(item, checkpoint) {
+  if (
+    checkpoint?.status !== "failed" ||
+    checkpoint.failureKind !== "local_state_integrity" ||
+    checkpoint.retryable !== false ||
+    checkpoint.recoveryDecision !== "stop_until_fixed" ||
+    checkpoint.failedStage !== "resume-book-1" ||
+    checkpoint.errorSummary !== "resume-book produced empty stdout"
+  ) {
+    return checkpoint;
+  }
+  const passedResume = (checkpoint.commandChecks ?? []).find((check) =>
+    check.name === "resume-book-1" &&
+    check.status === "passed" &&
+    check.stdoutBytes === 0 &&
+    check.stderrBytes === 0
+  );
+  if (passedResume == null || !hasBatchStopEventForRunner(checkpoint)) {
+    return checkpoint;
+  }
+  const recovered = {
+    ...checkpoint,
+    status: "pending",
+    failedAt: undefined,
+    errorSummary: "batch stop requested before command: runner_signal_SIGTERM",
+    failureKind: undefined,
+    retryable: undefined,
+    retryExhausted: undefined,
+    recoveryDecision: "continue_pending",
+    nextRetryAt: undefined,
+    retryDelaySeconds: undefined,
+    runnerHeartbeatAt: now(),
+    commandChecks: [
+      ...checkpoint.commandChecks,
+      batchStopInterruptError("resume-book-1").commandCheck,
+    ],
+    metadata: withoutUndefined({
+      ...(checkpoint.metadata ?? {}),
+      interruptedByBatchStop: true,
+      batchStopReason: "runner_signal_SIGTERM",
+      recoveredResumeEmptyStdoutAfterBatchStop: true,
+      originalFailureKind: checkpoint.failureKind,
+      originalRecoveryDecision: checkpoint.recoveryDecision,
+      waitingForProviderRecovery: false,
+      failureKind: undefined,
+    }),
+  };
+  event({
+    itemId: item.itemId,
+    event: "item_interrupted_by_batch_stop_recovered",
+    status: "pending",
+    recoveryDecision: "continue_pending",
+    failedStage: recovered.failedStage,
+    message: recovered.errorSummary,
+    metadata: {
+      previousErrorSummary: checkpoint.errorSummary,
+      activeCommand: checkpoint.activeCommand,
+    },
+  });
+  return recovered;
+}
+
 function checkpointHasLocalArtifactGateFailure(checkpoint) {
   return isLocalArtifactGateFailureText(checkpointFailureText(checkpoint));
 }
@@ -1863,6 +2080,9 @@ function providerAuthConfig() {
 }
 
 function providerAuthSourceForKey(key, value, rootEnv, vaultEnv) {
+  if (providerRuntimeEnvSelection.sources[key] != null) {
+    return providerRuntimeEnvSelection.sources[key];
+  }
   const rootValue = rootEnv[key];
   const vaultValue = vaultEnv[key];
   const rootHasValue = typeof rootValue === "string" && rootValue.trim() !== "";
@@ -2025,6 +2245,11 @@ function providerAuthFailureFingerprint(checkpoint) {
   return undefined;
 }
 
+function providerAuthFailureReadinessStatus(checkpoint) {
+  const value = checkpoint?.metadata?.providerAuthReadinessStatus;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
 function providerAuthReopenDecision(checkpoint, context = providerAuthContext()) {
   const candidate = checkpoint?.status === "failed" &&
     checkpoint.retryable === false &&
@@ -2080,7 +2305,16 @@ function providerAuthReopenDecision(checkpoint, context = providerAuthContext())
       reason: "current_provider_auth_fingerprint_matches_failure",
     };
   }
-  if (reopenedFingerprints.includes(currentFingerprint)) {
+  if (
+    reopenedFingerprints.includes(currentFingerprint) &&
+    !alreadyReopenedFingerprintCanRepeat({
+      currentFingerprint,
+      failureFingerprint,
+      reopenedFingerprints,
+      latestFailureReadinessStatus:
+        providerAuthFailureReadinessStatus(checkpoint),
+    })
+  ) {
     return {
       ...base,
       reopen: false,
@@ -2333,6 +2567,293 @@ function applyProviderAuthReopenPass(items, checkpoints) {
         return withBuildStatusSnapshot(
           activeItem,
           reopenProviderAuthCheckpoint(activeItem, current, currentDecision),
+        );
+      },
+    );
+    checkpoints.set(item.itemId, reopened);
+    reopenedCount += 1;
+  }
+  return reopenedCount;
+}
+
+function durableChecksumReopenMetadata(decision, eligible) {
+  return withoutUndefined({
+    durableChecksumReopenDecision: decision.decision,
+    durableChecksumReopenEligible: eligible,
+    durableChecksumReopenReason: eligible ? decision.reason : undefined,
+    durableChecksumReopenBlockedReason: eligible ? undefined : decision.reason,
+    durableChecksumReopenTargetLocator: decision.targetLocator,
+    durableChecksumReopenSidecarTargetLocator: decision.sidecarTargetLocator,
+    durableChecksumReopenChecksumMetaLocator: decision.checksumMetaLocator,
+    durableChecksumReopenChecksum: decision.checksum,
+    durableChecksumReopenChecksumRecoveryDecision:
+      decision.checksumRecoveryDecision,
+  });
+}
+
+function durablePreflightDeferReopenMetadata(decision, eligible) {
+  return withoutUndefined({
+    durablePreflightDeferReopenDecision: decision.decision,
+    durablePreflightDeferReopenEligible: eligible,
+    durablePreflightDeferReopenReason: eligible ? decision.reason : undefined,
+    durablePreflightDeferReopenBlockedReason:
+      eligible ? undefined : decision.reason,
+    durablePreflightDeferReopenTargetLocator: decision.targetLocator,
+    durablePreflightDeferReopenOperationId: decision.operationId,
+    durablePreflightDeferReopenRunnerSessionId: decision.runnerSessionId,
+  });
+}
+
+function reopenDurablePreflightDeferredCheckpoint(item, checkpoint, decision) {
+  const metadata = withoutUndefined({
+    ...(checkpoint.metadata ?? {}),
+    reopenedFromStatus: checkpoint.status,
+    reopenedToStatus: "pending",
+    reopenedFromRecoveryDecision:
+      checkpoint.recoveryDecision ?? "stop_until_fixed",
+    activeCommand: checkpoint.activeCommand ?? checkpoint.currentCommand ??
+      checkpoint.failedStage,
+    normalCommandChecksRequired: true,
+    waitingForProviderRecovery: false,
+    ...durablePreflightDeferReopenMetadata(decision, true),
+  });
+  event({
+    itemId: item.itemId,
+    event: "item_durable_preflight_deferred_reopened",
+    status: "pending",
+    failureKind: checkpoint.failureKind ?? "local_state_integrity",
+    retryable: false,
+    recoveryDecision: "continue_pending",
+    localFailureClass: checkpoint.localFailureClass,
+    failedStage: checkpoint.failedStage,
+    targetLocator: decision.targetLocator,
+    operationId: decision.operationId,
+    message: checkpoint.errorSummary,
+    metadata,
+  });
+  return {
+    ...checkpoint,
+    status: "pending",
+    failedAt: undefined,
+    errorSummary: undefined,
+    failureKind: undefined,
+    retryable: undefined,
+    retryExhausted: undefined,
+    recoveryDecision: "continue_pending",
+    localFailureClass: undefined,
+    targetLocator: undefined,
+    redactedEvidenceLocator: undefined,
+    lane: undefined,
+    targetMappingOwner: undefined,
+    laneTimeoutMs: undefined,
+    releaseOn: undefined,
+    operationId: undefined,
+    completedPublishRule: undefined,
+    lockOwnerEvidence: undefined,
+    durableMode: undefined,
+    failedStage: undefined,
+    activeCommand: checkpoint.activeCommand ?? checkpoint.currentCommand ??
+      checkpoint.failedStage,
+    currentCommand: undefined,
+    currentCommandStartedAt: undefined,
+    nextRetryAt: undefined,
+    retryDelaySeconds: undefined,
+    runnerSessionId: undefined,
+    runnerHost: undefined,
+    runnerPid: undefined,
+    runnerHeartbeatAt: now(),
+    commandChecks: [],
+    metadata,
+  };
+}
+
+function applyDurablePreflightDeferReopenPass(items, checkpoints) {
+  let reopenedCount = 0;
+  for (const item of items) {
+    const checkpoint = checkpoints.get(item.itemId);
+    const decision = durablePreflightDeferReopenDecision({
+      checkpoint,
+      projectRoot: root,
+    });
+    if (!decision.candidate) continue;
+    if (!decision.reopen) {
+      event({
+        itemId: item.itemId,
+        event: "item_durable_preflight_defer_reopen_blocked",
+        status: "failed",
+        failureKind: checkpoint.failureKind ?? "local_state_integrity",
+        retryable: false,
+        recoveryDecision: "stop_until_fixed",
+        localFailureClass: checkpoint.localFailureClass,
+        failedStage: checkpoint.failedStage,
+        targetLocator: decision.targetLocator,
+        message: checkpoint.errorSummary,
+        metadata: durablePreflightDeferReopenMetadata(decision, false),
+      });
+      continue;
+    }
+    const reopened = lockedReadWriteTypedJson(
+      itemPath(item),
+      BatchItemCheckpointSchema,
+      (loaded) => {
+        const current = loaded ?? checkpoint;
+        if (
+          current.status !== checkpoint.status ||
+          current.attempts !== checkpoint.attempts ||
+          current.failedAt !== checkpoint.failedAt ||
+          current.recoveryDecision !== checkpoint.recoveryDecision ||
+          current.localFailureClass !== checkpoint.localFailureClass ||
+          current.failedStage !== checkpoint.failedStage ||
+          current.runnerSessionId !== checkpoint.runnerSessionId ||
+          current.runnerHeartbeatAt !== checkpoint.runnerHeartbeatAt
+        ) {
+          throw new Error(
+            `checkpoint changed before durable preflight reopen; refusing duplicate runner for ${item.itemId}`,
+          );
+        }
+        const currentDecision = durablePreflightDeferReopenDecision({
+          checkpoint: current,
+          projectRoot: root,
+        });
+        if (!currentDecision.reopen) {
+          throw new Error(
+            `durable preflight reopen became ineligible while locked for ${item.itemId}: ` +
+            `${currentDecision.decision ?? "not_candidate"}`,
+          );
+        }
+        const activeItem = runtimeItemForCheckpoint(item, current);
+        return withBuildStatusSnapshot(
+          activeItem,
+          reopenDurablePreflightDeferredCheckpoint(
+            activeItem,
+            current,
+            currentDecision,
+          ),
+        );
+      },
+    );
+    checkpoints.set(item.itemId, reopened);
+    reopenedCount += 1;
+  }
+  return reopenedCount;
+}
+
+function reopenDurableChecksumCheckpoint(item, checkpoint, decision) {
+  const metadata = withoutUndefined({
+    ...(checkpoint.metadata ?? {}),
+    reopenedFromStatus: checkpoint.status,
+    reopenedToStatus: "pending",
+    reopenedFromRecoveryDecision:
+      checkpoint.recoveryDecision ?? "stop_until_fixed",
+    activeCommand: checkpoint.activeCommand ?? checkpoint.currentCommand ??
+      checkpoint.failedStage,
+    normalCommandChecksRequired: true,
+    waitingForProviderRecovery: false,
+    ...durableChecksumReopenMetadata(decision, true),
+  });
+  event({
+    itemId: item.itemId,
+    event: "item_durable_checksum_repaired_reopened",
+    status: "pending",
+    failureKind: checkpoint.failureKind ?? "local_state_integrity",
+    retryable: false,
+    recoveryDecision: "continue_pending",
+    localFailureClass: checkpoint.localFailureClass,
+    failedStage: checkpoint.failedStage,
+    targetLocator: decision.targetLocator,
+    sidecarTargetLocator: decision.sidecarTargetLocator,
+    checksumActual: decision.checksum,
+    checksumRecoveryDecision: decision.checksumRecoveryDecision,
+    message: checkpoint.errorSummary,
+    metadata,
+  });
+  return {
+    ...checkpoint,
+    status: "pending",
+    failedAt: undefined,
+    errorSummary: undefined,
+    failureKind: undefined,
+    retryable: undefined,
+    retryExhausted: undefined,
+    recoveryDecision: "continue_pending",
+    localFailureClass: undefined,
+    checksumRecoveryDecision: undefined,
+    failedStage: undefined,
+    activeCommand: checkpoint.activeCommand ?? checkpoint.currentCommand ??
+      checkpoint.failedStage,
+    currentCommand: undefined,
+    currentCommandStartedAt: undefined,
+    nextRetryAt: undefined,
+    retryDelaySeconds: undefined,
+    runnerSessionId: undefined,
+    runnerHost: undefined,
+    runnerPid: undefined,
+    runnerHeartbeatAt: now(),
+    commandChecks: [],
+    metadata,
+  };
+}
+
+function applyDurableChecksumReopenPass(items, checkpoints) {
+  let reopenedCount = 0;
+  for (const item of items) {
+    const checkpoint = checkpoints.get(item.itemId);
+    const decision = durableChecksumReopenDecision({
+      checkpoint,
+      projectRoot: root,
+    });
+    if (!decision.candidate) continue;
+    if (!decision.reopen) {
+      event({
+        itemId: item.itemId,
+        event: "item_durable_checksum_reopen_blocked",
+        status: "failed",
+        failureKind: checkpoint.failureKind ?? "local_state_integrity",
+        retryable: false,
+        recoveryDecision: "stop_until_fixed",
+        localFailureClass: checkpoint.localFailureClass,
+        failedStage: checkpoint.failedStage,
+        targetLocator: decision.targetLocator,
+        checksumActual: decision.checksumActual,
+        checksumExpected: decision.checksumExpected,
+        checksumRecoveryDecision: decision.checksumRecoveryDecision,
+        message: checkpoint.errorSummary,
+        metadata: durableChecksumReopenMetadata(decision, false),
+      });
+      continue;
+    }
+    const reopened = lockedReadWriteTypedJson(
+      itemPath(item),
+      BatchItemCheckpointSchema,
+      (loaded) => {
+        const current = loaded ?? checkpoint;
+        if (
+          current.status !== checkpoint.status ||
+          current.attempts !== checkpoint.attempts ||
+          current.failedAt !== checkpoint.failedAt ||
+          current.recoveryDecision !== checkpoint.recoveryDecision ||
+          current.localFailureClass !== checkpoint.localFailureClass ||
+          current.runnerSessionId !== checkpoint.runnerSessionId ||
+          current.runnerHeartbeatAt !== checkpoint.runnerHeartbeatAt
+        ) {
+          throw new Error(
+            `checkpoint changed before durable checksum reopen; refusing duplicate runner for ${item.itemId}`,
+          );
+        }
+        const currentDecision = durableChecksumReopenDecision({
+          checkpoint: current,
+          projectRoot: root,
+        });
+        if (!currentDecision.reopen) {
+          throw new Error(
+            `durable checksum reopen became ineligible while locked for ${item.itemId}: ` +
+            `${currentDecision.decision ?? "not_candidate"}`,
+          );
+        }
+        const activeItem = runtimeItemForCheckpoint(item, current);
+        return withBuildStatusSnapshot(
+          activeItem,
+          reopenDurableChecksumCheckpoint(activeItem, current, currentDecision),
         );
       },
     );
@@ -3148,6 +3669,12 @@ function durableProjection(source) {
     maxRunnerStartScannedTargets: field("maxRunnerStartScannedTargets"),
     maxRunnerStartReportedSamples: field("maxRunnerStartReportedSamples"),
     maxRunnerStartMutationCount: field("maxRunnerStartMutationCount"),
+    repairBoundary: field("repairBoundary"),
+    repairScope: field("repairScope"),
+    repairTargetFamily: field("repairTargetFamily"),
+    maxScannedTargets: field("maxScannedTargets"),
+    maxMutationCount: field("maxMutationCount"),
+    limitHit: field("limitHit"),
     evidenceIncomplete:
       field("evidenceIncomplete"),
     evidenceIncompleteReason:
@@ -3784,14 +4311,25 @@ function activeSubprocessRecords() {
   try {
     return readdirSync(subprocessRoot)
       .filter(isDurablePrimaryJsonEntry)
-      .map((name) => readTypedJsonIfExists(
+      .map((name) => readTypedJsonIfExistsLazy(
         join(subprocessRoot, name),
         SubprocessRecordSchema,
+        (raw) => raw?.status === "running",
       ))
       .filter(Boolean)
       .filter((record) => record.status === "running");
   } catch {
     return [];
+  }
+}
+
+function shouldReconcileRuntimeRecord(directory, entry) {
+  if (directory !== subprocessRoot) return true;
+  try {
+    const raw = JSON.parse(readFileSync(join(directory, entry), "utf8"));
+    return raw?.status === "running";
+  } catch {
+    return true;
   }
 }
 
@@ -3915,6 +4453,47 @@ function releaseBookLease(lease, status = "running") {
   });
 }
 
+function maybeInjectClaimStartCheckpointChange(item) {
+  if (
+    !testHooksEnabled ||
+    testClaimStartCheckpointChangeInjected ||
+    testClaimStartCheckpointChangeItemId === "" ||
+    testClaimStartCheckpointChangeItemId !== item.itemId
+  ) {
+    return;
+  }
+  testClaimStartCheckpointChangeInjected = true;
+  const path = itemPath(item);
+  let injected = false;
+  withJsonFileLock(path, () => {
+    const current = existsSync(path)
+      ? BatchItemCheckpointSchema.partial().parse(readJson(path))
+      : null;
+    if (current == null || current.status !== "pending") return;
+    injected = true;
+    writeJsonAtomicWithValue(path, {
+      ...current,
+      runnerHeartbeatAt: now(),
+      metadata: {
+        ...(current.metadata ?? {}),
+        testClaimStartCheckpointChangeInjected: true,
+      },
+    });
+  });
+  if (injected) {
+    event({
+      itemId: item.itemId,
+      event: "test_claim_start_checkpoint_change_injected",
+      status: "pending",
+      recoveryDecision: "continue_pending",
+      metadata: {
+        reason: "test_hook",
+        expectedItemId: testClaimStartCheckpointChangeItemId,
+      },
+    });
+  }
+}
+
 function subprocessRecordPath(subprocessId) {
   return join(subprocessRoot, `${subprocessId}.json`);
 }
@@ -3965,14 +4544,25 @@ function qmdIndexLockHasRecoveryFence(owner) {
     owner.operationId.length > 0;
 }
 
+function qmdIndexLockOwnerDeadSameHost(owner) {
+  const ownerHost = String(owner?.ownerHost ?? owner?.runnerHost ?? owner?.host ?? "");
+  const ownerPid = Number.parseInt(String(owner?.ownerPid ?? owner?.pid ?? ""), 10);
+  const ownerLocal = ownerHost === "" || ownerHost === runnerHost;
+  return ownerLocal && Number.isInteger(ownerPid) && ownerPid > 0 &&
+    !processAlive(ownerPid);
+}
+
 function removeStaleQmdIndexFileLock(lockPath) {
   try {
     const entry = statSync(lockPath);
-    if (Date.now() - entry.mtimeMs <= qmdIndexFileLockStaleMs) return false;
     const owner = readQmdIndexFileLockOwner(lockPath);
-    if (!qmdIndexLockOwnerExpired(owner, entry)) return false;
+    if (
+      !qmdIndexLockOwnerExpired(owner, entry) &&
+      !qmdIndexLockOwnerDeadSameHost(owner)
+    ) {
+      return false;
+    }
     if (!qmdIndexLockHasRecoveryFence(owner)) return false;
-    if (processAlive(owner.pid)) return false;
     unlinkSync(lockPath);
     fsyncDirectory(dirname(lockPath), owner);
     event({
@@ -4416,12 +5006,13 @@ const qmdIndexWriterLane = new AsyncSemaphore(1, "qmd_index_writer");
 
 async function withSemaphore(semaphore, metadata, callback) {
   const lease = await semaphore.acquire(metadata);
-  const providerSlotLease = await acquireProviderSlotLease(
-    semaphore,
-    metadata,
-    lease.waitMs,
-  );
+  let providerSlotLease = null;
   try {
+    providerSlotLease = await acquireProviderSlotLease(
+      semaphore,
+      metadata,
+      lease.waitMs,
+    );
     return await callback({ ...lease, providerSlotLease });
   } finally {
     releaseProviderSlotLease(providerSlotLease, metadata);
@@ -4566,16 +5157,28 @@ function registerExactRedactionsForEnv(parsed) {
 
 function loadDotenv() {
   if (values["skip-dotenv"]) return;
-  for (const dotenvPath of [projectDotenvPath, join(stateRoot, ".env")]) {
-    const parsed = parseDotenvFile(dotenvPath);
-    const authoritative = dotenvPath === join(stateRoot, ".env");
-    for (const [key, value] of Object.entries(parsed)) {
-      if (process.env[key] == null || (
-        authoritative && !initialEnvNames.has(key)
-      )) {
+  const projectEnv = parseDotenvFile(projectDotenvPath);
+  const graphVaultEnv = parseDotenvFile(join(stateRoot, ".env"));
+  const dotenvEntries = [
+    { env: projectEnv, authoritative: false },
+    { env: graphVaultEnv, authoritative: true },
+  ];
+  for (const { env, authoritative } of dotenvEntries) {
+    for (const [key, value] of Object.entries(env)) {
+      if (process.env[key] == null || (authoritative && !initialEnvNames.has(key))) {
         process.env[key] = value;
       }
     }
+  }
+  providerRuntimeEnvSelection = selectProviderRuntimeEnv({
+    env: process.env,
+    projectEnv,
+    graphVaultEnv,
+    observedEnvNames: providerAuthConfig().observedEnvNames,
+    initialEnvNames,
+  });
+  for (const [key, value] of Object.entries(providerRuntimeEnvSelection.envPatch)) {
+    process.env[key] = value;
   }
 }
 
@@ -5060,6 +5663,198 @@ function checksumCommitEvidenceMatches(path, checksum, meta) {
 
 function checksumMetaIsInvalid(path, checksum, meta) {
   return meta != null && meta.checksum !== checksum;
+}
+
+function graphOutputArtifactForDurableTarget(path) {
+  if (!migrateOnly) return null;
+  const stateRelativeLocator = relative(stateRoot, path).split(sep).join("/");
+  const match = /^books\/([^/]+)\/output\/([^/]+\.json)$/u
+    .exec(stateRelativeLocator);
+  if (match == null) return null;
+  const [, bookId] = match;
+  const artifactCatalog = readYamlSchemaIfExists(
+    join(stateRoot, "books", bookId, "artifacts.yaml"),
+    BookArtifactManifestListSchema,
+  );
+  const artifacts = artifactCatalog?.items ?? [];
+  const candidates = artifacts.filter((artifact) =>
+    artifact.bookId === bookId &&
+    durableGraphOutputJsonArtifactKinds.has(artifact.kind) &&
+    artifact.path === stateRelativeLocator
+  );
+  for (const artifact of sortedCurrentArtifacts(candidates)) {
+    try {
+      if (sha256File(path) !== artifact.contentHash) continue;
+      const parsed = JSON.parse(readFileSync(path, "utf8"));
+      if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        continue;
+      }
+      return artifact;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function graphOutputArtifactsForDurableTarget(path) {
+  if (!migrateOnly) return [];
+  const stateRelativeLocator = relative(stateRoot, path).split(sep).join("/");
+  const match = /^books\/([^/]+)\/output\/([^/]+\.json)$/u
+    .exec(stateRelativeLocator);
+  if (match == null) return [];
+  const [, bookId] = match;
+  const artifactCatalog = readYamlSchemaIfExists(
+    join(stateRoot, "books", bookId, "artifacts.yaml"),
+    BookArtifactManifestListSchema,
+  );
+  const artifacts = artifactCatalog?.items ?? [];
+  return sortedCurrentArtifacts(artifacts.filter((artifact) =>
+    artifact.bookId === bookId &&
+    durableGraphOutputJsonArtifactKinds.has(artifact.kind) &&
+    artifact.path === stateRelativeLocator
+  ));
+}
+
+function mutableGraphOutputStatsRepairDecision(path, parsed, options = {}) {
+  for (const artifact of graphOutputArtifactsForDurableTarget(path)) {
+    const decision = graphOutputStatsRepairDecision({
+      path,
+      stateRoot,
+      repairBoundary: migrateOnly ? "migrate_only" : "runner_start",
+      parsed,
+      artifact,
+      expectedChecksum: options.expectedChecksum,
+      checksumMeta: options.checksumMeta,
+    });
+    if (decision != null) return decision;
+  }
+  return null;
+}
+
+function eventGraphOutputStatsChecksumRefreshed(path, actual, expected, decision) {
+  event({
+    event: "graph_output_json_checksum_refreshed",
+    status: "pending",
+    checksumRecoveryDecision: decision.checksumRecoveryDecision,
+    metadata: {
+      locator: relative(root, path),
+      bookId: decision.bookId,
+      artifactId: decision.artifactId,
+      artifactKind: decision.artifactKind,
+      artifactStage: decision.artifactStage,
+      producerRunId: decision.producerRunId,
+      previousChecksum: expected,
+      checksum: actual,
+      checksumRecoveryDecision: decision.checksumRecoveryDecision,
+      reason: decision.reason,
+    },
+  });
+}
+
+function refreshMutableGraphOutputStatsChecksum(path, actual, expected, decision) {
+  backfillDurableChecksum(
+    path,
+    actual,
+    decision.checksumRecoveryDecision,
+    "durable_json_checksum_backfilled",
+  );
+  eventGraphOutputStatsChecksumRefreshed(path, actual, expected, decision);
+}
+
+function restoreMutableGraphOutputStatsFromQuarantine(path) {
+  if (!migrateOnly || existsSync(path)) return;
+  let entries;
+  try {
+    entries = readdirSync(dirname(path));
+  } catch {
+    return;
+  }
+  const candidates = entries
+    .map((entry) => join(dirname(path), entry))
+    .filter((candidate) => graphOutputStatsCorruptPrimaryPath(
+      candidate,
+      stateRoot,
+    ) === path)
+    .sort((left, right) =>
+      graphOutputStatsCorruptSortKey(right) -
+      graphOutputStatsCorruptSortKey(left)
+    );
+  for (const candidate of candidates) {
+    let parsed;
+    try {
+      parsed = JSON.parse(readFileSync(candidate, "utf8"));
+    } catch {
+      continue;
+    }
+    const expected = existsSync(durableChecksumPath(path))
+      ? readFileSync(durableChecksumPath(path), "utf8").trim()
+      : null;
+    const metaState = readChecksumMetaState(path);
+    const decision = mutableGraphOutputStatsRepairDecision(path, parsed, {
+      expectedChecksum: expected,
+      checksumMeta: metaState.meta,
+    });
+    if (decision == null) continue;
+    const operation = durableOperationEvidence(path, "json", {
+      localFailureClass: "durable_quarantined_target_recovered",
+      checksumRecoveryDecision: decision.checksumRecoveryDecision,
+      quarantineLocator: relative(root, candidate),
+      repairBoundary: "migrate_only",
+      repairAllowed: true,
+    });
+    renameWithDurableEvidence(candidate, path, operation);
+    fsyncDirectory(dirname(path), operation);
+    event({
+      event: "durable_json_target_recovered",
+      status: "pending",
+      checksumRecoveryDecision: decision.checksumRecoveryDecision,
+      ...durableProjection(operation),
+      metadata: {
+        ...durableProjection(operation),
+        locator: relative(root, path),
+        quarantineLocator: relative(root, candidate),
+        bookId: decision.bookId,
+        artifactId: decision.artifactId,
+        artifactKind: decision.artifactKind,
+        artifactStage: decision.artifactStage,
+        producerRunId: decision.producerRunId,
+        recoveryDecision: decision.reason,
+      },
+    });
+    return;
+  }
+}
+
+function repairMutableGraphOutputStatsFromQuarantine(path) {
+  if (!migrateOnly || existsSync(path)) return false;
+  return withJsonFileLock(path, () => {
+    restoreMutableGraphOutputStatsFromQuarantine(path);
+    if (!existsSync(path)) return false;
+    reconcileDurableJsonTargetUnlocked(path);
+    return true;
+  });
+}
+
+function repairKnownMutableGraphOutputStatsQuarantines(items, scanStats) {
+  if (!migrateOnly) return 0;
+  let repaired = 0;
+  const seen = new Set();
+  for (const item of items) {
+    const statsPath = join(stateRoot, "books", item.bookId, "output", "stats.json");
+    if (seen.has(statsPath)) continue;
+    seen.add(statsPath);
+    if (existsSync(statsPath)) continue;
+    if (
+      Number.isInteger(migrateRepair.maxMutationCount) &&
+      scanStats.mutationCount >= migrateRepair.maxMutationCount
+    ) {
+      break;
+    }
+    noteStartupPrimaryTarget(scanStats, relative(root, statsPath));
+    if (repairMutableGraphOutputStatsFromQuarantine(statsPath)) repaired += 1;
+  }
+  return repaired;
 }
 
 function checksumMetaSidecarEvidence(path, checksum, decision, extra = {}) {
@@ -5578,18 +6373,17 @@ function durableReadOnlyPreflightDecisionForTemp(temporaryPath) {
   });
 }
 
-function durablePreflightDecisionForLock(lockPath) {
+function durablePreflightDecisionForLock(lockPath, options = {}) {
   try {
     const entry = statSync(lockPath);
     const owner = readJsonLockOwner(lockPath);
-    const expiredAndDead = jsonLockOwnerExpired(owner, entry) &&
-      !processAlive(owner.pid);
-    if (expiredAndDead && jsonLockOwnerHasRecoveryFence(owner)) return null;
+    const recovery = staleJsonLockRecoveryDecision(owner, entry);
+    if (recovery.recoverable) {
+      if (removeStaleJsonLock(lockPath) || !existsSync(lockPath)) return null;
+    }
     return {
       localFailureClass: "durable_preflight_live_lock",
-      reason: expiredAndDead
-        ? "stale_lock_recovery_fence_missing"
-        : "lock_owner_live_or_unexpired",
+      reason: recovery.reason,
       targetLocator: owner.targetLocator ?? relative(root, lockPath),
       redactedEvidenceLocator: basename(lockPath),
       lane: owner.lane,
@@ -5608,15 +6402,11 @@ function durableReadOnlyPreflightDecisionForLock(lockPath) {
   try {
     const entry = statSync(lockPath);
     const owner = readJsonLockOwner(lockPath);
-    const expiredAndDead = jsonLockOwnerExpired(owner, entry) &&
-      !processAlive(owner.pid);
-    const reason = expiredAndDead
-      ? "stale_lock_recovery_fence_missing"
-      : "lock_owner_live_or_unexpired";
+    const recovery = staleJsonLockRecoveryDecision(owner, entry);
     return durableReadOnlyLockDiagnostic(lockPath, {
       context: startupPreflightDiagnosticContext,
       owner,
-      reason,
+      reason: recovery.reason,
       lockOwnerEvidence: redactJsonValue(owner),
     });
   } catch {
@@ -5677,7 +6467,17 @@ function durablePreflightDecisionForPrimaryYaml(path) {
 }
 
 function durablePreflightDecisionForPrimary(path, kind, options = {}) {
-  if (options.bookScopedReadOnly === true) {
+  if (
+    options.bookScopedReadOnly === true &&
+    options.bookScopedRepairBoundary !== true
+  ) {
+    return durableReadOnlyPrimaryDiagnostic(
+      path,
+      kind,
+      startupPreflightDiagnosticContext,
+    );
+  }
+  if (options.bookScopedRepairBoundary !== true && isBookScopedDurablePath(path)) {
     return durableReadOnlyPrimaryDiagnostic(
       path,
       kind,
@@ -5686,6 +6486,10 @@ function durablePreflightDecisionForPrimary(path, kind, options = {}) {
   }
   if (kind === "json") return durablePreflightDecisionForPrimaryJson(path);
   return durablePreflightDecisionForPrimaryYaml(path);
+}
+
+function isBookScopedDurablePath(path) {
+  return durableLocator(path).startsWith("graph_vault/books/");
 }
 
 function providerRequestDiagnosticBase(path) {
@@ -5704,13 +6508,13 @@ function providerRequestDiagnosticBase(path) {
     failureKind: "local_state_integrity",
     retryable: false,
     recoveryDecision: "continue_with_diagnostic_unless_catalog_blocked",
-    statusJsonDecision: "read_only_capped_diagnostic",
+    statusJsonDecision: "read_only_diagnostic",
     diagnosticClass: "provider_request_durable_degraded",
-    checksumRecoveryDecision: "read_only_capped_diagnostic",
+    checksumRecoveryDecision: "read_only_diagnostic",
     normalRunnerAction: "no_primary_quarantine",
     repairAllowed: false,
     completedPublishRule: "allowed_with_diagnostic",
-    durableMode: "read_only_capped_diagnostic",
+    durableMode: "read_only_diagnostic",
   };
 }
 
@@ -5790,7 +6594,7 @@ function providerRequestSummaryDiagnostic(diagnostics, scanned, truncated) {
       .slice(0, providerRequestStartupSampleLimit)
       .map((item) => item.targetLocator),
     scanTruncated: truncated,
-    maxRunnerStartScannedTargets: providerRequestStartupScanLimit,
+    maxRunnerStartScannedTargets: scanned,
     maxRunnerStartReportedSamples: providerRequestStartupSampleLimit,
     maxRunnerStartMutationCount: 0,
   };
@@ -5806,16 +6610,15 @@ function scanProviderRequestDiagnostics(directory) {
   const primaryJsonEntries = entries
     .filter((entry) => entry.isFile() && isDurablePrimaryJsonEntry(entry.name))
     .sort((left, right) => left.name.localeCompare(right.name));
-  const targets = primaryJsonEntries.slice(0, providerRequestStartupScanLimit);
   const diagnostics = [];
-  for (const entry of targets) {
+  for (const entry of primaryJsonEntries) {
     const diagnostic = providerRequestReadOnlyDiagnostic(join(directory, entry.name));
     if (diagnostic != null) diagnostics.push(diagnostic);
   }
   return {
     diagnostics,
-    scanned: targets.length,
-    truncated: primaryJsonEntries.length > targets.length,
+    scanned: primaryJsonEntries.length,
+    truncated: false,
   };
 }
 
@@ -5859,6 +6662,36 @@ function durablePreflightDecisionForQmdIndexLock() {
 function durablePreflightScanDirectory(directory, options = {}, depth = 0) {
   const blockers = [];
   const scanStats = options.scanStats;
+  const targetLimit = Number.isInteger(options.maxScannedTargets)
+    ? options.maxScannedTargets
+    : undefined;
+  const limitReached = () =>
+    targetLimit != null && scanStats != null && scanStats.targetCount >= targetLimit;
+  const limitBlocker = (path, limitKind = "scan") => migrateRepairLimitBlocker({
+    limitKind,
+    targetLocator: relative(root, path),
+    redactedEvidenceLocator: basename(path),
+    scannedTargetCount: scanStats?.targetCount ?? 0,
+    maxScannedTargets: targetLimit,
+    maxMutationCount: options.maxMutationCount,
+  });
+  const markLimitHit = () => {
+    if (scanStats != null) scanStats.repairLimitHit = true;
+  };
+  const mutationLimitReached = () =>
+    options.bookScopedRepairBoundary === true &&
+    Number.isInteger(options.maxMutationCount) &&
+    scanStats != null &&
+    scanStats.mutationCount > options.maxMutationCount;
+  const mutationLimitReachedBeforeWrite = () =>
+    options.bookScopedRepairBoundary === true &&
+    Number.isInteger(options.maxMutationCount) &&
+    scanStats != null &&
+    scanStats.mutationCount >= options.maxMutationCount;
+  const pushMutationLimitBlocker = (path) => {
+    markLimitHit();
+    blockers.push(limitBlocker(path, "mutation"));
+  };
   if (options.providerRequestReadOnly === true) {
     const scan = scanProviderRequestDiagnostics(directory);
     noteProviderRequestStartupScan(scanStats, scan);
@@ -5883,12 +6716,24 @@ function durablePreflightScanDirectory(directory, options = {}, depth = 0) {
   }
   for (const entry of entries.filter((entry) => entry.name.endsWith(".lock"))) {
     const path = join(directory, entry.name);
-    const blocker = options.bookScopedReadOnly === true
+    if (options.bookScopedRepairBoundary === true && mutationLimitReachedBeforeWrite()) {
+      pushMutationLimitBlocker(path);
+      if (options.failFast === true) return blockers;
+      continue;
+    }
+    const blocker = (
+      options.bookScopedReadOnly === true &&
+      options.bookScopedRepairBoundary !== true
+    )
       ? durableReadOnlyPreflightDecisionForLock(path)
-      : durablePreflightDecisionForLock(path);
+      : durablePreflightDecisionForLock(path, options);
     if (blocker != null) {
       noteStartupDegradedTarget(scanStats);
       blockers.push(blocker);
+      return blockers;
+    }
+    if (mutationLimitReached()) {
+      pushMutationLimitBlocker(path);
       if (options.failFast === true) return blockers;
     }
   }
@@ -5896,6 +6741,11 @@ function durablePreflightScanDirectory(directory, options = {}, depth = 0) {
     const path = join(directory, entry.name);
     if (entry.isDirectory()) {
       if (recursive && depth < maxDepth && !entry.name.includes(".corrupt-")) {
+        if (options.bookScopedRepairBoundary === true && limitReached()) {
+          markLimitHit();
+          blockers.push(limitBlocker(path));
+          return blockers;
+        }
         blockers.push(...durablePreflightScanDirectory(path, options, depth + 1));
         if (options.failFast === true && blockers.length > 0) break;
       }
@@ -5903,7 +6753,10 @@ function durablePreflightScanDirectory(directory, options = {}, depth = 0) {
     }
     if (entry.name.endsWith(".owner.json") || entry.name.endsWith(".lock")) continue;
     if (includeTemps && entry.name.includes(".tmp-")) {
-      const blocker = options.bookScopedReadOnly === true
+      const blocker = (
+        options.bookScopedReadOnly === true &&
+        options.bookScopedRepairBoundary !== true
+      )
         ? durableReadOnlyPreflightDecisionForTemp(path)
         : durablePreflightDecisionForTemp(path);
       if (blocker != null) {
@@ -5911,9 +6764,52 @@ function durablePreflightScanDirectory(directory, options = {}, depth = 0) {
         blockers.push(blocker);
         if (options.failFast === true) return blockers;
       }
+      if (mutationLimitReached()) {
+        pushMutationLimitBlocker(path);
+        if (options.failFast === true) return blockers;
+      }
+      continue;
+    }
+    const restoredStatsPath = graphOutputStatsCorruptPrimaryPath(path, stateRoot);
+    if (
+      options.bookScopedRepairBoundary === true &&
+      restoredStatsPath != null &&
+      !existsSync(restoredStatsPath)
+    ) {
+      if (mutationLimitReachedBeforeWrite()) {
+        pushMutationLimitBlocker(restoredStatsPath);
+        if (options.failFast === true) return blockers;
+        continue;
+      }
+      withJsonFileLock(restoredStatsPath, () => {
+        restoreMutableGraphOutputStatsFromQuarantine(restoredStatsPath);
+      });
+      if (existsSync(restoredStatsPath)) {
+        noteStartupPrimaryTarget(scanStats, relative(root, restoredStatsPath));
+        const blocker = durablePreflightDecisionForPrimary(
+          restoredStatsPath,
+          "json",
+          options,
+        );
+        if (blocker != null) {
+          noteStartupDegradedTarget(scanStats);
+          blockers.push(blocker);
+          if (options.failFast === true) return blockers;
+        }
+      }
+      if (mutationLimitReached()) {
+        pushMutationLimitBlocker(restoredStatsPath);
+        if (options.failFast === true) return blockers;
+      }
       continue;
     }
     if (isDurablePrimaryJsonEntry(entry.name)) {
+      if (options.bookScopedRepairBoundary === true && limitReached()) {
+        markLimitHit();
+        blockers.push(limitBlocker(path));
+        if (options.failFast === true) return blockers;
+        continue;
+      }
       noteStartupPrimaryTarget(scanStats, relative(root, path));
       const blocker = durablePreflightDecisionForPrimary(path, "json", options);
       if (blocker != null) {
@@ -5921,9 +6817,19 @@ function durablePreflightScanDirectory(directory, options = {}, depth = 0) {
         blockers.push(blocker);
         if (options.failFast === true) return blockers;
       }
+      if (mutationLimitReached()) {
+        pushMutationLimitBlocker(path);
+        if (options.failFast === true) return blockers;
+      }
       continue;
     }
     if (isDurablePrimaryYamlEntry(entry.name)) {
+      if (options.bookScopedRepairBoundary === true && limitReached()) {
+        markLimitHit();
+        blockers.push(limitBlocker(path));
+        if (options.failFast === true) return blockers;
+        continue;
+      }
       noteStartupPrimaryTarget(scanStats, relative(root, path));
       const blocker = durablePreflightDecisionForPrimary(path, "yaml", options);
       if (blocker != null) {
@@ -5931,6 +6837,10 @@ function durablePreflightScanDirectory(directory, options = {}, depth = 0) {
         blockers.push(blocker);
         if (options.failFast === true) return blockers;
       }
+    }
+    if (mutationLimitReached()) {
+      pushMutationLimitBlocker(path);
+      if (options.failFast === true) return blockers;
     }
     if (options.failFast === true && blockers.length > 0) break;
   }
@@ -5979,6 +6889,23 @@ function durablePreflightTargetsForItems(items) {
   const targets = [...durablePreflightTargets(undefined)];
   for (const item of items) {
     targets.push(...durablePreflightTargets(item));
+  }
+  return uniqueDurablePreflightTargets(targets);
+}
+
+function durablePreflightTargetsForStartupItems(items, checkpoints = new Map()) {
+  const targets = [...durablePreflightTargets(undefined)];
+  for (const item of items) {
+    const checkpoint = checkpoints.get(item.itemId);
+    const itemTargets = durablePreflightTargets(item).filter((target) =>
+      !target.bookScoped ||
+      shouldScanBookScopedStartupTarget({
+        statusJson,
+        migrateOnly,
+        checkpointStatus: checkpoint?.status,
+      })
+    );
+    targets.push(...itemTargets);
   }
   return uniqueDurablePreflightTargets(targets);
 }
@@ -6058,16 +6985,26 @@ function durablePreflight(stage, item = undefined, options = {}) {
   }
   if (blockers.length === 0) return;
   const first = blockers[0];
+  const evidence = {
+    ...first,
+    failedStage: stage,
+    durableMode: first.durableMode ?? "strict",
+    completedPublishRule: "forbidden",
+  };
+  if (claimPreflightBlockerCanDefer(stage, first)) {
+    throw new ClaimPreflightDeferredError(
+      `durable preflight deferred ${stage}: ${first.targetLocator}`,
+      {
+        evidence,
+        delayMs: claimPreflightDelayMs(first),
+      },
+    );
+  }
   const durableError = new DurableStateError(
     `durable preflight blocked ${stage}: ${first.targetLocator}`,
     {
       localFailureClass: first.localFailureClass,
-      evidence: {
-        ...first,
-        failedStage: stage,
-        durableMode: first.durableMode ?? "strict",
-        completedPublishRule: "forbidden",
-      },
+      evidence,
     },
   );
   event({
@@ -6113,6 +7050,7 @@ function backfillDurableChecksum(path, checksum, decision, eventName) {
     tempCreated = true;
     renameWithDurableEvidence(temporaryPath, checksumPath, operation);
     writeJsonAtomicSidecar(durableChecksumMetaPath(path), operation);
+    eventDurableChecksumMetaBackfilled(path, checksum, decision);
     rmSync(ownerPath, { force: true });
     fsyncDirectory(dirname(path), operation);
     event({
@@ -6197,6 +7135,7 @@ function reconcileDurableJsonTarget(path) {
 }
 
 function reconcileDurableJsonTargetUnlocked(path) {
+  restoreMutableGraphOutputStatsFromQuarantine(path);
   const directory = dirname(path);
   try {
     for (const entry of readdirSync(directory)) {
@@ -6234,7 +7173,7 @@ function reconcileDurableJsonTargetUnlocked(path) {
   if (!existsSync(path)) return;
   try {
     const text = readFileSync(path, "utf8");
-    JSON.parse(text);
+    const parsed = JSON.parse(text);
     const expected = existsSync(durableChecksumPath(path))
       ? readFileSync(durableChecksumPath(path), "utf8").trim()
       : null;
@@ -6251,13 +7190,63 @@ function reconcileDurableJsonTargetUnlocked(path) {
         );
         return;
       }
+      const statsRepair = mutableGraphOutputStatsRepairDecision(path, parsed, {
+        expectedChecksum: expected,
+        checksumMeta: meta,
+      });
+      if (statsRepair != null) {
+        refreshMutableGraphOutputStatsChecksum(path, actual, expected, statsRepair);
+        return;
+      }
+      const artifact = graphOutputArtifactForDurableTarget(path);
+      if (artifact != null && artifact.contentHash === actual) {
+        backfillDurableChecksum(
+          path,
+          actual,
+          "artifact_evidence_checksum_refreshed",
+          "durable_json_checksum_backfilled",
+        );
+        event({
+          event: "graph_output_json_checksum_refreshed",
+          status: "pending",
+          checksumRecoveryDecision: "artifact_evidence_checksum_refreshed",
+          metadata: {
+            locator: relative(root, path),
+            bookId: artifact.bookId,
+            artifactId: artifact.artifactId,
+            artifactKind: artifact.kind,
+            producerRunId: artifact.producerRunId,
+            previousChecksum: expected,
+            checksum: actual,
+          },
+        });
+        return;
+      }
       throw Object.assign(new Error("checksum_mismatch"), {
         checksumExpected: expected,
         checksumActual: actual,
       });
     }
     if (expected == null) {
-      if (!checksumCommitEvidenceMatches(path, actual, meta)) {
+      const statsRepair = mutableGraphOutputStatsRepairDecision(path, parsed, {
+        expectedChecksum: expected,
+        checksumMeta: meta,
+      });
+      if (statsRepair != null) {
+        refreshMutableGraphOutputStatsChecksum(path, actual, expected, statsRepair);
+        return;
+      }
+      const artifact = graphOutputArtifactForDurableTarget(path);
+      if (artifact != null && artifact.contentHash === actual) {
+        backfillDurableChecksum(
+          path,
+          actual,
+          "artifact_evidence_checksum_refreshed",
+          "durable_json_checksum_backfilled",
+        );
+        return;
+      }
+      if (meta != null && !checksumCommitEvidenceMatches(path, actual, meta)) {
         throw Object.assign(new Error("checksum_mismatch"), {
           checksumExpected: null,
           checksumActual: actual,
@@ -6397,7 +7386,7 @@ function reconcileDurableYamlTargetUnlocked(path) {
       });
     }
     if (expected == null) {
-      if (!checksumCommitEvidenceMatches(path, actual, meta)) {
+      if (meta != null && !checksumCommitEvidenceMatches(path, actual, meta)) {
         throw Object.assign(new Error("checksum_mismatch"), {
           checksumExpected: null,
           checksumActual: actual,
@@ -6479,6 +7468,7 @@ function reconcileDurableRunFiles() {
     try {
       for (const entry of readdirSync(directory)) {
         if (!isDurablePrimaryJsonEntry(entry)) continue;
+        if (!shouldReconcileRuntimeRecord(directory, entry)) continue;
         reconcileDurableJsonTarget(join(directory, entry));
       }
     } catch {
@@ -6504,54 +7494,54 @@ function readJsonLockOwner(lockPath) {
 }
 
 function jsonLockOwnerExpired(owner, entry) {
-  const expiryMs = epochMs(owner?.expiresAt);
-  return expiryMs > 0
-    ? Date.now() > expiryMs
-    : Date.now() - entry.mtimeMs > jsonFileLockStaleMs;
+  return staleJsonLockRecoveryDecision(owner, entry).expired;
 }
 
 function jsonLockOwnerHasRecoveryFence(owner) {
-  return Number.isInteger(owner?.generation) &&
-    typeof owner?.fencingTokenHash === "string" &&
-    owner.fencingTokenHash.length > 0 &&
-    typeof owner?.runnerSessionId === "string" &&
-    owner.runnerSessionId.length > 0 &&
-    typeof owner?.operationId === "string" &&
-    owner.operationId.length > 0;
+  return lockOwnerHasRecoveryFence(owner);
+}
+
+function staleJsonLockRecoveryDecision(owner, entry) {
+  return staleLockRecoveryDecision({
+    owner,
+    entry,
+    localHost: runnerHost,
+    processAlive,
+    fallbackTtlMs: jsonFileLockStaleMs,
+  });
 }
 
 function removeStaleJsonLock(path) {
   try {
     const lockPath = path;
     const entry = statSync(lockPath);
-    if (Date.now() - entry.mtimeMs > jsonFileLockStaleMs) {
-      const owner = readJsonLockOwner(lockPath);
-      if (!jsonLockOwnerExpired(owner, entry)) return;
-      if (!jsonLockOwnerHasRecoveryFence(owner)) return;
-      if (processAlive(owner.pid)) return;
-      unlinkSync(lockPath);
-      fsyncDirectory(dirname(lockPath));
-      event({
-        event: "durable_lock_recovered",
-        status: "pending",
-        localFailureClass: "durable_stale_lock_recovered",
-        targetLocator: owner.targetLocator ?? relative(root, lockPath),
-        lane: owner.lane,
-        targetMappingOwner: owner.targetMappingOwner,
-        laneTimeoutMs: owner.laneTimeoutMs,
-        releaseOn: owner.releaseOn,
-        operationId: owner.operationId,
+    const owner = readJsonLockOwner(lockPath);
+    const recovery = staleJsonLockRecoveryDecision(owner, entry);
+    if (!recovery.recoverable) return false;
+    unlinkSync(lockPath);
+    fsyncDirectory(dirname(lockPath));
+    event({
+      event: "durable_lock_recovered",
+      status: "pending",
+      localFailureClass: "durable_stale_lock_recovered",
+      targetLocator: owner.targetLocator ?? relative(root, lockPath),
+      lane: owner.lane,
+      targetMappingOwner: owner.targetMappingOwner,
+      laneTimeoutMs: owner.laneTimeoutMs,
+      releaseOn: owner.releaseOn,
+      operationId: owner.operationId,
+      lockOwnerEvidence: redactJsonValue(owner),
+      durableMode: "strict",
+      metadata: {
+        lockPath: relative(root, lockPath),
         lockOwnerEvidence: redactJsonValue(owner),
-        durableMode: "strict",
-        metadata: {
-          lockPath: relative(root, lockPath),
-          lockOwnerEvidence: redactJsonValue(owner),
-          recoveryDecision: "stale_lock_removed",
-        },
-      });
-    }
+        recoveryDecision: recovery.reason,
+      },
+    });
+    return true;
   } catch {
     // Missing or concurrently removed locks are expected under contention.
+    return false;
   }
 }
 
@@ -6563,9 +7553,8 @@ function staleJsonLockWithoutRecoveryFenceError(path, lockPath, mapping) {
     return null;
   }
   const lockOwnerEvidence = readJsonLockOwner(lockPath);
-  const expiredAndDead = jsonLockOwnerExpired(lockOwnerEvidence, entry) &&
-    !processAlive(lockOwnerEvidence.pid);
-  if (!expiredAndDead || jsonLockOwnerHasRecoveryFence(lockOwnerEvidence)) {
+  const recovery = staleJsonLockRecoveryDecision(lockOwnerEvidence, entry);
+  if (!recovery.expired || recovery.hasFence) {
     return null;
   }
   return new DurableStateError(
@@ -6835,7 +7824,7 @@ async function withJsonFileLockAsync(path, callback) {
 function lockedReadWriteTypedJson(path, schema, callback) {
   if (statusJson) return callback(undefined);
   return withJsonFileLock(path, () => {
-    const current = existsSync(path) ? schema.parse(readJson(path)) : undefined;
+    const current = existsSync(path) ? schema.partial().parse(readJson(path)) : undefined;
     const next = schema.parse(withoutUndefined(callback(current)));
     writeJsonAtomicWithValue(path, next);
     return next;
@@ -6876,6 +7865,24 @@ function readTypedJsonIfExists(path, schema) {
     return schema.parse(readJson(path));
   } catch {
     return null;
+  }
+}
+
+function readTypedJsonIfExistsLazy(path, schema, shouldReconcile) {
+  if (isDurableAuxiliaryPath(path)) return null;
+  if (!existsSync(path)) return null;
+  if (statusJson) return readTypedJsonIfExists(path, schema);
+  let raw;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return readTypedJsonIfExists(path, schema);
+  }
+  if (shouldReconcile(raw)) return readTypedJsonIfExists(path, schema);
+  try {
+    return schema.parse(raw);
+  } catch {
+    return readTypedJsonIfExists(path, schema);
   }
 }
 
@@ -6990,7 +7997,13 @@ function normalizeEventLogLines(lines) {
 function recoverEventLogTail() {
   if (statusJson || !existsSync(eventsPath)) return false;
   const text = readFileSync(eventsPath, "utf8");
-  const normalized = normalizeEventLogLines(text.split(/\r?\n/u));
+  const lines = text.split(/\r?\n/u);
+  const scan = scanEventLogRecoveryNeed(lines, {
+    runId,
+    schemaVersion: SchemaVersion,
+  });
+  if (!scan.needsRecovery) return false;
+  const normalized = normalizeEventLogLines(lines);
   const recovered = normalized.recovered;
   if (!recovered) return false;
   writeJsonlAtomic(eventsPath, normalized.lines);
@@ -7473,6 +8486,8 @@ function loadManifest(items) {
 function writeStartupRecoveryManifest(manifest, update = {}) {
   if (statusJson) return manifest;
   const current = manifest.metadata?.startupRecovery ?? {};
+  const mergePolicy = startupRecoveryMergePolicy(update);
+  const currentRepairContext = mergePolicy.preservesRepairContext ? current : {};
   const startupRecovery = StartupRecoverySchema.parse(withoutUndefined({
     ...current,
     runId,
@@ -7484,11 +8499,26 @@ function writeStartupRecoveryManifest(manifest, update = {}) {
     mutationCount: update.mutationCount ?? current.mutationCount ?? 0,
     firstSample: update.firstSample ?? current.firstSample,
     lastSample: update.lastSample ?? current.lastSample,
-    firstBlocker: update.firstBlocker ?? current.firstBlocker,
+    firstBlocker: mergePolicy.clearsBlockingOutcome
+      ? update.firstBlocker
+      : update.firstBlocker ?? current.firstBlocker,
     decision: update.decision ?? current.decision ?? "created_before_preflight",
-    recoveryDecision: update.recoveryDecision ?? current.recoveryDecision,
+    recoveryDecision: mergePolicy.clearsBlockingOutcome
+      ? update.recoveryDecision
+      : update.recoveryDecision ?? current.recoveryDecision,
     nextOperatorAction:
-      update.nextOperatorAction ?? current.nextOperatorAction,
+      update.nextOperatorAction ?? (
+        mergePolicy.clearsBlockingOutcome ? undefined : current.nextOperatorAction
+      ),
+    repairBoundary: update.repairBoundary ?? currentRepairContext.repairBoundary,
+    repairScope: update.repairScope ?? currentRepairContext.repairScope,
+    repairTargetFamily:
+      update.repairTargetFamily ?? currentRepairContext.repairTargetFamily,
+    maxScannedTargets:
+      update.maxScannedTargets ?? currentRepairContext.maxScannedTargets,
+    maxMutationCount:
+      update.maxMutationCount ?? currentRepairContext.maxMutationCount,
+    limitHit: update.limitHit ?? currentRepairContext.limitHit,
     explicitRepairHint: update.explicitRepairHint ?? current.explicitRepairHint ??
       "use explicit repair or migrate-only for provider request durable repairs",
     providerRequestDiagnostics: update.providerRequestDiagnostics ??
@@ -7653,6 +8683,37 @@ function runtimeItemForCheckpoint(item, checkpoint) {
   };
 }
 
+function withExistingBuildStatusSnapshot(item, checkpoint) {
+  return {
+    ...checkpoint,
+    qmdBuildStatus: checkpoint.qmdBuildStatus ??
+      { status: "pending", checkedAt: now(), stage: "qmd-build" },
+    graphBuildStatus: checkpoint.graphBuildStatus ??
+      { status: "pending", checkedAt: now(), stage: "ingest" },
+    graphQueryStatus: checkpoint.graphQueryStatus ??
+      { status: "pending", checkedAt: now(), stage: "qmd-query-graphrag-json" },
+  };
+}
+
+function maybeDowngradeCompletedOnLoad(item, checkpoint) {
+  if (checkpoint.status !== "completed") return checkpoint;
+  if (statusJson || migrateOnly) {
+    return downgradeCompletedIfClosedLoopInvalid(item, checkpoint);
+  }
+  return checkpoint;
+}
+
+function finalizeLoadedCheckpoint(path, item, checkpoint, shouldPersist) {
+  const checkpointEvidenceItem = evidenceItemForCheckpoint(item, checkpoint);
+  const finalized = withCheckpointPersistenceInvariants(
+    withExistingBuildStatusSnapshot(checkpointEvidenceItem, checkpoint),
+  );
+  if (statusJson || !shouldPersist) {
+    return BatchItemCheckpointSchema.parse(finalized);
+  }
+  return writeTypedJson(path, BatchItemCheckpointSchema, finalized);
+}
+
 function loadCheckpoint(item, completedSeed) {
   const path = itemPath(item);
   if (!existsSync(path)) {
@@ -7688,7 +8749,7 @@ function loadCheckpoint(item, completedSeed) {
   if (migrateOnly) {
     const checkpoint = recoverProviderTransientCheckpoint(item,
       recoverLegacyResponsesOutputNoneCheckpoint(item,
-        downgradeCompletedIfClosedLoopInvalid(
+        maybeDowngradeCompletedOnLoad(
           hydratedEvidenceItem,
           hydrated,
         ),
@@ -7696,42 +8757,28 @@ function loadCheckpoint(item, completedSeed) {
     );
     const checkpointEvidenceItem = evidenceItemForCheckpoint(item, checkpoint);
     if (statusJson) {
-      return BatchItemCheckpointSchema.parse(
-        withCheckpointPersistenceInvariants(
-          withBuildStatusSnapshot(checkpointEvidenceItem, checkpoint),
-        ),
-      );
+      return finalizeLoadedCheckpoint(path, checkpointEvidenceItem, checkpoint, false);
     }
-    return writeTypedJson(
-      path,
-      BatchItemCheckpointSchema,
-      withCheckpointPersistenceInvariants(
-        withBuildStatusSnapshot(checkpointEvidenceItem, checkpoint),
-      ),
-    );
+    return finalizeLoadedCheckpoint(path, checkpointEvidenceItem, checkpoint, true);
   }
   const checkpoint = recoverProviderTransientCheckpoint(item,
     recoverLegacyResponsesOutputNoneCheckpoint(item,
-      recoverOrphanedRunningCheckpoint(item, downgradeCompletedIfClosedLoopInvalid(
-        hydratedEvidenceItem,
-        hydrated,
-      )),
+      recoverResumeEmptyStdoutAfterBatchStopCheckpoint(item,
+        recoverOrphanedRunningCheckpoint(item,
+          maybeDowngradeCompletedOnLoad(hydratedEvidenceItem, hydrated),
+        ),
+      ),
     ),
   );
   const checkpointEvidenceItem = evidenceItemForCheckpoint(item, checkpoint);
   if (statusJson) {
-    return BatchItemCheckpointSchema.parse(
-      withCheckpointPersistenceInvariants(
-        withBuildStatusSnapshot(checkpointEvidenceItem, checkpoint),
-      ),
-    );
+    return finalizeLoadedCheckpoint(path, checkpointEvidenceItem, checkpoint, false);
   }
-  return writeTypedJson(
+  return finalizeLoadedCheckpoint(
     path,
-    BatchItemCheckpointSchema,
-    withCheckpointPersistenceInvariants(
-      withBuildStatusSnapshot(checkpointEvidenceItem, checkpoint),
-    ),
+    checkpointEvidenceItem,
+    checkpoint,
+    checkpoint !== hydrated,
   );
 }
 
@@ -7741,6 +8788,30 @@ function withBuildStatusSnapshot(item, checkpoint) {
     qmdBuildStatus: redactJsonValue(qmdBuildEvidence(item)),
     graphBuildStatus: redactJsonValue(graphBuildEvidence(item)),
     graphQueryStatus: redactJsonValue(graphQueryEvidence(checkpoint)),
+  };
+}
+
+function summaryEvidenceForItem(item) {
+  if (
+    shouldUsePersistedSummaryEvidence({
+      statusJson,
+      migrateOnly,
+      itemStatus: item.status,
+    })
+  ) {
+    return {
+      qmdStatus: item.qmdBuildStatus ??
+        { status: "pending", checkedAt: now(), stage: "qmd-build" },
+      graphStatus: item.graphBuildStatus ??
+        { status: "pending", checkedAt: now(), stage: "ingest" },
+      graphQueryStatus: item.graphQueryStatus ??
+        { status: "pending", checkedAt: now(), stage: "qmd-query-graphrag-json" },
+    };
+  }
+  return {
+    qmdStatus: qmdBuildEvidence(item),
+    graphStatus: graphBuildEvidence(item),
+    graphQueryStatus: graphQueryEvidence(item),
   };
 }
 
@@ -8066,6 +9137,14 @@ function qmdBuildManifestLocator(item) {
 
 function qmdBuildManifestPath(item) {
   return join(stateRoot, qmdBuildManifestLocator(item));
+}
+
+function bookDistributionManifestPath(item) {
+  return join(stateRoot, "books", item.bookId, "distribution_manifest.json");
+}
+
+function graphOutputProducerManifestPath(item) {
+  return join(stateRoot, "books", item.bookId, "output", "qmd_output_manifest.json");
 }
 
 function qmdBuildArtifactId(item, normalizedContentHash) {
@@ -8797,8 +9876,18 @@ function graphBuildEvidence(item) {
   };
 }
 
-function migrateGraphOutputProducerManifests() {
-  for (const item of discoverItems()) {
+function migrateGraphOutputProducerManifests(items = discoverItems(), checkpoints = new Map()) {
+  for (const item of items) {
+    const checkpoint = checkpoints.get(item.itemId);
+    if (
+      !shouldScanBookScopedStartupTarget({
+        statusJson,
+        migrateOnly,
+        checkpointStatus: checkpoint?.status,
+      })
+    ) {
+      continue;
+    }
     const manifestPath = join(
       stateRoot,
       "books",
@@ -8900,6 +9989,42 @@ function readQmdBuildManifest(item) {
   return readJsonSchemaIfExists(qmdBuildManifestPath(item), QmdBuildManifestSchema);
 }
 
+function bookScopedNormalizedPath(item) {
+  return join(stateRoot, "books", item.bookId, "input", basename(item.normalizedPath));
+}
+
+function writeBookDistributionManifest(item, options = {}) {
+  if (statusJson) return null;
+  const producer = readGraphOutputProducerManifest(graphOutputProducerManifestPath(item));
+  const manifest = buildBookDistributionManifest({
+    stateRoot,
+    bookId: item.bookId,
+    itemId: item.itemId,
+    runId,
+    sourceHash: item.sourceHash,
+    sourceRelativePath: item.sourceRelativePath,
+    normalizedPath: item.normalizedPath,
+    producer,
+    now,
+  });
+  const parsed = withoutUndefined(manifest);
+  writeJsonAtomicWithValue(bookDistributionManifestPath(item), parsed);
+  if (options.emitEvent !== false) {
+    event({
+      itemId: item.itemId,
+      event: "book_distribution_manifest_written",
+      status: options.status ?? "completed",
+      metadata: {
+        bookId: item.bookId,
+        manifestLocator: relative(root, bookDistributionManifestPath(item)),
+        fileCount: parsed.files?.length ?? 0,
+        missingRunRecordIds: parsed.producerEvidence?.missingRunRecordIds ?? [],
+      },
+    });
+  }
+  return parsed;
+}
+
 function writeQmdBuildManifest(item, commandChecks) {
   const commandCheckStatus = qmdCommandCheckEvidence({ commandChecks });
   if (commandCheckStatus.status !== "succeeded") {
@@ -8965,6 +10090,7 @@ function writeQmdBuildManifest(item, commandChecks) {
     sourceRelativePath: item.sourceRelativePath,
     sourceHash: item.sourceHash,
     normalizedPath: relative(root, item.normalizedPath),
+    canonicalBookNormalizedPath: relative(root, bookScopedNormalizedPath(item)),
     normalizedContentHash: sha256File(item.normalizedPath),
     qmdIndexLocator: relative(root, qmdIndexPath),
     qmdIndexHash: sha256File(qmdIndexPath),
@@ -9354,7 +10480,6 @@ function recoverOrphanedRunningCheckpoint(item, checkpoint) {
 
 function checkpointIsRecoveredRunnerOrphan(checkpoint) {
   return checkpoint?.metadata?.orphanedRunnerRecovered === true &&
-    checkpoint.failedStage === "runner_orphaned" &&
     checkpoint.metadata?.waitingForProviderRecovery !== true;
 }
 
@@ -9473,6 +10598,43 @@ function recoverProviderTransientCheckpoints(items, checkpoints) {
   return recoveredCount;
 }
 
+function currentDurableFailureProjection(item) {
+  if (item == null || item.status === "completed" || item.status === "skipped") {
+    return null;
+  }
+  const failedCommand = (item.commandChecks ?? [])
+    .filter((check) => check.status === "failed")
+    .at(-1);
+  const durable = durableProjection(failedCommand ?? {
+    failureKind: item.failureKind,
+    retryable: item.retryable,
+    localFailureClass: item.localFailureClass,
+    recoveryDecision: item.recoveryDecision,
+    activeCommand: item.activeCommand ?? item.currentCommand,
+    targetLocator: item.targetLocator,
+    redactedEvidenceLocator: item.redactedEvidenceLocator,
+    lane: item.lane,
+    targetMappingOwner: item.targetMappingOwner,
+    laneTimeoutMs: item.laneTimeoutMs,
+    releaseOn: item.releaseOn,
+    operationId: item.operationId,
+    failedStage: item.failedStage,
+    completedPublishRule: item.completedPublishRule,
+    lockOwnerEvidence: item.lockOwnerEvidence,
+    durableMode: item.durableMode,
+    primaryTargetLocator: item.primaryTargetLocator,
+    sidecarTargetLocator: item.sidecarTargetLocator,
+    checksumRecoveryDecision: item.checksumRecoveryDecision,
+    checksumExpected: item.checksumExpected,
+    checksumActual: item.checksumActual,
+  });
+  return durable.localFailureClass == null &&
+    item.failureKind !== "local_state_integrity" &&
+    item.failureKind !== "local_state_lock_timeout"
+    ? null
+    : durable;
+}
+
 function updateManifest(manifest, checkpoints) {
   const previousCounts = {
     pendingItems: manifest.pendingItems,
@@ -9514,18 +10676,17 @@ function updateManifest(manifest, checkpoints) {
   manifest.updatedAt = now();
   const durableFailure = [...checkpoints]
     .reverse()
-    .find((item) =>
-      item.failureKind === "local_state_integrity" ||
-      item.failureKind === "local_state_lock_timeout" ||
-      durableProjection(item).localFailureClass != null
-    );
-  manifest.durableFailureSummary = durableFailure == null
-    ? undefined
-    : withoutUndefined({
-        ...durableProjection(durableFailure),
-        recoveryDecision: durableFailure.recoveryDecision,
-        failedStage: durableFailure.failedStage,
+    .map((item) => ({ item, durable: currentDurableFailureProjection(item) }))
+    .find(({ durable }) => durable != null);
+  if (durableFailure == null) {
+    delete manifest.durableFailureSummary;
+  } else {
+    manifest.durableFailureSummary = withoutUndefined({
+        ...durableFailure.durable,
+        recoveryDecision: durableFailure.item.recoveryDecision,
+        failedStage: durableFailure.item.failedStage,
       });
+  }
   const expectedCounts = {
     pendingItems: pending,
     runningItems: running,
@@ -9636,13 +10797,19 @@ function buildRecoverySummary(manifest, checkpoints) {
   }
   const items = checkpoints.map((item) => {
     const slotSummary = activeSlotsByItem.get(item.itemId);
-    const qmdStatus = qmdBuildEvidence(item);
+    const summaryEvidence = summaryEvidenceForItem(item);
+    const qmdStatus = summaryEvidence.qmdStatus;
     const commandCheckStatus = commandCheckSetEvidence(item);
-    const graphStatus = graphBuildEvidence(item);
-    const graphQueryStatus = graphQueryEvidence(item);
+    const graphStatus = summaryEvidence.graphStatus;
+    const graphQueryStatus = summaryEvidence.graphQueryStatus;
     const failedCommands = (item.commandChecks ?? [])
       .filter((check) => check.status === "failed");
     const failedCommand = failedCommands.at(-1);
+    const durableSummary = failedCommand != null
+      ? durableProjection(failedCommand)
+      : item.status === "failed"
+        ? durableProjection(item)
+        : {};
     const waitingForProviderRecovery =
       item.status === "pending" &&
       item.failureKind === "transient" &&
@@ -9664,7 +10831,7 @@ function buildRecoverySummary(manifest, checkpoints) {
       retryable: item.retryable,
       retryExhausted: item.retryExhausted,
       recoveryDecision: item.recoveryDecision,
-      ...durableProjection(failedCommand ?? item),
+      ...durableSummary,
       failedStage: item.failedStage,
       providerStatusCode: failedCommand?.providerStatusCode,
       retryAfterSeconds: failedCommand?.retryAfterSeconds,
@@ -9724,6 +10891,38 @@ function buildRecoverySummary(manifest, checkpoints) {
         item.metadata?.localArtifactGateRepairRequiresRealRebuild,
       localArtifactGateRepairRebuildStage:
         item.metadata?.localArtifactGateRepairRebuildStage,
+      durableChecksumReopenDecision:
+        item.metadata?.durableChecksumReopenDecision,
+      durableChecksumReopenEligible:
+        item.metadata?.durableChecksumReopenEligible,
+      durableChecksumReopenReason:
+        item.metadata?.durableChecksumReopenReason,
+      durableChecksumReopenBlockedReason:
+        item.metadata?.durableChecksumReopenBlockedReason,
+      durableChecksumReopenTargetLocator:
+        item.metadata?.durableChecksumReopenTargetLocator,
+      durableChecksumReopenSidecarTargetLocator:
+        item.metadata?.durableChecksumReopenSidecarTargetLocator,
+      durableChecksumReopenChecksumMetaLocator:
+        item.metadata?.durableChecksumReopenChecksumMetaLocator,
+      durableChecksumReopenChecksum:
+        item.metadata?.durableChecksumReopenChecksum,
+      durableChecksumReopenChecksumRecoveryDecision:
+        item.metadata?.durableChecksumReopenChecksumRecoveryDecision,
+      durablePreflightDeferReopenDecision:
+        item.metadata?.durablePreflightDeferReopenDecision,
+      durablePreflightDeferReopenEligible:
+        item.metadata?.durablePreflightDeferReopenEligible,
+      durablePreflightDeferReopenReason:
+        item.metadata?.durablePreflightDeferReopenReason,
+      durablePreflightDeferReopenBlockedReason:
+        item.metadata?.durablePreflightDeferReopenBlockedReason,
+      durablePreflightDeferReopenTargetLocator:
+        item.metadata?.durablePreflightDeferReopenTargetLocator,
+      durablePreflightDeferReopenOperationId:
+        item.metadata?.durablePreflightDeferReopenOperationId,
+      durablePreflightDeferReopenRunnerSessionId:
+        item.metadata?.durablePreflightDeferReopenRunnerSessionId,
       ...providerAuthSummaryProjection(item),
       errorSummary: item.errorSummary ? redacted(item.errorSummary) : undefined,
     });
@@ -10297,6 +11496,7 @@ async function runCommand(item, name, command, args, options = {}) {
               : String(options.providerSlotLease.generation),
           QMD_GRAPHRAG_PROVIDER_SLOT_FENCING_TOKEN:
             options.providerSlotLease?.fencingToken ?? "",
+          QMD_GRAPHRAG_INHERIT_PARENT_PROCESS_GROUP: "1",
           ...(options.env ?? {}),
         },
       });
@@ -10310,6 +11510,9 @@ async function runCommand(item, name, command, args, options = {}) {
     const stderr = result.stderr ?? "";
     writeFileSync(join(logRoot, `${item.itemId}-${name}.out`), redactLog(stdout));
     writeFileSync(join(logRoot, `${item.itemId}-${name}.err`), redactLog(stderr));
+    if (batchStopRequested && result.status !== 0) {
+      throw batchStopInterruptError(name);
+    }
     const timeoutMessage =
       result.error?.code === "ETIMEDOUT"
         ? `command timed out after ${commandTimeoutSeconds} seconds`
@@ -10490,6 +11693,7 @@ async function qmd(item, name, args, attempts = 1, options = {}) {
   ], {
     attempts,
     env: options.env,
+    maxBuffer: options.maxBuffer,
     workerId: options.workerId,
     providerSlotLease: lease.providerSlotLease,
   });
@@ -10533,6 +11737,13 @@ function parseResumeOutput(stdout) {
     if (start >= 0) return JSON.parse(text.slice(start + 1));
     throw new Error("resume-book stdout did not contain a JSON object");
   }
+}
+
+function parseResumeOutputOrStopInterrupt(stdout, command) {
+  if (batchStopRequested && !stdout.trim()) {
+    throw batchStopInterruptError(command);
+  }
+  return parseResumeOutput(stdout);
 }
 
 function requirePath(path, label) {
@@ -10751,8 +11962,9 @@ async function runGraphResume(item, checkpoint, options = {}) {
 
     let resume;
     try {
-      resume = parseResumeOutput(result.stdout);
+      resume = parseResumeOutputOrStopInterrupt(result.stdout, name);
     } catch (error) {
+      if (isBatchStopInterrupt(error)) throw error;
       const message = error instanceof Error ? error.message : String(error);
       const failureText = [message, result.check?.errorSummary]
         .filter(Boolean)
@@ -10764,7 +11976,7 @@ async function runGraphResume(item, checkpoint, options = {}) {
       event: options.repairLocalArtifactGateOnly
         ? "local_artifact_gate_repair_pass_completed"
         : "resume_pass_completed",
-      status: resume.status === "ready" ? "completed" : "running",
+      status: resumePassEventStatus(resume),
       metadata: {
         pass,
         command: name,
@@ -10776,7 +11988,7 @@ async function runGraphResume(item, checkpoint, options = {}) {
     });
     nextStageHint = resume.nextStage;
     if (
-      (resume.status === "ready" && resume.nextStage == null) ||
+      isResumeTerminalReady(resume) ||
       (options.repairLocalArtifactGateOnly && resume.status === "repaired")
     ) {
       return options.repairLocalArtifactGateOnly
@@ -11031,6 +12243,7 @@ async function runCliChecks(item, checkpoint, options = {}) {
     if (!requiredCommandCheckNames.includes(name)) return;
     if (seen.has(name)) return;
     record(await qmd(item, name, args, attempts, {
+      maxBuffer: qmdValidationOutputMaxBufferBytes,
       workerId: options.workerId,
     }));
   };
@@ -11060,7 +12273,10 @@ async function runCliChecks(item, checkpoint, options = {}) {
     "qmd-get-book",
     ["get", `qmd://books/${basename(item.normalizedPath)}`, "-l", "5"],
   );
-  await recordQmd("qmd-multi-get-json", ["multi-get", "books/*.md", "-l", "1", "--json"]);
+  await recordQmd(
+    "qmd-multi-get-json",
+    qmdMultiGetJsonArgsForNormalizedPath(item.normalizedPath),
+  );
   await recordQmd("qmd-collection-list", ["collection", "list"]);
   await recordQmd("qmd-collection-show-books", ["collection", "show", "books"]);
   await recordQmd("qmd-context-list", ["context", "list"]);
@@ -11077,7 +12293,7 @@ async function runCliChecks(item, checkpoint, options = {}) {
   });
   await recordQmd(
     "qmd-query-auto-json",
-    ["query", "--mode", "auto", "--json", query],
+    ["query", "--mode", "auto", "--graph-book-id", item.bookId, "--json", query],
     maxCommandAttempts,
   );
   await recordQmd(
@@ -11189,6 +12405,7 @@ async function runItem(item, checkpoint, options = {}) {
       },
     );
   }
+  writeBookDistributionManifest(resolvedItem, { status: "completed" });
   const terminalFinalization = buildTerminalFinalizationFence(checkpoint);
   const completed = {
     ...checkpoint,
@@ -11288,78 +12505,147 @@ function buildInterruptedCheckpoint({ running, error }) {
   };
 }
 
+function buildDurablePreflightDeferredCheckpoint({ running, error }) {
+  const projection = durableProjection(error?.evidence);
+  return {
+    ...running,
+    status: "pending",
+    failedAt: undefined,
+    errorSummary: redacted(error instanceof Error ? error.message : String(error)),
+    failureKind: undefined,
+    retryable: undefined,
+    retryExhausted: undefined,
+    recoveryDecision: "continue_pending",
+    failedStage: error?.evidence?.failedStage ?? running.failedStage,
+    nextRetryAt: undefined,
+    retryDelaySeconds: undefined,
+    runnerHeartbeatAt: now(),
+    activeCommand: running.activeCommand ?? running.currentCommand ??
+      running.failedStage,
+    currentCommand: undefined,
+    currentCommandStartedAt: undefined,
+    metadata: {
+      ...(running.metadata ?? {}),
+      waitingForProviderRecovery: false,
+      waitingForDurablePreflight: true,
+      durablePreflightDeferred: true,
+      durablePreflightDeferredAt: now(),
+      durablePreflightDelayMs: error?.delayMs ?? 0,
+      durablePreflightDeferralKey: claimPreflightDeferralKey(error),
+      ...projection,
+    },
+  };
+}
+
+function claimCheckpointProjection(item, checkpoint) {
+  return {
+    ...checkpoint,
+    sourceIdentityPath: checkpoint.sourceIdentityPath ?? item.sourceIdentityPath ??
+      item.sourceRelativePath,
+    sourceHash: checkpoint.sourceHash ?? item.sourceHash,
+    normalizedPath: checkpoint.normalizedPath ?? item.normalizedRel ??
+      item.normalizedPath,
+    bookId: checkpoint.bookId ?? item.bookId,
+  };
+}
+
 function markItemRunning(item, checkpoint, checkpoints, manifest, workerId) {
   durablePreflight("before_claim", item);
   const startedAt = now();
   const bookLease = acquireBookLease(item, workerId);
+  maybeInjectClaimStartCheckpointChange(item);
   const itemFencingToken = randomToken("item-fence");
-  const running = lockedReadWriteTypedJson(
-    itemPath(item),
-    BatchItemCheckpointSchema,
-    (loaded) => {
-      const current = loaded ??
-        BatchItemCheckpointSchema.parse(withBuildStatusSnapshot(item, checkpoint));
-      if (
-        current.status !== checkpoint.status ||
-        current.attempts !== checkpoint.attempts ||
-        current.completedAt !== checkpoint.completedAt ||
-        current.failedAt !== checkpoint.failedAt ||
-        current.runnerSessionId !== checkpoint.runnerSessionId ||
-        current.runnerHeartbeatAt !== checkpoint.runnerHeartbeatAt
-      ) {
-        throw new Error(
-          `checkpoint changed before item start; refusing duplicate runner for ${item.itemId}`,
-        );
-      }
-      return withBuildStatusSnapshot(item, {
-        ...current,
-        status: "running",
-        attempts: current.attempts + 1,
-        startedAt: current.startedAt ?? startedAt,
-        retryStartedAt: current.retryStartedAt,
-        nextRetryAt: undefined,
-        retryDelaySeconds: undefined,
-        failedAt: undefined,
-        errorSummary: undefined,
-        failureKind: undefined,
-        retryable: undefined,
-        retryExhausted: undefined,
-        recoveryDecision: "none",
-        failedStage: undefined,
-        expectedCommandCheckCount,
-        maxCommandAttempts,
-        maxTransientCommandAttempts,
-        maxResumePasses,
-        retryBaseDelaySeconds,
-        retryMaxDelaySeconds,
-        retryBudgetSeconds,
-        maxProviderRecoveryWaits,
-        commandTimeoutSeconds,
-        runnerSessionId,
-        runnerHost,
-        runnerPid,
-        runnerHeartbeatAt: startedAt,
-        leaseGeneration: coordinatorLease?.generation ?? 1,
-        fencingToken: itemFencingToken,
-        leaseExpiresAt: leaseExpiresAt(),
-        bookLeaseGeneration: bookLease?.generation ?? 1,
-        bookFencingToken: bookLease?.fencingToken ?? randomToken("book-fence"),
-        metadata: {
-          ...(current.metadata ?? {}),
-          waitingForProviderRecovery: false,
-          workerId,
-          coordinatorGeneration: coordinatorLease?.generation ?? 1,
-          itemFencingToken,
-          bookLeaseGeneration: bookLease?.generation,
-          bookFencingToken: bookLease?.fencingToken,
-        },
-      });
-    },
-  );
+  let claimConflict = null;
+  let running;
+  try {
+    running = lockedReadWriteTypedJson(
+      itemPath(item),
+      BatchItemCheckpointSchema,
+      (loaded) => {
+        const current = loaded ??
+          BatchItemCheckpointSchema.parse(withBuildStatusSnapshot(item, checkpoint));
+        const projected = claimCheckpointProjection(item, current);
+        if (claimStartCheckpointChanged(current, checkpoint)) {
+          claimConflict = BatchItemCheckpointSchema.parse(
+            withBuildStatusSnapshot(item, projected),
+          );
+          return claimConflict;
+        }
+        return withBuildStatusSnapshot(item, {
+          ...projected,
+          status: "running",
+          attempts: current.attempts + 1,
+          startedAt: current.startedAt ?? startedAt,
+          retryStartedAt: current.retryStartedAt,
+          nextRetryAt: undefined,
+          retryDelaySeconds: undefined,
+          failedAt: undefined,
+          errorSummary: undefined,
+          failureKind: undefined,
+          retryable: undefined,
+          retryExhausted: undefined,
+          recoveryDecision: "none",
+          failedStage: undefined,
+          expectedCommandCheckCount,
+          maxCommandAttempts,
+          maxTransientCommandAttempts,
+          maxResumePasses,
+          retryBaseDelaySeconds,
+          retryMaxDelaySeconds,
+          retryBudgetSeconds,
+          maxProviderRecoveryWaits,
+          commandTimeoutSeconds,
+          runnerSessionId,
+          runnerHost,
+          runnerPid,
+          runnerHeartbeatAt: startedAt,
+          leaseGeneration: coordinatorLease?.generation ?? 1,
+          fencingToken: itemFencingToken,
+          leaseExpiresAt: leaseExpiresAt(),
+          bookLeaseGeneration: bookLease?.generation ?? 1,
+          bookFencingToken: bookLease?.fencingToken ?? randomToken("book-fence"),
+          metadata: {
+            ...(current.metadata ?? {}),
+            waitingForProviderRecovery: false,
+            workerId,
+            coordinatorGeneration: coordinatorLease?.generation ?? 1,
+            itemFencingToken,
+            bookLeaseGeneration: bookLease?.generation,
+            bookFencingToken: bookLease?.fencingToken,
+          },
+        });
+      },
+    );
+  } catch (error) {
+    releaseBookLease(bookLease, "failed");
+    throw error;
+  }
+  if (claimConflict != null) {
+    checkpoints.set(item.itemId, claimConflict);
+    updateManifest(manifest, Array.from(checkpoints.values()));
+    releaseBookLease(bookLease, claimConflict.status ?? "pending");
+    event({
+      itemId: item.itemId,
+      event: "item_claim_conflict_deferred",
+      status: claimConflict.status,
+      recoveryDecision: claimConflict.recoveryDecision ?? "continue_pending",
+      metadata: {
+        ...claimStartConflictMetadata(claimConflict, checkpoint),
+        workerId,
+        bookId: item.bookId,
+        bookLeaseGeneration: bookLease?.generation,
+      },
+    });
+    return {
+      claimed: false,
+      reason: "checkpoint_changed_before_item_start",
+      current: claimConflict,
+    };
+  }
   checkpoints.set(item.itemId, running);
   updateManifest(manifest, Array.from(checkpoints.values()));
   event({ itemId: item.itemId, event: "item_start", status: "running" });
-  return { running, bookLease };
+  return { claimed: true, running, bookLease };
 }
 
 function retryWindowDelayMs(checkpoint) {
@@ -11382,6 +12668,28 @@ function eventRetryWindowDeferred(item, checkpoint, delayMs) {
       delayMs,
       retryDelaySeconds: checkpoint.retryDelaySeconds,
       retryBudgetSeconds,
+    },
+  });
+}
+
+function eventClaimPreflightDeferred(item, error) {
+  const failedStage = error?.evidence?.failedStage ?? "before_claim";
+  event({
+    itemId: item.itemId,
+    event: failedStage === "before_claim"
+      ? "item_claim_preflight_deferred"
+      : "item_durable_preflight_deferred",
+    status: "pending",
+    recoveryDecision: "continue_pending",
+    failedStage,
+    ...durableProjection(error?.evidence),
+    message: error instanceof Error ? error.message : String(error),
+    metadata: {
+      ...durableProjection(error?.evidence),
+      delayMs: error?.delayMs ?? 0,
+      deferralKey: claimPreflightDeferralKey(error),
+      claimDeferred: failedStage === "before_claim",
+      durablePreflightDeferred: failedStage !== "before_claim",
     },
   });
 }
@@ -11546,10 +12854,30 @@ async function handleRunItemFailure({
   const durableFailure = durableFailureForError(error, itemPath(item));
   const commandDurableProjection = durableProjection(commandCheck);
   const errorDurableProjection = durableProjection(durableFailure);
-  const durableFields = {
+  const durableOutcomeFields = {
     ...errorDurableProjection,
     ...commandDurableProjection,
   };
+  const durableFields = {
+    ...diagnosticProjectionOnly(errorDurableProjection),
+    ...diagnosticProjectionOnly(commandDurableProjection),
+  };
+  if (error instanceof ClaimPreflightDeferredError) {
+    const deferredCheckpoint = buildDurablePreflightDeferredCheckpoint({
+      running,
+      error,
+    });
+    const persistedCheckpoint = saveCheckpoint(activeRuntimeItem, deferredCheckpoint);
+    checkpoints.set(item.itemId, persistedCheckpoint);
+    updateManifestState(manifestState, checkpoints);
+    eventClaimPreflightDeferred(activeRuntimeItem, error);
+    return {
+      processed: true,
+      stopAfterNonTransientFailure: false,
+      deferred: true,
+      deferredDelayMs: error.delayMs ?? 1000,
+    };
+  }
   if (isBatchStopInterrupt(error)) {
     const interrupted = buildInterruptedCheckpoint({ running, error });
     saveCheckpoint(activeRuntimeItem, interrupted);
@@ -11571,7 +12899,7 @@ async function handleRunItemFailure({
   }
   const failureKind =
     commandCheck?.failureKind ??
-    durableFields.failureKind ??
+    durableOutcomeFields.failureKind ??
     "unknown";
   const retryable = commandCheck?.retryable ?? false;
   const canRecoverInThisRun =
@@ -11620,6 +12948,12 @@ async function handleRunItemFailure({
   const recoverableProviderFailure =
     retryable &&
     failureKind === "transient";
+  const providerRecoveryDelay = recoverableProviderFailure
+    ? providerRecoveryDelaySeconds(running)
+    : undefined;
+  const recoveryWaitCount = recoverableProviderFailure
+    ? nextProviderRecoveryWaitCount(running)
+    : undefined;
   const providerRecoveryWaitStillAvailable =
     recoverableProviderFailure && providerRecoveryWaitAvailable(running);
   if (recoverableProviderFailure && !providerRecoveryWaitStillAvailable) {
@@ -11697,78 +13031,104 @@ async function handleRunItemFailure({
     return { processed: true, stopAfterNonTransientFailure: true };
   }
 
-  const providerRecoveryDelay = recoverableProviderFailure
-    ? providerRecoveryDelaySeconds(running)
-    : undefined;
-  const recoveryWaitCount = recoverableProviderFailure
-    ? nextProviderRecoveryWaitCount(running)
-    : undefined;
+  if (recoverableProviderFailure) {
+    const retryDelaySeconds = commandCheck?.retryDelaySeconds ??
+      providerRecoveryDelay;
+    const waiting = {
+      ...running,
+      status: "pending",
+      failedAt: undefined,
+      errorSummary: redacted(
+        error instanceof Error ? error.message : String(error),
+      ),
+      failureKind: "transient",
+      retryable: true,
+      retryExhausted: false,
+      recoveryDecision: "retry_same_run_id",
+      ...durableFields,
+      failedStage: commandCheck?.name ?? durableFields.failedStage,
+      retryStartedAt:
+        running.retryStartedAt ?? commandCheck?.completedAt ?? now(),
+      nextRetryAt: commandCheck?.nextRetryAt ??
+        isoAfterSeconds(retryDelaySeconds ?? retryMaxDelaySeconds),
+      retryDelaySeconds,
+      runnerHeartbeatAt: now(),
+      activeCommand: commandCheck?.name ?? running.activeCommand ??
+        running.currentCommand ?? running.failedStage,
+      commandChecks: commandCheck
+        ? [...(running.commandChecks ?? []), commandCheck]
+        : (running.commandChecks ?? []),
+      metadata: {
+        ...(running.metadata ?? {}),
+        waitingForProviderRecovery: true,
+        providerRecoveryWaitStartedAt: now(),
+        providerRecoveryReason: "transient_retry_budget_window_elapsed",
+        providerRecoveryWaitCount: recoveryWaitCount,
+        maxProviderRecoveryWaits,
+        retryBudgetSeconds,
+        sourceName: activeRuntimeItem.sourceName,
+        ...durableFields,
+      },
+    };
+    saveCheckpoint(activeRuntimeItem, waiting);
+    checkpoints.set(item.itemId, waiting);
+    updateManifestState(manifestState, checkpoints);
+    event({
+      itemId: item.itemId,
+      event: "item_provider_recovery_wait",
+      status: "pending",
+      message: waiting.errorSummary,
+      failureKind: "transient",
+      retryable: true,
+      attemptExhausted: false,
+      providerStatusCode: commandCheck?.providerStatusCode,
+      retryAfterSeconds: commandCheck?.retryAfterSeconds,
+      recoveryDecision: "retry_same_run_id",
+      failedStage: waiting.failedStage,
+      ...durableFields,
+      metadata: {
+        nextRetryAt: waiting.nextRetryAt,
+        retryDelaySeconds,
+        retryBudgetSeconds,
+        elapsedRetrySeconds: elapsedRetrySeconds(waiting),
+        providerRecoveryWaitCount: recoveryWaitCount,
+        maxProviderRecoveryWaits,
+        ...durableFields,
+      },
+    });
+    return { processed: true, stopAfterNonTransientFailure: false };
+  }
+
   const projectionRejectionMetadata =
     rejectedSettingsProjectionMetadata(error);
   const authFailureMetadata = providerAuthFailureMetadata(commandCheck);
-  const failed = recoverableProviderFailure
-    ? {
-        ...running,
-        status: "failed",
-        failedAt: now(),
-        errorSummary: redacted(
-          error instanceof Error ? error.message : String(error),
-        ),
-        failureKind: "transient",
-        retryable: false,
-        retryExhausted: true,
-        recoveryDecision: "stop_until_fixed",
-        ...durableFields,
-        failedStage: commandCheck?.name ?? durableFields.failedStage,
-        retryStartedAt:
-          running.retryStartedAt ?? commandCheck?.completedAt ?? now(),
-        nextRetryAt: undefined,
-        retryDelaySeconds: undefined,
-        runnerHeartbeatAt: now(),
-        activeCommand: commandCheck?.name ?? running.activeCommand ??
-          running.currentCommand ?? running.failedStage,
-        metadata: {
-          ...(running.metadata ?? {}),
-          waitingForProviderRecovery: false,
-          providerRecoveryWaitStartedAt: now(),
-          providerRecoveryReason: providerRecoveryWaitStillAvailable
-            ? "transient_retry_budget_window_elapsed"
-            : "provider_recovery_wait_limit_reached",
-          providerRecoveryWaitCount: recoveryWaitCount,
-          maxProviderRecoveryWaits,
-          retryBudgetSeconds,
-          providerRecoveryExcludedFromRun: true,
-          sourceName: activeRuntimeItem.sourceName,
-          ...durableFields,
-        },
-      }
-    : {
-        ...running,
-        status: "failed",
-        failedAt: now(),
-        errorSummary: redacted(
-          error instanceof Error ? error.message : String(error),
-        ),
-        failureKind,
-        retryable: false,
-        retryExhausted: Boolean(commandCheck?.attemptExhausted) ||
-          (retryable && failureKind === "transient"),
-        recoveryDecision: "stop_until_fixed",
-        ...durableFields,
-        failedStage: commandCheck?.name ?? durableFields.failedStage,
-        nextRetryAt: undefined,
-        retryDelaySeconds: undefined,
-        runnerHeartbeatAt: now(),
-        activeCommand: commandCheck?.name ?? running.activeCommand ??
-          running.currentCommand ?? running.failedStage,
-        metadata: {
-          ...(running.metadata ?? {}),
-          ...projectionRejectionMetadata,
-          ...authFailureMetadata,
-          ...durableFields,
-          waitingForProviderRecovery: false,
-        },
-      };
+  const failed = {
+    ...running,
+    status: "failed",
+    failedAt: now(),
+    errorSummary: redacted(
+      error instanceof Error ? error.message : String(error),
+    ),
+    failureKind,
+    retryable: false,
+    retryExhausted: Boolean(commandCheck?.attemptExhausted) ||
+      (retryable && failureKind === "transient"),
+    recoveryDecision: "stop_until_fixed",
+    ...durableFields,
+    failedStage: commandCheck?.name ?? durableFields.failedStage,
+    nextRetryAt: undefined,
+    retryDelaySeconds: undefined,
+    runnerHeartbeatAt: now(),
+    activeCommand: commandCheck?.name ?? running.activeCommand ??
+      running.currentCommand ?? running.failedStage,
+    metadata: {
+      ...(running.metadata ?? {}),
+      ...projectionRejectionMetadata,
+      ...authFailureMetadata,
+      ...durableFields,
+      waitingForProviderRecovery: false,
+    },
+  };
   if (commandCheck) {
     failed.commandChecks = [
       ...(failed.commandChecks ?? []),
@@ -11927,6 +13287,7 @@ async function runClaimedBatchItem({
         workerId,
         bookConcurrency,
         stopAfterNonTransientFailure: result.stopAfterNonTransientFailure,
+        deferred: result.deferred ?? false,
       },
     });
     releaseBookLease(activeBookLease, checkpoints.get(item.itemId)?.status ?? "failed");
@@ -11948,6 +13309,8 @@ async function runWorkerPool({
   let rejectedError;
   let stopAfterNonTransientFailure = false;
   let processed = false;
+  let deferred = false;
+  let minDeferredDelayMs = Number.POSITIVE_INFINITY;
 
   return await new Promise((resolvePool, rejectPool) => {
     const settleIfDone = () => {
@@ -11967,6 +13330,7 @@ async function runWorkerPool({
         activeCount < bookConcurrency &&
         candidateIndex < candidates.length &&
         !stopAfterNonTransientFailure &&
+        !batchStopRequested &&
         rejectedError == null
       ) {
         const candidate = candidates[candidateIndex];
@@ -11999,6 +13363,15 @@ async function runWorkerPool({
             manifestState.manifest,
             workerId,
           );
+          if (!claim.claimed) {
+            deferred = true;
+            minDeferredDelayMs = Math.min(minDeferredDelayMs, 250);
+            manifestState.manifest = updateManifest(
+              manifestState.manifest,
+              Array.from(checkpoints.values()),
+            );
+            continue;
+          }
           running = claim.running;
           event({
             itemId: candidate.item.itemId,
@@ -12025,6 +13398,13 @@ async function runWorkerPool({
           }).then((result) => {
             results.push(result);
             processed = processed || result.processed;
+            if (result.deferred) {
+              deferred = true;
+              minDeferredDelayMs = Math.min(
+                minDeferredDelayMs,
+                result.deferredDelayMs ?? 1000,
+              );
+            }
             stopAfterNonTransientFailure = stopAfterNonTransientFailure ||
               result.stopAfterNonTransientFailure;
             if (result.stopAfterNonTransientFailure) {
@@ -12045,6 +13425,12 @@ async function runWorkerPool({
             settleIfDone();
           });
         } catch (error) {
+          if (error instanceof ClaimPreflightDeferredError) {
+            deferred = true;
+            minDeferredDelayMs = Math.min(minDeferredDelayMs, error.delayMs ?? 1000);
+            eventClaimPreflightDeferred(candidate.item, error);
+            continue;
+          }
           rejectedError = error;
           break;
         }
@@ -12057,7 +13443,11 @@ async function runWorkerPool({
     } catch (error) {
       rejectPool(error);
     }
-  });
+  }).then((result) => ({
+    ...result,
+    deferred,
+    deferredDelayMs: Number.isFinite(minDeferredDelayMs) ? minDeferredDelayMs : 0,
+  }));
 }
 
 async function waitForNextRetryWindow(items, checkpoints) {
@@ -12107,7 +13497,15 @@ async function main() {
   if (!statusJson) {
     acquireCoordinatorLock();
     manifest = loadManifest(items);
-    const runnerStartTargets = durablePreflightTargetsForItems(items);
+    const completedSeed = loadCompletedSeed();
+    const startupCheckpoints = new Map(items.map((item) => [
+      item.itemId,
+      loadCheckpoint(item, completedSeed),
+    ]));
+    const runnerStartTargets = durablePreflightTargetsForStartupItems(
+      items,
+      startupCheckpoints,
+    );
     const startupScanStats = createStartupScanStats(runnerStartTargets.length);
     manifest = writeStartupRecoveryManifest(manifest, {
       scopeCount: startupScanStats.scopeCount,
@@ -12115,7 +13513,16 @@ async function main() {
       degradedTargetCount: 0,
       mutationCount: 0,
       decision: "created_before_preflight",
+      ...(migrateOnly ? migrateRepairStartupUpdate({
+        migrateOnly,
+        providerRequestDiagnostics: [],
+        stats: startupScanStats,
+        limits: migrateRepair,
+      }) : {}),
     });
+    if (migrateOnly) {
+      repairKnownMutableGraphOutputStatsQuarantines(items, startupScanStats);
+    }
     if (!testSkipRunnerStartPreflight) {
       const providerRequestDiagnostics = [];
       try {
@@ -12125,6 +13532,10 @@ async function main() {
           providerRequestDiagnostics,
           scanStats: startupScanStats,
           failFast: true,
+          ...migrateRepairPreflightOptions({
+            migrateOnly,
+            limits: migrateRepair,
+          }),
         });
       } catch (error) {
         if (error instanceof DurableStateError) {
@@ -12145,9 +13556,12 @@ async function main() {
       manifest = writeStartupRecoveryManifest(
         manifest,
         startupRecoveryFromStats(startupScanStats, {
-          decision: providerRequestDiagnostics.length > 0
-            ? "continue_with_provider_request_diagnostic"
-            : "startup_preflight_passed",
+          ...migrateRepairStartupUpdate({
+            migrateOnly,
+            providerRequestDiagnostics,
+            stats: startupScanStats,
+            limits: migrateRepair,
+          }),
         }),
       );
     }
@@ -12185,7 +13599,7 @@ async function main() {
     item.itemId,
     loadCheckpoint(item, completedSeed),
   ]));
-  if (!statusJson) migrateGraphOutputProducerManifests();
+  if (!statusJson) migrateGraphOutputProducerManifests(items, checkpoints);
   manifest = updateManifest(manifest, Array.from(checkpoints.values()));
   if (!statusJson && batchStopRequested) {
     manifest = persistBatchStopManifest(
@@ -12257,9 +13671,27 @@ async function main() {
   while (processedInPass) {
     processedInPass = false;
     let deferredForRetryWindow = false;
+    let deferredForClaimPreflight = false;
+    let claimPreflightDelayMs = 0;
     const providerAuthReopenedCount =
       applyProviderAuthReopenPass(items, checkpoints);
     if (providerAuthReopenedCount > 0) {
+      manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+      manifestState.manifest = manifest;
+      writeRecoverySummary(manifest, Array.from(checkpoints.values()));
+      processedInPass = true;
+    }
+    const durableChecksumReopenedCount =
+      applyDurableChecksumReopenPass(items, checkpoints);
+    if (durableChecksumReopenedCount > 0) {
+      manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+      manifestState.manifest = manifest;
+      writeRecoverySummary(manifest, Array.from(checkpoints.values()));
+      processedInPass = true;
+    }
+    const durablePreflightDeferReopenedCount =
+      applyDurablePreflightDeferReopenPass(items, checkpoints);
+    if (durablePreflightDeferReopenedCount > 0) {
       manifest = updateManifest(manifest, Array.from(checkpoints.values()));
       manifestState.manifest = manifest;
       writeRecoverySummary(manifest, Array.from(checkpoints.values()));
@@ -12320,6 +13752,10 @@ async function main() {
         break;
       }
       if (checkpoint?.status === "completed") {
+        writeBookDistributionManifest(activeItem, {
+          status: "completed",
+          emitEvent: false,
+        });
         event({ itemId: item.itemId, event: "item_skip_completed", status: "completed" });
         continue;
       }
@@ -12398,12 +13834,15 @@ async function main() {
           } catch (error) {
             const projectionRejectionMetadata =
               rejectedSettingsProjectionMetadata(error);
-            const durableFields = {
+            const durableOutcomeFields = {
               ...durableProjection(durableFailureForError(
                 error,
                 itemPath(activeItem ?? item),
               )),
               ...durableProjection(error?.commandCheck),
+            };
+            const durableFields = {
+              ...diagnosticProjectionOnly(durableOutcomeFields),
             };
             const activeCommand =
               error?.commandCheck?.name ?? checkpoint.activeCommand ??
@@ -12416,7 +13855,7 @@ async function main() {
               errorSummary: redacted(error instanceof Error
                 ? error.message
                 : String(error)),
-              failureKind: "permanent",
+              failureKind: durableOutcomeFields.failureKind ?? "permanent",
               retryable: false,
               retryExhausted: true,
               recoveryDecision: "stop_until_fixed",
@@ -12589,6 +14028,15 @@ async function main() {
           manifest,
           workerId,
         );
+        if (!claim.claimed) {
+          deferredForClaimPreflight = true;
+          claimPreflightDelayMs = claimPreflightDelayMs > 0
+            ? Math.min(claimPreflightDelayMs, 250)
+            : 250;
+          manifest = updateManifest(manifest, Array.from(checkpoints.values()));
+          manifestState.manifest = manifest;
+          continue;
+        }
         const running = claim.running;
         manifestState.manifest = manifest;
         const result = await runClaimedBatchItem({
@@ -12604,6 +14052,12 @@ async function main() {
         });
         manifest = manifestState.manifest;
         processedInPass = result.processed || processedInPass;
+        if (result.deferred) {
+          deferredForClaimPreflight = true;
+          claimPreflightDelayMs = claimPreflightDelayMs > 0
+            ? Math.min(claimPreflightDelayMs, result.deferredDelayMs ?? 1000)
+            : (result.deferredDelayMs ?? 1000);
+        }
         if (result.stopAfterNonTransientFailure) {
           stopAfterNonTransientFailure = true;
           requestBatchStop("single_worker_stop_until_fixed");
@@ -12611,6 +14065,14 @@ async function main() {
           break;
         }
       } catch (error) {
+        if (error instanceof ClaimPreflightDeferredError) {
+          deferredForClaimPreflight = true;
+          claimPreflightDelayMs = claimPreflightDelayMs > 0
+            ? Math.min(claimPreflightDelayMs, error.delayMs ?? 1000)
+            : (error.delayMs ?? 1000);
+          eventClaimPreflightDeferred(item, error);
+          continue;
+        }
         if (batchFailureWasHandled(error)) throw error;
         const result = await handleRunItemFailure({
           error,
@@ -12656,6 +14118,10 @@ async function main() {
       });
       manifest = manifestState.manifest;
       processedInPass = processedInPass || poolResult.processed;
+      deferredForClaimPreflight = deferredForClaimPreflight || poolResult.deferred;
+      claimPreflightDelayMs = claimPreflightDelayMs > 0 && poolResult.deferredDelayMs > 0
+        ? Math.min(claimPreflightDelayMs, poolResult.deferredDelayMs)
+        : Math.max(claimPreflightDelayMs, poolResult.deferredDelayMs);
       stopAfterNonTransientFailure = stopAfterNonTransientFailure ||
         poolResult.stopAfterNonTransientFailure;
       if (poolResult.stopAfterNonTransientFailure) {
@@ -12676,7 +14142,23 @@ async function main() {
         },
       });
     }
+    if (batchStopRequested) break;
     if (stopAfterNonTransientFailure) break;
+    if (deferredForClaimPreflight) {
+      const delayMs = Math.max(250, claimPreflightDelayMs || 1000);
+      event({
+        event: "batch_wait_claim_preflight_retry",
+        status: "running",
+        recoveryDecision: "continue_pending",
+        metadata: {
+          delayMs,
+          reason: "durable_preflight_live_lock",
+        },
+      });
+      await delay(delayMs);
+      processedInPass = true;
+      continue;
+    }
     if (!processedInPass && deferredForRetryWindow) {
       if (providerRecoveryWaitLimitReached(items, checkpoints)) {
         eventProviderRecoveryWaitLimit(items, checkpoints);

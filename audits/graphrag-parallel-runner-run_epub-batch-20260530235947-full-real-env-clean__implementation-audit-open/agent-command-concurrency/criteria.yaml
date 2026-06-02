@@ -1,0 +1,64 @@
+schema_version: "1.0"
+audit_id: "agent-command-concurrency"
+run_id: "epub-batch-20260530235947-full-real-env-clean"
+criteria:
+  - id: "C01"
+    title: "命令行并发参数解析与持久化"
+    statement: >
+      Runner must parse, clamp, emit, and persist book-concurrency,
+      openai-provider-concurrency, jina-provider-concurrency, and
+      local-cpu-concurrency without silent zero or negative values.
+  - id: "C02"
+    title: "多书 Worker Pool 编排"
+    statement: >
+      Runner must schedule independent books through a bounded worker pool,
+      keep duplicate book identities fenced, and quiesce siblings after a
+      non-transient stop condition.
+  - id: "C03"
+    title: "Provider 与本地 CPU 槽位映射"
+    statement: >
+      Runner must route OpenAI, Jina, qmd-index-writer, and local CPU work to
+      the correct semaphore lane according to command or GraphRAG stage.
+  - id: "C04"
+    title: "OpenAI/Jina Durable 槽位容量门"
+    statement: >
+      Provider slots must use durable leases with provider-scoped registry
+      locks so concurrent workers and resumed runners cannot exceed configured
+      OpenAI or Jina capacity.
+  - id: "C05"
+    title: "槽位释放与终态栅栏"
+    statement: >
+      Every acquired provider slot must be released or recovered on success,
+      failure, timeout, and cancellation, and completed checkpoints must prove
+      that no active provider slot remains.
+  - id: "C06"
+    title: "QMD 验证链完整性"
+    statement: >
+      The normal closed loop must execute and validate the full required QMD
+      command chain: version, status, doctor, pull, update, embed, search,
+      query, get, multi-get, collection, context, skills, dspy, cleanup,
+      query-auto, and query-graphrag.
+  - id: "C07"
+    title: "QMD 索引写入串行化"
+    statement: >
+      QMD commands that mutate the shared index must be serialized through a
+      dedicated writer lane and file lock so parallel books do not corrupt the
+      SQLite index.
+  - id: "C08"
+    title: "Provider transient retry 与恢复等待"
+    statement: >
+      Retryable provider and timeout failures must be classified as transient,
+      retried with bounded attempts and delay metadata, then moved to
+      retry_same_run_id recovery wait without losing item identity.
+  - id: "C09"
+    title: "Provider auth 恢复闭环与脱敏"
+    statement: >
+      401/403 provider auth failures must be captured as non-retryable until a
+      changed provider-auth fingerprint permits reopening, and persisted logs
+      must not contain secret values.
+  - id: "C10"
+    title: "真实 run 完整性与可查询终态"
+    statement: >
+      The audited real run must finish all 38 books, persist zero active
+      provider slots/subprocesses/book leases, and retain query-ready GraphRAG
+      plus QMD evidence for completed items.

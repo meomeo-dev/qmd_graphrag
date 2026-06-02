@@ -42,7 +42,8 @@ const GRAPH_RAG_EARLY_STOP_MAX_EVIDENCE = 20;
 const GRAPH_RAG_EARLY_STOP_MAX_LINE_LENGTH = 240;
 const GRAPH_RAG_PROVIDER_PAYLOAD_ASSIGNMENT_PATTERN =
   /\b(?:raw|payload|body|provider[_-]?request|provider[_-]?response|provider[_-]?request[_-]?body|provider[_-]?response[_-]?body|provider[_-]?request[_-]?payload|provider[_-]?response[_-]?payload|raw[_-]?request|raw[_-]?response|request[_-]?body|response[_-]?body|request[_-]?payload|response[_-]?payload)\b\s*[:=]\s*(?:"[^"]*"|'[^']*'|\{[^}]*\}|\[[^\]]*\]|[^,\s}]+)/giu;
-const PYTHON_BRIDGE_PROCESS_GROUP = process.platform !== "win32";
+const PYTHON_BRIDGE_INHERIT_PARENT_PROCESS_GROUP =
+  "QMD_GRAPHRAG_INHERIT_PARENT_PROCESS_GROUP";
 
 type EarlyStopWatcher = {
   stop(): void;
@@ -72,6 +73,13 @@ type BridgeSubprocessRecord = {
   signal?: string | null;
   completedAt?: string;
 };
+
+function pythonBridgeUsesProcessGroup(): boolean {
+  return (
+    process.platform !== "win32" &&
+    process.env[PYTHON_BRIDGE_INHERIT_PARENT_PROCESS_GROUP] !== "1"
+  );
+}
 
 function parsePositiveInteger(value: string | undefined): number | undefined {
   if (value == null || value === "") return undefined;
@@ -111,6 +119,7 @@ function buildBridgeSubprocessRecord(input: {
   completedAt?: string;
   exitCode?: number | null;
   signal?: string | null;
+  processGroup: boolean;
 }): BridgeSubprocessRecord | null {
   const runId = optionalString(process.env.QMD_GRAPHRAG_RUN_ID);
   const runnerSessionId = optionalString(process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID);
@@ -138,7 +147,7 @@ function buildBridgeSubprocessRecord(input: {
     providerSlotFencingToken: optionalString(
       process.env.QMD_GRAPHRAG_PROVIDER_SLOT_FENCING_TOKEN,
     ),
-    processGroup: PYTHON_BRIDGE_PROCESS_GROUP,
+    processGroup: input.processGroup,
     startedAt: input.startedAt,
     heartbeatAt: new Date().toISOString(),
     status: input.status,
@@ -158,9 +167,10 @@ function writeBridgeSubprocessRecord(record: BridgeSubprocessRecord | null): voi
 function terminatePythonBridgeChild(
   child: ReturnType<typeof spawn>,
   signal: NodeJS.Signals,
+  processGroup: boolean,
 ): void {
   try {
-    if (child.pid != null && PYTHON_BRIDGE_PROCESS_GROUP) {
+    if (child.pid != null && processGroup) {
       process.kill(-child.pid, signal);
       return;
     }
@@ -323,10 +333,11 @@ export async function callPythonBridge<TRequest, TResponse>(
   return new Promise<TResponse>((resolve, reject) => {
     const subprocessId = `python-bridge-${randomUUID()}`;
     const startedAt = new Date().toISOString();
+    const processGroup = pythonBridgeUsesProcessGroup();
     const child = spawn(pythonBin, [scriptPath, options.command], {
       cwd: options.workingDirectory,
       stdio: ["pipe", "pipe", "pipe"],
-      detached: PYTHON_BRIDGE_PROCESS_GROUP,
+      detached: processGroup,
     });
     try {
       writeBridgeSubprocessRecord(buildBridgeSubprocessRecord({
@@ -335,11 +346,12 @@ export async function callPythonBridge<TRequest, TResponse>(
         startedAt,
         pid: child.pid,
         status: "running",
+        processGroup,
       }));
     } catch (error) {
-      terminatePythonBridgeChild(child, "SIGTERM");
+      terminatePythonBridgeChild(child, "SIGTERM", processGroup);
       setTimeout(() => {
-        terminatePythonBridgeChild(child, "SIGKILL");
+        terminatePythonBridgeChild(child, "SIGKILL", processGroup);
       }, GRAPH_RAG_EARLY_STOP_KILL_GRACE_MS).unref?.();
       reject(error);
       return;
@@ -377,10 +389,10 @@ export async function callPythonBridge<TRequest, TResponse>(
 
     const terminateCurrentChild = () => {
       if (child.exitCode != null || child.signalCode != null) return;
-      terminatePythonBridgeChild(child, "SIGTERM");
+      terminatePythonBridgeChild(child, "SIGTERM", processGroup);
       killTimer = setTimeout(() => {
         if (child.exitCode == null && child.signalCode == null) {
-          terminatePythonBridgeChild(child, "SIGKILL");
+          terminatePythonBridgeChild(child, "SIGKILL", processGroup);
         }
       }, GRAPH_RAG_EARLY_STOP_KILL_GRACE_MS);
       killTimer.unref?.();
@@ -411,6 +423,7 @@ export async function callPythonBridge<TRequest, TResponse>(
         pid: child.pid,
         status: "spawn_error",
         completedAt: new Date().toISOString(),
+        processGroup,
       }));
       rejectOnce(error);
     });
@@ -426,6 +439,7 @@ export async function callPythonBridge<TRequest, TResponse>(
         exitCode: code,
         signal,
         completedAt: new Date().toISOString(),
+        processGroup,
       }));
       if (finished) return;
       if (earlyStopError != null) {

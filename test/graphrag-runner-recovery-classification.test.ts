@@ -40,16 +40,19 @@ import {
   writeProviderAuthReopenGraphFixture,
   writeProviderAuthStoppedBatchFixture,
 } from "./helpers/graphrag-runner-harness.ts";
+import {
+  qmdIndexWriterCommandCheckNames,
+} from "../scripts/graphrag/qmd-validation-policy.mjs";
 
 describe("GraphRAG EPUB batch runner - Recovery Classification", () => {
-  test("all batch qmd commands acquire the qmd index file lock", async () => {
+  test("only qmd writer validation commands acquire the qmd index file lock", async () => {
     const fixture = await runParallelRunnerFixture({
       concurrency: 1,
       runId: "qmd-index-file-lock-fixture",
       commandCheckNames: requiredBatchCommandCheckNames,
       bookCount: 1,
     });
-    const lockedCommands = new Set(requiredBatchCommandCheckNames);
+    const lockedCommands = new Set(qmdIndexWriterCommandCheckNames);
     const acquired = fixture.events.filter((event) =>
       event.event === "qmd_index_file_lock_acquired"
     );
@@ -65,7 +68,6 @@ describe("GraphRAG EPUB batch runner - Recovery Classification", () => {
 
     expect(fixture.result.exitCode).toBe(0);
     expect(fixture.result.stderr).toBe("");
-    expect(acquired.length).toBeGreaterThanOrEqual(lockedCommands.size);
     expect(released).toHaveLength(acquired.length);
     expect(acquired.every((event) => lockedCommands.has(String(event.command))))
       .toBe(true);
@@ -73,6 +75,8 @@ describe("GraphRAG EPUB batch runner - Recovery Classification", () => {
       .toBe(true);
     expect(new Set(acquired.map((event) => String(event.command))))
       .toEqual(lockedCommands);
+    expect(acquired.some((event) => event.command === "qmd-multi-get-json"))
+      .toBe(false);
     expect(countByCommand(acquired)).toEqual(countByCommand(released));
     expect(acquired.every((event) =>
       typeof event.metadata?.generation === "number" &&

@@ -1,0 +1,175 @@
+{
+  "status": "fail",
+  "auditId": "agent-artifact-portability",
+  "runId": "epub-batch-20260530235947-full-real-env-clean",
+  "criteriaCount": 10,
+  "criteriaResults": {
+    "C01": "PASS",
+    "C02": "FAIL",
+    "C03": "PASS",
+    "C04": "FAIL",
+    "C05": "FAIL",
+    "C06": "PASS",
+    "C07": "FAIL",
+    "C08": "FAIL",
+    "C09": "FAIL",
+    "C10": "UNKNOWN"
+  },
+  "runObserved": {
+    "items": 38,
+    "completed": 38,
+    "failed": 0,
+    "missingBookDirs": 0,
+    "missingSourceDirs": 0,
+    "missingOutputFiles": 0,
+    "missingLanceDbTables": 0,
+    "badParquetMagic": 0
+  },
+  "findings": [
+    {
+      "id": "F-C02-01",
+      "criterionId": "C02",
+      "severity": "high",
+      "status": "open",
+      "title": "qmd and normalize metadata depends on root graph_vault/input",
+      "affectedCount": 38,
+      "evidence": [
+        {
+          "path": "graph_vault/catalog/batch-runs/epub-batch-20260530235947-full-real-env-clean/items/item-00474fb29e5e-93717be0.json",
+          "line": 10
+        },
+        {
+          "path": "graph_vault/books/book-00474fb29e5e-59d02d41/qmd/qmd_build_manifest.json",
+          "line": 10
+        },
+        {
+          "path": "scripts/graphrag/batch-epub-workflow.mjs",
+          "line": 8269
+        }
+      ],
+      "recommendation": "Make normalized markdown paths book-scoped or add a distribution manifest that includes and rewrites the root input dependency."
+    },
+    {
+      "id": "F-C04-01",
+      "criterionId": "C04",
+      "severity": "high",
+      "status": "open",
+      "title": "checkpoint artifactIds are not fully resolvable in artifacts.yaml",
+      "affectedCount": 28,
+      "evidence": [
+        {
+          "path": "graph_vault/books/book-00474fb29e5e-59d02d41/checkpoints.yaml",
+          "line": 49
+        },
+        {
+          "path": "graph_vault/books/book-00474fb29e5e-59d02d41/artifacts.yaml",
+          "line": 130
+        }
+      ],
+      "recommendation": "Repair checkpoint artifactIds or preserve superseded artifact manifest entries required by checkpoints."
+    },
+    {
+      "id": "F-C05-01",
+      "criterionId": "C05",
+      "severity": "high",
+      "status": "open",
+      "title": "stageProducerRunIds lack corresponding book-scoped run records",
+      "affectedCount": 24,
+      "evidence": [
+        {
+          "path": "graph_vault/books/book-0c8dffd9585c-41a7e47b/output/qmd_output_manifest.json",
+          "line": 18
+        },
+        {
+          "path": "graph_vault/books/book-0c8dffd9585c-41a7e47b/checkpoints.yaml",
+          "line": 90
+        },
+        {
+          "path": "graph_vault/books/book-0c8dffd9585c-41a7e47b/runs/community_report-20260526142538-jm0hf1.yaml.corrupt-1780053017516"
+        }
+      ],
+      "recommendation": "Ensure each stageProducerRunId has a valid runs/<runId>.yaml or an explicit manifest-backed substitute."
+    },
+    {
+      "id": "F-C07-01",
+      "criterionId": "C07",
+      "severity": "high",
+      "status": "open",
+      "title": "single-book distribution manifest is absent",
+      "affectedCount": 38,
+      "evidence": [
+        {
+          "path": "scripts/graphrag/batch-epub-workflow.mjs",
+          "line": 1148
+        },
+        {
+          "path": "scripts/graphrag/batch-epub-workflow.mjs",
+          "line": 1302
+        },
+        {
+          "path": "graph_vault/books/book-00474fb29e5e-59d02d41/output/qmd_output_manifest.json",
+          "line": 1
+        }
+      ],
+      "recommendation": "Add an explicit book distribution manifest that enumerates sources, books, qmd, input, output, runs, catalog projections, sidecars, and exclusions."
+    },
+    {
+      "id": "F-C08-01",
+      "criterionId": "C08",
+      "severity": "medium",
+      "status": "open",
+      "title": "active vault contains non-run historical book/source directories",
+      "affectedCount": 34,
+      "evidence": [
+        {
+          "path": "graph_vault/catalog/sources.yaml",
+          "line": 3
+        },
+        {
+          "path": "graph_vault/catalog/sources.yaml",
+          "line": 22
+        },
+        {
+          "path": "docs/records/architecture/2026-05-21-portable-graph-vault.yaml",
+          "line": 57
+        }
+      ],
+      "recommendation": "Archive or explicitly filter historical directories when building a run or single-book distribution closure."
+    },
+    {
+      "id": "F-C09-01",
+      "criterionId": "C09",
+      "severity": "medium",
+      "status": "open",
+      "title": "book-scoped directories contain unmanifested corrupt quarantine files",
+      "affectedCount": 1224,
+      "evidence": [
+        {
+          "path": "graph_vault/books/book-00474fb29e5e-59d02d41/job.yaml.corrupt-1780053083407"
+        },
+        {
+          "path": "graph_vault/books/book-00474fb29e5e-59d02d41/output/context.json.corrupt-1780053084112"
+        },
+        {
+          "path": "graph_vault/books/book-0c8dffd9585c-41a7e47b/runs/community_report-20260526142538-jm0hf1.yaml.corrupt-1780053017516"
+        }
+      ],
+      "recommendation": "Define distribution-time quarantine handling: exclude by default or list as recovery-only evidence."
+    },
+    {
+      "id": "R-C10-01",
+      "criterionId": "C10",
+      "severity": "medium",
+      "status": "unknown",
+      "title": "sensitive payload exclusion cannot be proven without a distribution manifest",
+      "affectedCount": 38,
+      "evidence": [
+        {
+          "path": "graph_vault/books/book-00474fb29e5e-59d02d41/output/qmd_output_manifest.json",
+          "line": 15
+        }
+      ],
+      "recommendation": "Declare .env and provider request/response payload exclusions in the single-book distribution manifest."
+    }
+  ]
+}

@@ -221,6 +221,13 @@ const DurableTargetMappingTable = [
   },
   {
     pattern:
+      /\/graph_vault\/books\/[^/]+\/output\/qmd_durable_output_repair\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "graphOutputProducer",
+  },
+  {
+    pattern:
       /\/graph_vault\/books\/[^/]+\/output\/lancedb\/[^/]+\.lance\/qmd_row_count\.json$/,
     lane: "checkpointWriterLane",
     durableKind: "json",
@@ -469,6 +476,93 @@ export async function reconcileDurableTextFile(
 ): Promise<void> {
   rejectDurableAuxiliaryTarget(path);
   await withDurableFileLock(path, () => reconcileDurableTextFileUnlocked(path, kind));
+}
+
+export type DurableChecksumRefreshResult = {
+  path: string;
+  checksum: string;
+  previousChecksum: string | null;
+  checksumRecoveryDecision: string;
+  mutated: boolean;
+};
+
+export async function refreshDurableTextFileChecksum(
+  path: string,
+  kind: "yaml" | "json",
+  input: {
+    checksumRecoveryDecision?: string;
+    expectedChecksum?: string;
+    evidence?: Record<string, unknown>;
+  } = {},
+): Promise<DurableChecksumRefreshResult> {
+  rejectDurableAuxiliaryTarget(path);
+  return withDurableFileLock(path, async () => {
+    await removeStaleDurableTempsUnlocked(path);
+    await removeStaleDurableTempsUnlocked(durableChecksumPath(path));
+    const raw = await readFile(path, "utf8");
+    validateText(kind, raw, path);
+    const actual = hashText(raw);
+    const decision = input.checksumRecoveryDecision ??
+      "writer_boundary_checksum_refreshed";
+    if (
+      input.expectedChecksum != null &&
+      input.expectedChecksum !== actual
+    ) {
+      throw new DurableStateError(
+        `durable checksum refresh evidence mismatch: ${path}`,
+        {
+          localFailureClass: "durable_checksum_refresh_evidence_mismatch",
+          evidence: {
+            ...newOperationEvidence(path, "checksum-refresh"),
+            checksumExpected: input.expectedChecksum,
+            checksumActual: actual,
+            checksumRecoveryDecision: "stop_until_fixed",
+            recoveryDecision: "stop_until_fixed",
+            repairAllowed: true,
+            ...input.evidence,
+          },
+        },
+      );
+    }
+    const checksumPath = durableChecksumPath(path);
+    const previousChecksum = existsSync(checksumPath)
+      ? readFileSync(checksumPath, "utf8").trim()
+      : null;
+    const metaState = readChecksumMetaState(path);
+    const metaNeedsRepair = metaState.status !== "present" ||
+      checksumMetaIsPending(metaState.meta) ||
+      checksumMetaIsInvalid(actual, metaState.meta);
+    if (previousChecksum === actual) {
+      if (metaNeedsRepair) {
+        await reconcileDurableTextFileUnlocked(path, kind);
+        await appendChecksumRefreshRecord(path, actual, previousChecksum, {
+          checksumRecoveryDecision: "checksum_meta_refreshed",
+          ...input.evidence,
+        });
+      }
+      return {
+        path,
+        checksum: actual,
+        previousChecksum,
+        checksumRecoveryDecision: metaNeedsRepair
+          ? "checksum_meta_refreshed"
+          : "committed",
+        mutated: metaNeedsRepair,
+      };
+    }
+    await backfillChecksum(path, actual, decision);
+    await appendChecksumRefreshRecord(path, actual, previousChecksum, {
+      checksumRecoveryDecision: decision,
+      ...input.evidence,
+    });
+    return {
+      path,
+      checksum: actual,
+      previousChecksum,
+      checksumRecoveryDecision: decision,
+      mutated: true,
+    };
+  });
 }
 
 async function writeTextFileDurable(
@@ -958,14 +1052,12 @@ async function removeStaleDurableLock(path: string): Promise<void> {
   try {
     const entry = await stat(path);
     const owner = await readJsonSidecar(path);
-    const ownerPid = numberValue(owner?.pid);
-    const ownerHost = stringValue(owner?.host);
+    const ownerDeadSameHost = durableLockOwnerDeadSameHost(owner);
     if (
-      Date.now() - entry.mtimeMs > DurableLockStaleMs &&
-      durableLockOwnerExpired(owner, entry) &&
+      (durableLockOwnerExpired(owner, entry) || ownerDeadSameHost) &&
       durableLockOwnerHasRecoveryFence(owner) &&
-      (ownerHost == null || ownerHost === Host) &&
-      !processAlive(ownerPid)
+      durableLockOwnerLocal(owner) &&
+      !durableLockOwnerAlive(owner)
     ) {
       const staleAgeMs = Math.floor(Date.now() - entry.mtimeMs);
       await rm(path, { force: true });
@@ -997,14 +1089,12 @@ function removeStaleDurableLockSync(path: string): void {
   try {
     const entry = statSync(path);
     const owner = readJsonSidecarSync(path);
-    const ownerPid = numberValue(owner?.pid);
-    const ownerHost = stringValue(owner?.host);
+    const ownerDeadSameHost = durableLockOwnerDeadSameHost(owner);
     if (
-      Date.now() - entry.mtimeMs > DurableLockStaleMs &&
-      durableLockOwnerExpired(owner, entry) &&
+      (durableLockOwnerExpired(owner, entry) || ownerDeadSameHost) &&
       durableLockOwnerHasRecoveryFence(owner) &&
-      (ownerHost == null || ownerHost === Host) &&
-      !processAlive(ownerPid)
+      durableLockOwnerLocal(owner) &&
+      !durableLockOwnerAlive(owner)
     ) {
       const staleAgeMs = Math.floor(Date.now() - entry.mtimeMs);
       rmSync(path, { force: true });
@@ -1212,6 +1302,24 @@ function backfillChecksumSync(
     rmSync(`${tempPath}.owner.json`, { force: true });
     throw classifyDurableWriteError(error, operation);
   }
+}
+
+async function appendChecksumRefreshRecord(
+  path: string,
+  checksum: string,
+  previousChecksum: string | null,
+  extra: Record<string, unknown>,
+): Promise<void> {
+  await appendDurableRecoveryRecord(dirname(path), {
+    event: "durable_checksum_refreshed",
+    targetLocator: path,
+    checksum,
+    previousChecksum,
+    refreshedAt: new Date().toISOString(),
+    recoveryDecision: "continue_pending",
+    repairAllowed: true,
+    ...extra,
+  });
 }
 
 async function writeChecksumMeta(
@@ -1906,6 +2014,21 @@ function durableLockOwnerHasRecoveryFence(
     stringValue(owner?.fencingTokenHash) != null &&
     stringValue(owner?.runnerSessionId) != null &&
     stringValue(owner?.operationId) != null;
+}
+
+function durableLockOwnerLocal(owner: Record<string, unknown> | null): boolean {
+  const ownerHost = stringValue(owner?.ownerHost ?? owner?.runnerHost ?? owner?.host);
+  return ownerHost == null || ownerHost === Host;
+}
+
+function durableLockOwnerAlive(owner: Record<string, unknown> | null): boolean {
+  const ownerPid = numberValue(owner?.ownerPid ?? owner?.pid);
+  return durableLockOwnerLocal(owner) && ownerPid != null && processAlive(ownerPid);
+}
+
+function durableLockOwnerDeadSameHost(owner: Record<string, unknown> | null): boolean {
+  const ownerPid = numberValue(owner?.ownerPid ?? owner?.pid);
+  return durableLockOwnerLocal(owner) && ownerPid != null && !processAlive(ownerPid);
 }
 
 function durableTempOwnerMatchesTarget(

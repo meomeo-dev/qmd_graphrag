@@ -29,6 +29,12 @@ export function createStartupRecoverySchema({
     decision: z.string().min(1).optional(),
     recoveryDecision: BatchRecoveryDecisionSchema.optional(),
     nextOperatorAction: StartupNextOperatorActionSchema.optional(),
+    repairBoundary: z.string().min(1).optional(),
+    repairScope: z.string().min(1).optional(),
+    repairTargetFamily: z.string().min(1).optional(),
+    maxScannedTargets: z.number().int().positive().optional(),
+    maxMutationCount: z.number().int().nonnegative().optional(),
+    limitHit: z.boolean().optional(),
     explicitRepairHint: z.string().min(1).optional(),
     providerRequestDiagnostics: z.array(DurableStateDiagnosticSchema).optional(),
     updatedAt: z.string().datetime().optional(),
@@ -77,6 +83,7 @@ export function isStartupPreflightMutationEvent(eventName) {
   const name = String(eventName ?? "");
   return /^durable_.*_(?:target_quarantined|checksum_backfilled|temp_reconciled)$/u
     .test(name) ||
+    /^durable_.*_target_recovered$/u.test(name) ||
     /^durable_.*_(?:recovered|deleted|renamed|written|committed)$/u
       .test(name) ||
     name === "durable_checksum_meta_backfilled" ||
@@ -97,6 +104,23 @@ export function startupRecoveryFromStats(stats, update = {}) {
   };
 }
 
+export function startupRecoveryMergePolicy(update = {}) {
+  const decision = update.decision;
+  const clearsBlockingOutcome = [
+    "created_before_preflight",
+    "startup_preflight_passed",
+    "continue_with_provider_request_diagnostic",
+    "migrate_only_repair_preflight_passed",
+  ].includes(decision);
+  const preservesRepairContext =
+    update.repairBoundary != null ||
+    update.repairScope != null ||
+    update.repairTargetFamily != null ||
+    decision === "migrate_only_repair_preflight_passed" ||
+    decision === "migrate_only_repair_limit_reached";
+  return { clearsBlockingOutcome, preservesRepairContext };
+}
+
 export function buildStartupPreflightFailureManifest(input) {
   const blocker = input.DurableStateDiagnosticSchema.parse(input.withoutUndefined({
     failureKind: input.durableError.failureKind ?? "local_state_integrity",
@@ -106,6 +130,21 @@ export function buildStartupPreflightFailureManifest(input) {
     localFailureClass: input.durableError.localFailureClass,
     ...input.durableProjection(input.durableError.evidence),
   }));
+  const current = input.manifest.metadata?.startupRecovery ?? {};
+  const nextOperatorAction = blocker.repairAllowed === true &&
+    blocker.durableMode === "migrate_only_repair_boundary"
+    ? "run_migrate_only"
+    : "run_explicit_repair";
+  const explicitRepairHint = nextOperatorAction === "run_migrate_only"
+    ? "rerun migrate-only with a larger explicit repair bound"
+    : "run explicit repair or migrate-only before starting a new run";
+  const repairBoundary = {
+    repairBoundary: current.repairBoundary,
+    repairScope: current.repairScope,
+    repairTargetFamily: current.repairTargetFamily,
+    maxScannedTargets: current.maxScannedTargets,
+    maxMutationCount: current.maxMutationCount,
+  };
   return input.BatchRunManifestSchema.parse(input.withoutUndefined({
     ...input.manifest,
     status: "failed",
@@ -128,16 +167,21 @@ export function buildStartupPreflightFailureManifest(input) {
       ...(input.manifest.metadata ?? {}),
       startupRecovery: input.StartupRecoverySchema.parse(input.withoutUndefined(
         startupRecoveryFromStats(input.stats, {
+          ...repairBoundary,
           runId: input.manifest.runId,
           stage: "runner_start",
           firstSample: input.stats.firstSample ?? blocker.targetLocator,
           lastSample: input.stats.lastSample ?? blocker.targetLocator,
           firstBlocker: blocker,
-          decision: "blocked_before_claim",
+          decision: current.repairBoundary === "migrate_only"
+            ? "migrate_only_repair_limit_reached"
+            : "blocked_before_claim",
           recoveryDecision: "stop_until_fixed",
-          nextOperatorAction: "run_explicit_repair",
-          explicitRepairHint:
-            "run explicit repair or migrate-only before starting a new run",
+          nextOperatorAction,
+          limitHit: current.repairBoundary === "migrate_only"
+            ? true
+            : current.limitHit,
+          explicitRepairHint,
           updatedAt: input.now(),
         }),
       )),

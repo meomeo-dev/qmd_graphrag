@@ -42,6 +42,8 @@ async function importRuntime() {
     assertGraphRagStageArtifactsReady: indexModule.assertGraphRagStageArtifactsReady,
     graphRagIndexLogOffset: indexModule.graphRagIndexLogOffset,
     loadGraphQueryCapabilities: indexModule.loadGraphQueryCapabilities,
+    refreshGraphRagStageOutputDurableSidecars:
+      indexModule.refreshGraphRagStageOutputDurableSidecars,
     syncGraphRagBookWorkspace: indexModule.syncGraphRagBookWorkspace,
     writeGraphRagOutputProducerManifest: indexModule.writeGraphRagOutputProducerManifest,
     DurableStateError: indexModule.DurableStateError,
@@ -1428,6 +1430,14 @@ async function run() {
       producerRunId: runId,
       stage: nextStage,
     });
+    const durableOutputRefresh =
+      await runtimeApi.refreshGraphRagStageOutputDurableSidecars({
+        outputDir: scopedOutputDir,
+        repo,
+        bookId: sync.job.bookId,
+        stage: nextStage,
+        producerRunId: runId,
+      });
 
     const { sync: stageSynced } = await syncCurrentBook(
       runtimeApi,
@@ -1461,6 +1471,7 @@ async function run() {
         graphWorkspace: "book_scoped",
         residualCleanup,
         stageReportHealth,
+        durableOutputRefresh,
       },
     });
 

@@ -257,6 +257,26 @@ describe("CLI Multi-Get Command", () => {
     expect(stdout).toContain("Test Project");
     expect(stdout).toContain("Team Meeting");
   });
+
+  test("retrieves one document by exact virtual path", async () => {
+    const { stdout, exitCode } = await harness.runQmd([
+      "multi-get",
+      "qmd://fixtures/notes/meeting.md",
+      "-l",
+      "1",
+      "--max-bytes",
+      "4096",
+      "--json",
+    ], { dbPath: localDbPath });
+    const payload = JSON.parse(stdout);
+
+    expect(exitCode).toBe(0);
+    expect(payload[0]).toMatchObject({
+      file: "qmd://fixtures/notes/meeting.md",
+    });
+    expect(payload[0].skipped).toBeUndefined();
+    expect(payload[0].body).toContain("Meeting");
+  });
 });
 
 describe("CLI Update Command", () => {
@@ -1173,4 +1193,3 @@ describe("status and collection list hide filesystem paths", () => {
 // =============================================================================
 // MCP HTTP Daemon Lifecycle
 // =============================================================================
-

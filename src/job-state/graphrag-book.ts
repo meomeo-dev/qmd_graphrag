@@ -68,6 +68,7 @@ import {
   readJsonFileDurable,
   writeJsonFileDurable,
 } from "./durable-json.js";
+import { refreshGraphRagOutputJsonSidecars } from "./graphrag-output-durable.js";
 import {
   ensureManagedGraphRagSettings,
   type ManagedGraphRagSettingsRepairResult,
@@ -1684,6 +1685,23 @@ export async function writeGraphRagOutputProducerManifest(input: {
     join(input.outputDir, "qmd_output_manifest.json"),
     JSON.stringify(manifest, null, 2) + "\n",
   );
+}
+
+export async function refreshGraphRagStageOutputDurableSidecars(input: {
+  outputDir: string;
+  repo?: FileBookJobStateRepository;
+  bookId: string;
+  stage: BookStage;
+  producerRunId: string;
+}) {
+  return refreshGraphRagOutputJsonSidecars({
+    outputDir: input.outputDir,
+    repo: input.repo,
+    bookId: input.bookId,
+    stage: input.stage,
+    producerRunId: input.producerRunId,
+    reason: "stage_success",
+  });
 }
 
 function currentBatchBookLeaseFenceMetadata(): {

@@ -86,6 +86,10 @@ hardInvariants:
         compare-and-swap。
       - 所有 book-scoped artifact、producer run record、graph capability 与
         book checkpoint 写入前必须验证 book fencingToken。
+      - 带 book lease 的 document identity 写入如果遇到相同
+        documentId/contentHash 的历史身份，必须优先选择当前
+        QMD_GRAPHRAG_BOOK_ID 对应的 canonicalBookId；找不到当前 book
+        身份时必须 fail-closed，不能回退写入旧 bookId。
       - itemId 不同但解析到相同 bookId 时，后到 worker 必须等待、跳过或
         重新排队，不能并发写入。
   - id: graph_artifact_isolation
@@ -100,6 +104,12 @@ hardInvariants:
     enforcement:
       - catalogWriterLane 保护 graph_vault/catalog 下共享索引。
       - qmdIndexWriterLane 保护 .qmd/index.sqlite 与 qmd corpus 写入。
+      - qmd validation 子命令必须按 read/write 分类；只有会写入
+        .qmd/index.sqlite 或 corpus 的命令可持有 qmdIndexWriterLane。
+      - qmd validation 只读命令不得持有 qmd index writer lock，不得阻塞其他
+        图书的 claim preflight 或验证命令。
+      - qmd validation 输出必须有界；stdout/stderr 采集、脱敏、落盘与 final
+        fsync 不得无限阻塞 coordinator 或长期持有 writer lane。
       - eventWriterLane 保护 events.jsonl 原子追加。
       - manifestWriterLane 只写派生后的 manifest，不维护未同步内存计数。
       - writer lane 默认不得嵌套持有。确需嵌套时必须按 qmdIndexWriterLane、
@@ -157,6 +167,18 @@ resourceControls:
       requiredBehavior: >
         所有 worker 的 OpenAI 请求必须共享同一个 semaphore。429、5xx、timeout、
         Responses output none 与网络中断必须进入统一 retry/recovery 分类。
+      requestTimeoutPolicy:
+        defaultSeconds: 120
+        configuredBy:
+          - QMD_GRAPHRAG_RESPONSES_TIMEOUT_SECONDS
+          - QMD_RESPONSES_REQUEST_TIMEOUT_SECONDS
+        fingerprintRole: runtime_recovery_boundary
+        requiredBehavior: >
+          GraphRAG Responses adapter 必须给每个真实 Responses request 设置
+          request-level timeout。timeout 只作为运行时恢复边界，不改变图谱抽取、
+          community report、embedding 或 query_ready 的语义输入指纹；因此不得
+          仅因调整 timeout 使已完成高成本阶段变 stale。timeout 触发后必须按
+          transient provider failure 进入 bounded retry，并释放 provider slot。
       childProcessBoundary: >
         对 GraphRAG LLM 子进程，默认使用 process_level_slot。若未来 adapter
         支持 request_level_proxy，必须保留同一 status/event 证据字段。
@@ -505,7 +527,7 @@ resourceControls:
         targetFamily: provider_request_fingerprint
         criticality: historical_observation
         startupCriticality: non_blocking
-        runnerStartPreflightMode: read_only_capped_diagnostic
+        runnerStartPreflightMode: read_only_full_scan_diagnostic
         normalRunnerMutationPolicy: no_primary_quarantine
         writableRepairBoundary: explicit_repair_or_migrate_only
         retentionAuthority: cache_like_observation
@@ -555,6 +577,12 @@ resourceControls:
         owner: graphOutputProducer
         laneTimeoutMs: 120000
         releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/books/{bookId}/distribution_manifest.json
+        lane: checkpointWriterLane
+        durableKind: json
+        owner: bookDistributionProducer
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
       - target: graph_vault/books/{bookId}/output/context.json
         lane: checkpointWriterLane
         durableKind: json
@@ -567,6 +595,28 @@ resourceControls:
         owner: graphOutputProducer
         laneTimeoutMs: 120000
         releaseOn: [commit, error, cancellation, lease_loss, timeout]
+        mutableByGraphRagStages:
+          - graph_extract
+          - community_report
+          - embed
+        sidecarRefreshRule: >
+          GraphRAG producer stages may rewrite stats.json as an observability
+          summary after stage execution. The resume boundary that observes a
+          successful graph_extract, community_report, or embed stage must
+          refresh the stats.json checksum and checksum meta sidecars while
+          holding the graphOutputProducer mapping. The refresh evidence must
+          preserve both refreshStage and artifactStage so graph_extract artifact
+          lineage is not confused with the later stage that rewrote the file.
+        migrateRepairRule: >
+          A migrate-only repair boundary may refresh a mismatched stats.json
+          checksum with checksumRecoveryDecision
+          graph_output_stats_observability_refreshed when the primary JSON is a
+          valid GraphRAG stats observability object and the artifact manifest
+          maps the same bookId to graphrag_stats_json. This decision may also
+          restore the latest stats.json.corrupt-* quarantine created by an
+          earlier over-strict checksum repair attempt. Normal runner_start must
+          not apply this writable repair outside the explicit migrate-only
+          boundary.
       - target: graph_vault/books/{bookId}/output/lancedb/*.lance/qmd_row_count.json
         lane: checkpointWriterLane
         durableKind: json
@@ -779,8 +829,10 @@ resourceControls:
           - expiresAt
           - createdAt
         staleRule: >
-          lock 只有在超过 stale TTL 且 owner pid 不存活，或具备等价 fencing
-          证据时才能被移除。不得仅凭 mtime 删除仍由活进程持有的 lock。
+          lock 只有在具备 generation、fencingTokenHash、runnerSessionId 与
+          operationId 的 recovery fence，且 owner pid 在同主机不存活，或 lease
+          已过期且 owner 可判定不存活时才能被移除。不得仅凭 mtime 删除仍由
+          活进程或不可判定远端进程持有的 lock。
         heartbeatRule: >
           预计可能超过 stale TTL 的 critical section 必须刷新 lock heartbeat。
           不支持 heartbeat 的短 critical section 必须声明最大执行时间小于
@@ -819,7 +871,7 @@ resourceControls:
             quarantine，并必须写入 durable event 或 recovery summary evidence。
             target family 可收窄该许可。provider_request_fingerprint 属于
             historical_observation；normal runner_start 与 normal resume 默认只能
-            执行 read-only/capped diagnostic，不得 quarantine primary target。
+            执行 read-only full-scan diagnostic，不得 quarantine primary target。
             对该 family 的 writable checksum backfill、meta backfill 或 primary
             quarantine 只能发生在 explicit repair 或 migrate-only 边界内，并必须
             有数量上限与 operator-visible summary。
@@ -833,18 +885,19 @@ resourceControls:
             targetPattern: graph_vault/catalog/provider-requests/*.json
             criticality: historical_observation
             authority: cache_like_observation
-            runnerStartPreflightMode: read_only_capped_diagnostic
-            statusJsonProjection: same_scope_read_only_capped_diagnostic
+            runnerStartPreflightMode: read_only_full_scan_diagnostic
+            statusJsonProjection: same_scope_read_only_full_scan_diagnostic
             normalRunnerPrimaryQuarantine: forbidden
             explicitRepairPrimaryQuarantine: bounded_only
-            maxRunnerStartScannedTargets: 200
             maxRunnerStartReportedSamples: 10
             maxRunnerStartMutationCount: 0
             recoveryDecision: continue_with_diagnostic_unless_catalog_blocked
             stopRule: >
               runner_start 发现 provider request checksum mismatch、checksum
               missing、checksum meta missing 或 invalid JSON 时，不得写 checksum、
-              meta、event 或 quarantine target。它必须输出 capped diagnostic；
+              meta、event 或 quarantine target。它必须全量扫描 primary request
+              JSON target 并输出只读 diagnostic；diagnostic 的 sample 输出可以
+              截断，但 scannedTargetCount 与 degradedTargetCount 不得漏报；
               若 diagnostic 本身无法可信生成，则 stop_until_fixed，但仍不得
               mutate provider-requests primary target。
         sidecarQuarantineDecisionTable:
@@ -1012,6 +1065,14 @@ resourceControls:
 
 terminalCommitProtocol:
   completed:
+    normalStartupResume: >
+      normal runner resume must skip completed item checkpoints without
+      re-running GraphRAG stages or qmd validation commands. If the persisted
+      build-status snapshot is missing, startup may use pending placeholder
+      status fields in memory only; it must not persist placeholder-only
+      changes, downgrade the item, or publish item_completed_reopened.
+      Operators use status-json or migrate-only when a full closed-loop audit of
+      completed evidence is required.
     order:
       - 验证 item lease、book lease 与 provider slot 均处于当前 generation。
       - 验证 qmd、GraphRAG stage、producer lineage 与 query_ready 证据齐全。
@@ -1090,6 +1151,27 @@ scheduler:
     - EPUB files discovered from --source-dir.
     - Existing item checkpoints under the current runId.
     - Retryable failed items whose nextRetryAt has elapsed.
+  startupCheckpointLoadPolicy: >
+    normal runner startup must load existing item checkpoints with a lazy
+    build-status snapshot. It may reuse persisted qmdBuildStatus、
+    graphBuildStatus 与 graphQueryStatus, or fill missing fields with pending
+    in-memory placeholders, but it must not persist placeholder-only changes or
+    rescan GraphRAG/QMD artifacts merely because a completed checkpoint already
+    exists. Full closed-loop reconciliation of completed checkpoints is
+    reserved for status-json, migrate-only, claim-time preflight, checkpoint
+    save, and real processing boundaries. Normal recovery-summary and startup
+    manifest projection for completed items must use persisted build-status
+    evidence only; missing evidence is represented as an in-memory pending
+    placeholder and must not trigger book-scoped durable reads or repair.
+  startupRuntimeRecordPolicy: >
+    normal runner startup must inspect provider slot, subprocess and book lease
+    runtime records only to determine current liveness and recovery blockers.
+    Historical terminal subprocess records such as exited, killed, quarantined
+    or spawn_error are immutable observation records and must not be fully
+    reconciled or fsync-rewritten on every startup. Running records, live leases,
+    stale locks, temp files and records that affect activeSubprocesses、
+    activeProviderSlots or activeBookLeases still require durable reconciliation
+    before scheduling resumes.
   orderingPolicy: >
     Coordinator must prefer resumable incomplete items before new items, then
     stable source path order. This keeps recovery deterministic across restarts.
@@ -1106,6 +1188,14 @@ scheduler:
     duplicateBookPolicy: >
       If another live worker owns the same bookId, the candidate item remains
       queued until the book lease is released.
+    startCasConflictPolicy: >
+      If checkpoint compare-and-swap observes that the item changed after the
+      coordinator acquired the book lease but before publishing item running,
+      the coordinator must release the just-acquired book lease, refresh the
+      in-memory checkpoint projection, record item_claim_conflict_deferred with
+      changedFields evidence, and defer/requeue the candidate under the same
+      runId. This conflict is not a coordinator crash condition and must not
+      create a duplicate runner for the item.
   workerLifecycle:
     startup: >
       Worker receives item lease, book lease, provider semaphore handles and
@@ -1119,6 +1209,29 @@ scheduler:
     failure: >
       Worker records failureKind、retryable、recoveryDecision、failedStage、
       activeCommand、attempt counters and nextRetryAt before releasing leases.
+    commandAttemptExhaustionProjection: >
+      commandCheck.attemptExhausted=true 表示单个子命令在当前尝试预算内
+      已耗尽；它不得自动提升为 item checkpoint retryExhausted=true。
+      当 failureKind=transient 且 retryable=true 时，worker 必须把 item
+      checkpoint 投影为 pending、retryable=true、retryExhausted=false、
+      recoveryDecision=retry_same_run_id，并写入 nextRetryAt 以便同一 runId
+      后续恢复。只有整本书级别被排除出本次运行并需要人工介入时，才允许
+      item checkpoint 使用 retryExhausted=true、retryable=false、
+      recoveryDecision=stop_until_fixed。
+    durableDiagnosticProjectionBoundary: >
+      durable failure envelope 与 commandCheck 可向 item checkpoint 补充
+      localFailureClass、targetLocator、failedStage、tempId、operationId 等诊断
+      evidence；但不得覆盖 item 级别最终 recoveryDecision、retryable 或
+      retryExhausted。item 级 outcome 必须由当前状态机分支统一决定。
+    resumeOutputTerminalContract: >
+      resume-book-workspace 的 `status: ready, nextStage: null` 与
+      `status: completed, nextStage: null` 都表示 GraphRAG stage plan 已到
+      query-ready 终态。父 runner 必须把这两种输出视为 terminal ready，
+      立即进入正常 qmd validation 子命令闭环；不得因为 status 为 completed
+      而启动额外的 resume-book-N pass、重复占用 provider slot，或延迟发布
+      item completed。只有 `nextStage` 非 null、`status: blocked`、
+      repair-only 的 `status: repaired` 等非普通终态才允许继续 resume 或
+      进入对应 repair/recovery 分支。
     subprocessOwnership: >
       Worker 启动 qmd 或 GraphRAG 子进程时必须创建独立 process group，并在
       durable subprocess registry 记录 pid、pgid、commandId、itemId、bookId、
@@ -1126,6 +1239,14 @@ scheduler:
       worker 失去 lease、收到 cancellation 或 coordinator quiesce 时，必须先
       向 process group 发送 graceful terminate，再按 timeout kill，并记录
       subprocess_cancelled 或 subprocess_killed。
+    nestedBridgeProcessGroupBoundary: >
+      batch runner 管理的 worker command 是 process-group root。该 command
+      内部启动的 Python bridge、GraphRAG index 与 query 子进程必须继承同一
+      process group，不能再自建独立 process group；否则 command timeout、
+      cancellation、lease loss 与 startup recovery 可能只能终止外层
+      resume-book 进程，留下 orphan provider 子进程继续写产物。非 batch
+      直接调用 Python bridge 时仍可自建 process group，作为本地 early-stop
+      与 direct child cleanup 的隔离边界。
     subprocessDurableFailureProjection:
       scope:
         - resume-book-workspace
@@ -1224,16 +1345,82 @@ stateModel:
   stopUntilFixedResumePolicy: >
     同一 runId 内，failed_stop_until_fixed checkpoint 是故障证据主链。实现修复
     或设计审计通过后，普通恢复流程不得静默改写该 checkpoint 为 pending。
-    继续同一 item 只能通过显式 repair/resume 操作记录恢复事件；若目标是验证
-    修复后的全目录闭环，可使用新的 runId 对相同 EPUB 目录重新执行真实 runner。
-    新 run 必须重新发现所有 EPUB，并从当前 durable catalog、book-scoped state、
-    qmd index 与 producer evidence 重新建立闭环，不得把旧 manifest 当成完成依据。
+    继续同一 item 只能通过显式 repair/resume 操作、provider auth config
+    reopen gate，或 durable checksum fixed reopen gate 记录恢复事件；若目标是
+    验证修复后的全目录闭环，可使用新的 runId 对相同 EPUB 目录重新执行真实
+    runner。新 run 必须重新发现所有 EPUB，并从当前 durable catalog、
+    book-scoped state、qmd index 与 producer evidence 重新建立闭环，不得把
+    旧 manifest 当成完成依据。
+  durableChecksumFixedReopenGate:
+    scope: >
+      仅适用于 item checkpoint 已停在 failed_stop_until_fixed，且 failureKind 为
+      local_state_integrity、localFailureClass 为 durable_checksum_mismatch、
+      retryable false 的历史 checkpoint。
+    requiredCurrentEvidence:
+      - primary target still exists at checkpoint targetLocator or primaryTargetLocator
+      - primary target sha256 equals current .sha256 sidecar
+      - .sha256.meta.json checksum equals current primary target sha256
+      - meta checksumRecoveryDecision is a controlled repair decision such as
+        artifact_evidence_checksum_refreshed, target_new_checksum_old,
+        target_new_checksum_missing, abandoned_pending_commit_recovered or
+        pending_meta_committed
+      - if the failed checkpoint recorded checksumActual, it must equal the
+        current primary target sha256
+    forbiddenActions:
+      - reopen a missing target, missing sidecar or invalid meta target
+      - reopen when current checksum differs from sidecar or meta checksum
+      - mutate primary target, checksum sidecar or meta sidecar during reopen
+      - erase the historical failed checkpoint without an
+        item_durable_checksum_repaired_reopened event
+    reopenedCheckpoint:
+      status: pending
+      recoveryDecision: continue_pending
+      normalCommandChecksRequired: true
+      event: item_durable_checksum_repaired_reopened
   stageStates:
     qmd:
       requiredEvidence:
         - qmd registration succeeded
         - qmd embed/update succeeded when configured
         - required qmd validation subcommands succeeded
+      validationCommandPolicy:
+        readOnlyCommands:
+          - qmd-version
+          - qmd-status
+          - qmd-doctor-json
+          - qmd-ls-books
+          - qmd-search-json
+          - qmd-search-csv
+          - qmd-search-md
+          - qmd-search-xml
+          - qmd-search-files
+          - qmd-vsearch-json
+          - qmd-query-json
+          - qmd-query-auto-json
+          - qmd-query-graphrag-json
+          - qmd-get-book
+          - qmd-multi-get-json
+          - qmd-collection-list
+          - qmd-collection-show-books
+          - qmd-context-list
+          - qmd-skills-list-json
+          - qmd-skills-get-json
+          - qmd-skills-path-json
+          - qmd-skill-show
+          - qmd-dspy-status-json
+        writerCommands:
+          - qmd-pull
+          - qmd-update
+          - qmd-embed
+          - qmd-cleanup
+        boundedOutputRule: >
+          每个 validation 命令必须限制目标范围与输出规模；父 runner 对
+          stdout/stderr 的采集、脱敏、日志写入与 fsync 必须有 maxBuffer、
+          timeout 和 release-on-error 证据。
+        multiGetScopeRule: >
+          qmd-multi-get-json 必须限定到当前书的 qmd://books/{fileName}
+          或等价单文件目标，并设置 --max-bytes；不得使用 books/*.md
+          扫描全库作为每本书完成门控。
     graph_extract:
       requiredEvidence:
         - GraphRAG workflow succeeded
@@ -1244,16 +1431,20 @@ stateModel:
         - GraphRAG community report workflow succeeded
         - report parquet artifacts validated
         - producer lineage points to the same bookId
+        - stats.json checksum sidecar refreshed when GraphRAG rewrites it
     embed:
       requiredEvidence:
         - GraphRAG embedding workflow succeeded
         - vector artifacts validated
         - provider metrics or stage logs captured
+        - stats.json checksum sidecar refreshed when GraphRAG rewrites it
     query_ready:
       requiredEvidence:
         - graph_extract、community_report 与 embed completed
         - graph capability projection present
         - qmd GraphRAG query succeeds for the book
+        - per-book qmd auto/graphrag validation queries carry current bookId
+          scope and must not scan or repair unrelated book-scoped state
 
 failureRecovery:
   transientProviderFailures:
@@ -1261,6 +1452,7 @@ failureRecovery:
       - HTTP 429
       - HTTP 5xx
       - network timeout
+      - Responses request-level timeout
       - connection reset
       - Responses API output none with completed status
       - provider concurrency or rate-limit messages
@@ -1284,6 +1476,16 @@ failureRecovery:
       - classify as failed_stop_until_fixed
       - stop the coordinator after durable failure event
       - preserve completed books and retryable state for later resume
+      - provider auth config reopen gate may set the item back to pending only
+        when current provider auth readiness is ready, current credential
+        fingerprint differs from the latest failure fingerprint, and an
+        item_provider_auth_reopened event is appended before processing.
+      - if the same ready fingerprint was already reopened but the later
+        provider auth refailure recorded providerAuthReadinessStatus as not
+        ready, the same ready fingerprint may be reopened again within the
+        fixed maxProviderAuthReopenAttempts budget. If the latest failure
+        fingerprint equals the current ready fingerprint, reopen remains
+        blocked as unchanged.
       - stop 时必须先 quiesce scheduler，禁止新 claim，再取消未进入终态的
         provider 子进程，并把 live running item 写成 recoverable stopped state。
   artifactGateFailures:
@@ -1331,6 +1533,10 @@ failureRecovery:
         200 个 primary targets、报告 10 个样本。book-scoped target 的
         normal runner_start mutation budget 固定为 0。超过任一上限必须
         stop_until_fixed，且不得继续扫描产生额外 quarantine/backfill。
+      - normal runner_start must exclude book-scoped durable targets whose
+        checkpoint is already completed. status-json, migrate-only, explicit
+        repair and claim-time processing may still scan those targets under
+        their own bounded rules.
       - book-scoped durable repair 只能通过 explicit repair 或 migrate-only
         边界执行。该边界必须显式声明 repairScope、maxScannedTargets、
         maxReportedSamples、maxMutationCount、firstSample、lastSample、
@@ -1338,7 +1544,7 @@ failureRecovery:
         manifest、status.json 或 recovery-summary。normal runner_start 只能
         复用这些 summary 作为只读证据，不能自行补写或扩大修复。
       - 对 provider_request_fingerprint 等 historical_observation target，
-        runner_start 只能执行 read-only capped diagnostic，mutationCount 必须为
+        runner_start 只能执行 read-only full-scan diagnostic，mutationCount 必须为
         0。不得创建 lock、temp、checksum、checksum meta、corrupt target 或
         provider-requests 目录内 recovery event。
       - status-json 必须能以相同 scope 的 read-only 方式预告 runner_start 会
@@ -1351,8 +1557,9 @@ failureRecovery:
         degradedTargetCount 统计异常 target 数；mutationCount 统计实际发生的
         lock/temp/checksum/meta/backfill/quarantine/delete/rename 写操作。若任何
         durable_*_target_quarantined、durable_*_checksum_backfilled、
-        durable_checksum_meta_backfilled 或 durable_*_temp_reconciled event
-        发生，mutationCount 必须同步递增，不能保持 0。
+        durable_checksum_meta_backfilled、durable_*_target_recovered 或
+        durable_*_temp_reconciled event 发生，mutationCount 必须同步递增，不能
+        保持 0。
       - runner_start 在 item checkpoint 创建前失败时，manifest 不得停留在
         ambiguous running。必须写入 status failed、failedAt、
         recoveryDecision stop_until_fixed、startupRecovery.decision
@@ -1377,21 +1584,68 @@ failureRecovery:
         auxiliarySidecarMappingRule 覆盖的 temp、owner、lock 与 corrupt
         quarantine paths；对未启用 checksumPolicy 的 JSONL target 不要求
         checksum sidecar 存在。
-      - 任一 target 出现 unknown temp、live temp 被误删证据、checksum 无法收敛
-        或 lock owner 不可判定时，coordinator 必须 stop_until_fixed，不能 claim
-        新 item。
+      - before_claim 扫描到明确 live/unexpired JSON lock，且 lock owner evidence
+        能证明这是当前或并发 writer 的未过期持有状态时，coordinator 必须把
+        本轮 claim 记录为 deferred、短暂等待后重新扫描，不得把整个 batch
+        标记为 failed 或退出。该退避只适用于
+        durable_preflight_live_lock + lock_owner_live_or_unexpired。
+      - before_claim 或 runner_start 的目录 preflight 一旦发现 live/unexpired
+        JSON lock blocker，必须先返回该 blocker 并进入 defer/fail-fast 决策；
+        不得继续读取或修复同一目录下被该 lock 保护的 primary target，避免
+        在 preflight 阶段退化为长时间 lock wait。
+      - runner_start 与 before_claim 扫描到同主机 owner PID 已死亡，或 lease
+        已过期且 owner 可判定不存活，并且 JSON lock 带
+        generation/fencing/session/operationId recovery fence 时，coordinator 必须
+        清理该 stale lock 并记录 durable_lock_recovered，然后继续 startup/claim；
+        不得仅因遗留 lock 把 manifest 标记为 failed。owner PID 仍存活、远端
+        owner 不可判定或缺少 recovery fence 时仍必须 fail/defer。
+      - 任一 target 出现 unknown temp、live temp 被误删证据、checksum 无法收敛、
+        stale lock 缺少 recovery fence 或 lock owner 不可判定时，coordinator
+        必须 stop_until_fixed，不能 claim 新 item。
     beforeResumeBook:
       - resume-book 子进程启动前必须完成 book-scoped durable state preflight。
+      - before_resume_book 扫描到共享 catalog 明确 live/unexpired JSON lock，
+        且 lock owner evidence 能证明这是当前或并发 writer 的未过期持有状态时，
+        worker 必须把当前 item 从 running 回退为 pending、释放 book lease、
+        记录 item_durable_preflight_deferred，并短暂等待后重新调度。该退避
+        只适用于 durable_preflight_live_lock +
+        lock_owner_live_or_unexpired，不能覆盖 checksum mismatch、unknown temp、
+        stale lock 缺少 recovery fence 或 owner 不可判定等真实损坏。
+      - 已被旧策略误写为 failed/stop_until_fixed 的 before_resume_book
+        durable_preflight_live_lock checkpoint，只有在原 lock target 的 .lock
+        已消失且原 lock owner evidence 含 runnerSessionId 与 operationId 时，
+        才能通过固定 reopen gate 转回 pending，并必须记录
+        item_durable_preflight_deferred_reopened。reopen 后必须清空旧
+        commandChecks，避免误把已失败的 resume pass 当成验证证据。
       - 发现同 bookId 旧 generation 的未决 temp、run record 半写或 checkpoint
         checksum 不一致时，必须先 repair/quarantine/stop_until_fixed。
       - book-scoped preflight 必须递归扫描 targetMapping 注册的嵌套 production
         targets，不得只扫描固定目录一层。
       - preflight 结果必须写入 event 或 recovery summary，不能只写 stdout。
+      - normal resume 的主路径不得为了构建 resume plan 全量读取
+        graph_vault/books/{bookId}/runs/*.yaml。它只能读取当前 checkpoint 明确
+        引用的 runId，或读取 catalog 中按 bookId、stage、status 精确过滤后的
+        有界当前候选。历史 run record 的全量 repair、checksum backfill、
+        checksum meta backfill、quarantine 或 corrupt rename 只能发生在
+        explicit repair 或 migrate-only 边界内。
+      - normal registerBookSource 的 legacy bookId migration 不得全量扫描或
+        重写 graph_vault/books/{bookId}/runs/*.yaml。run record remap 只能处理
+        old/new checkpoints 明确引用的 runId；历史 run record repair/backfill
+        只能进入 explicit repair 或 migrate-only 边界。
+      - normal resume 对 superseded running run 的 abandon 清理只能基于
+        catalog 中 status=running 的有界条目写入 abandoned 记录；不得为清理
+        历史 running 候选而先读取或 reconcile 旧 run record primary target。
   partialWriteRecovery:
     eventsJsonl:
       - 恢复时扫描 events.jsonl，截断最后一个非完整 JSON 行。
       - eventId 或 sequence 重复时保留首次 durable event，后续重复进入
         duplicate_event_ignored 诊断。
+      - normal runner startup 必须先执行 event log 快速规范性扫描
+        (tail-first canonical scan)，只校验 JSON 完整性、eventId 唯一性、
+        sequence 单调性、runnerSessionId、runId 与 schemaVersion。若扫描未发现
+        需要恢复的证据，不得全量重写或重新脱敏历史 events.jsonl；只有发现坏尾、
+        缺字段、重复 eventId 或 sequence 异常时才进入完整 normalize/rewrite
+        慢路径并记录 partial_event_tail_recovered 或 event_log_normalized。
     checkpoints:
       - 未过期 temp 文件必须视为 live 或 recently-live，不能删除；超过
         durable temp stale TTL 后才可按 orphan temp 清理。
@@ -1419,7 +1673,7 @@ failureRecovery:
     providerRequestFingerprint:
       authority: historical_observation
       storage: graph_vault/catalog/provider-requests/*.json
-      normalRunnerRecovery: read_only_capped_diagnostic
+      normalRunnerRecovery: read_only_full_scan_diagnostic
       explicitRepairRecovery: bounded_repair_or_quarantine
       rules:
         - 历史 provider request fingerprint 记录只用于成本、审计与高成本恢复
@@ -1450,12 +1704,26 @@ failureRecovery:
           blocked_before_claim。
         - normal runner_start 不得修改任何既有 book-scoped primary target、
           checksum sidecar、meta sidecar、temp、owner、lock 或 corrupt target。
+        - normal resume 不得把历史 runs/*.yaml 全库扫描作为每本书恢复前置
+          条件；resume plan 只能读取 checkpoint 引用的 run record，或有界读取
+          当前 stage/status 需要接管、abandon 或验证的 run record。
+        - normal registerBookSource legacy migration 只能读写 checkpoint 引用的
+          run record；旧目录合并与 stable 目录重写均不得 readdir(runs) 作为
+          默认路径。
+        - normal resume 的 abandon-running 清理不得读取历史 run record 内容；
+          对 catalog 中有界 running 候选可直接以 catalog evidence 写入
+          abandoned 终态 run record。
         - explicit repair 或 migrate-only 必须按 bookId 和 target family
           bounded 执行，默认 maxMutationCount 为 1，超过上限必须停止并保留
           nextOperatorAction。
         - 修复后恢复真实 EPUB 处理时，必须重新执行 status-json 或正常
           runner_start read-only preflight，确认 mutationCount 为 0 且
           degradedTargetCount 为 0，才能 claim item。
+        - 对已由 explicit repair 或 migrate-only 修复的 book-scoped
+          durable_checksum_mismatch，normal runner 可通过 durable checksum fixed
+          reopen gate 将历史 failed checkpoint 置回 pending；该 gate 只读取当前
+          primary、checksum sidecar 与 meta sidecar，不得在 reopen 时写入
+          book-scoped durable target。
 
 recoveryReconciliation:
   authorityOrder:
@@ -1472,7 +1740,9 @@ recoveryReconciliation:
     - graph_vault/catalog/batch-runs/{runId}/recovery-summary.json
   observabilityBoundary: >
     manifest、status.json 与 recovery-summary.json 均为 checkpoint/event
-    派生状态。manifest 保留批次计数与最近 durableFailureSummary；
+    派生状态。manifest 保留批次计数；仅当当前 checkpoint 投影仍存在
+    durable failure 时保留 durableFailureSummary，故障恢复后必须删除 stale
+    durableFailureSummary；
     status.json 与 recovery-summary.json 承载逐 item durable diagnostics。
     event/checkpoint 是故障证据主链，manifest/status 不得单独证明 completed。
   matrix:
@@ -1793,10 +2063,10 @@ observability:
       status cache 写入或 recovery summary 写入。
     providerRequestProjectionRule: >
       --status-json 必须能对 graph_vault/catalog/provider-requests/*.json 执行
-      read-only capped scan，使用与 runner_start 相同的 family policy，但不得
+      read-only full scan，使用与 runner_start 相同的 family policy，但不得
       mutate stateRoot。输出必须包含 scannedTargetCount、degradedTargetCount、
       sampleTargetLocators、diagnosticClass 与 normalRunnerAction。若目录过大，
-      只扫描设计上限内的 targets 并报告 scanTruncated true。
+      可以截断 sampleTargetLocators，但不得截断 primary target 扫描。
     forbiddenOperations:
       - acquire exclusive durable write lock or per-target lock
       - create or delete .lock files
@@ -1821,7 +2091,7 @@ observability:
         condition: >
           provider request target has checksum missing, checksum mismatch,
           checksum meta missing, invalid target, live temp or unresolved lock
-        statusJsonDecision: read_only_capped_diagnostic
+        statusJsonDecision: read_only_diagnostic
         recoveryDecision: continue_with_diagnostic_unless_catalog_blocked
         normalRunnerAction: no_primary_quarantine
       - diagnosticClass: unresolved_temp_or_lock
@@ -1970,16 +2240,23 @@ configurationContract:
         default: 2
         validation: integer >= 1
       - setting: providerSecrets
-        precedence: shell environment > project dotenv > graph_vault dotenv
+        precedence: graph_vault dotenv > project dotenv > shell environment
         default: none
         validation: required for stages that call the provider
     dotenvPrecedence: >
-      Provider secret 读取顺序必须可观测。项目级 .env 与 graph_vault/.env 的
-      选择规则必须写入启动事件，但不得输出 secret 值。
+      Provider secret 在正常批跑恢复中使用受控环境（controlled
+      environment）：graph_vault/.env 覆盖项目级 .env 和 shell 环境，
+      项目级 .env 覆盖 shell 环境，shell 环境仅作为 dotenv 缺失时的
+      fallback。--skip-dotenv 是显式操作员模式，此时不加载 dotenv，
+      shell 环境成为唯一凭据来源。所有选择规则必须写入状态诊断，但不得
+      输出 secret 值。
     secretHandling:
       - events、status-json、logs 不得输出 API key。
       - 子进程环境只传递必要 provider 变量。
-      - shell 环境覆盖 dotenv 时必须在 doctor/status 中可诊断。
+      - 正常批跑中 dotenv 覆盖 shell provider env 时必须在 doctor/status 中
+        可诊断。
+      - --skip-dotenv 模式中 shell 环境与 dotenv 缺口必须在 doctor/status
+        中可诊断。
       - 子进程 env 必须使用 allowlist，禁止传递无关 secret。
       - 诊断只能输出 source、presence、redacted hash 和 validation error code。
 
@@ -2001,6 +2278,24 @@ validationRequirements:
     - INVALID_API_KEY 类失败必须停止 coordinator，不能无限 pending。
     - provider 子进程未获得 slot lease 时不得启动。
     - qmd SQLite locked 会进入 bounded retry 并暴露 sqliteRetryCount。
+    - 只读 qmd validation 命令不产生 qmd_index_file_lock_acquired 事件。
+    - qmd-multi-get-json 只读取当前书并带 --max-bytes 输出边界。
+    - 每个 completed item 必须写入
+      graph_vault/books/{bookId}/distribution_manifest.json，作为单书分发
+      闭包（single-book distribution closure）的唯一枚举入口。
+    - distribution_manifest.json 必须至少包含 sources/{bookId}/source.epub、
+      books/{bookId}/job.yaml、artifacts.yaml、checkpoints.yaml、qmd/、
+      input/、output/、runs/{producerRunId}.yaml 及其 checksum sidecars。
+    - distribution_manifest.json 必须声明 canonicalNormalizedPath 指向
+      books/{bookId}/input/{file}.md；若历史 qmd_build_manifest 仍引用根级
+      input/{file}.md，则必须同时记录 legacyNormalizedPath 并复制 canonical
+      book-scoped input，使单书包不依赖 graph_vault/input 全局目录。
+    - distribution_manifest.json 必须显式排除 .env、provider request/response
+      payload、非本书 batch logs、非当前 book/source 目录与 `.corrupt-*`
+      quarantine 文件；缺失 producer run record 必须进入
+      producerEvidence.missingRunRecordIds。
+    - completed checkpoint 被 normal resume 跳过时，runner 仍可补写
+      distribution_manifest.json，但不得调用 GraphRAG/QMD 高成本命令。
   faultInjection:
     - worker crash with active GraphRAG subprocess.
     - coordinator crash during terminal completed commit.
@@ -2202,13 +2497,13 @@ validationRequirements:
           checksum mismatch or missing checksum metadata
         - runner_start creates or loads startup recovery manifest before any
           writable recovery
-        - runner_start reports provider_request_durable_degraded with capped
-          scannedTargetCount, degradedTargetCount and sampleTargetLocators
+        - runner_start reports provider_request_durable_degraded with full
+          scannedTargetCount, degradedTargetCount and bounded sampleTargetLocators
         - runner_start does not rename provider request primary targets to
           .corrupt-* and does not create provider request lock, temp, checksum
           or checksum meta files
         - status-json reports the same provider request diagnostic class with
-          read_only_capped_diagnostic and no stateRoot mutation
+          read_only_diagnostic and no stateRoot mutation
         - normal runner can proceed to manifest creation unless a critical
           catalog target is also blocked
     - case: provider_requests_explicit_repair_bounded
@@ -2231,11 +2526,30 @@ validationRequirements:
     - case: before_resume_book_book_yaml_preflight_reconcile
       evidence:
         - beforeResumeBook derives scan scope from targetMapping
-        - job.yaml, checkpoints.yaml, artifacts.yaml and runs/*.yaml are scanned
+        - job.yaml, checkpoints.yaml and artifacts.yaml are scanned
+        - normal resume scans only checkpoint-referenced or bounded current
+          run records, not all historical runs/*.yaml
         - primary YAML checksum sidecars and checksum meta sidecars are scanned
         - unresolved temp, live lock, checksum mismatch and checksum meta conflict
           block completed publication
         - diagnostics include targetLocator and owner evidence
+    - case: before_resume_book_shared_catalog_live_lock_defer
+      evidence:
+        - shared catalog durable_preflight_live_lock with
+          lock_owner_live_or_unexpired defers running item to pending
+        - deferred item releases book lease and does not increment failedItems
+        - batch waits bounded delay and retries pending work under the same runId
+        - stale failed checkpoint from this exact policy gap is reopened only
+          after the original .lock disappears and owner fence fields are present
+        - reopened checkpoint clears failed commandChecks before the next real
+          resume pass
+    - case: item_start_checkpoint_cas_conflict_defer
+      evidence:
+        - checkpoint refresh after book lease claim returns claimed=false
+        - just-acquired book lease is released before the next claim attempt
+        - item_claim_conflict_deferred records changedFields and workerId
+        - coordinator continues without failedItems or fatal duplicate-runner error
+        - the same runId can claim the refreshed pending checkpoint and complete
     - case: sidecar_only_quarantine_boundary
       evidence:
         - target valid and checksum matches but meta invalid or conflicting keeps

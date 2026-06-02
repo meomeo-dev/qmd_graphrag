@@ -63,6 +63,8 @@ describe("Python bridge GraphRAG stage early stop", () => {
         process.env.QMD_GRAPHRAG_PROVIDER_SLOT_GENERATION,
       QMD_GRAPHRAG_PROVIDER_SLOT_FENCING_TOKEN:
         process.env.QMD_GRAPHRAG_PROVIDER_SLOT_FENCING_TOKEN,
+      QMD_GRAPHRAG_INHERIT_PARENT_PROCESS_GROUP:
+        process.env.QMD_GRAPHRAG_INHERIT_PARENT_PROCESS_GROUP,
     };
     try {
       process.env.QMD_GRAPHRAG_RUN_ID = "bridge-registry-run";
@@ -98,7 +100,7 @@ describe("Python bridge GraphRAG stage early stop", () => {
 
       const records = await Promise.all(
         (await readdir(registryDir))
-          .filter((entry) => entry.endsWith(".json"))
+          .filter((entry) => entry.endsWith(".json") && !entry.includes(".sha256"))
           .map(async (entry) =>
             JSON.parse(await readFile(join(registryDir, entry), "utf8"))
           ),
@@ -122,6 +124,68 @@ describe("Python bridge GraphRAG stage early stop", () => {
         exitCode: 0,
       });
       expect(records[0].processGroup).toBe(process.platform !== "win32");
+    } finally {
+      for (const [key, value] of Object.entries(previousEnv)) {
+        if (value == null) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  test("inherits parent process group when managed by the batch runner", async () => {
+    const workspace = await createWorkspace();
+    const registryDir = join(workspace, "subprocesses");
+    const previousEnv = {
+      QMD_GRAPHRAG_RUN_ID: process.env.QMD_GRAPHRAG_RUN_ID,
+      QMD_GRAPHRAG_RUNNER_SESSION_ID:
+        process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID,
+      QMD_GRAPHRAG_RUNNER_PID: process.env.QMD_GRAPHRAG_RUNNER_PID,
+      QMD_GRAPHRAG_SUBPROCESS_REGISTRY_DIR:
+        process.env.QMD_GRAPHRAG_SUBPROCESS_REGISTRY_DIR,
+      QMD_GRAPHRAG_INHERIT_PARENT_PROCESS_GROUP:
+        process.env.QMD_GRAPHRAG_INHERIT_PARENT_PROCESS_GROUP,
+    };
+    try {
+      process.env.QMD_GRAPHRAG_RUN_ID = "bridge-inherit-run";
+      process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID = "runner-session";
+      process.env.QMD_GRAPHRAG_RUNNER_PID = String(process.pid);
+      process.env.QMD_GRAPHRAG_SUBPROCESS_REGISTRY_DIR = registryDir;
+      process.env.QMD_GRAPHRAG_INHERIT_PARENT_PROCESS_GROUP = "1";
+      const fakeBridge = await writeFakeBridge(
+        workspace,
+        [
+          "process.stdout.write(JSON.stringify({",
+          `  schemaVersion: ${JSON.stringify(SchemaVersion)},`,
+          "  method: 'standard',",
+          "  outputs: [{ workflow: 'extract_graph', hasError: false, stateKeys: [] }],",
+          "}));",
+        ].join("\n"),
+      );
+
+      await callPythonBridge({
+        command: "graphrag_index",
+        pythonBin: fakeBridge,
+        workingDirectory: workspace,
+        request: {},
+        responseSchema: GraphRagIndexResponseSchema,
+      });
+
+      const records = await Promise.all(
+        (await readdir(registryDir))
+          .filter((entry) => entry.endsWith(".json") && !entry.includes(".sha256"))
+          .map(async (entry) =>
+            JSON.parse(await readFile(join(registryDir, entry), "utf8"))
+          ),
+      );
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({
+        runId: "bridge-inherit-run",
+        command: "python-bridge:graphrag_index",
+        processGroup: false,
+        status: "exited",
+        exitCode: 0,
+      });
     } finally {
       for (const [key, value] of Object.entries(previousEnv)) {
         if (value == null) delete process.env[key];

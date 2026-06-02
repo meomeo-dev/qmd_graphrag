@@ -1,0 +1,25 @@
+schemaVersion: "1.0.0"
+agentId: agent-artifact-portability
+auditKind: implementation
+runId: epub-batch-20260530235947-full-real-env-clean
+criteria:
+  - id: AP01
+    principle: Each completed book must have books/{bookId}/distribution_manifest.json.
+  - id: AP02
+    principle: Distribution manifest must include canonical normalized markdown.
+  - id: AP03
+    principle: Distribution manifest must retain legacy normalized locator.
+  - id: AP04
+    principle: Distribution manifest must include qmd artifacts when present.
+  - id: AP05
+    principle: Distribution manifest must include GraphRAG output artifacts.
+  - id: AP06
+    principle: Distribution manifest must include source closure when present.
+  - id: AP07
+    principle: Distribution manifest must include producer run evidence status.
+  - id: AP08
+    principle: Distribution manifest must exclude provider request/response payload roots.
+  - id: AP09
+    principle: Distribution manifest must exclude corrupt quarantine artifacts.
+  - id: AP10
+    principle: Durable mapping must cover distribution_manifest.json writes.

@@ -1,0 +1,111 @@
+{
+  "schemaVersion": "1.0.0",
+  "auditAgent": "agent-state-recovery",
+  "runId": "epub-batch-20260530235947-full-real-env-clean",
+  "status": "fail",
+  "criteria": [
+    {
+      "id": "C01",
+      "status": "PASS"
+    },
+    {
+      "id": "C02",
+      "status": "PASS"
+    },
+    {
+      "id": "C03",
+      "status": "PASS"
+    },
+    {
+      "id": "C04",
+      "status": "PASS"
+    },
+    {
+      "id": "C05",
+      "status": "PASS"
+    },
+    {
+      "id": "C06",
+      "status": "PASS"
+    },
+    {
+      "id": "C07",
+      "status": "PASS"
+    },
+    {
+      "id": "C08",
+      "status": "FAIL"
+    },
+    {
+      "id": "C09",
+      "status": "FAIL"
+    },
+    {
+      "id": "C10",
+      "status": "PASS"
+    }
+  ],
+  "findings": [
+    {
+      "id": "F01",
+      "criteria": ["C08"],
+      "severity": "high",
+      "status": "fail",
+      "title": "Completed manifest retains stale durable failure summary",
+      "evidence": [
+        {
+          "path": "graph_vault/catalog/batch-runs/epub-batch-20260530235947-full-real-env-clean/manifest.json",
+          "line": 72,
+          "description": "Final completed manifest still contains durableFailureSummary for durable_preflight_live_lock."
+        },
+        {
+          "path": "graph_vault/catalog/batch-runs/epub-batch-20260530235947-full-real-env-clean/recovery-summary.json",
+          "line": 33,
+          "description": "Recovery summary reports recoveryDecision none and no durableStateFailures."
+        },
+        {
+          "path": "/tmp/qmd-epub-batch-20260530235947-full-real-env-clean/status-json-post-complete.json",
+          "line": 33,
+          "description": "Status-json reports recoveryDecision none and no durableStateFailures."
+        },
+        {
+          "path": "scripts/graphrag/batch-epub-workflow.mjs",
+          "line": 10577,
+          "description": "updateManifest recomputes durableFailureSummary from checkpoint failures, but persisted output retains the stale optional field."
+        }
+      ]
+    },
+    {
+      "id": "F02",
+      "criteria": ["C09"],
+      "severity": "medium",
+      "status": "fail",
+      "title": "Provider request diagnostics can be hidden by the fixed scan cap",
+      "evidence": [
+        {
+          "path": "scripts/graphrag/batch-epub-workflow.mjs",
+          "line": 315,
+          "description": "providerRequestStartupScanLimit is fixed at 200."
+        },
+        {
+          "path": "scripts/graphrag/batch-epub-workflow.mjs",
+          "line": 6594,
+          "description": "scanProviderRequestDiagnostics scans only the first 200 sorted primary JSON records."
+        },
+        {
+          "path": "scripts/graphrag/batch-epub-workflow.mjs",
+          "line": 13483,
+          "description": "status-json records only diagnostics returned by the capped scan."
+        }
+      ],
+      "observedCounts": {
+        "providerRequestJson": 855,
+        "validWithSidecars": 660,
+        "missingChecksumSidecar": 194,
+        "missingChecksumMeta": 1,
+        "corruptFiles": 731,
+        "diagnosticsInFirst200SortedJson": 0
+      }
+    }
+  ]
+}

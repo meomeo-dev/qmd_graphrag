@@ -1,0 +1,60 @@
+{
+  "schemaVersion": "1.0",
+  "auditId": "agent-command-concurrency",
+  "runId": "epub-batch-20260530235947-full-real-env-clean",
+  "status": "fail",
+  "criteria": [
+    { "id": "C01", "status": "pass" },
+    { "id": "C02", "status": "pass" },
+    { "id": "C03", "status": "pass" },
+    { "id": "C04", "status": "pass" },
+    { "id": "C05", "status": "fail" },
+    { "id": "C06", "status": "pass" },
+    { "id": "C07", "status": "pass" },
+    { "id": "C08", "status": "pass" },
+    { "id": "C09", "status": "pass" },
+    { "id": "C10", "status": "pass" }
+  ],
+  "realRunEvidence": {
+    "manifestStatus": "completed",
+    "totalItems": 38,
+    "completedItems": 38,
+    "failedItems": 0,
+    "expectedCommandCheckCount": 27,
+    "activeProviderSlots": 0,
+    "activeSubprocesses": 0,
+    "activeBookLeases": 0,
+    "providerSlotEvents": {
+      "acquired": 559,
+      "released": 558,
+      "recovered": 1,
+      "unreleasedAfterRecovery": 0,
+      "primarySlotFilesRemaining": 0
+    },
+    "commandChecks": {
+      "itemsWithAllRequiredChecksPassed": 38,
+      "requiredCommandNames": 27
+    }
+  },
+  "findings": [
+    {
+      "id": "F01",
+      "severity": "medium",
+      "status": "open",
+      "criteria": ["C05"],
+      "title": "Durable provider lease acquisition failure can leak the in-memory semaphore slot",
+      "file": "scripts/graphrag/batch-epub-workflow.mjs",
+      "lines": [4989, 5001],
+      "evidence": [
+        "withSemaphore acquires the in-memory semaphore before acquireProviderSlotLease.",
+        "If acquireProviderSlotLease throws, the callback try/finally has not started and lease.release is not called.",
+        "The timeout throw site is scripts/graphrag/batch-epub-workflow.mjs:4926-4929."
+      ],
+      "reproduction": [
+        "Hold provider durable slots at limit until providerSlotAcquireWaitMs is exceeded.",
+        "Run a provider-wrapped command such as qmd-query-json or resume-book-*.",
+        "The durable lease acquisition throws before the in-memory semaphore release finally block is installed."
+      ]
+    }
+  ]
+}

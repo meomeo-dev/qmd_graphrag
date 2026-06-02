@@ -693,7 +693,7 @@ export async function writeCompletedGraphBatchFixture(input: {
   const sourceRelativePath = relative(projectRoot, sourcePath);
   const bookId = batchBookId(sourceHash, sourceRelativePath);
   const itemId = `item-${sourceHash.slice(0, 12)}-${
-    createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
+    stableTextHash(sourceRelativePath).slice(0, 8)
   }`;
   const outputRel = join("books", bookId, "output");
   const outputDir = join(input.stateRoot, outputRel);
@@ -1121,6 +1121,7 @@ export function runBatchWorkflow(input: {
   configDir: string;
   runId: string;
   statusJson?: boolean;
+  maxResumePasses?: number;
   env?: Record<string, string>;
   timeoutMs?: number;
 }): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
@@ -1138,7 +1139,7 @@ export function runBatchWorkflow(input: {
       "--skip-dotenv",
       "--book-concurrency", "1",
       "--max-command-attempts", "1",
-      "--max-resume-passes", "1",
+      "--max-resume-passes", String(input.maxResumePasses ?? 1),
       ...(input.statusJson === true ? ["--status-json"] : []),
     ], {
       cwd: input.tmpRoot,

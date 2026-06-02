@@ -692,6 +692,7 @@ export {
   assertGraphRagStageArtifactsReady,
   readGraphTextUnitIdentity,
   registerQmdCorpusDocument,
+  refreshGraphRagStageOutputDurableSidecars,
   syncGraphRagBookWorkspace,
   writeGraphRagOutputProducerManifest,
 } from "./job-state/graphrag-book.js";

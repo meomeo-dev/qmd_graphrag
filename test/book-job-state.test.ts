@@ -43,6 +43,7 @@ import {
   durableChecksumPath,
   readJsonFileDurable,
   writeJsonFileDurable,
+  writeYamlFileDurable,
 } from "../src/job-state/durable-state-store.js";
 import {
   registerQmdCorpusDocument,
@@ -3999,7 +4000,7 @@ describe("FileBookJobStateRepository", () => {
         providerFingerprint: job.providerFingerprint!,
         artifactIds: artifacts.map((artifact) => artifact.artifactId),
       });
-      await writeFile(checkpointsPath, YAML.stringify(checkpoints), "utf8");
+      await writeYamlFileDurable(checkpointsPath, checkpoints);
 
       expect(await loadGraphQueryCapabilities({ graphVault })).toEqual([]);
     } finally {
@@ -4657,28 +4658,25 @@ describe("FileBookJobStateRepository", () => {
         join(root, "graph_vault", "books", legacyBookId, "artifacts.yaml"),
         "utf8",
       )).split(stableJob.bookId).join(legacyBookId);
-      await writeFile(
+      await writeYamlFileDurable(
         join(root, "graph_vault", "books", legacyBookId, "artifacts.yaml"),
-        legacyArtifacts,
-        "utf8",
+        YAML.parse(legacyArtifacts),
       );
       const legacyCheckpoints = (await readFile(
         join(root, "graph_vault", "books", legacyBookId, "checkpoints.yaml"),
         "utf8",
       )).split(stableJob.bookId).join(legacyBookId);
-      await writeFile(
+      await writeYamlFileDurable(
         join(root, "graph_vault", "books", legacyBookId, "checkpoints.yaml"),
-        legacyCheckpoints,
-        "utf8",
+        YAML.parse(legacyCheckpoints),
       );
       const legacyJob = (await readFile(
         join(root, "graph_vault", "books", legacyBookId, "job.yaml"),
         "utf8",
       )).split(stableJob.bookId).join(legacyBookId);
-      await writeFile(
+      await writeYamlFileDurable(
         join(root, "graph_vault", "books", legacyBookId, "job.yaml"),
-        legacyJob,
-        "utf8",
+        YAML.parse(legacyJob),
       );
 
       const migratedJob = await repo.registerBookSource({

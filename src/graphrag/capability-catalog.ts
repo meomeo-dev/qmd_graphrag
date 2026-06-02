@@ -196,17 +196,16 @@ async function loadRunRecordCandidates(
   const catalogResult = BookJobRunCatalogSchema.safeParse(catalogRaw);
   if (!catalogResult.success) return [];
 
-  const records = await Promise.all(
-    catalogResult.data.items
-      .filter((item) => item.bookId === book.bookId)
-      .map(async (item) => {
-        const raw = await readYaml(
-          join(graphVault, "books", book.bookId, "runs", `${item.runId}.yaml`),
-        );
-        const result = BookJobRunRecordSchema.safeParse(raw);
-        return result.success ? result.data : null;
-      }),
-  );
+  const records: Array<BookJobRunRecord | null> = [];
+  for (const item of catalogResult.data.items.filter((entry) =>
+    entry.bookId === book.bookId
+  )) {
+    const raw = await readYaml(
+      join(graphVault, "books", book.bookId, "runs", `${item.runId}.yaml`),
+    );
+    const result = BookJobRunRecordSchema.safeParse(raw);
+    records.push(result.success ? result.data : null);
+  }
   return records
     .filter((record): record is BookJobRunRecord => record != null)
     .map((record) => runRecordToCheckpointCandidate(record, book));
@@ -335,8 +334,15 @@ async function selectQueryReadyCheckpoint(input: {
 
 export type ResolveGraphCapabilitiesInput = {
   graphVault: string;
+  bookIds?: readonly (string | null | undefined)[];
   documentIds?: readonly (string | null | undefined)[];
   sourceIds?: readonly (string | null | undefined)[];
+};
+
+type CapabilityScope = {
+  bookIds: ReadonlySet<string>;
+  documentIds: ReadonlySet<string>;
+  sourceIds: ReadonlySet<string>;
 };
 
 async function readYaml(path: string): Promise<unknown | null> {
@@ -363,12 +369,28 @@ function normalizeIdentitySet(
 
 function matchesRequestedScope(
   capability: GraphCapability,
-  documentIds: Set<string>,
-  sourceIds: Set<string>,
+  bookIds: ReadonlySet<string>,
+  documentIds: ReadonlySet<string>,
+  sourceIds: ReadonlySet<string>,
 ): boolean {
-  const hasScope = documentIds.size > 0 || sourceIds.size > 0;
+  const hasScope = bookIds.size > 0 || documentIds.size > 0 || sourceIds.size > 0;
   if (!hasScope) return true;
-  return documentIds.has(capability.documentId) || sourceIds.has(capability.sourceId);
+  return bookIds.has(capability.bookId) ||
+    documentIds.has(capability.documentId) ||
+    sourceIds.has(capability.sourceId);
+}
+
+function bookMatchesRequestedScope(
+  book: BookJob,
+  scope: CapabilityScope,
+): boolean {
+  const hasScope = scope.bookIds.size > 0 ||
+    scope.documentIds.size > 0 ||
+    scope.sourceIds.size > 0;
+  if (!hasScope) return true;
+  return scope.bookIds.has(book.bookId) ||
+    scope.documentIds.has(book.documentId) ||
+    scope.sourceIds.has(`sha256:${book.sourceHash}`);
 }
 
 function methodCapabilities(
@@ -556,6 +578,7 @@ export async function loadExplicitCapabilityCatalog(
 async function filterValidatedCapabilities(
   graphVault: string,
   capabilities: readonly GraphCapability[],
+  scope: CapabilityScope,
 ): Promise<GraphCapability[]> {
   const identityRaw = await readYaml(
     join(graphVault, "catalog", "document-identity-map.yaml"),
@@ -566,6 +589,16 @@ async function filterValidatedCapabilities(
   const result: GraphCapability[] = [];
   for (const capability of capabilities) {
     if (!capability.ready) continue;
+    if (
+      !matchesRequestedScope(
+        capability,
+        scope.bookIds,
+        scope.documentIds,
+        scope.sourceIds,
+      )
+    ) {
+      continue;
+    }
     if (!capabilityHasGraphIdentity(capability, identities)) {
       continue;
     }
@@ -616,6 +649,7 @@ function capabilityHasGraphIdentity(
 
 async function deriveCapabilitiesFromBookState(
   graphVault: string,
+  scope: CapabilityScope,
 ): Promise<GraphCapability[]> {
   const booksRaw = await readYaml(join(graphVault, "catalog", "books.yaml"));
   if (booksRaw == null) return [];
@@ -629,6 +663,7 @@ async function deriveCapabilitiesFromBookState(
   const capabilities: GraphCapability[] = [];
 
   for (const book of books) {
+    if (!bookMatchesRequestedScope(book, scope)) continue;
     const lineageArtifactIds = await loadQueryReadyLineageArtifactIds(
       graphVault,
       book.bookId,
@@ -691,12 +726,14 @@ export async function loadGraphCapabilities(
   input: ResolveGraphCapabilitiesInput,
 ): Promise<GraphCapability[]> {
   const graphVault = resolve(input.graphVault);
+  const bookIds = normalizeIdentitySet(input.bookIds);
   const documentIds = normalizeIdentitySet(input.documentIds);
   const sourceIds = normalizeIdentitySet(input.sourceIds);
+  const scope = { bookIds, documentIds, sourceIds };
   const explicit = await loadExplicitCapabilityCatalog(graphVault);
   const [derived, validatedExplicit] = await Promise.all([
-    deriveCapabilitiesFromBookState(graphVault),
-    filterValidatedCapabilities(graphVault, explicit),
+    deriveCapabilitiesFromBookState(graphVault, scope),
+    filterValidatedCapabilities(graphVault, explicit, scope),
   ]);
   const byCapabilityId = new Map<string, GraphCapability>();
   for (const capability of derived) {
@@ -716,7 +753,9 @@ export async function loadGraphCapabilities(
 
   return capabilities
     .filter((capability) => capability.ready)
-    .filter((capability) => matchesRequestedScope(capability, documentIds, sourceIds));
+    .filter((capability) =>
+      matchesRequestedScope(capability, bookIds, documentIds, sourceIds)
+    );
 }
 
 export async function loadGraphQueryCapabilities(
@@ -809,10 +848,12 @@ function candidateMatchesCapability(input: {
 
 export async function resolveCandidateGraphCapabilities(input: {
   graphVault: string;
+  bookIds?: readonly (string | null | undefined)[];
   candidates: readonly QmdRetrievalCandidate[];
 }): Promise<Map<string, GraphCapability[]>> {
   const capabilities = await loadGraphQueryCapabilities({
     graphVault: input.graphVault,
+    bookIds: input.bookIds,
   });
   const contentHashCounts = new Map<string, number>();
   for (const capability of capabilities) {
