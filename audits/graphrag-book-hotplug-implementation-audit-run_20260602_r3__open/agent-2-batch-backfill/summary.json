@@ -1,0 +1,76 @@
+{
+  "schemaVersion": "1.0.0",
+  "agentId": "agent-2-batch-backfill",
+  "scenario": "当前 38 本完成书与 34 个历史残留目录迁移到热插拔布局",
+  "overall_result": "partial",
+  "baselineResults": [
+    {
+      "id": "current_vs_residue_classification",
+      "result": "pass"
+    },
+    {
+      "id": "migration_source_of_truth",
+      "result": "partial"
+    },
+    {
+      "id": "package_layout_transform",
+      "result": "pass"
+    },
+    {
+      "id": "checksum_manifest_regeneration",
+      "result": "pass"
+    },
+    {
+      "id": "residue_quarantine_policy",
+      "result": "pass"
+    },
+    {
+      "id": "idempotent_migration",
+      "result": "partial"
+    },
+    {
+      "id": "conflict_and_duplicate_handling",
+      "result": "partial"
+    },
+    {
+      "id": "rollback_and_audit_trail",
+      "result": "partial"
+    },
+    {
+      "id": "catalog_projection_cleanup",
+      "result": "pass"
+    },
+    {
+      "id": "executable_migration_tests",
+      "result": "partial"
+    }
+  ],
+  "verifiedEvidence": {
+    "tscNoEmit": "passed",
+    "hotplugCatalogTest": "5 passed",
+    "realVaultPackageValidation": {
+      "totalWithManifest": 38,
+      "ok": 38,
+      "failed": 0
+    },
+    "realVaultQualityGate": {
+      "total": 38,
+      "passedCopyAllowed": 38
+    },
+    "migrationClassification": {
+      "totalDirectories": 72,
+      "alreadyMigrated": 38,
+      "residueQuarantined": 34,
+      "residueGenerationAllowed": 0
+    },
+    "catalogProjection": {
+      "books": 38,
+      "identities": 38,
+      "graphCapabilities": 30,
+      "staleBooks": 0,
+      "missingBooks": 0,
+      "staleCapabilities": 0
+    }
+  },
+  "residualRiskCount": 5
+}

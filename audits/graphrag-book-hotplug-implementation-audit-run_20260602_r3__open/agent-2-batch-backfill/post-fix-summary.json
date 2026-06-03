@@ -1,0 +1,125 @@
+{
+  "schemaVersion": "1.0.0",
+  "agentId": "agent-2-batch-backfill",
+  "scenario": "当前 38 本完成书与 34 个历史残留目录迁移到热插拔布局",
+  "baselinePath": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-2-batch-backfill/baseline.yaml",
+  "baselineSha256": "3754841ae8300fd9651d4137fab9ebab88946538ee1c8f00d83e039f1ec08282",
+  "overall_result": "partial",
+  "baselineResults": [
+    {
+      "id": "current_vs_residue_classification",
+      "result": "pass"
+    },
+    {
+      "id": "migration_source_of_truth",
+      "result": "pass"
+    },
+    {
+      "id": "package_layout_transform",
+      "result": "pass"
+    },
+    {
+      "id": "checksum_manifest_regeneration",
+      "result": "pass"
+    },
+    {
+      "id": "residue_quarantine_policy",
+      "result": "pass"
+    },
+    {
+      "id": "idempotent_migration",
+      "result": "partial"
+    },
+    {
+      "id": "conflict_and_duplicate_handling",
+      "result": "partial"
+    },
+    {
+      "id": "rollback_and_audit_trail",
+      "result": "partial"
+    },
+    {
+      "id": "catalog_projection_cleanup",
+      "result": "pass"
+    },
+    {
+      "id": "executable_migration_tests",
+      "result": "partial"
+    }
+  ],
+  "verifiedEvidence": {
+    "tscNoEmit": "passed",
+    "hotplugCatalogTest": "7 passed",
+    "realVaultPackageValidation": {
+      "totalDirectories": 72,
+      "totalWithManifest": 38,
+      "ok": 38,
+      "failed": 0
+    },
+    "realVaultQualityGate": {
+      "total": 38,
+      "passedCopyAllowed": 38,
+      "failedOrMissing": 0
+    },
+    "queryReadiness": {
+      "queryReadyTrue": 30,
+      "queryReadyFalse": 8,
+      "falseReason": "producer lineage missing, marked not query-ready"
+    },
+    "latestMigrationEvidence": {
+      "migrationId": "hotplug-backfill-20260602171023255",
+      "classificationCounts": {
+        "totalDirectories": 72,
+        "candidates": 38,
+        "residues": 34,
+        "alreadyMigrated": 38,
+        "legacyOnly": 0,
+        "repairRequired": 0,
+        "residueQuarantined": 34,
+        "partialMigration": 0,
+        "failedInterrupted": 0
+      },
+      "copyMapEntries": 38,
+      "copyMapFileEntries": 70493,
+      "pendingFileEntries": 0,
+      "manifestDiffEntries": 38,
+      "manifestDiffCommitted": 38,
+      "residueReportCount": 34,
+      "conflictReportCount": 34,
+      "conflictCodes": {
+        "migration_source_hash_prefix_conflict": 34
+      },
+      "evidenceSidecarsValid": true,
+      "topReportSidecarsValid": true
+    },
+    "catalogProjection": {
+      "books": 38,
+      "sources": 38,
+      "identities": 38,
+      "graphCapabilities": 30
+    }
+  },
+  "residualRisks": [
+    {
+      "id": "force_rerun_identity_stability",
+      "baseline": "idempotent_migration",
+      "severity": "medium"
+    },
+    {
+      "id": "live_root_publish_without_full_staging_rollback",
+      "baseline": "rollback_and_audit_trail",
+      "severity": "medium"
+    },
+    {
+      "id": "full_conflict_matrix_not_executably_proven",
+      "baseline": "conflict_and_duplicate_handling",
+      "severity": "medium"
+    },
+    {
+      "id": "migration_test_matrix_incomplete",
+      "baseline": "executable_migration_tests",
+      "severity": "medium"
+    }
+  ],
+  "residualRiskCount": 4
+}

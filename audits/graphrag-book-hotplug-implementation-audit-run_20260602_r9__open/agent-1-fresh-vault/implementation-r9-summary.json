@@ -1,0 +1,217 @@
+{
+  "schemaVersion": "1.0.0",
+  "agentId": "agent-1-fresh-vault",
+  "runId": "20260602_r9",
+  "status": "partial",
+  "passCount": 7,
+  "partialCount": 3,
+  "failCount": 0,
+  "baselineSource": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r8__open/agent-1-fresh-vault/fixed-baseline.yaml",
+  "targetDocuments": [
+    "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml",
+    "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml"
+  ],
+  "criteriaResults": [
+    {
+      "baselineId": "direct_query_entrypoint",
+      "status": "partial",
+      "summary": "Runtime gate is manifest-first and package-local, but query-ready lineage still depends on catalog/books.yaml plus artifacts/checkpoints projection to derive final graph capability.",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-runtime-gate.ts:350",
+        "src/graphrag/capability-catalog.ts:474",
+        "src/graphrag/capability-catalog.ts:480",
+        "src/graphrag/capability-catalog.ts:492",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:944"
+      ],
+      "residualRisks": [
+        "Manifest validation can succeed while capability derivation still fails if catalog projection state cannot be rebuilt."
+      ]
+    },
+    {
+      "baselineId": "artifact_minimum_closure",
+      "status": "pass",
+      "summary": "Required GraphRAG artifact set, file checksums, bytes, and required flags are defined and enforced fail-closed.",
+      "evidencePaths": [
+        "scripts/graphrag/book-hotplug-package.mjs:40",
+        "scripts/graphrag/book-hotplug-package.mjs:635",
+        "src/graphrag/book-hotplug-runtime-gate.ts:206",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:1614"
+      ],
+      "residualRisks": [
+        "Correctness still depends on the producer continuing to emit the expected closure."
+      ]
+    },
+    {
+      "baselineId": "artifact_gate_state_machine",
+      "status": "partial",
+      "summary": "Candidate validation, publish marker ordering, live validation, and marker removal exist, but publish is not a staging-directory atomic rename into liveRoot.",
+      "evidencePaths": [
+        "scripts/graphrag/book-hotplug-publish-gate.mjs:27",
+        "scripts/graphrag/batch-epub-workflow.mjs:10188",
+        "scripts/graphrag/batch-epub-workflow.mjs:10220",
+        "scripts/graphrag/batch-epub-workflow.mjs:10258",
+        "scripts/graphrag/backfill-hotplug-packages.mjs:180",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:198"
+      ],
+      "residualRisks": [
+        "A live-root write window still exists and is hidden by marker semantics instead of directory generation isolation."
+      ]
+    },
+    {
+      "baselineId": "producer_lineage_completeness",
+      "status": "pass",
+      "summary": "Required artifact metadata rows and producer run summaries cover producer run, step, input fingerprint, tool/schema version, createdAt, and upstream hashes, and incomplete lineage fails closed.",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-runtime-gate.ts:300",
+        "src/graphrag/book-hotplug-producer-run-bindings.ts:104",
+        "src/contracts/book-job.ts:167",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:302",
+        "test/graphrag-book-hotplug-runtime-gate-hardening.test.ts:204",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:983"
+      ],
+      "residualRisks": [
+        "Semantic quality of upstreamArtifactHashes still relies on producer-side metadata generation."
+      ]
+    },
+    {
+      "baselineId": "lineage_artifact_binding",
+      "status": "pass",
+      "summary": "Producer run evidence is semantically bound to artifact rows through run.artifactIds or durable refresh bindings, with stage and provider fingerprint checks.",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-producer-run-bindings.ts:158",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:356",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:439",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:983"
+      ],
+      "residualRisks": [
+        "New shared artifact refresh patterns would need matching durable refresh binding logic."
+      ]
+    },
+    {
+      "baselineId": "schema_runtime_compatibility",
+      "status": "pass",
+      "summary": "Runtime compatibility now fail-closes on package schema, layout, qmd schema, GraphRAG artifact schema, min runtime version, provider fingerprint, embedding dimension, and output/parquet/LanceDB/artifact metadata digests.",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-runtime-gate.ts:350",
+        "src/graphrag/book-hotplug-runtime-compatibility-digests.ts:66",
+        "scripts/graphrag/book-hotplug-runtime-compatibility.mjs:143",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:221",
+        "test/graphrag-book-hotplug-runtime-gate-hardening.test.ts:316",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:1648"
+      ],
+      "residualRisks": [
+        "Embedding model identity is not checked as a distinct explicit field, but the implemented contract checks the runtime compatibility inputs and digests that are currently normative."
+      ]
+    },
+    {
+      "baselineId": "query_scope_isolation",
+      "status": "pass",
+      "summary": "Capability loading and projection filtering remain book/document/source scoped and skip unrelated damaged run records.",
+      "evidencePaths": [
+        "src/graphrag/capability-catalog.ts:401",
+        "src/graphrag/capability-catalog.ts:715",
+        "src/graphrag/capability-catalog.ts:775",
+        "test/graphrag-capability-scope.test.ts:83",
+        "test/graphrag-capability-scope.test.ts:113"
+      ],
+      "residualRisks": [
+        "Projection remains a cache layer, so isolation correctness still assumes projection rebuild continues to respect the same scope filters."
+      ]
+    },
+    {
+      "baselineId": "privacy_payload_exclusion",
+      "status": "pass",
+      "summary": "Runtime gate and package validation reject provider payload roots, logs, debug, lock files, and other forbidden sensitive material.",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-runtime-gate.ts:104",
+        "scripts/graphrag/book-hotplug-package.mjs:721",
+        "test/graphrag-book-hotplug-catalog.test.ts:573",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:293"
+      ],
+      "residualRisks": [
+        "Future sensitive path conventions will require denylist maintenance."
+      ]
+    },
+    {
+      "baselineId": "recovery_diagnostics",
+      "status": "partial",
+      "summary": "Stable diagnostics and publish marker rollback are implemented, but there is no explicit prior-generation liveRoot preservation or interrupted publish recovery based on generation swap.",
+      "evidencePaths": [
+        "scripts/graphrag/batch-epub-workflow.mjs:10259",
+        "scripts/graphrag/batch-epub-workflow.mjs:10261",
+        "scripts/graphrag/backfill-hotplug-packages.mjs:356",
+        "scripts/graphrag/backfill-hotplug-packages.mjs:360",
+        "test/graphrag-book-hotplug-backfill.test.ts:169"
+      ],
+      "residualRisks": [
+        "A failed live publish can be hidden by removing the marker, but the contract-grade last-good generation rollback story remains incomplete."
+      ]
+    },
+    {
+      "baselineId": "executable_contract_tests",
+      "status": "pass",
+      "summary": "Current tests cover runtime digest mismatch, layout/embedding mismatch, missing metadata rows, forged lineage, provider payload exclusion, stale catalog rebuild, missing producer runs, readonly package lock non-creation, and backfill conflicts.",
+      "evidencePaths": [
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:221",
+        "test/graphrag-book-hotplug-runtime-gate-hardening.test.ts:204",
+        "test/graphrag-book-hotplug-catalog.test.ts:136",
+        "test/graphrag-book-hotplug-catalog.test.ts:623",
+        "test/graphrag-book-hotplug-catalog.test.ts:732",
+        "test/graphrag-book-hotplug-backfill.test.ts:128",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:1686"
+      ],
+      "residualRisks": [
+        "Staged import rollback is still not exercised as a directory-generation test."
+      ]
+    }
+  ],
+  "findings": [
+    {
+      "severity": "medium",
+      "baselineId": "direct_query_entrypoint",
+      "summary": "Manifest-first runtime gate exists, but direct query capability derivation still requires catalog/books.yaml plus book-state projections."
+    },
+    {
+      "severity": "medium",
+      "baselineId": "artifact_gate_state_machine",
+      "summary": "Publish ordering is hardened, but atomic directory replacement is still absent."
+    },
+    {
+      "severity": "medium",
+      "baselineId": "recovery_diagnostics",
+      "summary": "Publish marker rollback exists, but previous live generation rollback is not implemented as an explicit recoverable package lifecycle."
+    },
+    {
+      "severity": "low",
+      "baselineId": "schema_runtime_compatibility",
+      "summary": "R8 partial is closed for the current contract surface; remaining ambiguity is limited to whether embedding model identity should become an explicit checked field in a future contract revision."
+    },
+    {
+      "severity": "low",
+      "baselineId": "producer_lineage_completeness",
+      "summary": "Producer lineage checks now cover the requested completeness dimensions for query-ready artifacts and fail closed when producer evidence is missing or forged."
+    },
+    {
+      "severity": "low",
+      "baselineId": "privacy_payload_exclusion",
+      "summary": "Readonly package .lock creation concern is closed: runtime validation performs read-only package access and tests assert no .lock files are written."
+    }
+  ],
+  "commandsConsidered": [
+    {
+      "command": "npm exec -- tsc -p tsconfig.build.json --noEmit",
+      "status": "pass"
+    },
+    {
+      "command": "npx vitest run test/graphrag-book-hotplug-runtime-gate.test.ts test/graphrag-book-hotplug-runtime-gate-hardening.test.ts test/graphrag-book-hotplug-catalog.test.ts test/graphrag-book-hotplug-backfill.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true",
+      "status": "pass",
+      "testFileCount": 4,
+      "testCount": 19
+    },
+    {
+      "command": "npm run build",
+      "status": "not_run",
+      "reason": "User supplied current mainline validation status already includes build success; this audit role performed focused read-only verification plus targeted test execution."
+    }
+  ]
+}

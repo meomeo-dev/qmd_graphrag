@@ -1,0 +1,73 @@
+{
+  "agentId": "agent-3-runtime-provider",
+  "scenario": "runtime provider / 挂载后 GraphRAG 查询和 provider 隔离",
+  "status": "partial",
+  "baselineCount": 10,
+  "passed": 2,
+  "partial": 8,
+  "failed": 0,
+  "findings": [
+    {
+      "severity": "high",
+      "baselineId": "privacy_payload_exclusion",
+      "summary": "Unified answer 未清洗 GraphRAG evidence.locator，provider 若返回绝对路径或私有 URI，可直接进入回答。",
+      "evidencePaths": [
+        "src/query/unified-answer.ts:83-99",
+        "src/vault/metadata.ts:55-80",
+        "test/cli-graphrag-route.test.ts:747-753"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "direct_query_entrypoint",
+      "summary": "dataDir 已切到 manifest-first，但运行时仍保留 legacy output fallback，且 capability 推导仍依赖可重建 catalog 与 state 投影，而非仅靠 manifest 与包内最小闭包。",
+      "evidencePaths": [
+        "src/graphrag/book-package-layout.ts:34-50",
+        "src/graphrag/capability-catalog.ts:442-547",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:942-990"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "schema_runtime_compatibility",
+      "summary": "runtime compatibility digest 仅覆盖 output manifest、parquet、LanceDB、artifact metadata 四组摘要，未实现设计声明的 embedding model/dimension、package layout、runtime reader 等兼容输入。",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-runtime-compatibility-digests.ts:76-113",
+        "src/graphrag/book-hotplug-runtime-gate.ts:270-330",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:1648-1669"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "artifact_gate_state_machine",
+      "summary": "runtime gate 失败会抑制 query capability，但 catalog 重建未显式投影 visible_not_query_ready 或 quarantined，状态机在实现层未完整落地。",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-runtime-gate.ts:332-395",
+        "src/graphrag/book-hotplug-catalog.ts:336-370",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:990-1097"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "lineage_artifact_binding",
+      "summary": "当前对 graphrag/runs/*.yaml 的校验主要停留在存在性层面，尚未把 run 记录内部的 artifact/hash/input 与当前文件闭包做语义绑定。",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-runtime-gate.ts:243-267",
+        "src/graphrag/book-hotplug-runtime-gate.ts:378-382",
+        "src/graphrag/book-hotplug-catalog.ts:247-279",
+        "src/graphrag/capability-catalog.ts:266-338"
+      ]
+    },
+    {
+      "severity": "low",
+      "baselineId": "executable_contract_tests",
+      "summary": "现有测试覆盖主路径，但尚缺 stale graph-capabilities cache、locator 私有路径脱敏、output manifest/LanceDB/artifact metadata digest mismatch 等独立契约用例。",
+      "evidencePaths": [
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:984-989",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:1091-1097",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:206-362",
+        "test/unified-query.test.ts:688-840"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+schemaVersion: "1.0.0"
+taskId: graphrag-book-hotplug-implementation-audit
+runId: "20260602_r11"
+status: open
+baselinePolicy: reuse_r10_fixed_baselines_without_changes
+scope:
+  - scripts/graphrag/book-hotplug-creation-identity.mjs
+  - scripts/graphrag/batch-epub-workflow.mjs
+  - test/graphrag-book-hotplug-creation-gate.test.ts
+  - scripts/graphrag/backfill-hotplug-packages.mjs
+  - scripts/graphrag/book-hotplug-package.mjs
+verification:
+  completed:
+    - npx vitest run test/graphrag-book-hotplug-creation-gate.test.ts --testTimeout 240000 --pool forks --poolOptions.forks.singleFork=true
+    - npx vitest run test/graphrag-book-hotplug-backfill.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true
+    - npx vitest run test/graphrag-book-hotplug-runtime-gate.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true
+    - npx vitest run test/graphrag-book-hotplug-catalog.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true
+    - npx vitest run test/graphrag-book-hotplug-qmd-projection.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true
+    - npx vitest run test/graphrag-book-hotplug-runtime-gate-hardening.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true
+    - npm exec -- tsc -p tsconfig.build.json --noEmit
+    - node scripts/graphrag/backfill-hotplug-packages.mjs --state-root graph_vault --only-missing --rebuild-catalog --fail-fast
+  realVault:
+    migrationId: hotplug-backfill-20260603023040784
+    discovered: 38
+    scannedDirectories: 72
+    residueCount: 34
+    processed: 0
+    skipped: 38
+    failed: 0
+    catalogBookCount: 38
+    catalogIdentityCount: 38
+    catalogCapabilityCount: 30

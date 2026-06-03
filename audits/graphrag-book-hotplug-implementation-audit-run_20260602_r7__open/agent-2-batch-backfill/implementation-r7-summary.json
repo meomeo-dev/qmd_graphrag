@@ -1,0 +1,178 @@
+{
+  "agentId": "agent-2-batch-backfill",
+  "scenario": "batch backfill / 38 包 + 34 residue 迁移清理",
+  "status": "partial",
+  "baselinePath": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r7__open/agent-2-batch-backfill/fixed-baseline.yaml",
+  "sourceBaselinePath": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r5__open/agent-2-batch-backfill/baseline.yaml",
+  "sourceBaselineSha256": "3754841ae8300fd9651d4137fab9ebab88946538ee1c8f00d83e039f1ec08282",
+  "baselineCount": 10,
+  "passCount": 6,
+  "partialCount": 4,
+  "failCount": 0,
+  "realVaultEvidence": {
+    "userProvidedMigrationId": "hotplug-backfill-20260602211359498",
+    "latestObservedMigrationId": "hotplug-backfill-20260602223718973",
+    "migrationCount": 17,
+    "totalDirectories": 72,
+    "discoveredCandidates": 38,
+    "alreadyMigrated": 38,
+    "residueQuarantined": 34,
+    "processed": 0,
+    "skipped": 38,
+    "failed": 0,
+    "residues": 34,
+    "conflicts": 34,
+    "conflictCounts": {
+      "migration_source_hash_prefix_conflict": 34
+    },
+    "catalogBooks": 38,
+    "catalogSources": 38,
+    "catalogDocumentIdentities": 38,
+    "catalogGraphCapabilities": 30,
+    "staleCatalogSourceCount": 0,
+    "staleCatalogDocumentIdentityCount": 0,
+    "staleCatalogGraphCapabilityCount": 0,
+    "manifestCount": 38,
+    "publishMarkerCount": 38,
+    "completeManifestPublishSidecarSets": 38,
+    "missingMarkerOrSidecarCount": 0,
+    "validatedPackageCount": 38,
+    "validatedPackageFailureCount": 0,
+    "forbiddenPathPackageCount": 0,
+    "qmdProjectionYamlExists": false,
+    "qmdBookProjectionsExists": false
+  },
+  "criteriaResults": [
+    {
+      "id": "current_vs_residue_classification",
+      "status": "pass",
+      "summary": "真实 vault 最新 evidence 将 72 个目录分为 38 个 already_migrated 和 34 个 residue_quarantined，residue 的 mayGenerateBookManifest=false，未被提升为 authoritative package。"
+    },
+    {
+      "id": "migration_source_of_truth",
+      "status": "pass",
+      "summary": "source-of-truth gate 绑定 distribution manifest sidecars、canonical input、source closure、qmd build manifest、GraphRAG output manifest、producer lineage 和 artifact checksums；缺 source closure 测试 fail closed 且不生成 BOOK_MANIFEST。"
+    },
+    {
+      "id": "package_layout_transform",
+      "status": "pass",
+      "summary": "实现将 legacy source/input/qmd/output/runs/state 转为 package-relative source、input、qmd、graphrag/output、graphrag/runs、state，并以 mount.packageRoot='.' 与 files closure 记录目标布局。"
+    },
+    {
+      "id": "checksum_manifest_regeneration",
+      "status": "pass",
+      "summary": "BOOK_MANIFEST、manifest checksum、content checksum、runtime compatibility、artifact metadata 与 publish marker checksum 均由包内当前内容重新生成；backfill 对新包发布保持 marker-last。"
+    },
+    {
+      "id": "residue_quarantine_policy",
+      "status": "pass",
+      "summary": "34 个 residue 保留 quarantine_without_delete、mountAllowed=false、exportAllowed=false、deletePerformed=false；真实包 forbidden residue scan 为 0。"
+    },
+    {
+      "id": "idempotent_migration",
+      "status": "partial",
+      "summary": "--force 对已验证包走 verified_existing 且不重写 manifest/publish marker/runtime compatibility；真实 vault 38 个包可验证且 skipped 38。但 partial_migration staged resume、failed_interrupted 显式恢复、用户 metadata 冲突防覆盖仍未闭环，--only-missing 跳过路径主要依赖 marker 存在性。"
+    },
+    {
+      "id": "conflict_and_duplicate_handling",
+      "status": "pass",
+      "summary": "sameSourceHashDifferentBookId、sameBookIdDifferentSourceHash、source-hash prefix conflict、partial/target/live-root conflict 均有稳定诊断记录；backfill 将 duplicate 和 hard identity conflict fail closed，focused tests 覆盖 duplicate sourceHash 与 same bookId different sourceHash。"
+    },
+    {
+      "id": "rollback_and_audit_trail",
+      "status": "partial",
+      "summary": "evidence 包含 plan、classification、copy-map、manifest-diff、checkpoint、validation、commit-record、residue-report、book-conflicts，且记录 skipped、failed、packageResults；但最终 backfill 仍直接写 live root，缺 build staging root、fsync、atomic rename、rollback restore 的实现证明。"
+    },
+    {
+      "id": "catalog_projection_cleanup",
+      "status": "partial",
+      "summary": "books/sources/document-identity-map/graph-capabilities 可从 BOOK_MANIFEST 和 publish marker 重建；真实 catalog 为 38/38/38/30 且 stale 引用为 0。global qmd projection / qmd-book-projections cleanup 仍未实现或产生 evidence。"
+    },
+    {
+      "id": "executable_migration_tests",
+      "status": "partial",
+      "summary": "本轮 backfill 3 tests、catalog 8 tests、runtime gate 2 tests 通过，覆盖 duplicate conflict、same bookId conflict、verify-only、residue/source-closure/catalog/runtime gate。仍缺 38/34 批量 fixture、partial resume、failed interrupted、用户 metadata conflict、staging mismatch/lock takeover 和完整 manual decision workflow 自动化。"
+    }
+  ],
+  "findings": [
+    {
+      "severity": "medium",
+      "baselineId": "idempotent_migration",
+      "summary": "partial_migration 与 failed_interrupted 已能分类并写入冲突/evidence，但尚无从 copy-map checkpoint staged resume 或显式 resume/restart decision 的执行路径。",
+      "evidencePaths": [
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:1176",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:1183",
+        "scripts/graphrag/book-hotplug-migration-state.mjs:452",
+        "scripts/graphrag/book-hotplug-migration-state.mjs:590",
+        "scripts/graphrag/book-hotplug-migration-state.mjs:606"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "idempotent_migration",
+      "summary": "--only-missing skip branch checks BOOK_MANIFEST/PUBLISH_READY sidecar existence rather than validateExistingHotplugPackage(); the current real vault validates 38/38, but a corrupt existing package with all marker files present could be skipped without quality-gate validation.",
+      "evidencePaths": [
+        "scripts/graphrag/backfill-hotplug-packages.mjs:126",
+        "scripts/graphrag/backfill-hotplug-packages.mjs:264",
+        "scripts/graphrag/backfill-hotplug-packages.mjs:296",
+        "scripts/graphrag/book-hotplug-package.mjs:713"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "rollback_and_audit_trail",
+      "summary": "candidate validation uses a temporary staging root, but live migration writes manifest and marker directly under the live book root; no implementation evidence for staging-first build root, fsync, atomic rename, or restore of previous live root.",
+      "evidencePaths": [
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:214",
+        "scripts/graphrag/book-hotplug-publish-gate.mjs:27",
+        "scripts/graphrag/backfill-hotplug-packages.mjs:167",
+        "scripts/graphrag/backfill-hotplug-packages.mjs:187",
+        "scripts/graphrag/backfill-hotplug-packages.mjs:356"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "catalog_projection_cleanup",
+      "summary": "catalog 38/38/30 已满足且 stale 引用为 0，但 final contracts 要求的 qmd-projection.yaml / qmd-book-projections 派生状态与 cleanup 未见实现或真实 vault evidence。",
+      "evidencePaths": [
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:326",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:403",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:961",
+        "src/graphrag/book-hotplug-catalog.ts:463"
+      ]
+    },
+    {
+      "severity": "low",
+      "baselineId": "conflict_and_duplicate_handling",
+      "summary": "sameBookIdDifferentSourceHash 当前由 backfill hard conflict 阻断，但 classification 在追加 migration_book_id_source_hash_conflict 之前计算 criticalDiagnostics，导致该分类对象本身仍可能显示 mayGenerateBookManifest=true；执行层已补救，分类语义仍不够收敛。",
+      "evidencePaths": [
+        "scripts/graphrag/book-hotplug-migration-state.mjs:421",
+        "scripts/graphrag/book-hotplug-migration-state.mjs:435",
+        "scripts/graphrag/book-hotplug-migration-state.mjs:445",
+        "scripts/graphrag/backfill-hotplug-packages.mjs:156",
+        "test/graphrag-book-hotplug-backfill.test.ts:220"
+      ]
+    },
+    {
+      "severity": "low",
+      "baselineId": "executable_migration_tests",
+      "summary": "focused tests 已通过，但固定基准要求的 38/34 批量 fixture、中断恢复、用户 metadata 冲突、staging mismatch、锁接管和 durable manual-decision matrix 尚未自动化。",
+      "evidencePaths": [
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:1212",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:1297",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:1353",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:1886"
+      ]
+    }
+  ],
+  "commandsRun": [
+    "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/graphrag-book-hotplug-backfill.test.ts",
+    "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/graphrag-book-hotplug-catalog.test.ts",
+    "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/graphrag-book-hotplug-runtime-gate.test.ts",
+    "read-only Node check for latest real vault migration evidence",
+    "read-only Node check for catalog counts and stale projection references",
+    "read-only Node check for manifest/publish marker sidecar completeness",
+    "read-only Node validateBookHotplugPackage scan over 38 real packages",
+    "read-only Node scan for forbidden package residues"
+  ]
+}

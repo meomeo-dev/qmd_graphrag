@@ -1,0 +1,80 @@
+{
+  "agentId": "agent-2-batch-backfill",
+  "scenario": "batch backfill / 38 包 + 34 residue 迁移清理",
+  "status": "partial",
+  "baselineCount": 10,
+  "passed": 4,
+  "partial": 5,
+  "failed": 1,
+  "findings": [
+    {
+      "severity": "high",
+      "baselineId": "conflict_and_duplicate_handling",
+      "summary": "冲突记录仅写入 evidence，未作为候选过滤与人工决策闸门；同源/重复候选仍可进入 backfill，未满足 fail-closed。",
+      "evidencePaths": [
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:87",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:1756",
+        "scripts/graphrag/book-hotplug-migration-state.mjs:453",
+        "scripts/graphrag/book-hotplug-migration-state.mjs:599",
+        "scripts/graphrag/backfill-hotplug-packages.mjs:197"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "current_vs_residue_classification",
+      "summary": "current/residue 分类字段与诊断已实现，但 sourceHash 优先级没有回流到 candidates 选择，冲突完整目录仍可能被当作 authoritative package 回填。",
+      "evidencePaths": [
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:846",
+        "scripts/graphrag/book-hotplug-migration-state.mjs:344",
+        "scripts/graphrag/book-hotplug-migration-state.mjs:579",
+        "scripts/graphrag/backfill-hotplug-packages.mjs:217"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "idempotent_migration",
+      "summary": "already_migrated 的 verify-only 已成立，但 partial_migration 和 failed_interrupted 仅被识别，未进入 staging-first resume/rollback 流程，超时恢复主要依赖重跑。",
+      "evidencePaths": [
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:825",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:1466",
+        "scripts/graphrag/book-hotplug-migration-state.mjs:415",
+        "scripts/graphrag/backfill-hotplug-packages.mjs:197",
+        "test/graphrag-book-hotplug-backfill.test.ts:128"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "rollback_and_audit_trail",
+      "summary": "迁移 evidence 已较完整，但仍缺 final contracts 要求的多项 before/after 字段，且 backfill 直接写 live root，rollback 更偏声明性而非可执行事务。",
+      "evidencePaths": [
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:213",
+        "scripts/graphrag/book-hotplug-migration-state.mjs:623",
+        "scripts/graphrag/book-hotplug-quality-gate.mjs:171",
+        "src/job-state/durable-state-store.ts:1163"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "catalog_projection_cleanup",
+      "summary": "books/sources/document-identity-map/graph-capabilities 可从 manifest 重建并清理 stale 项，但 qmd projection cache 的清理未见实现证据。",
+      "evidencePaths": [
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:942",
+        "src/graphrag/book-hotplug-catalog.ts:305",
+        "src/graphrag/book-hotplug-catalog.ts:459",
+        "test/graphrag-book-hotplug-catalog.test.ts:370"
+      ]
+    },
+    {
+      "severity": "low",
+      "baselineId": "executable_migration_tests",
+      "summary": "现有测试覆盖 verify-only、residue 不提升、catalog cleanup 与 provider payload 拒绝，但缺冲突决策、中断恢复、锁接管与代表性 batch 场景。",
+      "evidencePaths": [
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:1265",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:1800",
+        "test/graphrag-book-hotplug-backfill.test.ts:128",
+        "test/graphrag-book-hotplug-catalog.test.ts:278",
+        "test/graphrag-book-hotplug-catalog.test.ts:573"
+      ]
+    }
+  ]
+}

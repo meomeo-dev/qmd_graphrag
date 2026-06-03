@@ -1,0 +1,228 @@
+{
+  "schemaVersion": "1.0.0",
+  "agentId": "agent-2-batch-backfill",
+  "scenario": "当前 38 本完成书与 34 个历史残留目录迁移到热插拔布局",
+  "baselinePath": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-2-batch-backfill/baseline.yaml",
+  "baselineSha256": "3754841ae8300fd9651d4137fab9ebab88946538ee1c8f00d83e039f1ec08282",
+  "status": "partial",
+  "reviewMode": "r4 read-only plus temp-clone verification",
+  "realGraphVaultModified": false,
+  "codeModified": false,
+  "baselineModified": false,
+  "latestRealMigrationId": "hotplug-backfill-20260602182957235",
+  "tempCloneMigrationId": "hotplug-backfill-20260602184651030",
+  "criteriaResults": [
+    {
+      "id": "current_vs_residue_classification",
+      "status": "pass",
+      "reason": "真实 vault 72 个目录被稳定分类为 38 个 already_migrated 与 34 个 residue_quarantined。",
+      "evidence": {
+        "totalDirectories": 72,
+        "alreadyMigrated": 38,
+        "residueQuarantined": 34,
+        "mayGenerateBookManifestTrue": 38,
+        "mayGenerateBookManifestFalse": 34
+      }
+    },
+    {
+      "id": "migration_source_of_truth",
+      "status": "pass",
+      "reason": "source-of-truth gate 已对 72 个目录落盘，producer lineage 缺失的 8 个包被稳定标记为 not query-ready，语义 digest 伪造测试可 fail-closed。",
+      "evidence": {
+        "sourceTruthEntries": 72,
+        "producerMissingMarkedNotQueryReady": 8,
+        "runtimeCompatibilitySemanticDigestTest": "passed",
+        "runtimeCompatibilityPresent": 38,
+        "runtimeCompatibilityCompatible": 38
+      }
+    },
+    {
+      "id": "package_layout_transform",
+      "status": "pass",
+      "reason": "copy-map 与临时 clone force backfill 共同证明 package-relative 布局转换可执行且无 pending 文件。",
+      "evidence": {
+        "copyMapEntries": 38,
+        "copyMapFileEntries": 70493,
+        "copyMapPendingFileEntries": 0,
+        "tempForceProcessed": 38,
+        "tempForceFailed": 0
+      }
+    },
+    {
+      "id": "checksum_manifest_regeneration",
+      "status": "pass",
+      "reason": "38 个 manifest diff 均 committed，runtime compatibility digest 已参与 fail-closed 校验。",
+      "evidence": {
+        "manifestDiffEntries": 38,
+        "manifestDiffCommitted": 38,
+        "runtimeCompatibilityPresent": 38,
+        "runtimeCompatibilityCompatible": 38
+      }
+    },
+    {
+      "id": "residue_quarantine_policy",
+      "status": "pass",
+      "reason": "34 个 residue 维持不可 mount、不可 export、不可 delete，且真实 package forbidden residue scan 为 0。",
+      "evidence": {
+        "residueReportCount": 34,
+        "forbiddenPathPackageCount": 0,
+        "mountAllowedResidues": 0,
+        "exportAllowedResidues": 0,
+        "deletePerformedResidues": 0
+      }
+    },
+    {
+      "id": "idempotent_migration",
+      "status": "partial",
+      "reason": "force rerun 已能成功完成，但它不是 verify-only：38/38 manifest、publish marker、runtime compatibility 与 createdAt 都发生了重写。",
+      "evidence": {
+        "tempForceExitStatus": 0,
+        "tempForceProcessed": 38,
+        "tempForceFailed": 0,
+        "manifestTextChanged": 38,
+        "publishReadyTextChanged": 38,
+        "runtimeCompatibilityTextChanged": 38,
+        "createdAtChanged": 38,
+        "packageGenerationStable": 38,
+        "queryReadyStable": 38
+      }
+    },
+    {
+      "id": "conflict_and_duplicate_handling",
+      "status": "partial",
+      "reason": "代码分支已覆盖多类冲突，但真实证据当前只完整覆盖 34 个 source-hash prefix conflict。",
+      "evidence": {
+        "conflictReportCount": 34,
+        "conflictCodes": {
+          "migration_source_hash_prefix_conflict": 34
+        },
+        "codePathsPresent": [
+          "migration_duplicate_source_hash",
+          "migration_staging_target_exists",
+          "migration_target_generation_conflict",
+          "migration_target_live_root_exists"
+        ]
+      }
+    },
+    {
+      "id": "rollback_and_audit_trail",
+      "status": "partial",
+      "reason": "evidence sidecar、copy-map 与 commit-record 已齐全，但 backfill 仍直接写 live root，缺少 staging-first rollback 证明。",
+      "evidence": {
+        "migrationEvidenceSidecarsValid": 9,
+        "rollbackAvailable": true,
+        "legacyEvidencePreserved": true,
+        "copyMapEntries": 38,
+        "copyMapFileEntries": 70493,
+        "copyMapPendingFileEntries": 0,
+        "stagingFirstRollbackProven": false
+      }
+    },
+    {
+      "id": "catalog_projection_cleanup",
+      "status": "pass",
+      "reason": "真实 vault catalog 当前稳定为 38/38/38/30，临时 clone rebuild 结果与之对齐，且 stale cleanup focused test 已通过。",
+      "evidence": {
+        "catalogBooks": 38,
+        "catalogSources": 38,
+        "catalogDistinctIdentities": 38,
+        "catalogCapabilities": 30,
+        "staleBooks": 0,
+        "staleIdentityRefs": 0,
+        "staleCapabilityRefs": 0,
+        "tempCatalogRebuild": {
+          "bookCount": 38,
+          "identityCount": 38,
+          "capabilityCount": 30
+        }
+      }
+    },
+    {
+      "id": "executable_migration_tests",
+      "status": "partial",
+      "reason": "focused tests 当前全绿，但固定基准要求的批量 38/34、中断重试、force rerun identity stability 与完整冲突矩阵仍未全自动化证明。",
+      "evidence": {
+        "tscNoEmit": "passed",
+        "runtimeGateVitest": "1 passed",
+        "hotplugCatalogVitest": "8 passed",
+        "missingMatrix": [
+          "38 complete books and 34 residues batch fixture",
+          "interrupted retry",
+          "force rerun identity stability",
+          "full conflict decision matrix"
+        ]
+      }
+    }
+  ],
+  "blockingFindings": [
+    {
+      "id": "force_rerun_rewrites_validated_package_outputs",
+      "criterion": "idempotent_migration",
+      "severity": "medium",
+      "summary": "临时 clone 上的 --force rerun 虽然 exit 0，但 38/38 manifest、publish marker、runtime compatibility 与 identity.createdAt 都被重写。"
+    },
+    {
+      "id": "real_conflict_evidence_covers_prefix_only",
+      "criterion": "conflict_and_duplicate_handling",
+      "severity": "medium",
+      "summary": "最新真实 conflict report 仅完整覆盖 34 个 migration_source_hash_prefix_conflict，其他冲突族缺执行证明。"
+    },
+    {
+      "id": "live_root_publish_without_staging_first_rollback_proof",
+      "criterion": "rollback_and_audit_trail",
+      "severity": "medium",
+      "summary": "evidence 已齐，但 backfill 仍在 candidate validation 后直接写 live root，尚无 staging-first rollback 执行证明。"
+    },
+    {
+      "id": "migration_contract_test_matrix_incomplete",
+      "criterion": "executable_migration_tests",
+      "severity": "medium",
+      "summary": "focused tests 已全绿，但完整合同矩阵仍缺 batch 38/34、中断重试、force stability 与全冲突矩阵自动化。"
+    }
+  ],
+  "residualRisks": [
+    {
+      "id": "force_rerun_identity_drift",
+      "criterion": "idempotent_migration",
+      "severity": "medium",
+      "summary": "force rerun 保持 packageGeneration 与 queryReady 稳定，但会重写 manifest、publish marker、runtime compatibility 与 createdAt。"
+    },
+    {
+      "id": "non_prefix_conflicts_not_executably_proven",
+      "criterion": "conflict_and_duplicate_handling",
+      "severity": "medium",
+      "summary": "duplicate source hash、staging target exists、generation conflict、live root exists 目前主要停留在代码分支层面。"
+    },
+    {
+      "id": "live_root_write_not_staging_first",
+      "criterion": "rollback_and_audit_trail",
+      "severity": "medium",
+      "summary": "rollbackAvailable 已记录，但尚未证明 publish 过程具备 staging-first swap 与原子回滚能力。"
+    },
+    {
+      "id": "script_and_runtime_digest_logic_can_drift",
+      "criterion": "checksum_manifest_regeneration",
+      "severity": "low",
+      "summary": "runtime compatibility digest 的脚本实现与运行时实现当前行为一致，但仍存在双份逻辑，后续维护有漂移风险。"
+    },
+    {
+      "id": "live_vault_read_sweep_can_hit_transient_lancedb_lock_enoent",
+      "criterion": "executable_migration_tests",
+      "severity": "low",
+      "summary": "对真实 vault 直接逐本做 validator sweep 时，曾命中一次 LanceDB 临时 .lock 文件消失的 ENOENT，说明 live-root 读时仍有瞬时竞态。"
+    }
+  ],
+  "commandsRun": [
+    "shasum -a 256 audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-2-batch-backfill/baseline.yaml",
+    "node ./node_modules/typescript/bin/tsc -p tsconfig.build.json --noEmit",
+    "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/graphrag-book-hotplug-runtime-gate.test.ts",
+    "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 120000 test/graphrag-book-hotplug-catalog.test.ts",
+    "cp -cR graph_vault /tmp/qmd-agent2-audit-r4-IcJMMj/graph_vault",
+    "node scripts/graphrag/backfill-hotplug-packages.mjs --state-root /tmp/qmd-agent2-audit-r4-IcJMMj/graph_vault --force --rebuild-catalog --fail-fast",
+    "node --input-type=module (read-only real-vault package, gate, runtime-compatibility, catalog, and forbidden-residue scan)",
+    "node --input-type=module (read-only latest real migration evidence and sidecar verification)",
+    "node --input-type=module (read-only temp-clone migration evidence and catalog rebuild verification)",
+    "node --input-type=module (compare real manifests versus temp force-rerun outputs)",
+    "node --input-type=module (live validator sweep on real vault; hit transient ENOENT on a disappearing LanceDB lock file)"
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "status": "partial",
+  "passCount": 6,
+  "partialCount": 4,
+  "failCount": 0,
+  "findings": [
+    {
+      "severity": "medium",
+      "baselineId": "artifact_gate_state_machine",
+      "summary": "新书创建流程已有 pre-publish quality gate、staged candidate validation 和最后 PUBLISH_READY.json marker；但 live root 发布仍按 manifest、quality/runtime gate、publish marker 多文件顺序提交，未实现目录级 buildStagingRoot -> fsync -> atomic rename liveRoot。",
+      "evidencePaths": [
+        "scripts/graphrag/batch-epub-workflow.mjs:10161",
+        "scripts/graphrag/batch-epub-workflow.mjs:10188",
+        "scripts/graphrag/batch-epub-workflow.mjs:10219",
+        "scripts/graphrag/batch-epub-workflow.mjs:10258",
+        "scripts/graphrag/book-hotplug-publish-gate.mjs:27"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "direct_query_entrypoint",
+      "summary": "fresh vault 查询可通过当前 manifest+marker 包集合重建 catalog projection；但 projectQueryReadyLineage() 仍读取 catalog/books.yaml 的 stageFingerprints/providerFingerprint，尚未达到完全 package-only direct query entrypoint。",
+      "evidencePaths": [
+        "src/graphrag/capability-catalog.ts:467",
+        "src/graphrag/capability-catalog.ts:473",
+        "src/graphrag/capability-catalog.ts:573",
+        "src/graphrag/capability-catalog.ts:807",
+        "src/graphrag/book-hotplug-catalog.ts:459"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "recovery_diagnostics",
+      "summary": "失败路径会删除 publish marker 并写入 stable quality/runtime gate diagnostics，catalog projection 也可重建；但 rollback 仍主要依赖 marker/gate/projection，缺少完整 last-good liveRoot generation 事务回滚。",
+      "evidencePaths": [
+        "scripts/graphrag/batch-epub-workflow.mjs:10260",
+        "scripts/graphrag/book-hotplug-quality-gate.mjs:57",
+        "scripts/graphrag/book-hotplug-quality-gate.mjs:114",
+        "scripts/graphrag/book-hotplug-quality-gate.mjs:171",
+        "scripts/graphrag/book-hotplug-publish-marker.mjs:17"
+      ]
+    },
+    {
+      "severity": "low",
+      "baselineId": "executable_contract_tests",
+      "summary": "现有测试覆盖 stale catalog、provider payload、producer runs、artifact metadata、runtime compatibility、backfill conflict/idempotency 和 CLI scope；但缺少目录级 atomic publish / crash visibility 的专门测试。",
+      "evidencePaths": [
+        "test/graphrag-book-hotplug-catalog.test.ts:370",
+        "test/graphrag-book-hotplug-catalog.test.ts:573",
+        "test/graphrag-book-hotplug-catalog.test.ts:623",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:206",
+        "test/graphrag-book-hotplug-backfill.test.ts:128",
+        "test/cli-graphrag-route.test.ts:892",
+        "test/cli-graphrag-route.test.ts:918"
+      ]
+    }
+  ]
+}

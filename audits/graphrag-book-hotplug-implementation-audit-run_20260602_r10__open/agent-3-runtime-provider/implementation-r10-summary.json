@@ -1,0 +1,27 @@
+{
+  "schemaVersion": "1.0.0",
+  "runId": "20260602_r10",
+  "agentId": "agent-3-runtime-provider",
+  "scenario": "runtime provider / producer lineage",
+  "auditMode": "local_degraded_after_subagent_upstream_failure",
+  "baselineSha256": "10c3e3d217ea17e6f2ec875b701b441bccceff2bda3e26138413534aa732c419",
+  "baselinePolicy": "reuse_fixed_baseline_without_changes",
+  "overallStatus": "pass",
+  "baselineCount": 10,
+  "passed": 10,
+  "partial": 0,
+  "failed": 0,
+  "results": [
+    { "id": "direct_query_entrypoint", "status": "pass" },
+    { "id": "artifact_minimum_closure", "status": "pass" },
+    { "id": "artifact_gate_state_machine", "status": "pass" },
+    { "id": "producer_lineage_completeness", "status": "pass" },
+    { "id": "lineage_artifact_binding", "status": "pass" },
+    { "id": "schema_runtime_compatibility", "status": "pass" },
+    { "id": "query_scope_isolation", "status": "pass" },
+    { "id": "privacy_payload_exclusion", "status": "pass" },
+    { "id": "recovery_diagnostics", "status": "pass" },
+    { "id": "executable_contract_tests", "status": "pass" }
+  ],
+  "blockingFindings": []
+}

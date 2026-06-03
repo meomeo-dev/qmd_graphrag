@@ -1,0 +1,52 @@
+{
+  "status": "partial",
+  "passCount": 7,
+  "partialCount": 3,
+  "failCount": 0,
+  "findings": [
+    {
+      "baselineId": "producer_lineage_completeness",
+      "severity": "medium",
+      "summary": "R8 now parses producer run records and binds artifact metadata rows to runId, bookId, status, artifactIds, stage, and provider fingerprint. The baseline remains partial because stageFingerprint/providerFingerprint are optional in rows and only compared when present, while run records do not carry producer tool/schema version or run-level generation time.",
+      "evidencePaths": [
+        "src/contracts/book-job.ts:167",
+        "src/contracts/book-job.ts:176",
+        "src/graphrag/book-hotplug-runtime-gate.ts:52",
+        "src/graphrag/book-hotplug-runtime-gate.ts:293",
+        "src/graphrag/book-hotplug-producer-run-bindings.ts:122",
+        "src/graphrag/book-hotplug-producer-run-bindings.ts:176",
+        "src/graphrag/book-hotplug-producer-run-bindings.ts:188",
+        "scripts/graphrag/book-hotplug-artifact-metadata.mjs:239"
+      ]
+    },
+    {
+      "baselineId": "schema_runtime_compatibility",
+      "severity": "medium",
+      "summary": "Runtime compatibility still fail-closes on four semantic digests, but embedding model/dimension, package layout version, and runtime reader compatibility are not independently compared by the TS runtime gate or script validator.",
+      "evidencePaths": [
+        "scripts/graphrag/book-hotplug-runtime-compatibility.mjs:96",
+        "scripts/graphrag/book-hotplug-runtime-compatibility.mjs:109",
+        "scripts/graphrag/book-hotplug-runtime-compatibility.mjs:161",
+        "src/graphrag/book-hotplug-runtime-gate.ts:39",
+        "src/graphrag/book-hotplug-runtime-gate.ts:350",
+        "src/graphrag/book-hotplug-runtime-compatibility-digests.ts:76",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:1648",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:1686"
+      ]
+    },
+    {
+      "baselineId": "executable_contract_tests",
+      "severity": "low",
+      "summary": "R8 adds executable fail-closed tests for forged producer run artifactIds and forged provider fingerprint, but still lacks negative tests for missing stage/provider fingerprints and broader runtime compatibility fields such as embedding dimension and package layout/runtime reader mismatch.",
+      "evidencePaths": [
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:220",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:242",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:321",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:400",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:477",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:1680",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:1690"
+      ]
+    }
+  ]
+}

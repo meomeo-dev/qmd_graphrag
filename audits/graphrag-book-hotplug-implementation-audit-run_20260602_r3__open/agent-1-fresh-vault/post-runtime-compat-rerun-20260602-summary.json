@@ -1,0 +1,208 @@
+{
+  "status": "partial",
+  "scenario": "fresh-vault single-book hotplug package",
+  "baselinePath": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-1-fresh-vault/baseline.yaml",
+  "baselineSha256": "10c3e3d217ea17e6f2ec875b701b441bccceff2bda3e26138413534aa732c419",
+  "reviewMode": "read-only plus temporary-vault rerun",
+  "realGraphVaultModified": false,
+  "codeModified": false,
+  "baselineModified": false,
+  "realVaultState": {
+    "bookDirCount": 72,
+    "packageCount": 38,
+    "validatorPassed": 38,
+    "validatorFailed": 0,
+    "manifestCount": 38,
+    "publishReadyCount": 38,
+    "artifactMetadataCount": 38,
+    "runtimeCompatibilityCount": 38,
+    "qualityGateCount": 38,
+    "runtimeGateCount": 38,
+    "copyDistributionAllowedTrue": 38,
+    "manifestQueryReadyTrue": 30,
+    "manifestQueryReadyFalse": 8,
+    "runtimeGateQueryReady": 30,
+    "runtimeGateVisibleNotQueryReady": 8,
+    "runtimeGateQuarantined": 0
+  },
+  "sampleEvidence": {
+    "positiveQueryReadyBookId": "book-00474fb29e5e-59d02d41",
+    "visibleNotQueryReadyBookId": "book-0c8dffd9585c-41a7e47b",
+    "positiveFreshVaultCapabilityCount": 1,
+    "positiveFreshVaultCapabilityId": "book-00474fb29e5e-59d02d41:graph_query",
+    "positiveFreshVaultArtifactCount": 9,
+    "positiveFreshVaultQueryEvidenceBookId": "book-00474fb29e5e-59d02d41"
+  },
+  "criteriaResults": [
+    {
+      "id": "direct_query_entrypoint",
+      "name": "直接查询入口",
+      "result": "pass",
+      "evidence": [
+        "真实样本书复制到临时 fresh vault 后，validateBookHotplugPackage() 通过。",
+        "loadGraphQueryCapabilities({ bookIds: [sampleBookId] }) 返回 1 个 graph_query capability。",
+        "fake bridge GraphRAG 查询返回 evidence.bookId=book-00474fb29e5e-59d02d41，dataDir 指向复制书包自己的 graphrag/output。"
+      ]
+    },
+    {
+      "id": "artifact_minimum_closure",
+      "name": "查询 Artifact 最低闭包",
+      "result": "pass",
+      "evidence": [
+        "38/38 真实 hotplug packages 同时具备 BOOK_MANIFEST、PUBLISH_READY、artifact-metadata、runtime-compatibility 与 sidecars。",
+        "删除 PUBLISH_READY 或 runtime-compatibility 后，validator fail closed，capabilityCount=0。",
+        "样本 manifest.requiredArtifacts=13；artifact-metadata 对其余 required output artifacts 建立 row 闭包。"
+      ]
+    },
+    {
+      "id": "artifact_gate_state_machine",
+      "name": "Artifact Gate 状态机",
+      "result": "partial",
+      "evidence": [
+        "真实 query-ready 包存在 copied/candidate/validated/mounted/query_ready 转移记录。",
+        "真实 non-query-ready 包存在 visible_not_query_ready 状态。",
+        "receiver-side 失败复制会阻断查询，但不会自动把接收端 hotplug-runtime-gate.json 重写为新的 quarantined 状态。"
+      ]
+    },
+    {
+      "id": "producer_lineage_completeness",
+      "name": "Producer Lineage 完整性",
+      "result": "partial",
+      "evidence": [
+        "删除 graphrag/runs 后，validator 报 missing_required_file:graphrag/runs/...，capabilityCount=0。",
+        "artifact-metadata rows 已含 producerRunId、producerStep、producerSchemaVersion、upstreamArtifactHashes。",
+        "真实样本仍存在 producerToolVersion=\"unknown\"，逐 artifact tool version / upstream closure 仍不完整。"
+      ]
+    },
+    {
+      "id": "lineage_artifact_binding",
+      "name": "Lineage 与 Artifact 绑定",
+      "result": "pass",
+      "evidence": [
+        "manifest.producerRunIds、graphrag/runs、state/artifacts.yaml、artifact-metadata 与 capability projection 已形成硬绑定。",
+        "删除 producer runs 后，loadGraphQueryCapabilities() 返回 0。"
+      ]
+    },
+    {
+      "id": "schema_runtime_compatibility",
+      "name": "Schema 与运行时兼容",
+      "result": "partial",
+      "evidence": [
+        "38/38 真实包包含 runtime-compatibility.json，并被 validator 与 runtime query gate 强制校验。",
+        "删除 runtime-compatibility 文件时，diagnostics=runtime_compatibility_missing，capabilityCount=0。",
+        "durable 改写 compatibilityStatus=incompatible 时，diagnostics=runtime_compatibility_not_compatible，capabilityCount=0。",
+        "当前 gate 仍未把当前 runtime / embedding / parquet / LanceDB 的实值比较做成完整兼容矩阵。"
+      ]
+    },
+    {
+      "id": "query_scope_isolation",
+      "name": "单书查询范围隔离",
+      "result": "pass",
+      "evidence": [
+        "fresh-vault 单书复制仅生成 1 个该书 capability。",
+        "resolveBookGraphRagDataDir() 返回 books/book-00474fb29e5e-59d02d41/graphrag/output。",
+        "fake bridge 收到的 selectedBookIds / graphCapabilityIds / artifactIds 均来自该书。"
+      ]
+    },
+    {
+      "id": "privacy_payload_exclusion",
+      "name": "Provider Payload 排除",
+      "result": "pass",
+      "evidence": [
+        "新增 provider-requests/payload.json 后，validator diagnostics 包含 forbidden_sensitive_material:provider-requests/payload.json。",
+        "该情况下 capabilityCount=0。"
+      ]
+    },
+    {
+      "id": "recovery_diagnostics",
+      "name": "失败恢复与诊断",
+      "result": "partial",
+      "evidence": [
+        "已观察到稳定诊断码：missing_publish_marker、missing_required_file:graphrag/runs/...、forbidden_sensitive_material、runtime_compatibility_missing、runtime_compatibility_not_compatible。",
+        "接收端 quarantine state 与 projection rollback 的持久化可观测性仍不完整。"
+      ]
+    },
+    {
+      "id": "executable_contract_tests",
+      "name": "可执行契约测试",
+      "result": "fail",
+      "evidence": [
+        "npx vitest run test/graphrag-book-hotplug-catalog.test.ts --testTimeout 120000 结果为 6/8 通过，2 个正向 hotplug capability 投影用例失败。",
+        "定向复跑显示 validateHotplugRuntimeQueryGate() 返回 ok=true，但 loadGraphQueryCapabilities() 仍返回空数组。",
+        "npx vitest run test/cli-graphrag-route.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true 结果为 8/9 通过，1 个非 JSON CLI 用例超时失败。",
+        "npx vitest run test/unified-query.test.ts --testTimeout 120000 仍为 36/36 通过。"
+      ]
+    }
+  ],
+  "blockingFindings": [
+    {
+      "id": "BF-01",
+      "severity": "high",
+      "title": "正向 hotplug capability 契约测试回归",
+      "details": "当前 latest implementation 下，fresh-vault 正向 capability 投影的关键契约测试失败；runtime query gate 已返回 ok=true，但 loadGraphQueryCapabilities() 仍为空。这阻断了 executable_contract_tests 维度的通过签核。",
+      "evidence": [
+        "test/graphrag-book-hotplug-catalog.test.ts: 6/8 pass, 2 fail",
+        "定向单测中 validateHotplugRuntimeQueryGate({ graphVault, bookId }) => { ok: true, diagnostics: [], producerRunIds: [...] }",
+        "同一工作区下，真实 backfill 样本包复制到 fresh vault 仍可得到 1 个 capability，说明问题更像实现与测试夹具/契约之间的偏移，而非所有真实包都失效。"
+      ]
+    }
+  ],
+  "residualRisks": [
+    "runtime-compatibility gate 当前更像 required gate marker，而不是完整的 runtime/parquet/LanceDB/embedding compatibility matrix。",
+    "真实样本 artifact-metadata 中仍可见 producerToolVersion=\"unknown\"，逐 artifact lineage completeness 仍不足。",
+    "receiver-side 失败复制时，查询阻断有效，但 hotplug-runtime-gate 的持久化 quarantined 状态不会自动刷新。",
+    "CLI GraphRAG 非 JSON 输出路径仍存在超时与目录清理残留风险。"
+  ],
+  "commandsRun": [
+    {
+      "command": "shasum -a 256 audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-1-fresh-vault/baseline.yaml",
+      "status": "pass",
+      "summary": "baseline hash matched 10c3e3d217ea17e6f2ec875b701b441bccceff2bda3e26138413534aa732c419"
+    },
+    {
+      "command": "npm exec -- tsc -p tsconfig.build.json --noEmit",
+      "status": "pass",
+      "summary": "typecheck passed"
+    },
+    {
+      "command": "npx vitest run test/unified-query.test.ts --testTimeout 120000",
+      "status": "pass",
+      "summary": "36/36 passed"
+    },
+    {
+      "command": "npx vitest run test/graphrag-book-hotplug-catalog.test.ts --testTimeout 120000",
+      "status": "fail",
+      "summary": "6/8 passed; positive hotplug capability projection tests failed"
+    },
+    {
+      "command": "npx vitest run test/graphrag-book-hotplug-catalog.test.ts -t \"rebuilds graph capability catalog from BOOK_MANIFEST package\" --reporter verbose --testTimeout 120000",
+      "status": "fail",
+      "summary": "runtime query gate returned ok=true, but loadGraphQueryCapabilities() still returned []"
+    },
+    {
+      "command": "npx vitest run test/cli-graphrag-route.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true",
+      "status": "fail",
+      "summary": "8/9 passed; non-json GraphRAG CLI evidence formatting test timed out with ENOTEMPTY cleanup error"
+    },
+    {
+      "command": "node --input-type=module <<'EOF' # real vault inventory / validator / gate-state scan EOF",
+      "status": "pass",
+      "summary": "72 book dirs; 38 hotplug packages; validator 38/38 pass; runtime-compatibility 38/38; quality gate 38/38; queryReady 30; visible_not_query_ready 8"
+    },
+    {
+      "command": "node --import tsx --input-type=module <<'EOF' # positive fresh-vault copy mount + fake bridge query closure EOF",
+      "status": "pass",
+      "summary": "copied real sample book validated successfully, produced 1 graph_query capability, and returned 1 scoped evidence via fake bridge"
+    },
+    {
+      "command": "node --import tsx --input-type=module <<'EOF' # negative fresh-vault gate checks: missing PUBLISH_READY / missing runs / provider payload / missing runtime-compat EOF",
+      "status": "pass",
+      "summary": "all four negative scenarios failed closed with capabilityCount=0"
+    },
+    {
+      "command": "node --import tsx --input-type=module <<'EOF' # durable rewrite: runtime-compatibility => incompatible EOF",
+      "status": "pass",
+      "summary": "runtime_compatibility_not_compatible observed and capabilityCount dropped to 0"
+    }
+  ]
+}

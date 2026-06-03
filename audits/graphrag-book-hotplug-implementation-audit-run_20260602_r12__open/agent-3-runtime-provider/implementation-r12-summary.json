@@ -1,0 +1,62 @@
+{
+  "overallStatus": "passed",
+  "agentId": "agent-3-runtime-provider",
+  "auditRound": "r12",
+  "fixedBaselinePath": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r12__open/agent-3-runtime-provider/fixed-baseline.yaml",
+  "fixedBaselineSha256": "10c3e3d217ea17e6f2ec875b701b441bccceff2bda3e26138413534aa732c419",
+  "passed": [
+    {
+      "id": "r11_manifest_sidecar_gate",
+      "summary": "Runtime query gate validates BOOK_MANIFEST sidecar contents through package boundary validation."
+    },
+    {
+      "id": "r11_tampered_manifest_no_graph_query",
+      "summary": "Tampered BOOK_MANIFEST returns manifest_sha256_mismatch and exports no graph_query capability."
+    },
+    {
+      "id": "r11_synthetic_identity_no_query_ready",
+      "summary": "Synthetic/test-hook qmd_graph_text_unit_identity is rejected and exports no query-ready graph_query capability."
+    },
+    {
+      "id": "legacy_book_state_positive_overlay",
+      "summary": "Legacy book-state graph_query capability overlay now remains authoritative and is not erased by empty hotplug projection rebuild."
+    },
+    {
+      "id": "typecheck",
+      "summary": "TypeScript build check passed with --noEmit."
+    }
+  ],
+  "partial": [],
+  "failed": [],
+  "remainingFindings": [],
+  "closedFindings": [
+    {
+      "id": "legacy_book_state_capability_overlay_returns_empty",
+      "status": "closed",
+      "summary": "The previous extra finding is closed; the targeted unified-query overlay test now passes."
+    }
+  ],
+  "testEvidence": [
+    {
+      "command": "npx vitest run test/unified-query.test.ts -t \"keeps derived book-state capability authoritative over explicit catalog\" --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true",
+      "result": "passed",
+      "tests": "1 passed, 36 skipped"
+    },
+    {
+      "command": "npx vitest run test/graphrag-book-hotplug-catalog.test.ts -t \"stale manifest sidecar|rebuilds graph capability catalog|does not project package\" --testTimeout 180000 --pool forks --poolOptions.forks.singleFork=true",
+      "result": "passed",
+      "tests": "2 passed, 8 skipped"
+    },
+    {
+      "command": "npm exec -- tsc -p tsconfig.build.json --noEmit",
+      "result": "passed",
+      "tests": "typecheck passed"
+    },
+    {
+      "command": "npx vitest run test/graphrag-book-hotplug-runtime-gate.test.ts -t \"manifest content changes|synthetic test-hook|global catalog is absent\" --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true",
+      "result": "passed",
+      "tests": "3 passed, 6 skipped"
+    }
+  ],
+  "fixedBaselineModified": false
+}

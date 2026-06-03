@@ -1,0 +1,46 @@
+{
+  "schemaVersion": "1.0.0",
+  "runId": "20260602_r10",
+  "status": "partial",
+  "auditMode": "local_degraded_after_subagent_upstream_failure",
+  "subagentFailures": [
+    "first R10 attempt: three subagents failed with upstream disconnects",
+    "second R10 attempt: subagents failed with 502 Bad Gateway or disconnect"
+  ],
+  "agents": [
+    {
+      "agentId": "agent-1-fresh-vault",
+      "status": "partial",
+      "passed": 8,
+      "partial": 2,
+      "failed": 0
+    },
+    {
+      "agentId": "agent-2-batch-backfill",
+      "status": "partial",
+      "passed": 8,
+      "partial": 2,
+      "failed": 0
+    },
+    {
+      "agentId": "agent-3-runtime-provider",
+      "status": "pass",
+      "passed": 10,
+      "partial": 0,
+      "failed": 0
+    }
+  ],
+  "latestBackfillRun": "hotplug-backfill-20260603012939480",
+  "realPackageValidation": {
+    "hotplugPackages": 38,
+    "passed": 38,
+    "failed": 0,
+    "qualityGatePassed": 38,
+    "queryReady": 30,
+    "visibleNotQueryReady": 8
+  },
+  "remainingFindings": [
+    "directory-level staged publish, fsync, and last-good root restore remain partial",
+    "partial_migration and failed_interrupted execution recovery remain partial"
+  ]
+}

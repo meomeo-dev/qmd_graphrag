@@ -1,0 +1,195 @@
+{
+  "status": "pass",
+  "passCount": 10,
+  "partialCount": 0,
+  "failCount": 0,
+  "criteriaResults": [
+    {
+      "baselineId": "direct_query_entrypoint",
+      "name": "直接查询入口",
+      "status": "pass",
+      "evidencePaths": [
+        "src/graphrag/capability-catalog.ts:474",
+        "src/graphrag/capability-catalog.ts:814",
+        "src/graphrag/capability-catalog.ts:827",
+        "src/graphrag/capability-catalog.ts:833",
+        "src/graphrag/book-hotplug-runtime-gate.ts:467",
+        "test/python/test_graphrag_bridge_scope.py:1089"
+      ],
+      "residualRisk": "仍会读取由 package 重建的 catalog/identity projection，但 stale cache 不能覆盖 manifest-first gate。"
+    },
+    {
+      "baselineId": "artifact_minimum_closure",
+      "name": "查询 Artifact 最低闭包",
+      "status": "pass",
+      "evidencePaths": [
+        "scripts/graphrag/book-hotplug-package.mjs:632",
+        "src/graphrag/book-hotplug-runtime-gate.ts:206",
+        "src/graphrag/book-hotplug-runtime-gate.ts:243",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:582",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:1614"
+      ],
+      "residualRisk": "未来 schema 扩展时需要同步 RequiredGraphRagArtifacts。"
+    },
+    {
+      "baselineId": "artifact_gate_state_machine",
+      "name": "Artifact Gate 状态机",
+      "status": "pass",
+      "evidencePaths": [
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:1032",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:1099",
+        "src/graphrag/book-hotplug-runtime-gate.ts:467",
+        "scripts/graphrag/book-hotplug-package.mjs:716",
+        "src/graphrag/capability-catalog.ts:478"
+      ],
+      "residualRisk": "状态机主要以诊断和投影行为体现，不是单一 enum。"
+    },
+    {
+      "baselineId": "producer_lineage_completeness",
+      "name": "Producer Lineage 完整性",
+      "status": "pass",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-runtime-gate.ts:74",
+        "src/graphrag/book-hotplug-runtime-gate.ts:314",
+        "src/graphrag/book-hotplug-runtime-gate.ts:341",
+        "src/graphrag/book-hotplug-producer-run-bindings.ts:104",
+        "src/graphrag/book-hotplug-producer-run-bindings.ts:176",
+        "scripts/graphrag/book-hotplug-artifact-metadata.mjs:226",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:326",
+        "test/graphrag-book-hotplug-runtime-gate-hardening.test.ts:222",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:980"
+      ],
+      "residualRisk": "run-level tool/schema/completedAt 仍主要通过 artifact metadata rows 组合表达，而非 run record 顶层字段。"
+    },
+    {
+      "baselineId": "lineage_artifact_binding",
+      "name": "Lineage 与 Artifact 绑定",
+      "status": "pass",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-runtime-gate.ts:291",
+        "src/graphrag/book-hotplug-producer-run-bindings.ts:168",
+        "scripts/graphrag/book-hotplug-package.mjs:883",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:405",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:482"
+      ],
+      "residualRisk": "durable refresh 共享文件绑定依赖 stage/artifactKind/checksum 三元组。"
+    },
+    {
+      "baselineId": "schema_runtime_compatibility",
+      "name": "Schema 与运行时兼容",
+      "status": "pass",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-runtime-gate.ts:350",
+        "src/graphrag/book-hotplug-runtime-gate.ts:389",
+        "src/graphrag/book-hotplug-runtime-gate.ts:438",
+        "src/graphrag/book-hotplug-runtime-gate.ts:453",
+        "scripts/graphrag/book-hotplug-runtime-compatibility.mjs:143",
+        "scripts/graphrag/book-hotplug-runtime-compatibility.mjs:170",
+        "scripts/graphrag/book-hotplug-runtime-compatibility.mjs:193",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:247",
+        "test/graphrag-book-hotplug-runtime-gate-hardening.test.ts:316",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:969",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:1388"
+      ],
+      "residualRisk": "主 Type DD 更宽的 embeddingModel/graphProjectionVersion/runtimeReaderVersion 仍未成为最终合同 stable diagnostics。"
+    },
+    {
+      "baselineId": "query_scope_isolation",
+      "name": "单书查询范围隔离",
+      "status": "pass",
+      "evidencePaths": [
+        "src/graphrag/capability-catalog.ts:628",
+        "src/graphrag/capability-catalog.ts:655",
+        "src/graphrag/capability-catalog.ts:717",
+        "test/graphrag-capability-scope.test.ts:91",
+        "test/python/test_graphrag_bridge_scope.py:1225",
+        "test/cli-graphrag-route.test.ts:918"
+      ],
+      "residualRisk": "隔离行为仍依赖 identity/projection 文件与 runtime gate 一起工作。"
+    },
+    {
+      "baselineId": "privacy_payload_exclusion",
+      "name": "Provider Payload 排除",
+      "status": "pass",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-package-readonly.ts:1",
+        "src/graphrag/book-hotplug-runtime-gate.ts:104",
+        "src/graphrag/book-hotplug-runtime-gate.ts:481",
+        "scripts/graphrag/book-hotplug-package.mjs:643",
+        "scripts/graphrag/book-hotplug-package.mjs:721",
+        "test/graphrag-book-hotplug-catalog.test.ts:573",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:1015"
+      ],
+      "residualRisk": "未来新增 provider 相关目录时需要同步 forbidden path 规则。"
+    },
+    {
+      "baselineId": "recovery_diagnostics",
+      "name": "失败恢复与诊断",
+      "status": "pass",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-runtime-gate.ts:223",
+        "src/graphrag/book-hotplug-runtime-gate.ts:363",
+        "src/graphrag/book-hotplug-producer-run-bindings.ts:118",
+        "scripts/graphrag/book-hotplug-package.mjs:909",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:1389"
+      ],
+      "residualRisk": "诊断定义跨多个模块分布。"
+    },
+    {
+      "baselineId": "executable_contract_tests",
+      "name": "可执行契约测试",
+      "status": "pass",
+      "evidencePaths": [
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:221",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:247",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:326",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:405",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:482",
+        "test/graphrag-book-hotplug-runtime-gate-hardening.test.ts:222",
+        "test/graphrag-book-hotplug-runtime-gate-hardening.test.ts:269",
+        "test/graphrag-book-hotplug-runtime-gate-hardening.test.ts:316",
+        "test/graphrag-book-hotplug-catalog.test.ts:573",
+        "test/graphrag-book-hotplug-catalog.test.ts:732",
+        "test/graphrag-capability-scope.test.ts:125",
+        "test/python/test_graphrag_bridge_scope.py:1188"
+      ],
+      "residualRisk": "LanceDB 维度失配与通用 embedding dimension 失配共用同一门禁测试模式。"
+    }
+  ],
+  "findings": [
+    {
+      "severity": "info",
+      "baselineId": "producer_lineage_completeness",
+      "summary": "R8 的 lineage partial 已关闭。缺失 stage/provider fingerprint、forged artifactIds、forged provider fingerprint 现在都被稳定拒绝，且运行时与 package validator 行为一致。"
+    },
+    {
+      "severity": "info",
+      "baselineId": "schema_runtime_compatibility",
+      "summary": "R8 的 runtime compatibility partial 已关闭。当前实现对最终合同要求的 layout/provider fingerprint/embedding dimension/min runtime/digest 全部 fail-closed。"
+    },
+    {
+      "severity": "info",
+      "baselineId": "executable_contract_tests",
+      "summary": "R8 的测试 partial 已关闭。runtime gate hardening 3 tests 与 catalog/runtime gate 套件共同覆盖缺失 fingerprint、forged layout+dimension、payload exclusion、只读 gate 与 capability fail-closed。"
+    },
+    {
+      "severity": "low",
+      "baselineId": "producer_lineage_completeness",
+      "summary": "run-level producer tool/schema version 与 full generation time 仍主要通过 artifact metadata row 与 run startedAt/finishedAt 组合表达，而不是单独的 run 顶层 completedAt 字段；该差异不影响本固定基准 passCriteria。"
+    },
+    {
+      "severity": "low",
+      "baselineId": "schema_runtime_compatibility",
+      "summary": "主 Type DD 中较宽的 embeddingModel/graphProjectionVersion/runtimeReaderVersion 尚未成为最终合同的稳定 runtime gate 诊断项，因此未作为本轮 fail item。"
+    }
+  ],
+  "commandsConsidered": [
+    "npm exec -- tsc -p tsconfig.build.json --noEmit",
+    "npx vitest run test/graphrag-book-hotplug-runtime-gate.test.ts --reporter=dot --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true",
+    "npx vitest run test/graphrag-book-hotplug-runtime-gate-hardening.test.ts --reporter=dot --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true",
+    "npx vitest run test/graphrag-book-hotplug-catalog.test.ts --reporter=dot --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true",
+    "rg -n \"runtime gate|provider fingerprint|stage fingerprint|producer lineage|queryReady|visible_not_query_ready|quarantine|provider payload|schema.*compat|artifact metadata|lineage|fingerprint|readonly no lock|createdAt missing|artifactIds forged|embedding dimension|layout version|runtime compatibility|fail closed\" src test docs -S",
+    "rg --files src test | rg \"graphrag|manifest|runtime|provider|lineage|catalog|mount|query|package|artifact|validator|gate|fingerprint|graph-capabilities|book-runtime|quarantine\"",
+    "多轮 nl/sed 检查 docs/architecture、src/graphrag、scripts/graphrag、test/* 相关实现与合同条款"
+  ]
+}

@@ -1,0 +1,47 @@
+schemaVersion: "1.0.0"
+taskId: graphrag-book-hotplug-implementation-audit
+runId: "20260602_r12"
+status: passed
+baselinePolicy: fixed_from_r11_without_changes
+createdAt: "2026-06-03T03:30:00.000Z"
+agents:
+  - id: agent-1-fresh-vault
+    baselinePath: ../agent-1-fresh-vault/fixed-baseline.yaml
+    baselineSha256: 94a81f0a1b22a3837b481d515d3a6f2c5a8365e2c6e007176ac6a7bdbcfe8f3c
+    status: passed
+    passed: 10
+    partial: 0
+    failed: 0
+  - id: agent-2-batch-backfill
+    baselinePath: ../agent-2-batch-backfill/fixed-baseline.yaml
+    baselineSha256: 1d15ad741b3425cba731459cae844c9d7d4879f5f9386003d1c8ad2a33acfc41
+    status: passed
+    passed: 10
+    partial: 0
+    failed: 0
+  - id: agent-3-runtime-provider
+    baselinePath: ../agent-3-runtime-provider/fixed-baseline.yaml
+    baselineSha256: 10c3e3d217ea17e6f2ec875b701b441bccceff2bda3e26138413534aa732c419
+    status: passed
+    passed: 5
+    partial: 0
+    failed: 0
+localVerification:
+  hotplugVitest:
+    status: passed
+    files: 6
+    tests: 32
+  typecheck:
+    status: passed
+    command: npm exec -- tsc -p tsconfig.build.json --noEmit
+  scriptSyntax:
+    status: passed
+  realVaultBackfill:
+    status: passed
+    migrationId: hotplug-backfill-20260603033036320
+    discovered: 38
+    skipped: 38
+    processed: 0
+    failed: 0
+    catalogBookCount: 38
+    catalogCapabilityCount: 30

@@ -1,0 +1,162 @@
+{
+  "agentId": "agent-2-batch-backfill",
+  "scenario": "batch backfill / 38 完成书 + 34 residue 场景",
+  "status": "partial",
+  "baselinePath": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r9__open/agent-2-batch-backfill/fixed-baseline.yaml",
+  "sourceBaselinePath": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r8__open/agent-2-batch-backfill/fixed-baseline.yaml",
+  "baselineCount": 10,
+  "passCount": 8,
+  "partialCount": 2,
+  "failCount": 0,
+  "criteriaResults": [
+    {
+      "id": "current_vs_residue_classification",
+      "status": "pass",
+      "summary": "72 个目录稳定分类为 38 already_migrated 与 34 residue_quarantined，residue 不会生成 authoritative package。"
+    },
+    {
+      "id": "migration_source_of_truth",
+      "status": "pass",
+      "summary": "source-of-truth gate 覆盖 distribution sidecars、canonical input、source closure、qmd manifest、GraphRAG output manifest、producer lineage 与 artifact checksums。"
+    },
+    {
+      "id": "package_layout_transform",
+      "status": "pass",
+      "summary": "包布局使用 package-relative source/input/qmd/graphrag/output/graphrag/runs/state，mount.packageRoot 为 '.'."
+    },
+    {
+      "id": "checksum_manifest_regeneration",
+      "status": "pass",
+      "summary": "manifest、sidecars、publish marker、artifact metadata 与 runtime compatibility checksum 均按当前包内容重建和校验。"
+    },
+    {
+      "id": "residue_quarantine_policy",
+      "status": "pass",
+      "summary": "34 个 residue 均 mount/export 禁止，且未投影到 books catalog、document identity 或 graph capabilities。"
+    },
+    {
+      "id": "idempotent_migration",
+      "status": "partial",
+      "summary": "真实 38 包重复 backfill 为 verified/already_migrated，重复运行不重写 manifest；但 partial_migration 与 failed_interrupted 恢复执行仍缺闭环证据。"
+    },
+    {
+      "id": "conflict_and_duplicate_handling",
+      "status": "pass",
+      "summary": "duplicate sourceHash、same bookId different sourceHash、prefix conflict、target exists 等均 fail closed 并生成稳定 conflict code。"
+    },
+    {
+      "id": "rollback_and_audit_trail",
+      "status": "partial",
+      "summary": "迁移审计记录完整，但 live-root staging-first atomic rename、fsync 与 rollback restore 仍缺实现或测试证明。"
+    },
+    {
+      "id": "catalog_projection_cleanup",
+      "status": "partial",
+      "summary": "catalog residue cleanup 已通过，R8 的包内 .lock 高问题已关闭；但 global qmd projection cleanup 仍缺实现或真实实证。"
+    },
+    {
+      "id": "executable_migration_tests",
+      "status": "pass",
+      "summary": "runtime gate 5 tests、backfill 3 tests、catalog 8 tests 本轮均通过，覆盖只读查询不写 .lock、重复运行 verify-only、冲突 fail closed 与 residue 隔离。"
+    }
+  ],
+  "findings": [
+    {
+      "baselineId": "catalog_projection_cleanup",
+      "severity": "closed",
+      "summary": "R8 的只读查询包内 .lock 高发现已关闭。capability-catalog 对包内 manifest/artifact/run 文件改走 readHotplugPackageUnknown()，测试与真实 vault 都未见包内 .lock。",
+      "evidencePaths": [
+        "src/graphrag/capability-catalog.ts:366",
+        "src/graphrag/book-hotplug-package-readonly.ts:5",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:221"
+      ]
+    },
+    {
+      "baselineId": "idempotent_migration",
+      "severity": "medium",
+      "summary": "partial_migration 与 failed_interrupted 已能分类并写 evidence，但未见 resume/restart 执行链的测试或真实证据。",
+      "evidencePaths": [
+        "scripts/graphrag/book-hotplug-migration-state.mjs:483",
+        "scripts/graphrag/book-hotplug-migration-state.mjs:485",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:1218",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:1225"
+      ]
+    },
+    {
+      "baselineId": "rollback_and_audit_trail",
+      "severity": "medium",
+      "summary": "backfill 最终仍直接写 live root，缺 staged publish + atomic rename + fsync + rollback restore 的闭环实现证明。",
+      "evidencePaths": [
+        "scripts/graphrag/backfill-hotplug-packages.mjs:167",
+        "scripts/graphrag/backfill-hotplug-packages.mjs:188",
+        "scripts/graphrag/backfill-hotplug-packages.mjs:357",
+        "scripts/graphrag/book-hotplug-publish-gate.mjs:27"
+      ]
+    },
+    {
+      "baselineId": "catalog_projection_cleanup",
+      "severity": "medium",
+      "summary": "全局 qmd projection 与 qmd-book-projections cleanup 在当前实现与真实 vault 中仍无独立闭环证据，因此该项继续保持 partial。",
+      "evidencePaths": [
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:326",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:403",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:961",
+        "src/graphrag/book-hotplug-catalog.ts:302"
+      ]
+    }
+  ],
+  "commandsConsidered": [
+    "npx vitest run test/graphrag-book-hotplug-runtime-gate.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true",
+    "npx vitest run test/graphrag-book-hotplug-backfill.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true",
+    "npx vitest run test/graphrag-book-hotplug-catalog.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true",
+    "read-only scan of graph_vault/catalog/book-package-migrations latest classification/commit-record",
+    "read-only scan of graph_vault/books forbidden payloads and .lock files",
+    "read-only validateBookHotplugPackage sweep over 38 real packages",
+    "read-only validateHotplugRuntimeQueryGate sweep over 30 query-ready packages",
+    "read-only scan of books.yaml / document-identity-map.yaml / graph-capabilities.yaml counts"
+  ],
+  "realVaultEvidence": {
+    "latestObservedMigrationId": "hotplug-backfill-20260603001029161",
+    "migrationCount": 19,
+    "totalDirectories": 72,
+    "candidatePackages": 38,
+    "alreadyMigrated": 38,
+    "residueQuarantined": 34,
+    "partialMigration": 0,
+    "failedInterrupted": 0,
+    "repairRequired": 0,
+    "manifestCount": 38,
+    "publishMarkerCount": 38,
+    "qualityGateCount": 38,
+    "runtimeGateCount": 38,
+    "queryReadyManifestCount": 30,
+    "packageValidation": {
+      "checked": 38,
+      "passed": 38,
+      "failed": 0
+    },
+    "queryReadyRuntimeGate": {
+      "checked": 30,
+      "passed": 30,
+      "failed": 0
+    },
+    "notQueryReadyPackages": 8,
+    "catalog": {
+      "books": 38,
+      "documentIdentityItems": 38,
+      "graphCapabilities": 30,
+      "residueProjectedInBooksCatalog": 0,
+      "residueProjectedInIdentity": 0,
+      "residueProjectedInCapabilities": 0
+    },
+    "packageInternalForbiddenFilesAfterScan": {
+      "lockFiles": 0,
+      "providerRequests": 0,
+      "providerResponses": 0,
+      "logs": 0,
+      "debug": 0,
+      "dotenv": 0,
+      "durableRecoveryJsonl": 0
+    }
+  }
+}

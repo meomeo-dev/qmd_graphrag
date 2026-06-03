@@ -1,0 +1,63 @@
+{
+  "agentId": "agent-1-fresh-vault",
+  "scenario": "fresh vault / 新书创建闭环",
+  "status": "partial",
+  "baselineCount": 10,
+  "passed": 6,
+  "partial": 3,
+  "failed": 1,
+  "findings": [
+    {
+      "severity": "high",
+      "baselineId": "artifact_gate_state_machine",
+      "summary": "fresh-vault 新书发布未实现 staging-first atomic publish。batch-epub-workflow 在 live root 直接顺序写入 BOOK_MANIFEST.json、PUBLISH_READY.json、hotplug-quality-gate.json、hotplug-runtime-gate.json，未满足设计合同要求的 buildStagingRoot -> fsync -> atomic rename -> rollback 保留 last-good generation。",
+      "evidencePaths": [
+        "scripts/graphrag/batch-epub-workflow.mjs:10158",
+        "scripts/graphrag/batch-epub-workflow.mjs:10216",
+        "scripts/graphrag/batch-epub-workflow.mjs:10243",
+        "scripts/graphrag/batch-epub-workflow.mjs:12655",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:196",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:208",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:678",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:703"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "direct_query_entrypoint",
+      "summary": "direct query 已具备 manifest/gate/包内 artifact 的 fail-closed 闭环，且能在 catalog 缺失时重建 projection；但 projectQueryReadyLineage() 仍依赖 catalog/books.yaml 中的 stageFingerprints/providerFingerprint，尚未完全达到“仅凭 BOOK_MANIFEST.json 与包内 artifact”的 baseline 要求。",
+      "evidencePaths": [
+        "src/graphrag/capability-catalog.ts:438",
+        "src/graphrag/capability-catalog.ts:444",
+        "src/graphrag/book-hotplug-runtime-gate.ts:332",
+        "test/graphrag-book-hotplug-catalog.test.ts:136",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:942"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "executable_contract_tests",
+      "summary": "现有测试已覆盖 catalog 缺失/陈旧、producer runs 缺失、artifact metadata 缺失、runtime compatibility forged、provider payload 排除、backfill verify-only 等关键负例；但 fixed-baseline 合同要求的 fresh-vault staging 可见性与 staged importer 前置验证测试尚未落地。",
+      "evidencePaths": [
+        "test/graphrag-book-hotplug-catalog.test.ts:136",
+        "test/graphrag-book-hotplug-catalog.test.ts:370",
+        "test/graphrag-book-hotplug-catalog.test.ts:623",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:205",
+        "test/graphrag-book-hotplug-backfill.test.ts:127",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:1305"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "recovery_diagnostics",
+      "summary": "诊断、quarantine、catalog rebuild、runtime gate rollback 字段已具备，但 fresh-vault 场景缺少真实 staged publish 事务，因此 validation/publish crash 的 rollback 仍主要停留在诊断层，未形成完整的 last-good generation 保护边界。",
+      "evidencePaths": [
+        "scripts/graphrag/book-hotplug-quality-gate.mjs:57",
+        "scripts/graphrag/book-hotplug-quality-gate.mjs:171",
+        "scripts/graphrag/book-hotplug-residue-quarantine.mjs:96",
+        "src/job-state/durable-state-store.ts:1724",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:263"
+      ]
+    }
+  ]
+}

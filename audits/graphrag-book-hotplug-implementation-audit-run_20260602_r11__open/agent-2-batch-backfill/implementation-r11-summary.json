@@ -1,0 +1,117 @@
+{
+  "runId": "20260602_r11",
+  "agentId": "agent-2-batch-backfill",
+  "baselinePolicy": "verbatim_reuse_of_fixed_baseline_yaml_10_criteria_without_add_delete_rename_reorder",
+  "baselineCount": 10,
+  "overallStatus": "partial",
+  "passed": 8,
+  "partial": 2,
+  "failed": 0,
+  "criteriaResults": [
+    {
+      "id": "current_vs_residue_classification",
+      "status": "pass",
+      "summary": "classifyBookDirectory 区分 already_migrated、residue_quarantined、partial_migration、failed_interrupted 等状态；真实 classification 记录 72 个目录中 38 个候选、34 个 residue。"
+    },
+    {
+      "id": "migration_source_of_truth",
+      "status": "pass",
+      "summary": "manifest 生成受 distribution manifest、canonical input、source closure、qmd/graph manifests、producer evidence 与 artifact checksums 共同约束；不满足时 fail-closed。"
+    },
+    {
+      "id": "package_layout_transform",
+      "status": "pass",
+      "summary": "copy-map 与 manifest 均使用 package-relative 的 source/input/qmd/graphrag/output/graphrag/runs/state 路径，mount.packageRoot 也被强制为相对根。"
+    },
+    {
+      "id": "checksum_manifest_regeneration",
+      "status": "pass",
+      "summary": "BOOK_MANIFEST、PUBLISH_READY 与 sidecars 重新生成并验证；stale sha sidecar 会触发 fail-closed，而不是复用旧校验。"
+    },
+    {
+      "id": "residue_quarantine_policy",
+      "status": "pass",
+      "summary": "34 个历史目录被识别为 residue_quarantined，不挂载、不投影、不删除；residue-report 与 Type DD/README 规则一致。"
+    },
+    {
+      "id": "idempotent_migration",
+      "status": "partial",
+      "summary": "already_migrated rerun 已是 verify-only，--only-missing skip 前也会先验证既有 package；但 partial_migration 与 failed_interrupted 仍只有分类与 evidence，没有执行级恢复。"
+    },
+    {
+      "id": "conflict_and_duplicate_handling",
+      "status": "pass",
+      "summary": "duplicate source hash、same bookId different sourceHash、prefix conflict 等都有稳定诊断和 fail-closed 行为；主冲突已由自动化测试覆盖。"
+    },
+    {
+      "id": "rollback_and_audit_trail",
+      "status": "partial",
+      "summary": "resume-plan.yaml 与 rollback-record.yaml 已落地，publish 失败也会撤除 publish marker；但仍缺 live-root 与 projection generation 的执行级 rollback。"
+    },
+    {
+      "id": "catalog_projection_cleanup",
+      "status": "pass",
+      "summary": "catalog rebuild 只从通过 validator 的 mounted packages 生成；真实 backfill 结果为 book/identity/capability=38/38/30，34 个 residue 未被投影。"
+    },
+    {
+      "id": "executable_migration_tests",
+      "status": "pass",
+      "summary": "backfill、creation gate 与 catalog evidence 测试已覆盖当前实现面；本轮独立复跑 2 个文件共 6 个测试全部通过。"
+    }
+  ],
+  "findings": [
+    {
+      "severity": "medium",
+      "baselineId": "idempotent_migration",
+      "summary": "partial_migration 与 failed_interrupted 仍停留在分类与 evidence 层，没有 resume/restart executor 消费 copy-map、checkpoint 与 resume-plan。",
+      "recommendation": "新增显式 --resume/--restart 路径，执行 staging validation、metadata protection 与 end-to-end 恢复测试。"
+    },
+    {
+      "severity": "medium",
+      "baselineId": "rollback_and_audit_trail",
+      "summary": "rollback-record.yaml 已记录策略与 packageRoots，但实现仍缺 live-root restore 与 catalog/qmd projection generation restore 的执行闭环。",
+      "recommendation": "实现 rollback executor，并覆盖 manifest 写入后、publish marker 提交后、projection 提交后的失败恢复测试。"
+    }
+  ],
+  "evidence": [
+    {
+      "type": "baseline",
+      "path": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r11__open/agent-2-batch-backfill/fixed-baseline.yaml",
+      "details": "固定 10 维基准，按原顺序逐字复用。"
+    },
+    {
+      "type": "real_run",
+      "path": "graph_vault/catalog/book-package-migrations/migrations/hotplug-backfill-20260603023040784/classification.yaml",
+      "details": "counts: totalDirectories=72, candidates=38, residues=34, alreadyMigrated=38, partialMigration=0, failedInterrupted=0"
+    },
+    {
+      "type": "real_run",
+      "path": "graph_vault/catalog/book-package-migrations/migrations/hotplug-backfill-20260603023040784/resume-plan.yaml",
+      "details": "status=ready, resumable=false, skippedBookIds=38"
+    },
+    {
+      "type": "real_run",
+      "path": "graph_vault/catalog/book-package-migrations/migrations/hotplug-backfill-20260603023040784/rollback-record.yaml",
+      "details": "status=committed, preservePublishedBookIds=38, packageRoots=72"
+    },
+    {
+      "type": "implementation",
+      "path": "scripts/graphrag/backfill-hotplug-packages.mjs",
+      "details": "--only-missing 在 skip 前验证既有 package，并只刷新 gate evidence；已迁移包不重写 manifest/publish marker。"
+    },
+    {
+      "type": "implementation",
+      "path": "scripts/graphrag/book-hotplug-migration-state.mjs",
+      "details": "partial_migration/failed_interrupted 的分类、resume-plan、rollback-record 与 conflict diagnostics 已实现，但没有恢复执行器。"
+    },
+    {
+      "type": "test_command",
+      "command": "npm exec -- vitest run test/graphrag-book-hotplug-backfill.test.ts test/graphrag-book-hotplug-creation-gate.test.ts",
+      "details": "passed: 2 files, 6 tests"
+    },
+    {
+      "type": "user_validated_runs",
+      "details": "creation gate、backfill、runtime gate、catalog、qmd projection、runtime hardening、tsc、真实 backfill --only-missing 均通过。"
+    }
+  ]
+}

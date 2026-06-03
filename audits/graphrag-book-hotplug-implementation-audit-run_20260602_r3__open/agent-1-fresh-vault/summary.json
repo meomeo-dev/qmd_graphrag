@@ -1,0 +1,67 @@
+{
+  "agentId": "agent-1-fresh-vault",
+  "scenario": "fresh-vault single-book copy mount",
+  "baselineSha256": "10c3e3d217ea17e6f2ec875b701b441bccceff2bda3e26138413534aa732c419",
+  "overall_result": "fail",
+  "baselineResults": [
+    {
+      "id": "direct_query_entrypoint",
+      "result": "partial"
+    },
+    {
+      "id": "artifact_minimum_closure",
+      "result": "pass"
+    },
+    {
+      "id": "artifact_gate_state_machine",
+      "result": "partial"
+    },
+    {
+      "id": "producer_lineage_completeness",
+      "result": "fail"
+    },
+    {
+      "id": "lineage_artifact_binding",
+      "result": "fail"
+    },
+    {
+      "id": "schema_runtime_compatibility",
+      "result": "partial"
+    },
+    {
+      "id": "query_scope_isolation",
+      "result": "pass"
+    },
+    {
+      "id": "privacy_payload_exclusion",
+      "result": "partial"
+    },
+    {
+      "id": "recovery_diagnostics",
+      "result": "partial"
+    },
+    {
+      "id": "executable_contract_tests",
+      "result": "partial"
+    }
+  ],
+  "positiveEvidence": {
+    "tsc": "pass",
+    "hotplugCatalogTests": "5/5 pass",
+    "realVaultPackageValidator": "38/38 pass",
+    "realVaultQualityGate": "38/38 passed copyDistributionAllowed",
+    "freshVaultSingleBookCopy": "1 book, 1 identity, 1 graph capability"
+  },
+  "blockingFindings": [
+    {
+      "id": "missing_run_evidence_still_query_capable",
+      "severity": "high",
+      "evidence": "Deleting graphrag/runs/*.yaml yields catalog rebuild capabilityCount 0, but loadGraphQueryCapabilities returns 1 capability."
+    },
+    {
+      "id": "stray_provider_payload_not_rejected",
+      "severity": "medium",
+      "evidence": "Adding provider-requests/payload.json outside manifest files leaves validateBookHotplugPackage validationOk true."
+    }
+  ]
+}

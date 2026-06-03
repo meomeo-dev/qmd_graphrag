@@ -1,0 +1,73 @@
+schemaVersion: "1.0.0"
+agentId: agent-1-fresh-vault
+scenario: fresh vault / 首次挂载 / catalog projection / copy-delete hotplug / 质量门
+source:
+  requestedBaselineDirectory: >
+    audits/graphrag-book-hotplug-implementation-audit-run_20260602_r6__open/agent-1-fresh-vault/
+  r6Report: >
+    audits/graphrag-book-hotplug-implementation-audit-run_20260602_r6__open/agent-1-fresh-vault/implementation-r6-report.md
+  originalBaseline: >
+    audits/graphrag-book-hotplug-implementation-audit-run_20260602_r5__open/agent-1-fresh-vault/baseline.yaml
+  policy: >
+    Reuse the R6 Agent 1 fixed ten baselines without adding, renaming,
+    deleting, or reordering criteria.
+baseline:
+  - id: direct_query_entrypoint
+    name: 直接查询入口
+    passCriteria: >
+      挂载扫描完成后，GraphRAG 查询入口能仅凭 BOOK_MANIFEST.json 和包内
+      artifacts 定位本书查询上下文，不依赖全局 catalog、旧 batch 状态、provider
+      payload、发送方绝对路径或人工补参。
+  - id: artifact_minimum_closure
+    name: 查询 Artifact 最低闭包
+    passCriteria: >
+      Type DD 明确列出 GraphRAG 查询所需的最低 artifact 集合、文件角色、schema
+      version、bytes、sha256 与 required 标记，并说明缺少任一必需 artifact 时
+      必须 fail closed 为 not query-ready。
+  - id: artifact_gate_state_machine
+    name: Artifact Gate 状态机
+    passCriteria: >
+      设计定义从 copied、candidate、validated、mounted、query-ready、
+      visible_not_query_ready 到 quarantined 的状态、转移条件、诊断输出和禁止
+      查询条件，artifact gate 通过前不得投影为可查询。
+  - id: producer_lineage_completeness
+    name: Producer Lineage 完整性
+    passCriteria: >
+      每个查询必需 artifact 均可追溯到 producer run、step、input hash、tool
+      version、schema version、生成时间和上游 artifact hash；lineage 不完整时
+      不得声明 queryReady。
+  - id: lineage_artifact_binding
+    name: Lineage 与 Artifact 绑定
+    passCriteria: >
+      manifest 中 producerRunIds、graphrag/runs 证据和 files 闭包之间有可验证
+      引用关系，能证明 artifact 是声明 producer 生成的当前文件，而非孤立残留或
+      被替换文件。
+  - id: schema_runtime_compatibility
+    name: Schema 与运行时兼容
+    passCriteria: >
+      设计区分 GraphRAG runtime、parquet schema、LanceDB schema、embedding
+      model/dimension、output manifest schema 和 package layout schema，并规定
+      兼容失败的 query gate 行为。
+  - id: query_scope_isolation
+    name: 单书查询范围隔离
+    passCriteria: >
+      挂载后直接查询只能读取该书包声明的 GraphRAG output、producer evidence 和
+      必要投影，不能把其他书、历史残留、全局缓存或 sibling roots 混入查询上下文。
+  - id: privacy_payload_exclusion
+    name: Provider Payload 排除
+    passCriteria: >
+      artifact gate 和 lineage 验证不得读取、要求或分发 provider request、
+      provider response、secrets、logs payload 或 recovery payload；需要的证据以
+      脱敏 metadata、hash 和 run manifest 表达。
+  - id: recovery_diagnostics
+    name: 失败恢复与诊断
+    passCriteria: >
+      当 artifact 缺失、hash 不匹配、lineage 断裂、schema 不兼容或 producer
+      evidence 缺失时，设计给出稳定诊断、修复入口、quarantine 行为和 catalog
+      projection 回滚规则。
+  - id: executable_contract_tests
+    name: 可执行契约测试
+    passCriteria: >
+      Type DD 足够具体，使实现者能编写挂载后 GraphRAG 直接查询、artifact
+      缺失、artifact 替换、lineage 缺失、schema 不兼容、跨书污染和 provider
+      payload 不读取的自动化测试。

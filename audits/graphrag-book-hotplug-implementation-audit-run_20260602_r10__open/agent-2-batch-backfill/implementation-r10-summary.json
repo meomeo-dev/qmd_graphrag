@@ -1,0 +1,34 @@
+{
+  "schemaVersion": "1.0.0",
+  "runId": "20260602_r10",
+  "agentId": "agent-2-batch-backfill",
+  "scenario": "batch backfill / migration cleanup",
+  "auditMode": "local_degraded_after_subagent_upstream_failure",
+  "baselineSha256": "1d15ad741b3425cba731459cae844c9d7d4879f5f9386003d1c8ad2a33acfc41",
+  "baselinePolicy": "reuse_fixed_baseline_without_changes",
+  "overallStatus": "partial",
+  "baselineCount": 10,
+  "passed": 8,
+  "partial": 2,
+  "failed": 0,
+  "results": [
+    { "id": "current_vs_residue_classification", "status": "pass" },
+    { "id": "migration_source_of_truth", "status": "pass" },
+    { "id": "package_layout_transform", "status": "pass" },
+    { "id": "checksum_manifest_regeneration", "status": "pass" },
+    { "id": "residue_quarantine_policy", "status": "pass" },
+    { "id": "idempotent_migration", "status": "partial" },
+    { "id": "conflict_and_duplicate_handling", "status": "pass" },
+    { "id": "rollback_and_audit_trail", "status": "partial" },
+    { "id": "catalog_projection_cleanup", "status": "pass" },
+    { "id": "executable_migration_tests", "status": "pass" }
+  ],
+  "blockingFindings": [
+    {
+      "id": "r10-agent2-resume-rollback-execution-partial",
+      "baselines": ["idempotent_migration", "rollback_and_audit_trail"],
+      "severity": "medium",
+      "summary": "Resume and rollback evidence is present, but partial/failed interrupted execution recovery is not fully executable."
+    }
+  ]
+}

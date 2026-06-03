@@ -1,0 +1,115 @@
+{
+  "runId": "20260602_r11",
+  "agentId": "agent-1-fresh-vault",
+  "baselinePolicy": "reuse_r6_agent1_fixed_ten_baselines_without_change",
+  "baselineCount": 10,
+  "overallStatus": "partial",
+  "passed": 7,
+  "partial": 3,
+  "failed": 0,
+  "criteriaResults": [
+    {
+      "id": "direct_query_entrypoint",
+      "status": "pass",
+      "summary": "Manifest-first direct query works without global catalog and resolves from package manifest, artifacts, and producer evidence."
+    },
+    {
+      "id": "artifact_minimum_closure",
+      "status": "pass",
+      "summary": "Manifest builder and validator define and enforce the minimum required GraphRAG artifact closure with package-relative paths, bytes, sha256, and required flags."
+    },
+    {
+      "id": "artifact_gate_state_machine",
+      "status": "partial",
+      "summary": "Creation/backfill/runtime gates encode copied-candidate-validated-mounted-query/quarantine transitions, but catalog and qmd projection do not reuse the full package validator before projecting copied packages."
+    },
+    {
+      "id": "producer_lineage_completeness",
+      "status": "pass",
+      "summary": "Artifact metadata and producer-run validation enforce run id, stage, tool version, schema version, stage/provider fingerprints, upstream hashes, and createdAt for query-ready artifacts."
+    },
+    {
+      "id": "lineage_artifact_binding",
+      "status": "pass",
+      "summary": "Producer run bindings are checked against artifact rows and run artifactIds, including durable refresh exceptions, preventing isolated or forged artifacts from claiming lineage."
+    },
+    {
+      "id": "schema_runtime_compatibility",
+      "status": "pass",
+      "summary": "Runtime compatibility metadata separates package/layout/qmd/GraphRAG schema concerns and fail-closes on mismatched digests, provider fingerprint, and embedding dimension."
+    },
+    {
+      "id": "query_scope_isolation",
+      "status": "pass",
+      "summary": "Query capability derivation is book-scoped and blocks promotion when package-local producer runs or required metadata are missing."
+    },
+    {
+      "id": "privacy_payload_exclusion",
+      "status": "pass",
+      "summary": "Validators and quarantine logic reject provider payload roots, .env, logs, debug traces, and similar sensitive residues without requiring payload reads."
+    },
+    {
+      "id": "recovery_diagnostics",
+      "status": "partial",
+      "summary": "Creation and backfill failures produce bounded diagnostics and remove publish markers, but copied invalid packages can still enter catalog/qmd projections because projection does not validate package closure first."
+    },
+    {
+      "id": "executable_contract_tests",
+      "status": "partial",
+      "summary": "Existing tests strongly cover creation, backfill, runtime, hardening, catalog, and qmd projection, but do not yet cover copied invalid package projection leakage or stale manifest sidecar rejection in runtime query gate."
+    }
+  ],
+  "findings": [
+    {
+      "severity": "high",
+      "baselineId": "artifact_gate_state_machine",
+      "summary": "Catalog and qmd projection accept published-looking packages by manifest/publish marker presence and schema parse alone, without reusing validateBookHotplugPackage.",
+      "recommendation": "Make book-hotplug catalog loading and projection depend on validateBookHotplugPackage or an equivalent full gate before projecting books, identities, or qmd items."
+    },
+    {
+      "severity": "medium",
+      "baselineId": "recovery_diagnostics",
+      "summary": "validateHotplugRuntimeQueryGate checks sidecar and publish marker presence but does not verify manifest sidecar content or publish marker manifestSha256 consistency.",
+      "recommendation": "Add manifest checksum sidecar content validation and publish marker consistency checks to the runtime query gate, then fail closed before capability derivation."
+    },
+    {
+      "severity": "medium",
+      "baselineId": "executable_contract_tests",
+      "summary": "The current suite lacks regression tests for copied invalid packages entering projection and for stale manifest sidecars passing the runtime query gate.",
+      "recommendation": "Add targeted tests for invalid copied package projection rejection and runtime gate rejection on stale BOOK_MANIFEST/PUBLISH_READY checksum evidence."
+    }
+  ],
+  "evidence": [
+    "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:232-235",
+    "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:303-335",
+    "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:744-807",
+    "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:1020-1095",
+    "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:1126-1163",
+    "scripts/graphrag/book-hotplug-creation-identity.mjs:214-242",
+    "scripts/graphrag/batch-epub-workflow.mjs:10188-10203",
+    "scripts/graphrag/batch-epub-workflow.mjs:10233-10358",
+    "scripts/graphrag/batch-epub-workflow.mjs:14107-14116",
+    "scripts/graphrag/backfill-hotplug-packages.mjs:191-214",
+    "scripts/graphrag/backfill-hotplug-packages.mjs:320-377",
+    "scripts/graphrag/backfill-hotplug-packages.mjs:396-421",
+    "scripts/graphrag/book-hotplug-package.mjs:21-40",
+    "scripts/graphrag/book-hotplug-package.mjs:348-441",
+    "scripts/graphrag/book-hotplug-package.mjs:716-940",
+    "scripts/graphrag/book-hotplug-quality-gate.mjs:57-155",
+    "src/job-state/graphrag-book.ts:942-977",
+    "src/graphrag/book-hotplug-catalog.ts:158-181",
+    "src/graphrag/book-hotplug-catalog.ts:354-519",
+    "src/graphrag/book-hotplug-runtime-gate.ts:467-525",
+    "src/graphrag/capability-catalog.ts:513-540",
+    "test/graphrag-book-hotplug-creation-gate.test.ts:21-103",
+    "test/graphrag-book-hotplug-backfill.test.ts:223-299",
+    "test/graphrag-book-hotplug-catalog.test.ts:699-747",
+    "test/graphrag-book-hotplug-catalog.test.ts:749-852",
+    "test/graphrag-book-hotplug-qmd-projection.test.ts:91-121",
+    "test/graphrag-book-hotplug-runtime-gate.test.ts:247-275",
+    "test/graphrag-book-hotplug-runtime-gate.test.ts:277-590",
+    "test/graphrag-book-hotplug-runtime-gate-hardening.test.ts:221-362",
+    "Independent vitest rerun on 2026-06-02: creation gate 1/1 passed; backfill 5/5 passed; runtime gate 6/6 passed; catalog 9/9 passed; qmd projection 1/1 passed; runtime hardening 3/3 passed",
+    "User-provided real-vault evidence on 2026-06-02/2026-06-03: creation gate, backfill, runtime gate, catalog, qmd projection, runtime hardening, tsc, and real backfill --only-missing passed; 38 hotplug packages valid; 34 historical residues not mounted"
+  ]
+}

@@ -1,0 +1,61 @@
+{
+  "status": "partial",
+  "passCount": 5,
+  "partialCount": 5,
+  "failCount": 0,
+  "findings": [
+    {
+      "severity": "high",
+      "baselineId": "direct_query_entrypoint",
+      "summary": "Manifest-first catalog rebuild can still return no graph_query capability on the BOOK_MANIFEST package main path; local test expected 1 capability and received 0.",
+      "evidencePaths": [
+        "test/graphrag-book-hotplug-catalog.test.ts:136-276",
+        "test/graphrag-book-hotplug-catalog.test.ts:251",
+        "src/graphrag/book-hotplug-catalog.ts:419-440",
+        "src/graphrag/capability-catalog.ts:438-556"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "producer_lineage_completeness",
+      "summary": "Runtime query gate checks producer run presence and artifact metadata fields, but does not fully compare run record artifactIds, input fingerprint, tool/schema version, and generation time against metadata rows.",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-runtime-gate.ts:243-267",
+        "src/graphrag/book-hotplug-runtime-gate.ts:378-382",
+        "scripts/graphrag/book-hotplug-artifact-metadata.mjs:264-273",
+        "src/graphrag/capability-catalog.ts:488-548"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "lineage_artifact_binding",
+      "summary": "Manifest files, artifact metadata, state artifacts, checkpoints, and producerRunIds are partially bound, but runtime gate still lacks full run-record artifact/hash/input semantic binding.",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-runtime-gate.ts:168-197",
+        "src/job-state/artifact-validation.ts:530-583",
+        "scripts/graphrag/book-hotplug-artifact-metadata.mjs:264-273"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "schema_runtime_compatibility",
+      "summary": "Runtime compatibility digest mismatch and createdAt gates are fixed, but package layout, runtime reader, and embedding model/dimension fields are not fully enforced by the TS runtime digest gate.",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-runtime-compatibility-digests.ts:76-131",
+        "src/graphrag/book-hotplug-runtime-gate.ts:270-330",
+        "scripts/graphrag/book-hotplug-runtime-compatibility.mjs:96-122",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:206-362"
+      ]
+    },
+    {
+      "severity": "low",
+      "baselineId": "executable_contract_tests",
+      "summary": "Local verification passed unified-query and runtime-gate tests, but graphrag-book-hotplug-catalog.test.ts still has one failing manifest-first capability projection case.",
+      "evidencePaths": [
+        "test/unified-query.test.ts:688-738",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:206-362",
+        "test/graphrag-book-hotplug-catalog.test.ts:136-276"
+      ]
+    }
+  ]
+}

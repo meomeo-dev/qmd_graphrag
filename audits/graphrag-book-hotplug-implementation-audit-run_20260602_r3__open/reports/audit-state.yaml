@@ -1,0 +1,26 @@
+schemaVersion: "1.0.0"
+taskId: graphrag-book-hotplug
+runId: "20260602_r3"
+status: open
+baselinePolicy: reuse_r2_fixed_baselines
+baselineSha256:
+  agent-1-fresh-vault: 10c3e3d217ea17e6f2ec875b701b441bccceff2bda3e26138413534aa732c419
+  agent-2-batch-backfill: 3754841ae8300fd9651d4137fab9ebab88946538ee1c8f00d83e039f1ec08282
+  agent-3-runtime-provider: 10c3e3d217ea17e6f2ec875b701b441bccceff2bda3e26138413534aa732c419
+verificationSnapshot:
+  typecheck: passed
+  hotplugCatalogTests: "4/4 passed"
+  focusedTests: "49/49 passed"
+  realVaultPackages: "38/38 validator passed"
+  realVaultQualityGates: "38/38 passed"
+  realVaultCatalog:
+    books: 38
+    sources: 38
+    documentIdentityMap: 38
+    graphCapabilities: 30
+  migrationResidues: 34
+  migrationConflicts: 34
+  freshVaultSingleBook: passed
+notes:
+  - Baselines are byte-for-byte copied from r2 and must not be modified.
+  - Subagents write only their report directories.

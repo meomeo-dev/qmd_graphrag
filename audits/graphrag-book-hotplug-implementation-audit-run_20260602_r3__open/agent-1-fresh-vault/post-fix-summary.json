@@ -1,0 +1,101 @@
+{
+  "agentId": "agent-1-fresh-vault",
+  "scenario": "fresh-vault single-book copy mount",
+  "baselinePath": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-1-fresh-vault/baseline.yaml",
+  "baselineSha256": "10c3e3d217ea17e6f2ec875b701b441bccceff2bda3e26138413534aa732c419",
+  "overall_result": "partial",
+  "reviewMode": "post-fix read-only",
+  "realGraphVaultModified": false,
+  "codeModified": false,
+  "baselineModified": false,
+  "commands": {
+    "tsc": "pass",
+    "hotplugCatalogTests": "7/7 pass",
+    "unifiedQueryTests": "36/36 pass",
+    "cliGraphRagRouteTests": "9/9 pass"
+  },
+  "realVaultState": {
+    "bookDirCount": 72,
+    "packageCount": 38,
+    "validatorPassed": 38,
+    "validatorFailed": 0,
+    "qualityGatePassedCopyAllowed": 38,
+    "catalogBooks": 38,
+    "catalogSources": 38,
+    "catalogIdentities": 38,
+    "catalogGraphCapabilities": 30,
+    "catalogGraphQueryCapabilities": 30,
+    "manifestQueryReady": 30,
+    "manifestNotQueryReady": 8
+  },
+  "postFixFocusFindings": [
+    {
+      "id": "missing_run_evidence_fail_closed",
+      "previousStatus": "fail",
+      "currentStatus": "fixed",
+      "evidence": "Deleting graphrag/runs in a copied real book package made validateBookHotplugPackage fail, catalog capabilityCount 0, and loadGraphQueryCapabilities return 0."
+    },
+    {
+      "id": "stray_provider_payload_fail_closed",
+      "previousStatus": "fail",
+      "currentStatus": "fixed",
+      "evidence": "Adding provider-requests/payload.json in a copied real book package made validateBookHotplugPackage fail with forbidden_sensitive_material and loadGraphQueryCapabilities return 0."
+    },
+    {
+      "id": "fresh_vault_single_book_positive_copy",
+      "previousStatus": "pass",
+      "currentStatus": "pass",
+      "evidence": "Copying book-00474fb29e5e-59d02d41 alone into a fresh vault rebuilt 1 book, 1 identity, 1 capability, and returned 1 query capability."
+    }
+  ],
+  "baselineResults": [
+    {
+      "id": "direct_query_entrypoint",
+      "result": "pass"
+    },
+    {
+      "id": "artifact_minimum_closure",
+      "result": "pass"
+    },
+    {
+      "id": "artifact_gate_state_machine",
+      "result": "partial"
+    },
+    {
+      "id": "producer_lineage_completeness",
+      "result": "partial"
+    },
+    {
+      "id": "lineage_artifact_binding",
+      "result": "pass"
+    },
+    {
+      "id": "schema_runtime_compatibility",
+      "result": "partial"
+    },
+    {
+      "id": "query_scope_isolation",
+      "result": "pass"
+    },
+    {
+      "id": "privacy_payload_exclusion",
+      "result": "pass"
+    },
+    {
+      "id": "recovery_diagnostics",
+      "result": "partial"
+    },
+    {
+      "id": "executable_contract_tests",
+      "result": "partial"
+    }
+  ],
+  "blockingFindings": [],
+  "remainingPartialAreas": [
+    "Complete persisted artifact gate state machine with copied/candidate/validated/mounted/query-ready/visible_not_query_ready/quarantined states.",
+    "Complete per-artifact producer lineage fields for step, tool version, schema version, upstream artifact hash, and executable validation.",
+    "Complete schema/runtime compatibility matrix for GraphRAG runtime, parquet, LanceDB, embedding dimension, output manifest, and package layout.",
+    "Expose runtime query gate diagnostics and quarantine/projection rollback behavior consistently to users and recovery tooling.",
+    "Add schema/runtime incompatibility and full state-machine contract tests."
+  ]
+}

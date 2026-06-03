@@ -1,0 +1,137 @@
+{
+  "runId": "20260602_r12",
+  "agentId": "agent-2-batch-backfill",
+  "baselinePolicy": "use_fixed_baseline_yaml_without_modification",
+  "fixedBaselinePath": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r12__open/agent-2-batch-backfill/fixed-baseline.yaml",
+  "fixedBaselineSha256": "1d15ad741b3425cba731459cae844c9d7d4879f5f9386003d1c8ad2a33acfc41",
+  "baselineCount": 10,
+  "overallStatus": "pass",
+  "passed": 10,
+  "partial": 0,
+  "failed": 0,
+  "remainingFindings": [],
+  "r11FindingsStatus": [
+    {
+      "id": "only_missing_pre_skip_validation",
+      "status": "closed",
+      "summary": "--only-missing validates existing published packages before skipping and fails closed on stale sidecars."
+    },
+    {
+      "id": "resume_interrupted_execution",
+      "status": "closed",
+      "summary": "--resume-interrupted executes staging cleanup, re-enters backfill, and writes execution-record.json."
+    },
+    {
+      "id": "rollback_interrupted_execution",
+      "status": "closed",
+      "summary": "--rollback-interrupted removes invalid live manifest/publish residue, re-enters backfill, and writes execution-record.json."
+    },
+    {
+      "id": "fail_closed_behavior",
+      "status": "closed",
+      "summary": "Conflict, validation, protected metadata, and fsync failure paths exit non-zero without publishing invalid packages."
+    },
+    {
+      "id": "real_graph_vault_no_rerun_completed_books",
+      "status": "closed",
+      "summary": "Read-only validation shows 38 already_migrated published packages, 34 residues, no partial/failed interrupted states, and existing evidence with processed=0 skipped=38 failed=0."
+    }
+  ],
+  "criteriaResults": [
+    {
+      "id": "current_vs_residue_classification",
+      "status": "pass",
+      "summary": "Classifier distinguishes completed books, residues, partial migrations, failed interruptions, repair-required roots, and already migrated packages."
+    },
+    {
+      "id": "migration_source_of_truth",
+      "status": "pass",
+      "summary": "Manifest generation is gated by distribution manifest sidecars, canonical input, source closure, qmd/graph manifests, producer evidence, and artifact checksums."
+    },
+    {
+      "id": "package_layout_transform",
+      "status": "pass",
+      "summary": "Package layout and manifest locators are package-relative, with mount.packageRoot validated as '.'."
+    },
+    {
+      "id": "checksum_manifest_regeneration",
+      "status": "pass",
+      "summary": "BOOK_MANIFEST, PUBLISH_READY, sidecars, embedded checksums, publish marker checksum, and file closure checksums are regenerated and validated."
+    },
+    {
+      "id": "residue_quarantine_policy",
+      "status": "pass",
+      "summary": "Residues are isolated from publish, mount, export, and catalog projection without deleting legacy evidence."
+    },
+    {
+      "id": "idempotent_migration",
+      "status": "pass",
+      "summary": "Already migrated packages are verify-only; interrupted states require explicit recovery flags and either execute recovery or fail closed."
+    },
+    {
+      "id": "conflict_and_duplicate_handling",
+      "status": "pass",
+      "summary": "Duplicate source hash, same bookId different sourceHash, manifest identity, staging, and live-root conflicts have stable fail-closed diagnostics."
+    },
+    {
+      "id": "rollback_and_audit_trail",
+      "status": "pass",
+      "summary": "Migration evidence and execution-record.json provide auditable plan, checkpoint, rollback, commit, and recovery decisions."
+    },
+    {
+      "id": "catalog_projection_cleanup",
+      "status": "pass",
+      "summary": "Catalog projection is rebuilt only from validated published packages; real evidence shows completed books skipped and residues excluded."
+    },
+    {
+      "id": "executable_migration_tests",
+      "status": "pass",
+      "summary": "Backfill tests cover only-missing validation, verify-only reruns, resume, rollback, protected metadata, fsync failure, and conflict fail-closed behavior."
+    }
+  ],
+  "verification": {
+    "targetTests": [
+      {
+        "command": "npm exec -- vitest run test/graphrag-book-hotplug-backfill.test.ts --reporter=verbose",
+        "status": "passed",
+        "testFiles": 1,
+        "tests": 8
+      }
+    ],
+    "realGraphVaultReadOnly": {
+      "totalDirectories": 72,
+      "candidates": 38,
+      "residues": 34,
+      "conflicts": 34,
+      "counts": {
+        "already_migrated": 38,
+        "legacy_only": 0,
+        "partial_migration": 0,
+        "failed_interrupted": 0,
+        "repair_required": 0,
+        "residue_quarantined": 34
+      },
+      "publishedCount": 38,
+      "invalidPublishedCount": 0,
+      "publishedWithRequiredSkipFiles": 38,
+      "incompleteHotplugMarkers": 0
+    },
+    "existingMigrationEvidence": {
+      "path": "graph_vault/catalog/book-package-migrations/migrations/hotplug-backfill-20260603033036320",
+      "classification": {
+        "totalDirectories": 72,
+        "candidates": 38,
+        "residues": 34,
+        "alreadyMigrated": 38,
+        "partialMigration": 0,
+        "failedInterrupted": 0
+      },
+      "commitRecord": {
+        "decisionStatus": "committed",
+        "processed": 0,
+        "skipped": 38,
+        "failed": 0
+      }
+    }
+  }
+}

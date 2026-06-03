@@ -1,0 +1,119 @@
+{
+  "runId": "20260602_r11",
+  "agentId": "agent-3-runtime-provider",
+  "baselinePolicy": "strict_reuse_fixed_10_baselines_without_change",
+  "baselineCount": 10,
+  "overallStatus": "fail",
+  "passed": 5,
+  "partial": 3,
+  "failed": 2,
+  "criteriaResults": [
+    {
+      "id": "direct_query_entrypoint",
+      "status": "pass",
+      "summary": "Manifest-first direct query works without global catalog and can derive graph_query capability from package-local evidence."
+    },
+    {
+      "id": "artifact_minimum_closure",
+      "status": "pass",
+      "summary": "Docs and implementation both define and validate a minimum GraphRAG artifact closure through requiredArtifacts, files, artifact metadata, and runtime compatibility."
+    },
+    {
+      "id": "artifact_gate_state_machine",
+      "status": "fail",
+      "summary": "Runtime gate accepts a tampered BOOK_MANIFEST.json when checksum sidecars are stale but still present, so a bad candidate can remain query-ready."
+    },
+    {
+      "id": "producer_lineage_completeness",
+      "status": "partial",
+      "summary": "Standard producer lineage checks are strong, but test-hook fallback can synthesize qmd_graph_text_unit_identity.json and still reach query capability."
+    },
+    {
+      "id": "lineage_artifact_binding",
+      "status": "partial",
+      "summary": "Regular GraphRAG outputs bind to producer runs, yet fallback-created identity artifacts pass as manifest-derived rows without proving they came from the declared producer."
+    },
+    {
+      "id": "schema_runtime_compatibility",
+      "status": "pass",
+      "summary": "Runtime gate fail-closes on forged layout, embedding dimension, provider fingerprint, and semantic digest mismatches."
+    },
+    {
+      "id": "query_scope_isolation",
+      "status": "pass",
+      "summary": "Book-scoped artifact paths, producer run IDs, stage fingerprints, provider fingerprints, and corpus hashes constrain direct query to the mounted book package."
+    },
+    {
+      "id": "privacy_payload_exclusion",
+      "status": "pass",
+      "summary": "Provider payload, .env, logs, debug, trace, and recovery payload paths are excluded from package validation and runtime gate inputs."
+    },
+    {
+      "id": "recovery_diagnostics",
+      "status": "fail",
+      "summary": "Manifest checksum sidecar mismatch produces no runtime diagnostic and no rollback to visible_not_query_ready or quarantine."
+    },
+    {
+      "id": "executable_contract_tests",
+      "status": "partial",
+      "summary": "Current tests cover the main runtime/provider cases, but they do not cover stale manifest sidecars or synthetic identity fallback containment."
+    }
+  ],
+  "findings": [
+    {
+      "severity": "high",
+      "baselineId": "artifact_gate_state_machine",
+      "summary": "validateHotplugRuntimeQueryGate only checks manifest sidecar existence, not checksum correctness. A stale BOOK_MANIFEST sidecar still allows ok=true and graph_query capability projection.",
+      "recommendation": "Make runtime gate verify BOOK_MANIFEST.json against both .sha256 and embedded manifest checksum fields before any query-ready decision."
+    },
+    {
+      "severity": "high",
+      "baselineId": "recovery_diagnostics",
+      "summary": "Manifest sidecar checksum mismatch has no stable runtime diagnostic and does not demote the package to visible_not_query_ready or quarantine.",
+      "recommendation": "Emit stable manifest checksum diagnostics in the runtime gate and route the package to a fail-closed state before direct query projection."
+    },
+    {
+      "severity": "medium",
+      "baselineId": "producer_lineage_completeness",
+      "summary": "With QMD_GRAPHRAG_ENABLE_TEST_HOOKS=1, creation identity fallback can generate synthetic graphDocumentId and graphTextUnitIds, and the resulting package can still expose graph_query capability.",
+      "recommendation": "Fence synthetic fallback behind a non-publishable state or explicitly force graphrag.queryReady=false whenever fallback identity is used."
+    },
+    {
+      "severity": "medium",
+      "baselineId": "executable_contract_tests",
+      "summary": "Automated tests do not cover stale manifest sidecar fail-closed behavior or the requirement that synthetic fallback identity must not project query capability.",
+      "recommendation": "Add dedicated runtime-provider contract tests for stale manifest sidecars and for fallback identity containment under test hooks."
+    }
+  ],
+  "evidence": [
+    {
+      "type": "baseline",
+      "path": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r11__open/agent-3-runtime-provider/fixed-baseline.yaml",
+      "sha256": "10c3e3d217ea17e6f2ec875b701b441bccceff2bda3e26138413534aa732c419",
+      "summary": "Verified that this audit reused the fixed 10-baseline policy without modification."
+    },
+    {
+      "type": "contract",
+      "path": "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:1040",
+      "summary": "Manifest-first query validation must validate manifest checksum sidecars before computing query_ready."
+    },
+    {
+      "type": "code",
+      "path": "src/graphrag/book-hotplug-runtime-gate.ts:484",
+      "summary": "Runtime gate checks only for manifest sidecar presence and does not verify sidecar checksum content."
+    },
+    {
+      "type": "test",
+      "command": "npx vitest run test/graphrag-book-hotplug-runtime-gate.test.ts test/graphrag-book-hotplug-runtime-gate-hardening.test.ts test/graphrag-book-hotplug-catalog.test.ts test/graphrag-book-hotplug-creation-gate.test.ts",
+      "summary": "Independent run passed all 19 relevant tests across runtime gate, hardening, catalog, and creation gate."
+    },
+    {
+      "type": "repro",
+      "summary": "Stale manifest sidecar repro returned ok=true, diagnostics=[], capabilityCount=1 while manifestSidecarStale=true."
+    },
+    {
+      "type": "repro",
+      "summary": "Synthetic fallback repro generated qmd_graph_text_unit_identity.json with synthetic graphTextUnitIds and produced capabilityCount=1 under allowTestFallback=true."
+    }
+  ]
+}

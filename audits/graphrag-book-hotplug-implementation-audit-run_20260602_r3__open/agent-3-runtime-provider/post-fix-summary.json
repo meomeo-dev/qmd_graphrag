@@ -1,0 +1,131 @@
+{
+  "schemaVersion": "1.0.0",
+  "agentId": "agent-3-runtime-provider",
+  "scenario": "runtime-provider/query recovery post-fix review",
+  "baselinePath": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-3-runtime-provider/baseline.yaml",
+  "baselineSha256": "10c3e3d217ea17e6f2ec875b701b441bccceff2bda3e26138413534aa732c419",
+  "overallResult": "partial",
+  "codeModified": false,
+  "realGraphVaultModified": false,
+  "reportPath": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-3-runtime-provider/post-fix-report.md",
+  "checks": {
+    "typescriptNoEmit": {
+      "command": "npm exec -- tsc -p tsconfig.build.json --noEmit",
+      "result": "passed"
+    },
+    "hotplugCatalogVitest": {
+      "command": "npx vitest run test/graphrag-book-hotplug-catalog.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true",
+      "result": "passed",
+      "passed": 7,
+      "total": 7
+    },
+    "unifiedQueryVitest": {
+      "command": "npx vitest run test/unified-query.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true",
+      "result": "passed",
+      "passed": 36,
+      "total": 36
+    },
+    "pythonBridgeVitest": {
+      "command": "npx vitest run test/integrations/python-bridge-early-stop.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true",
+      "result": "passed",
+      "passed": 7,
+      "total": 7
+    },
+    "cliGraphRagRouteVitest": {
+      "command": "npx vitest run test/cli-graphrag-route.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true",
+      "result": "passed",
+      "passed": 9,
+      "total": 9
+    },
+    "realGraphVaultReadonly": {
+      "bookDirCount": 72,
+      "packageCount": 38,
+      "publishReadyCount": 38,
+      "artifactMetadataCount": 38,
+      "qualityGatePassedCount": 38,
+      "qualityGateCopyAllowedCount": 38,
+      "packageValidatorOkCount": 38,
+      "runtimeGateOkCount": 30,
+      "manifestQueryReadyCount": 30,
+      "catalogBookCount": 38,
+      "catalogIdentityCount": 38,
+      "catalogCapabilityCount": 30,
+      "staleCapabilityBookIdCount": 0,
+      "forbiddenPathPackageCount": 0,
+      "notQueryReadyPackageCount": 8
+    },
+    "freshVaultCopy": {
+      "selectedBookId": "book-00474fb29e5e-59d02d41",
+      "bookCount": 1,
+      "identityCount": 1,
+      "capabilityCount": 1,
+      "capabilityIds": [
+        "book-00474fb29e5e-59d02d41:graph_query"
+      ]
+    },
+    "missingProducerRunsNegative": {
+      "result": "passed",
+      "runtimeGateOkAfterMissingRuns": false,
+      "capabilityCountAfterMissingRuns": 0
+    },
+    "providerPayloadNegative": {
+      "result": "passed",
+      "validatorOkAfterPayload": false,
+      "runtimeGateOkAfterPayload": false,
+      "capabilityCountAfterPayload": 0,
+      "diagnostic": "forbidden_sensitive_material:provider-requests/payload.json"
+    }
+  },
+  "baselineResults": [
+    {
+      "id": "direct_query_entrypoint",
+      "result": "pass"
+    },
+    {
+      "id": "artifact_minimum_closure",
+      "result": "pass"
+    },
+    {
+      "id": "artifact_gate_state_machine",
+      "result": "partial",
+      "reason": "runtime fail-closed exists, but gate failures are not fully persisted as state-machine transition and quarantine records"
+    },
+    {
+      "id": "producer_lineage_completeness",
+      "result": "partial",
+      "reason": "producer/stage/hash/provider binding exists, but tool version, schema version, and upstream artifact hash are not mandatory for every required artifact"
+    },
+    {
+      "id": "lineage_artifact_binding",
+      "result": "pass"
+    },
+    {
+      "id": "schema_runtime_compatibility",
+      "result": "partial",
+      "reason": "schema/runtime compatibility is partially checked, but schema digest and embedding compatibility are not a single mandatory runtime gate"
+    },
+    {
+      "id": "query_scope_isolation",
+      "result": "pass"
+    },
+    {
+      "id": "privacy_payload_exclusion",
+      "result": "pass"
+    },
+    {
+      "id": "recovery_diagnostics",
+      "result": "partial",
+      "reason": "stable diagnostics exist, but quarantine, rollback, and repair records are not fully materialized"
+    },
+    {
+      "id": "executable_contract_tests",
+      "result": "pass"
+    }
+  ],
+  "postFixBlockingIssues": [],
+  "residualRisks": [
+    "artifact gate state-machine diagnostics are not fully persisted",
+    "per-artifact lineage does not yet force tool version, schema version, and upstream artifact hash",
+    "schema/runtime compatibility gate lacks complete cross-schema digest validation"
+  ]
+}

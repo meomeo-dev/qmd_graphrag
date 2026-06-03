@@ -1,0 +1,58 @@
+{
+  "status": "partial",
+  "passCount": 6,
+  "partialCount": 4,
+  "failCount": 0,
+  "findings": [
+    {
+      "severity": "medium",
+      "baselineId": "producer_lineage_completeness",
+      "summary": "Runtime query readiness is strongly gated through artifact metadata, checkpoints, run records, and validateBookArtifactSet, but the TS runtime gate itself still checks graphrag/runs entries mainly for file presence and does not fully compare run-record artifactIds, inputFingerprint, tool/schema version, and generation time against metadata rows.",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-runtime-gate.ts:243",
+        "src/graphrag/book-hotplug-runtime-gate.ts:378",
+        "src/graphrag/capability-catalog.ts:182",
+        "src/graphrag/capability-catalog.ts:467",
+        "src/job-state/artifact-validation.ts:497",
+        "scripts/graphrag/book-hotplug-artifact-metadata.mjs:193"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "lineage_artifact_binding",
+      "summary": "Capability projection now binds package artifacts to bookId, producerRunId, stage/provider fingerprints, corpus content hash, and book-scoped output paths, but the manifest-first runtime gate does not fully enforce the declared bidirectional binding among producerRunIds, graphrag/runs records, artifact metadata rows, and files closure.",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-runtime-gate.ts:168",
+        "src/graphrag/book-hotplug-runtime-gate.ts:243",
+        "src/graphrag/book-hotplug-runtime-gate.ts:378",
+        "src/graphrag/capability-catalog.ts:517",
+        "src/job-state/artifact-validation.ts:530",
+        "scripts/graphrag/book-hotplug-artifact-metadata.mjs:264"
+      ]
+    },
+    {
+      "severity": "medium",
+      "baselineId": "schema_runtime_compatibility",
+      "summary": "Runtime compatibility artifacts include package/runtime metadata and four semantic schema digests, but the enforced TS gate still compares only outputManifestSchemaDigest, parquetSchemaDigest, lancedbSchemaDigest, and artifactMetadataSchemaDigest; embedding model/dimension, package layout, and runtime reader compatibility are not independently fail-closed.",
+      "evidencePaths": [
+        "scripts/graphrag/book-hotplug-runtime-compatibility.mjs:96",
+        "scripts/graphrag/book-hotplug-runtime-compatibility.mjs:137",
+        "src/graphrag/book-hotplug-runtime-compatibility-digests.ts:76",
+        "src/graphrag/book-hotplug-runtime-gate.ts:38",
+        "src/graphrag/book-hotplug-runtime-gate.ts:270",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:206"
+      ]
+    },
+    {
+      "severity": "low",
+      "baselineId": "executable_contract_tests",
+      "summary": "The previously failing manifest-first catalog test now passes, and runtime/privacy/route tests pass, but executable coverage still lacks negative cases for malformed run-record semantic binding and broader runtime compatibility fields such as embedding dimension and package layout/runtime reader mismatch.",
+      "evidencePaths": [
+        "test/graphrag-book-hotplug-catalog.test.ts:136",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:206",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:285",
+        "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml:1648"
+      ]
+    }
+  ]
+}

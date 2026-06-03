@@ -1,0 +1,181 @@
+{
+  "status": "partial",
+  "scenario": "runtime/provider security/query gate",
+  "baselinePath": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-3-runtime-provider/baseline.yaml",
+  "baselineSha256": "10c3e3d217ea17e6f2ec875b701b441bccceff2bda3e26138413534aa732c419",
+  "fixedBaselineSources": [
+    "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-3-runtime-provider/baseline.yaml",
+    "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-3-runtime-provider/report.md",
+    "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-3-runtime-provider/post-fix-summary.json",
+    "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-3-runtime-provider/post-fix-report.md",
+    "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-3-runtime-provider/post-runtime-compat-rerun-20260602-summary.json",
+    "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-3-runtime-provider/post-runtime-compat-rerun-20260602-report.md"
+  ],
+  "fixedBaselineNotes": [
+    "agent-3-runtime-provider 目录内未见独立 criteria 文件。",
+    "本轮固定维度完全沿用 baseline.yaml 的 10 个维度，未新增、未删除、未重命名、未重排。"
+  ],
+  "reviewMode": "read-only plus temporary-vault verification",
+  "realGraphVaultModified": false,
+  "codeModified": false,
+  "testsModified": false,
+  "baselineModified": false,
+  "reportPath": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r4__open/agent-3-runtime-provider/implementation-r4-report.md",
+  "realVaultState": {
+    "bookDirCount": 72,
+    "packageCount": 38,
+    "publishReadyCount": 38,
+    "artifactMetadataCount": 38,
+    "runtimeCompatibilityCount": 38,
+    "runtimeGateCount": 38,
+    "manifestQueryReadyTrue": 30,
+    "runtimeGateQueryReady": 30,
+    "runtimeGateVisibleNotQueryReady": 8,
+    "runtimeGateQuarantined": 0,
+    "catalogGraphCapabilityCount": 30
+  },
+  "sampleEvidence": {
+    "positiveQueryReadyBookId": "book-00474fb29e5e-59d02d41",
+    "visibleNotQueryReadyBookId": "book-0c8dffd9585c-41a7e47b",
+    "forgedDigestCapabilityCount": 0,
+    "missingProducerRunCapabilityCount": 0,
+    "providerPayloadCapabilityCount": 0,
+    "artifactMetadataMissingRowCapabilityCount": 0,
+    "artifactMetadataCreatedAtOptionalCapabilityCount": 1
+  },
+  "criteriaResults": [
+    {
+      "id": "direct_query_entrypoint",
+      "name": "直接查询入口",
+      "result": "pass",
+      "evidence": [
+        "临时单书复制样本 book-00474fb29e5e-59d02d41 后，catalog rebuild 生成 1 book / 1 identity / 1 graph_query capability。",
+        "query capability 仍由包内 BOOK_MANIFEST、graphrag/output 与 graphrag/runs 证据重建。"
+      ]
+    },
+    {
+      "id": "artifact_minimum_closure",
+      "name": "查询 Artifact 最低闭包",
+      "result": "pass",
+      "evidence": [
+        "RequiredGraphRagArtifacts 继续固定 output manifest、identity map、artifact metadata、runtime compatibility、context/stats、6 个 parquet 与 LanceDB。",
+        "package validator 会联合校验 requiredArtifacts、manifest file entries、artifact metadata 与 runtime compatibility。"
+      ]
+    },
+    {
+      "id": "artifact_gate_state_machine",
+      "name": "Artifact Gate 状态机",
+      "result": "partial",
+      "evidence": [
+        "state/hotplug-runtime-gate.json 持续落盘 copied/candidate/validated/mounted/final states。",
+        "真实 vault 中 currentState=query_ready 为 30，visible_not_query_ready 为 8。",
+        "visible_not_query_ready 实例的 diagnostics 当前为空数组，且 validating/rolled_back/quarantine record 仍未完整物化。"
+      ]
+    },
+    {
+      "id": "producer_lineage_completeness",
+      "name": "Producer Lineage 完整性",
+      "result": "partial",
+      "evidence": [
+        "删除 manifest 声明的 producerRunId 对应 graphrag/runs/*.yaml 后，package validator/runtime gate/capability projection 同时 fail closed。",
+        "artifact-metadata rows 已要求 producerRunId、producerStep、producerToolVersion、producerSchemaVersion、upstreamArtifactHashes。",
+        "删除 rows.createdAt 后 package validator/runtime gate 仍通过，说明逐产物时间字段尚未提升为强制门。"
+      ]
+    },
+    {
+      "id": "lineage_artifact_binding",
+      "name": "Lineage 与 Artifact 绑定",
+      "result": "pass",
+      "evidence": [
+        "manifest producerRunIds、graphrag/runs、artifact-metadata 行与 capability projection 之间仍可交叉验证。",
+        "artifact metadata 缺少 documents.parquet 对应行时，runtime gate fail closed 且 capabilityCount=0。"
+      ]
+    },
+    {
+      "id": "schema_runtime_compatibility",
+      "name": "Schema 与运行时兼容",
+      "result": "partial",
+      "evidence": [
+        "临时复制包中伪造 outputManifest/parquet/lancedb schema digests，并同步 sidecars、manifest、artifact metadata 绑定后，package validator 与 runtime gate 都返回 digest mismatch。",
+        "同一场景下 rebuild catalog capabilityCount=0，query capability 不可见。",
+        "runtime compatibility gate 目前仍以 digest/结构重算为主，尚未扩展为完整 runtime/parquet/LanceDB/embedding 实值兼容矩阵。"
+      ]
+    },
+    {
+      "id": "query_scope_isolation",
+      "name": "单书查询范围隔离",
+      "result": "pass",
+      "evidence": [
+        "临时 fresh vault 单书复制仅暴露该书 graph_query capability。",
+        "未观察到 sibling roots、其他书或全局残留混入 capability 投影。"
+      ]
+    },
+    {
+      "id": "privacy_payload_exclusion",
+      "name": "Provider Payload 排除",
+      "result": "pass",
+      "evidence": [
+        "临时复制包加入 provider-requests/payload.json 后，package validator/runtime gate/capability projection 同时 fail closed。",
+        "forbidden path 拒绝仍覆盖 provider-requests/provider-responses/logs/debug/trace/.env。"
+      ]
+    },
+    {
+      "id": "recovery_diagnostics",
+      "name": "失败恢复与诊断",
+      "result": "partial",
+      "evidence": [
+        "runtime compatibility 伪造、artifact metadata 缺行、provider payload 注入、producer run 缺失都会返回稳定诊断码并阻断 capability。",
+        "真实 vault 中 8 个 visible_not_query_ready 包虽已被阻断，但其 runtime gate 落盘 diagnostics 为空数组。",
+        "quarantine record、rollback record 与 repair entry 仍未完整物化。"
+      ]
+    },
+    {
+      "id": "executable_contract_tests",
+      "name": "可执行契约测试",
+      "result": "pass",
+      "evidence": [
+        "test/graphrag-book-hotplug-runtime-gate.test.ts 1/1 passed。",
+        "test/graphrag-book-hotplug-catalog.test.ts 8/8 passed。",
+        "本轮临时负例与现有测试结论一致。"
+      ]
+    }
+  ],
+  "blockingFindings": [],
+  "residualRisks": [
+    "artifact-metadata rows 的 createdAt 仍非 query-ready 强制字段，逐产物 lineage 完整性仍有缺口。",
+    "visible_not_query_ready 状态的落盘 diagnostics 为空，恢复审计链可观测性不足。",
+    "runtime compatibility 已能阻断 forged schema digests，但尚未扩展为更完整的 runtime/parquet/LanceDB/embedding 实值兼容矩阵。"
+  ],
+  "commandsRun": [
+    {
+      "command": "shasum -a 256 audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-3-runtime-provider/baseline.yaml",
+      "status": "pass",
+      "summary": "baseline hash matched 10c3e3d217ea17e6f2ec875b701b441bccceff2bda3e26138413534aa732c419"
+    },
+    {
+      "command": "npm exec -- tsc -p tsconfig.build.json --noEmit",
+      "status": "pass",
+      "summary": "typecheck passed"
+    },
+    {
+      "command": "npx vitest run test/graphrag-book-hotplug-runtime-gate.test.ts test/graphrag-book-hotplug-catalog.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true",
+      "status": "pass",
+      "summary": "9/9 passed; runtime digest forgery, missing producer runs, provider payload, and artifact metadata gate are all covered"
+    },
+    {
+      "command": "node --import tsx --input-type=module <<'EOF' # temporary-vault forged runtime-compatibility digest / missing producer run / provider payload / artifact metadata negative cases EOF",
+      "status": "pass",
+      "summary": "forged runtime digests failed closed with capabilityCount=0; declared producer run deletion failed closed with capabilityCount=0; provider payload failed closed with capabilityCount=0; artifact metadata missing row failed closed with capabilityCount=0; removing createdAt still passed with capabilityCount=1"
+    },
+    {
+      "command": "node --input-type=module <<'EOF' # real graph_vault state/hotplug-runtime-gate and catalog inventory EOF",
+      "status": "pass",
+      "summary": "72 book dirs; 38 packages; 38 publish-ready; 38 artifact-metadata; 38 runtime-compatibility; runtime gate query_ready=30; visible_not_query_ready=8; quarantined=0; graph capability catalog items=30"
+    },
+    {
+      "command": "node --input-type=module <<'EOF' # inspect one visible_not_query_ready runtime gate record EOF",
+      "status": "pass",
+      "summary": "sample visible_not_query_ready record persisted with diagnostics=[]"
+    }
+  ]
+}

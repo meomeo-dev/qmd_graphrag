@@ -1,0 +1,176 @@
+{
+  "schemaVersion": "1.0.0",
+  "agentId": "agent-2-batch-backfill",
+  "scenario": "当前 38 本完成书与 34 个历史残留目录迁移到热插拔布局",
+  "baselinePath": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-2-batch-backfill/baseline.yaml",
+  "baselineSha256": "3754841ae8300fd9651d4137fab9ebab88946538ee1c8f00d83e039f1ec08282",
+  "status": "partial",
+  "reviewMode": "post-runtime-compat-rerun read-only",
+  "realGraphVaultModified": false,
+  "codeModified": false,
+  "baselineModified": false,
+  "latestRealMigrationId": "hotplug-backfill-20260602174142049",
+  "criteriaResults": [
+    {
+      "id": "current_vs_residue_classification",
+      "status": "pass",
+      "evidence": {
+        "totalDirectories": 72,
+        "alreadyMigrated": 38,
+        "residueQuarantined": 34
+      }
+    },
+    {
+      "id": "migration_source_of_truth",
+      "status": "pass",
+      "evidence": {
+        "sourceTruthEntries": 72,
+        "mayGenerateBookManifestTrue": 38,
+        "mayGenerateBookManifestFalse": 34,
+        "producerMissingMarkedNotQueryReady": 8
+      }
+    },
+    {
+      "id": "package_layout_transform",
+      "status": "pass",
+      "evidence": {
+        "validatedPackages": 38,
+        "validatorFailures": 0
+      }
+    },
+    {
+      "id": "checksum_manifest_regeneration",
+      "status": "pass",
+      "evidence": {
+        "manifestDiffEntries": 38,
+        "manifestDiffCommitted": 38,
+        "runtimeCompatibilityPresent": 38,
+        "runtimeCompatibilityCompatible": 38
+      }
+    },
+    {
+      "id": "residue_quarantine_policy",
+      "status": "pass",
+      "evidence": {
+        "residueReportCount": 34,
+        "mountAllowedResidues": 0,
+        "exportAllowedResidues": 0,
+        "deletePerformedResidues": 0
+      }
+    },
+    {
+      "id": "idempotent_migration",
+      "status": "partial",
+      "evidence": {
+        "defaultRerunVerifyOnlyProvenOnTempCopy": true,
+        "tempOnlyMissingSkippedAlreadyMigratedCount": 2,
+        "tempOnlyMissingManifestUnchanged": true,
+        "tempOnlyMissingRuntimeCompatUnchanged": true,
+        "realLatestRunAlreadyMigratedCount": 38,
+        "realLatestRunProcessedCount": 38,
+        "forcePreservedGenerationSignal": 38,
+        "tempForceRerunExitStatus": 1
+      }
+    },
+    {
+      "id": "conflict_and_duplicate_handling",
+      "status": "partial",
+      "evidence": {
+        "conflictReportCount": 34,
+        "conflictCodes": {
+          "migration_source_hash_prefix_conflict": 34
+        }
+      }
+    },
+    {
+      "id": "rollback_and_audit_trail",
+      "status": "partial",
+      "evidence": {
+        "migrationEvidenceFilesWithValidSidecars": 9,
+        "commitRecordRollbackAvailable": true,
+        "legacyEvidencePreserved": true,
+        "stagingFirstRollbackProven": false
+      }
+    },
+    {
+      "id": "catalog_projection_cleanup",
+      "status": "pass",
+      "evidence": {
+        "catalogBooks": 38,
+        "catalogDistinctIdentities": 38,
+        "catalogGraphCapabilities": 30,
+        "staleBooks": 0,
+        "staleIdentityRefs": 0,
+        "staleCapabilityRefs": 0
+      }
+    },
+    {
+      "id": "executable_migration_tests",
+      "status": "partial",
+      "evidence": {
+        "tscNoEmit": "passed",
+        "hotplugCatalogVitest": "6 passed, 2 failed",
+        "failingTests": [
+          "rebuilds graph capability catalog from BOOK_MANIFEST package",
+          "rebuilds stale catalog projection from current package manifests"
+        ]
+      }
+    }
+  ],
+  "blockingFindings": [
+    {
+      "id": "force_rerun_not_verify_only",
+      "criterion": "idempotent_migration",
+      "severity": "medium",
+      "summary": "真实最新 migration evidence 显示 38 个 already_migrated 包被重新 processed；force 路径保留 packageGeneration，但会改写 manifest 和 runtime-compatibility 输出。"
+    },
+    {
+      "id": "live_root_publish_without_staging_rollback_proof",
+      "criterion": "rollback_and_audit_trail",
+      "severity": "medium",
+      "summary": "当前 evidence 已完整记录 plan/classification/copy-map/commit-record，但未提供 staging-first rollback 的执行证明。"
+    },
+    {
+      "id": "catalog_hotplug_tests_not_green",
+      "criterion": "executable_migration_tests",
+      "severity": "medium",
+      "summary": "test/graphrag-book-hotplug-catalog.test.ts 当前 8 个测试中 2 个失败，阻塞该维度达到 pass。"
+    }
+  ],
+  "residualRisks": [
+    {
+      "id": "force_rerun_identity_stability",
+      "criterion": "idempotent_migration",
+      "severity": "medium",
+      "summary": "默认 rerun 已验证为 verify-only，但 force rerun 当前更接近原地重写，而不是无副作用重验。"
+    },
+    {
+      "id": "copied_root_durable_sidecar_fragility",
+      "criterion": "idempotent_migration",
+      "severity": "medium",
+      "summary": "临时副本上的 force rerun 以 durable_checksum_mismatch 失败，说明 durable sidecar 对 copied root 的鲁棒性不足。"
+    },
+    {
+      "id": "incomplete_conflict_matrix_evidence",
+      "criterion": "conflict_and_duplicate_handling",
+      "severity": "medium",
+      "summary": "真实 evidence 仅完整覆盖 34 个 migration_source_hash_prefix_conflict。"
+    },
+    {
+      "id": "catalog_rebuild_proof_gap",
+      "criterion": "executable_migration_tests",
+      "severity": "medium",
+      "summary": "真实 catalog 当前正确，但最小 fixture 的 capability rebuild 测试仍失败。"
+    }
+  ],
+  "commandsRun": [
+    "shasum -a 256 audits/graphrag-book-hotplug-implementation-audit-run_20260602_r3__open/agent-2-batch-backfill/baseline.yaml",
+    "node ./node_modules/typescript/bin/tsc -p tsconfig.build.json --noEmit",
+    "node ./node_modules/vitest/vitest.mjs run --reporter=verbose --testTimeout 60000 test/graphrag-book-hotplug-catalog.test.ts",
+    "node --input-type=module -e \"import { validateBookHotplugPackage } from './scripts/graphrag/book-hotplug-package.mjs'; ...\"",
+    "node --input-type=module -e \"read graph_vault quality gates / runtime gates / runtime-compatibility / catalog counts\"",
+    "node --input-type=module -e \"read latest migration evidence: classification.yaml, validation.yaml, manifest-diff.yaml, commit-record.yaml, residue-report.yaml, book-conflicts.yaml\"",
+    "node scripts/graphrag/backfill-hotplug-packages.mjs --state-root /tmp/qmd-agent2-audit-PNSQEn/graph_vault --rebuild-catalog",
+    "node scripts/graphrag/backfill-hotplug-packages.mjs --state-root /tmp/qmd-agent2-audit-PNSQEn/graph_vault --force --rebuild-catalog"
+  ]
+}

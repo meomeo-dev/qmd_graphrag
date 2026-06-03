@@ -1,0 +1,91 @@
+{
+  "schemaVersion": "1.0.0",
+  "agentId": "agent-1-fresh-vault",
+  "runId": "20260602_r8",
+  "status": "partial",
+  "passCount": 5,
+  "partialCount": 5,
+  "failCount": 0,
+  "baselineSource": "audits/graphrag-book-hotplug-implementation-audit-run_20260602_r7__open/agent-1-fresh-vault/fixed-baseline.yaml",
+  "targetDocuments": [
+    "docs/architecture/graphrag-book-hotplug-package.type-dd.yaml",
+    "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml"
+  ],
+  "verification": [
+    {
+      "command": "npm exec -- tsc -p tsconfig.build.json --noEmit",
+      "status": "pass"
+    },
+    {
+      "command": "npx vitest run test/graphrag-book-hotplug-runtime-gate.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true",
+      "status": "pass",
+      "testCount": 5
+    },
+    {
+      "command": "npx vitest run test/graphrag-book-hotplug-catalog.test.ts --testTimeout 120000 --pool forks --poolOptions.forks.singleFork=true",
+      "status": "pass",
+      "testCount": 8
+    }
+  ],
+  "findings": [
+    {
+      "baselineId": "direct_query_entrypoint",
+      "severity": "medium",
+      "status": "partial",
+      "summary": "Runtime gate now validates package-local artifacts, but query-ready lineage still depends on catalog/books.yaml, so the direct query resolver is not fully package-only.",
+      "evidencePaths": [
+        "src/graphrag/capability-catalog.ts:467",
+        "src/graphrag/capability-catalog.ts:473",
+        "docs/architecture/graphrag-book-hotplug-package-final-contracts.type-dd.yaml:972"
+      ]
+    },
+    {
+      "baselineId": "artifact_gate_state_machine",
+      "severity": "medium",
+      "status": "partial",
+      "summary": "Quality/runtime gate states exist and publish marker ordering is guarded, but live publication still writes files in the book root rather than atomically renaming a completed package directory generation.",
+      "evidencePaths": [
+        "scripts/graphrag/batch-epub-workflow.mjs:10188",
+        "scripts/graphrag/batch-epub-workflow.mjs:10220",
+        "scripts/graphrag/batch-epub-workflow.mjs:10258",
+        "scripts/graphrag/book-hotplug-publish-gate.mjs:27"
+      ]
+    },
+    {
+      "baselineId": "schema_runtime_compatibility",
+      "severity": "medium",
+      "status": "partial",
+      "summary": "Runtime compatibility validates core digests, but embedding model/dimension, package layout, and runtime reader compatibility are not all enforced as independent fail-closed runtime gate conditions.",
+      "evidencePaths": [
+        "src/graphrag/book-hotplug-runtime-gate.ts:302",
+        "src/graphrag/book-hotplug-runtime-gate.ts:350",
+        "src/graphrag/book-hotplug-runtime-compatibility-digests.ts:76",
+        "scripts/graphrag/book-hotplug-runtime-compatibility.mjs:109"
+      ]
+    },
+    {
+      "baselineId": "recovery_diagnostics",
+      "severity": "medium",
+      "status": "partial",
+      "summary": "Stable diagnostics and publish marker removal exist, but there is no complete last-good liveRoot generation rollback or interrupted publish recovery evidence for fresh-vault mounting.",
+      "evidencePaths": [
+        "scripts/graphrag/batch-epub-workflow.mjs:10259",
+        "scripts/graphrag/batch-epub-workflow.mjs:10261",
+        "scripts/graphrag/backfill-hotplug-packages.mjs:356",
+        "scripts/graphrag/backfill-hotplug-packages.mjs:360"
+      ]
+    },
+    {
+      "baselineId": "executable_contract_tests",
+      "severity": "medium",
+      "status": "partial",
+      "summary": "Runtime gate and catalog tests cover many negative cases, but crash visibility, directory publish rollback, producer run book mismatch/status, and stage fingerprint mismatch cases are not yet covered as a full fixed matrix.",
+      "evidencePaths": [
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:220",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:400",
+        "test/graphrag-book-hotplug-runtime-gate.test.ts:477",
+        "test/graphrag-book-hotplug-catalog.test.ts:623"
+      ]
+    }
+  ]
+}
