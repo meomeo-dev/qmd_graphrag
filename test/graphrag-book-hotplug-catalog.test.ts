@@ -195,7 +195,7 @@ describe("GraphRAG hotplug catalog projection", () => {
           sourceHash,
           documentId: `doc-${sourceHash.slice(0, 12)}`,
           contentHash: normalizedHash,
-          normalizedPath: `books/${bookId}/input/book.md`,
+          normalizedPath: "input/book.md",
           graphDocumentId: `graph-doc-${bookId}`,
           graphTextUnitIds: [`tu-${bookId}`],
         },
@@ -270,6 +270,10 @@ describe("GraphRAG hotplug catalog projection", () => {
       expect(booksCatalog.items).toHaveLength(1);
       expect(identityCatalog.items).toHaveLength(1);
       expect(capabilityCatalog.items).toHaveLength(1);
+      expect(identityCatalog.items[0]?.normalizedPath)
+        .toBe(`books/${bookId}/input/book.md`);
+      expect(identityCatalog.items[0]?.metadata?.legacyGraphIdentityNormalizedPath)
+        .toBe("input/book.md");
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }

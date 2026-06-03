@@ -113,6 +113,7 @@ describe("GraphRAG hotplug qmd projection", () => {
         expect(projection.items).toHaveLength(1);
         expect(projection.items[0]).toMatchObject({
           bookId,
+          normalizedPath: `books/${bookId}/input/book.md`,
           packageRoot: `books/${bookId}`,
           projectionSource: "book_hotplug_manifest",
           qmdBuildManifestPath: "qmd/qmd_build_manifest.json",

@@ -76,6 +76,11 @@ type HotplugGraphOutputManifest =
 type HotplugGraphIdentity = z.infer<typeof GraphTextUnitIdentityMapSchema>;
 type HotplugQmdBuildManifest = z.infer<typeof HotplugQmdBuildManifestSchema>;
 
+function packagePathForVaultCatalog(bookId: string, packagePath: string): string {
+  if (packagePath.startsWith(`books/${bookId}/`)) return packagePath;
+  return `books/${bookId}/${packagePath}`;
+}
+
 async function readPackageJson(path: string): Promise<unknown | null> {
   return readHotplugPackageUnknown(path);
 }
@@ -225,6 +230,8 @@ export async function projectHotplugDocumentIdentity(
   bookId: string,
 ): Promise<DocumentIdentityMap | null> {
   const graphVault = resolve(graphVaultInput);
+  const manifest = await readBookManifest(graphVault, bookId);
+  if (manifest == null) return null;
   const identity = await readGraphIdentity(graphVault, bookId);
   if (identity == null) return null;
   const parsed = DocumentIdentityMapSchema.safeParse({
@@ -235,11 +242,18 @@ export async function projectHotplugDocumentIdentity(
     documentId: identity.documentId,
     contentHash: identity.contentHash,
     normalizationPolicyVersion: "graphrag-normalized-markdown-v1",
-    normalizedPath: identity.normalizedPath,
+    normalizedPath: packagePathForVaultCatalog(
+      manifest.identity.bookId,
+      manifest.input.canonicalNormalizedPath,
+    ),
     chunkIds: [],
     graphDocumentId: identity.graphDocumentId,
     graphTextUnitIds: identity.graphTextUnitIds,
-    metadata: { qmdCorpusRegistered: true },
+    metadata: {
+      qmdCorpusRegistered: true,
+      projectionSource: "book_hotplug_manifest",
+      legacyGraphIdentityNormalizedPath: identity.normalizedPath,
+    },
   });
   return parsed.success ? parsed.data : null;
 }

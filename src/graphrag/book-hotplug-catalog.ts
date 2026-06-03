@@ -128,19 +128,28 @@ function publishReadyPath(graphVault: string, bookId: string): string {
   return join(bookRoot(graphVault, bookId), "PUBLISH_READY.json");
 }
 
+function packagePathForVaultCatalog(bookId: string, packagePath: string): string {
+  if (packagePath.startsWith(`books/${bookId}/`)) return packagePath;
+  return `books/${bookId}/${packagePath}`;
+}
+
 function qmdProjectionItem(input: ProjectedBook): QmdProjectionItem {
+  const bookId = input.manifest.identity.bookId;
   return {
     schemaVersion: SchemaVersion,
-    bookId: input.manifest.identity.bookId,
+    bookId,
     packageGeneration: input.manifest.identity.packageGeneration,
     sourceHash: input.manifest.identity.sourceHash,
     normalizedHash: input.manifest.input.normalizedHash,
-    normalizedPath: input.manifest.input.canonicalNormalizedPath,
+    normalizedPath: packagePathForVaultCatalog(
+      bookId,
+      input.manifest.input.canonicalNormalizedPath,
+    ),
     qmdReadyState: input.manifest.qmd.qmdReadyState ?? "unknown",
     qmdIndexPolicy: input.manifest.qmd.indexPolicy,
     qmdIndexSchema: input.manifest.qmd.qmdIndexSchema ?? null,
     qmdBuildManifestPath: input.manifest.qmd.buildManifestPath,
-    packageRoot: `books/${input.manifest.identity.bookId}`,
+    packageRoot: `books/${bookId}`,
     manifestSha256: input.manifest.checksums.manifestSha256,
     projectionSource: "book_hotplug_manifest",
     updatedAt: input.manifest.identity.createdAt,
@@ -419,7 +428,10 @@ export async function rebuildCatalogFromBookHotplugPackages(
         graphOutputManifest?.contentHash ??
         qmdBuildManifest?.normalizedContentHash ??
         manifest.input.normalizedHash,
-      normalizedPath: manifest.input.canonicalNormalizedPath,
+      normalizedPath: packagePathForVaultCatalog(
+        manifest.identity.bookId,
+        manifest.input.canonicalNormalizedPath,
+      ),
       normalizationPolicyVersion:
         qmdBuildManifest?.normalizationPolicyVersion ??
         "graphrag-normalized-markdown-v1",
@@ -467,11 +479,18 @@ export async function rebuildCatalogFromBookHotplugPackages(
         documentId: graphIdentity.documentId,
         contentHash: graphIdentity.contentHash,
         normalizationPolicyVersion: "graphrag-normalized-markdown-v1",
-        normalizedPath: graphIdentity.normalizedPath,
+        normalizedPath: packagePathForVaultCatalog(
+          manifest.identity.bookId,
+          manifest.input.canonicalNormalizedPath,
+        ),
         chunkIds: [],
         graphDocumentId: graphIdentity.graphDocumentId,
         graphTextUnitIds: graphIdentity.graphTextUnitIds,
-        metadata: { qmdCorpusRegistered: true },
+        metadata: {
+          qmdCorpusRegistered: true,
+          projectionSource: "book_hotplug_manifest",
+          legacyGraphIdentityNormalizedPath: graphIdentity.normalizedPath,
+        },
       });
       capabilityCandidates.push({ manifest, identity: graphIdentity });
     }
