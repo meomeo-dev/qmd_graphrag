@@ -175,6 +175,7 @@ import {
   loadGraphQueryCapabilities,
   resolveCandidateGraphCapabilities,
 } from "../graphrag/capability-catalog.js";
+import { resolveBookGraphRagDataDir } from "../graphrag/book-package-layout.js";
 import {
   writeManagedGraphRagSettingsSync,
 } from "../graphrag/settings-projection.js";
@@ -3272,10 +3273,8 @@ async function autoQuerySearch(
 ): Promise<void> {
   await withLLMSession(async () => {
     const config = ensureRuntimeConfigForCli();
-    const graphVault = pathResolve(
-      getPwd(),
-      config.graphrag?.vault ?? "graph_vault",
-    );
+    const graphVault = resolveGraphVaultForCli(values, config);
+    ensureGraphRagSettingsProjectionForCli(config, graphVault);
     const method = GraphRagSearchMethodSchema.parse(
       config.graphrag?.default_method ?? "local",
     );
@@ -3326,14 +3325,13 @@ async function autoQuerySearch(
           }));
         }
         const runtime = createQmdGraphRagRuntime();
+        const dataDir = await resolveBookGraphRagDataDir(
+          graphVault,
+          decision.selectedBookIds[0]!,
+        );
         return runtime.graphQuery({
           rootDir: graphVault,
-          dataDir: pathResolve(
-            graphVault,
-            "books",
-            decision.selectedBookIds[0]!,
-            "output",
-          ),
+          dataDir,
           method: GraphRagSearchMethodSchema.parse(request.method ?? method),
           query: request.query,
           responseType,
@@ -3365,10 +3363,8 @@ async function graphRagQuerySearch(
   values: Record<string, unknown>,
 ): Promise<void> {
   const config = ensureRuntimeConfigForCli();
-  const graphVault = pathResolve(
-    getPwd(),
-    String(values["graph-vault"] || config.graphrag?.vault || "graph_vault"),
-  );
+  const graphVault = resolveGraphVaultForCli(values, config);
+  ensureGraphRagSettingsProjectionForCli(config, graphVault);
   const method = GraphRagSearchMethodSchema.parse(
     String(values["query-method"] || config.graphrag?.default_method || "local"),
   );
@@ -3439,9 +3435,13 @@ async function graphRagQuerySearch(
         }));
       }
       const runtime = createQmdGraphRagRuntime();
+      const dataDir = await resolveBookGraphRagDataDir(
+        graphVault,
+        decision.selectedBookIds[0]!,
+      );
       return runtime.graphQuery({
         rootDir: graphVault,
-        dataDir: pathResolve(graphVault, "books", decision.selectedBookIds[0]!, "output"),
+        dataDir,
         method: GraphRagSearchMethodSchema.parse(request.method ?? method),
         query: request.query,
         responseType,
@@ -5246,6 +5246,16 @@ function resolveGraphVaultForCli(
     getPwd(),
     String(values["graph-vault"] || config.graphrag?.vault || "graph_vault"),
   );
+}
+
+function ensureGraphRagSettingsProjectionForCli(
+  config: CollectionConfig,
+  graphVault: string,
+): void {
+  writeManagedGraphRagSettingsSync({
+    config,
+    graphVault,
+  });
 }
 
 function graphVaultPolicyRef(graphVault: string, store: DspyPolicyStore): string {

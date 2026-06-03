@@ -104,7 +104,7 @@ export const GraphRagEvidenceSchema = z.object({
     lineStart: z.number().int().positive().optional(),
     lineEnd: z.number().int().positive().optional(),
   }).nullable().optional(),
-  quote: z.string().optional(),
+  quote: z.string().nullable().optional(),
   score: z.number().optional(),
   metadata: z.record(z.string(), JsonValueSchema).optional(),
 });

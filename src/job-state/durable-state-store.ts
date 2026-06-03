@@ -23,7 +23,7 @@ import {
   stat,
   appendFile,
 } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { hostname } from "node:os";
 
 import YAML from "yaml";
@@ -93,16 +93,47 @@ const DurableTargetMappingTable = [
     targetMappingOwner: "capabilityCatalog",
   },
   {
+    pattern: /\/graph_vault\/catalog\/qmd-projection\.yaml$/,
+    lane: "catalogWriterLane",
+    durableKind: "yaml",
+    targetMappingOwner: "qmdProjectionCatalog",
+  },
+  {
     pattern: /\/graph_vault\/books\/[^/]+\/(?:job|artifacts|checkpoints)\.yaml$/,
     lane: "checkpointWriterLane",
     durableKind: "yaml",
     targetMappingOwner: "repository",
   },
   {
+    pattern:
+      /\/graph_vault\/books\/[^/]+\/state\/(?:job|artifacts|checkpoints)\.yaml$/,
+    lane: "checkpointWriterLane",
+    durableKind: "yaml",
+    targetMappingOwner: "bookHotplugPackage",
+  },
+  {
+    pattern: /\/graph_vault\/books\/[^/]+\/state\/hotplug-quality-gate\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "bookHotplugPackage",
+  },
+  {
+    pattern: /\/graph_vault\/books\/[^/]+\/state\/hotplug-runtime-gate\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "bookHotplugPackage",
+  },
+  {
     pattern: /\/graph_vault\/books\/[^/]+\/runs\/[^/]+\.yaml$/,
     lane: "checkpointWriterLane",
     durableKind: "yaml",
     targetMappingOwner: "repository",
+  },
+  {
+    pattern: /\/graph_vault\/books\/[^/]+\/graphrag\/runs\/[^/]+\.yaml$/,
+    lane: "checkpointWriterLane",
+    durableKind: "yaml",
+    targetMappingOwner: "bookHotplugPackage",
   },
   {
     pattern: /\/graph_vault\/settings\.yaml$/,
@@ -195,7 +226,25 @@ const DurableTargetMappingTable = [
     targetMappingOwner: "qmd",
   },
   {
+    pattern: /\/graph_vault\/books\/[^/]+\/BOOK_MANIFEST\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "bookHotplugPackage",
+  },
+  {
+    pattern: /\/graph_vault\/books\/[^/]+\/PUBLISH_READY\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "bookHotplugPackage",
+  },
+  {
     pattern: /\/graph_vault\/books\/[^/]+\/output\/qmd_output_manifest\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "graphOutputProducer",
+  },
+  {
+    pattern: /\/graph_vault\/books\/[^/]+\/graphrag\/output\/qmd_output_manifest\.json$/,
     lane: "checkpointWriterLane",
     durableKind: "json",
     targetMappingOwner: "graphOutputProducer",
@@ -208,7 +257,20 @@ const DurableTargetMappingTable = [
     targetMappingOwner: "graphOutputProducer",
   },
   {
+    pattern:
+      /\/graph_vault\/books\/[^/]+\/graphrag\/output\/qmd_graph_text_unit_identity\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "graphOutputProducer",
+  },
+  {
     pattern: /\/graph_vault\/books\/[^/]+\/output\/context\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "graphOutputProducer",
+  },
+  {
+    pattern: /\/graph_vault\/books\/[^/]+\/graphrag\/output\/context\.json$/,
     lane: "checkpointWriterLane",
     durableKind: "json",
     targetMappingOwner: "graphOutputProducer",
@@ -220,6 +282,26 @@ const DurableTargetMappingTable = [
     targetMappingOwner: "graphOutputProducer",
   },
   {
+    pattern: /\/graph_vault\/books\/[^/]+\/graphrag\/output\/stats\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "graphOutputProducer",
+  },
+  {
+    pattern:
+      /\/graph_vault\/books\/[^/]+\/graphrag\/output\/artifact-metadata\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "bookHotplugPackage",
+  },
+  {
+    pattern:
+      /\/graph_vault\/books\/[^/]+\/graphrag\/output\/runtime-compatibility\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "bookHotplugPackage",
+  },
+  {
     pattern:
       /\/graph_vault\/books\/[^/]+\/output\/qmd_durable_output_repair\.json$/,
     lane: "checkpointWriterLane",
@@ -228,7 +310,21 @@ const DurableTargetMappingTable = [
   },
   {
     pattern:
+      /\/graph_vault\/books\/[^/]+\/graphrag\/output\/qmd_durable_output_repair\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "graphOutputProducer",
+  },
+  {
+    pattern:
       /\/graph_vault\/books\/[^/]+\/output\/lancedb\/[^/]+\.lance\/qmd_row_count\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "artifactValidation",
+  },
+  {
+    pattern:
+      /\/graph_vault\/books\/[^/]+\/graphrag\/output\/lancedb\/[^/]+\.lance\/qmd_row_count\.json$/,
     lane: "checkpointWriterLane",
     durableKind: "json",
     targetMappingOwner: "artifactValidation",
@@ -1030,8 +1126,10 @@ async function appendDurableRecoveryRecord(
   directory: string,
   record: Record<string, unknown>,
 ): Promise<void> {
+  const recoveryDirectory = durableRecoveryRecordDirectory(directory);
+  await mkdir(recoveryDirectory, { recursive: true });
   await appendFile(
-    join(directory, DurableRecoveryLogName),
+    join(recoveryDirectory, DurableRecoveryLogName),
     `${JSON.stringify(record)}\n`,
     "utf8",
   );
@@ -1041,10 +1139,30 @@ function appendDurableRecoveryRecordSync(
   directory: string,
   record: Record<string, unknown>,
 ): void {
+  const recoveryDirectory = durableRecoveryRecordDirectory(directory);
+  mkdirSyncRecursive(recoveryDirectory);
   appendFileSync(
-    join(directory, DurableRecoveryLogName),
+    join(recoveryDirectory, DurableRecoveryLogName),
     `${JSON.stringify(record)}\n`,
     "utf8",
+  );
+}
+
+function durableRecoveryRecordDirectory(directory: string): string {
+  const normalized = directory.split("\\").join("/");
+  const match = /^(.*\/graph_vault)\/books\/([^/]+)(?:\/|$)/u.exec(normalized);
+  if (match == null) return directory;
+  const graphVault = match[1];
+  const bookId = match[2];
+  if (graphVault == null || bookId == null) return directory;
+  const recoveryId = hashText(relative(graphVault, directory)).slice(0, 16);
+  return join(
+    graphVault,
+    ".local",
+    "book-runtime",
+    bookId,
+    "durable-recovery",
+    recoveryId,
   );
 }
 

@@ -8,6 +8,9 @@ import type {
   BookStage,
 } from "../contracts/book-job.js";
 import { resolveVaultRelativePath } from "../vault/path.js";
+import {
+  bookScopedGraphOutputBases,
+} from "../graphrag/book-package-layout.js";
 import { createDeterministicHash, hashFile } from "./fingerprint.js";
 import { hashContent } from "../store.js";
 import {
@@ -682,15 +685,15 @@ function isBookScopedGraphOutputArtifact(
   bookId: string,
   artifact: BookArtifactManifest,
 ): boolean {
-  const base = `books/${bookId}/output`;
+  const bases = bookScopedGraphOutputBases(bookId);
   if (artifact.kind === "lancedb_index") {
-    return artifact.path === `${base}/lancedb`;
+    return bases.some((base) => artifact.path === `${base}/lancedb`);
   }
   if (
     artifact.kind === "graphrag_community_reports_parquet" ||
     artifact.kind.startsWith("graphrag_")
   ) {
-    return artifact.path.startsWith(`${base}/`);
+    return bases.some((base) => artifact.path.startsWith(`${base}/`));
   }
   return true;
 }

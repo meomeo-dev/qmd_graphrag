@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
+  copyFileSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -43,6 +44,29 @@ import { hydrateBatchCheckpoint } from "./batch-checkpoint-hydration.mjs";
 import {
   buildBookDistributionManifest,
 } from "./book-distribution-manifest.mjs";
+import {
+  buildBookHotplugPackage,
+  validateBookHotplugPackage,
+} from "./book-hotplug-package.mjs";
+import {
+  ensureBookCreationGraphTextUnitIdentity,
+} from "./book-hotplug-creation-identity.mjs";
+import {
+  validateHotplugPackagePublishCandidate,
+} from "./book-hotplug-publish-gate.mjs";
+import {
+  removeHotplugPublishMarkerForBookRoot,
+} from "./book-hotplug-publish-marker.mjs";
+import {
+  buildRuntimeGateState,
+  buildPostPublishQualityGate,
+  buildPrePublishQualityGateFailure,
+  graphRagNotQueryReadyFromGate,
+  hotplugRuntimeGatePathForBookRoot,
+  prePublishHotplugQualityGate,
+  qualityGateFailureMessage,
+  validationFailureMessage,
+} from "./book-hotplug-quality-gate.mjs";
 import {
   ClaimPreflightDeferredError,
   claimPreflightBlockerCanDefer,
@@ -395,6 +419,14 @@ const durableTargetMappingTable = [
     preflightScopes: [{ path: "graph_vault/books/{bookId}" }],
   },
   {
+    pattern:
+      /^graph_vault\/books\/[^/]+\/state\/(?:job|artifacts|checkpoints)\.yaml$/,
+    lane: "checkpointWriterLane",
+    durableKind: "yaml",
+    targetMappingOwner: "bookHotplugPackage",
+    preflightScopes: [{ path: "graph_vault/books/{bookId}/state" }],
+  },
+  {
     pattern: /^graph_vault\/books\/[^/]+\/runs\/[^/]+\.yaml$/,
     lane: "checkpointWriterLane",
     durableKind: "yaml",
@@ -524,12 +556,49 @@ const durableTargetMappingTable = [
     preflightScopes: [{ path: "graph_vault/books/{bookId}" }],
   },
   {
+    pattern: /^graph_vault\/books\/[^/]+\/BOOK_MANIFEST\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "bookHotplugPackage",
+    preflightScopes: [{ path: "graph_vault/books/{bookId}" }],
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/PUBLISH_READY\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "bookHotplugPackage",
+    preflightScopes: [{ path: "graph_vault/books/{bookId}" }],
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/state\/hotplug-quality-gate\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "bookHotplugPackage",
+    preflightScopes: [{ path: "graph_vault/books/{bookId}/state" }],
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/state\/hotplug-runtime-gate\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "bookHotplugPackage",
+    preflightScopes: [{ path: "graph_vault/books/{bookId}/state" }],
+  },
+  {
     pattern: /^graph_vault\/books\/[^/]+\/output\/qmd_output_manifest\.json$/,
     lane: "checkpointWriterLane",
     durableKind: "json",
     targetMappingOwner: "graphOutputProducer",
     preflightScopes: [
       { path: "graph_vault/books/{bookId}/output", recursive: true },
+    ],
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/graphrag\/output\/qmd_output_manifest\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "graphOutputProducer",
+    preflightScopes: [
+      { path: "graph_vault/books/{bookId}/graphrag/output", recursive: true },
     ],
   },
   {
@@ -543,12 +612,31 @@ const durableTargetMappingTable = [
     ],
   },
   {
+    pattern:
+      /^graph_vault\/books\/[^/]+\/graphrag\/output\/qmd_graph_text_unit_identity\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "graphOutputProducer",
+    preflightScopes: [
+      { path: "graph_vault/books/{bookId}/graphrag/output", recursive: true },
+    ],
+  },
+  {
     pattern: /^graph_vault\/books\/[^/]+\/output\/context\.json$/,
     lane: "checkpointWriterLane",
     durableKind: "json",
     targetMappingOwner: "graphOutputProducer",
     preflightScopes: [
       { path: "graph_vault/books/{bookId}/output", recursive: true },
+    ],
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/graphrag\/output\/context\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "graphOutputProducer",
+    preflightScopes: [
+      { path: "graph_vault/books/{bookId}/graphrag/output", recursive: true },
     ],
   },
   {
@@ -561,6 +649,35 @@ const durableTargetMappingTable = [
     ],
   },
   {
+    pattern: /^graph_vault\/books\/[^/]+\/graphrag\/output\/stats\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "graphOutputProducer",
+    preflightScopes: [
+      { path: "graph_vault/books/{bookId}/graphrag/output", recursive: true },
+    ],
+  },
+  {
+    pattern:
+      /^graph_vault\/books\/[^/]+\/graphrag\/output\/artifact-metadata\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "bookHotplugPackage",
+    preflightScopes: [
+      { path: "graph_vault/books/{bookId}/graphrag/output", recursive: true },
+    ],
+  },
+  {
+    pattern:
+      /^graph_vault\/books\/[^/]+\/graphrag\/output\/runtime-compatibility\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "bookHotplugPackage",
+    preflightScopes: [
+      { path: "graph_vault/books/{bookId}/graphrag/output", recursive: true },
+    ],
+  },
+  {
     pattern:
       /^graph_vault\/books\/[^/]+\/output\/lancedb\/[^/]+\.lance\/qmd_row_count\.json$/,
     lane: "checkpointWriterLane",
@@ -568,6 +685,16 @@ const durableTargetMappingTable = [
     targetMappingOwner: "artifactValidation",
     preflightScopes: [
       { path: "graph_vault/books/{bookId}/output", recursive: true },
+    ],
+  },
+  {
+    pattern:
+      /^graph_vault\/books\/[^/]+\/graphrag\/output\/lancedb\/[^/]+\.lance\/qmd_row_count\.json$/,
+    lane: "checkpointWriterLane",
+    durableKind: "json",
+    targetMappingOwner: "artifactValidation",
+    preflightScopes: [
+      { path: "graph_vault/books/{bookId}/graphrag/output", recursive: true },
     ],
   },
   {
@@ -643,6 +770,26 @@ const durableDirectoryFsyncScopeTable = [
     pattern: /^graph_vault\/books\/[^/]+\/runs$/,
     lane: "checkpointWriterLane",
     targetMappingOwner: "repository",
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/state$/,
+    lane: "checkpointWriterLane",
+    targetMappingOwner: "bookHotplugPackage",
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/graphrag$/,
+    lane: "checkpointWriterLane",
+    targetMappingOwner: "bookHotplugPackage",
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/graphrag\/runs$/,
+    lane: "checkpointWriterLane",
+    targetMappingOwner: "bookHotplugPackage",
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/graphrag\/output(?:\/.*)?$/,
+    lane: "checkpointWriterLane",
+    targetMappingOwner: "graphOutputProducer",
   },
   {
     pattern: /^graph_vault\/books\/[^/]+\/qmd$/,
@@ -9094,6 +9241,10 @@ function readGraphOutputProducerManifest(path) {
   return legacy.success ? legacy.data : null;
 }
 
+function firstExistingPath(paths) {
+  return paths.find((path) => existsSync(path)) ?? paths[0];
+}
+
 const graphStageArtifactKinds = {
   graph_extract: [
     "graphrag_documents_parquet",
@@ -9128,7 +9279,7 @@ function checkpointArtifactIds(checkpoint) {
 }
 
 function graphRagBookOutputLocator(bookId) {
-  return `books/${bookId}/output`;
+  return `books/${bookId}/graphrag/output`;
 }
 
 function qmdBuildManifestLocator(item) {
@@ -9143,8 +9294,36 @@ function bookDistributionManifestPath(item) {
   return join(stateRoot, "books", item.bookId, "distribution_manifest.json");
 }
 
+function bookManifestPath(item) {
+  return join(stateRoot, "books", item.bookId, "BOOK_MANIFEST.json");
+}
+
+function publishReadyPath(item) {
+  return join(stateRoot, "books", item.bookId, "PUBLISH_READY.json");
+}
+
+function hotplugQualityGatePath(item) {
+  return join(stateRoot, "books", item.bookId, "state", "hotplug-quality-gate.json");
+}
+
+function hotplugRuntimeGatePath(item) {
+  return hotplugRuntimeGatePathForBookRoot(
+    join(stateRoot, "books", item.bookId),
+  );
+}
+
 function graphOutputProducerManifestPath(item) {
-  return join(stateRoot, "books", item.bookId, "output", "qmd_output_manifest.json");
+  return firstExistingPath([
+    join(
+      stateRoot,
+      "books",
+      item.bookId,
+      "graphrag",
+      "output",
+      "qmd_output_manifest.json",
+    ),
+    join(stateRoot, "books", item.bookId, "output", "qmd_output_manifest.json"),
+  ]);
 }
 
 function qmdBuildArtifactId(item, normalizedContentHash) {
@@ -9617,9 +9796,13 @@ function selectValidStageArtifacts({
       invalidReasons.push(`stage_artifact_corpus_mismatch:${stage}`);
       continue;
     }
+    const graphOutputPrefixes = [
+      `books/${item.bookId}/graphrag/output`,
+      `books/${item.bookId}/output`,
+    ];
     const isBookScoped = stage === "embed"
-      ? artifact.path === `books/${item.bookId}/output/lancedb`
-      : artifact.path.startsWith(`books/${item.bookId}/output/`);
+      ? graphOutputPrefixes.some((prefix) => artifact.path === `${prefix}/lancedb`)
+      : graphOutputPrefixes.some((prefix) => artifact.path.startsWith(`${prefix}/`));
     if (!isBookScoped) {
       invalidReasons.push("stage_artifact_not_book_scoped");
       continue;
@@ -9762,23 +9945,24 @@ function validateGraphStageEvidence({
 function graphBuildEvidence(item) {
   const checkedAt = now();
   const checkpointCatalog = readYamlSchemaIfExists(
-    join(stateRoot, "books", item.bookId, "checkpoints.yaml"),
+    firstExistingPath([
+      join(stateRoot, "books", item.bookId, "state", "checkpoints.yaml"),
+      join(stateRoot, "books", item.bookId, "checkpoints.yaml"),
+    ]),
     BookJobCheckpointListSchema,
   );
   const artifactCatalog = readYamlSchemaIfExists(
-    join(stateRoot, "books", item.bookId, "artifacts.yaml"),
+    firstExistingPath([
+      join(stateRoot, "books", item.bookId, "state", "artifacts.yaml"),
+      join(stateRoot, "books", item.bookId, "artifacts.yaml"),
+    ]),
     BookArtifactManifestListSchema,
   );
   const checkpoints = checkpointCatalog?.items ?? [];
   const artifacts = artifactCatalog?.items ?? [];
-  const producerManifestPath = join(
-    stateRoot,
-    "books",
-    item.bookId,
-    "output",
-    "qmd_output_manifest.json",
+  const producer = readGraphOutputProducerManifest(
+    graphOutputProducerManifestPath(item),
   );
-  const producer = readGraphOutputProducerManifest(producerManifestPath);
   const job = readGraphJob(item);
   const expectedStageFingerprints = job?.stageFingerprints ?? producer?.stageFingerprints;
   const expectedProviderFingerprint = job?.providerFingerprint ??
@@ -9888,13 +10072,7 @@ function migrateGraphOutputProducerManifests(items = discoverItems(), checkpoint
     ) {
       continue;
     }
-    const manifestPath = join(
-      stateRoot,
-      "books",
-      item.bookId,
-      "output",
-      "qmd_output_manifest.json",
-    );
+    const manifestPath = graphOutputProducerManifestPath(item);
     if (!existsSync(manifestPath)) continue;
     let parsed;
     try {
@@ -9906,13 +10084,11 @@ function migrateGraphOutputProducerManifests(items = discoverItems(), checkpoint
     const expectedLocator = graphRagBookOutputLocator(item.bookId);
     if (parsed.outputDir === expectedLocator) continue;
     const resolvedOutputDir = resolve(parsed.outputDir);
-    const expectedOutputDir = resolve(
-      stateRoot,
-      "books",
-      item.bookId,
-      "output",
-    );
-    if (resolvedOutputDir !== expectedOutputDir) continue;
+    const expectedOutputDirs = [
+      resolve(stateRoot, "books", item.bookId, "output"),
+      resolve(stateRoot, "books", item.bookId, "graphrag", "output"),
+    ];
+    if (!expectedOutputDirs.includes(resolvedOutputDir)) continue;
     const migrated = GraphRagOutputProducerManifestSchema.parse({
       ...parsed,
       outputDir: expectedLocator,
@@ -9993,8 +10169,37 @@ function bookScopedNormalizedPath(item) {
   return join(stateRoot, "books", item.bookId, "input", basename(item.normalizedPath));
 }
 
+function ensureBookSourceClosure(item) {
+  const sourcePath = absoluteRuntimePath(item.sourceRelativePath);
+  if (!existsSync(sourcePath)) {
+    throw new Error(`book source closure missing: ${item.sourceRelativePath}`);
+  }
+  if (sha256File(sourcePath) !== item.sourceHash) {
+    throw new Error(`book source closure hash mismatch: ${item.sourceRelativePath}`);
+  }
+  const targetPath = join(stateRoot, "sources", item.bookId, "source.epub");
+  mkdirSync(dirname(targetPath), { recursive: true });
+  if (!existsSync(targetPath) || sha256File(targetPath) !== item.sourceHash) {
+    copyFileSync(sourcePath, targetPath);
+  }
+  return targetPath;
+}
+
+function ensureBookCreationHotplugQualityInputs(item) {
+  ensureBookCreationGraphTextUnitIdentity({
+    stateRoot,
+    bookId: item.bookId,
+    sourceHash: item.sourceHash,
+    normalizedPath: item.normalizedPath,
+    runnerSessionId,
+    allowTestFallback: process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS === "1",
+  });
+}
+
 function writeBookDistributionManifest(item, options = {}) {
   if (statusJson) return null;
+  ensureBookSourceClosure(item);
+  ensureBookCreationHotplugQualityInputs(item);
   const producer = readGraphOutputProducerManifest(graphOutputProducerManifestPath(item));
   const manifest = buildBookDistributionManifest({
     stateRoot,
@@ -10023,6 +10228,153 @@ function writeBookDistributionManifest(item, options = {}) {
     });
   }
   return parsed;
+}
+
+function writeBookHotplugPackage(item, options = {}) {
+  if (statusJson) return null;
+  const preGate = prePublishHotplugQualityGate({
+    stateRoot,
+    bookId: item.bookId,
+  });
+  if (!preGate.mayGenerateBookManifest) {
+    writeJsonAtomicWithValue(
+      hotplugQualityGatePath(item),
+      buildPrePublishQualityGateFailure({
+        bookId: item.bookId,
+        gate: preGate,
+        checkedAt: now(),
+      }),
+    );
+    throw new Error(qualityGateFailureMessage(item.bookId, preGate.diagnostics));
+  }
+  const { manifest, publishReady } = buildBookHotplugPackage({
+    stateRoot,
+    bookId: item.bookId,
+    sourceHash: item.sourceHash,
+    sourceRelativePath: item.sourceRelativePath,
+    forceGraphRagNotQueryReady: graphRagNotQueryReadyFromGate(preGate),
+    now,
+  });
+  const parsedManifest = withoutUndefined(manifest);
+  const parsedPublishReady = withoutUndefined(publishReady);
+  const candidateValidation = validateHotplugPackagePublishCandidate({
+    stateRoot,
+    bookId: item.bookId,
+    manifest: parsedManifest,
+    publishReady: parsedPublishReady,
+  });
+  if (!candidateValidation.ok) {
+    const qualityGate = buildPostPublishQualityGate({
+      bookId: item.bookId,
+      gate: preGate,
+      validation: candidateValidation,
+      manifest: parsedManifest,
+      checkedAt: now(),
+      phase: "pre_live_publish_package_validation",
+    });
+    writeJsonAtomicWithValue(hotplugQualityGatePath(item), qualityGate);
+    writeJsonAtomicWithValue(
+      hotplugRuntimeGatePath(item),
+      buildRuntimeGateState({
+        bookId: item.bookId,
+        gate: preGate,
+        validation: candidateValidation,
+        manifest: parsedManifest,
+        checkedAt: now(),
+        candidateValidationOk: false,
+      }),
+    );
+    throw new Error(
+      validationFailureMessage(item.bookId, candidateValidation.diagnostics),
+    );
+  }
+  const bookRoot = join(stateRoot, "books", item.bookId);
+  removeHotplugPublishMarkerForBookRoot(bookRoot);
+  writeJsonAtomicWithValue(bookManifestPath(item), parsedManifest);
+  const validation = candidateValidation;
+  const qualityGate = buildPostPublishQualityGate({
+    bookId: item.bookId,
+    gate: preGate,
+    validation,
+    manifest: parsedManifest,
+    checkedAt: now(),
+  });
+  if (!validation.ok) {
+    removeHotplugPublishMarkerForBookRoot(bookRoot);
+    writeJsonAtomicWithValue(hotplugQualityGatePath(item), qualityGate);
+    writeJsonAtomicWithValue(
+      hotplugRuntimeGatePath(item),
+      buildRuntimeGateState({
+        bookId: item.bookId,
+        gate: preGate,
+        validation,
+        manifest: parsedManifest,
+        checkedAt: now(),
+        candidateValidationOk: true,
+      }),
+    );
+    throw new Error(validationFailureMessage(item.bookId, validation.diagnostics));
+  }
+  writeJsonAtomicWithValue(hotplugQualityGatePath(item), qualityGate);
+  writeJsonAtomicWithValue(
+    hotplugRuntimeGatePath(item),
+    buildRuntimeGateState({
+      bookId: item.bookId,
+      gate: preGate,
+      validation,
+      manifest: parsedManifest,
+      checkedAt: now(),
+      candidateValidationOk: true,
+    }),
+  );
+  writeJsonAtomicWithValue(publishReadyPath(item), parsedPublishReady);
+  const publishedValidation = validateBookHotplugPackage({ bookRoot });
+  if (!publishedValidation.ok) {
+    removeHotplugPublishMarkerForBookRoot(bookRoot);
+    writeJsonAtomicWithValue(
+      hotplugQualityGatePath(item),
+      buildPostPublishQualityGate({
+        bookId: item.bookId,
+        gate: preGate,
+        validation: publishedValidation,
+        manifest: parsedManifest,
+        checkedAt: now(),
+        phase: "post_live_publish_package_validation",
+      }),
+    );
+    writeJsonAtomicWithValue(
+      hotplugRuntimeGatePath(item),
+      buildRuntimeGateState({
+        bookId: item.bookId,
+        gate: preGate,
+        validation: publishedValidation,
+        manifest: parsedManifest,
+        checkedAt: now(),
+        candidateValidationOk: true,
+      }),
+    );
+    throw new Error(
+      validationFailureMessage(item.bookId, publishedValidation.diagnostics),
+    );
+  }
+  if (options.emitEvent !== false) {
+    event({
+      itemId: item.itemId,
+      event: "book_hotplug_manifest_written",
+      status: options.status ?? "completed",
+      metadata: {
+        bookId: item.bookId,
+        manifestLocator: relative(root, bookManifestPath(item)),
+        publishReadyLocator: relative(root, publishReadyPath(item)),
+        qualityGateLocator: relative(root, hotplugQualityGatePath(item)),
+        fileCount: parsedManifest.files?.length ?? 0,
+        packageGeneration: parsedManifest.identity?.packageGeneration,
+        copyDistributionAllowed: qualityGate.copyDistributionAllowed,
+        graphRagReadyState: qualityGate.graphRagReadyState,
+      },
+    });
+  }
+  return parsedManifest;
 }
 
 function writeQmdBuildManifest(item, commandChecks) {
@@ -12406,6 +12758,7 @@ async function runItem(item, checkpoint, options = {}) {
     );
   }
   writeBookDistributionManifest(resolvedItem, { status: "completed" });
+  writeBookHotplugPackage(resolvedItem, { status: "completed" });
   const terminalFinalization = buildTerminalFinalizationFence(checkpoint);
   const completed = {
     ...checkpoint,
@@ -13753,6 +14106,10 @@ async function main() {
       }
       if (checkpoint?.status === "completed") {
         writeBookDistributionManifest(activeItem, {
+          status: "completed",
+          emitEvent: false,
+        });
+        writeBookHotplugPackage(activeItem, {
           status: "completed",
           emitEvent: false,
         });

@@ -11,6 +11,7 @@ import type { BookStage } from "../contracts/book-job.js";
 import { writeJsonFileDurableSync } from "../job-state/durable-state-store.js";
 import { resolveProjectPath } from "../utils/package-paths.js";
 import { sanitizeVaultText } from "../vault/metadata.js";
+import { projectDotenvEnvOverlay } from "../env/project-dotenv.js";
 
 export type PythonBridgeEarlyStop = {
   kind: "graphrag_stage_report";
@@ -329,6 +330,15 @@ export async function callPythonBridge<TRequest, TResponse>(
     (existsSync(bundledPython) ? bundledPython : undefined) ||
     process.env.PYTHON ||
     "python3";
+  const dotenvOverlay = projectDotenvEnvOverlay(
+    options.workingDirectory ?? process.cwd(),
+    [
+      "OPENAI_API_KEY",
+      "OPENAI_BASE_URL",
+      "JINA_API_KEY",
+      "JINA_API_BASE",
+    ],
+  );
 
   return new Promise<TResponse>((resolve, reject) => {
     const subprocessId = `python-bridge-${randomUUID()}`;
@@ -336,6 +346,10 @@ export async function callPythonBridge<TRequest, TResponse>(
     const processGroup = pythonBridgeUsesProcessGroup();
     const child = spawn(pythonBin, [scriptPath, options.command], {
       cwd: options.workingDirectory,
+      env: {
+        ...process.env,
+        ...dotenvOverlay,
+      },
       stdio: ["pipe", "pipe", "pipe"],
       detached: processGroup,
     });

@@ -7,17 +7,47 @@ import type {
 } from "../contracts/qmd-query.js";
 import {
   EvidenceRefSchema,
+  type EvidenceLocator,
   UnifiedAnswerSchema,
   type EvidenceRef,
   type QueryRouteDecision,
   type UnifiedAnswer,
 } from "../contracts/unified-query.js";
 import { sanitizeVaultMetadata } from "../vault/metadata.js";
+import {
+  hasAbsolutePathSyntax,
+  isPortableVaultRelativePath,
+} from "../vault/path.js";
 
 function sanitizeGraphRagMetadata(
   metadata?: Record<string, JsonValue>,
 ): Record<string, JsonValue> | undefined {
   return sanitizeVaultMetadata(metadata);
+}
+
+function isSafeLocatorUri(uri: string): boolean {
+  return /^(?:urn|doi):[A-Za-z0-9][A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]*$/iu
+    .test(uri);
+}
+
+function sanitizeGraphRagLocator(
+  locator: GraphRagQueryResponse["evidence"][number]["locator"],
+): EvidenceLocator | null {
+  if (locator == null) return null;
+  const safeLocator: EvidenceLocator = {};
+  if (
+    typeof locator.path === "string" &&
+    !hasAbsolutePathSyntax(locator.path) &&
+    isPortableVaultRelativePath(locator.path)
+  ) {
+    safeLocator.path = locator.path.replaceAll("\\", "/");
+  }
+  if (typeof locator.uri === "string" && isSafeLocatorUri(locator.uri)) {
+    safeLocator.uri = locator.uri;
+  }
+  if (locator.lineStart != null) safeLocator.lineStart = locator.lineStart;
+  if (locator.lineEnd != null) safeLocator.lineEnd = locator.lineEnd;
+  return Object.keys(safeLocator).length > 0 ? safeLocator : null;
 }
 
 export function buildEvidenceRefsFromQmdResults(
@@ -91,8 +121,8 @@ export function buildEvidenceRefsFromGraphRagResponse(
       bookId: item.bookId,
       graphTextUnitId: item.graphTextUnitId ?? null,
       artifactId: item.artifactId ?? null,
-      locator: item.locator ?? null,
-      quote: item.quote,
+      locator: sanitizeGraphRagLocator(item.locator),
+      ...(item.quote == null ? {} : { quote: item.quote }),
       score: item.score,
       metadata: sanitizeGraphRagMetadata(item.metadata),
     }),

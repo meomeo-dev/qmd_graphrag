@@ -12,6 +12,9 @@ import {
   type QmdRetrievalCandidate,
 } from "../contracts/qmd-query.js";
 import {
+  ensureCatalogProjectionFromBookHotplugPackages,
+} from "../graphrag/book-hotplug-catalog.js";
+import {
   QMD_SQLITE_NORMALIZATION_POLICY_VERSION,
   buildQmdChunkLineageId,
   projectQmdDocumentLineage,
@@ -64,7 +67,16 @@ export async function loadDocumentIdentitiesFromGraphVault(
     const raw = await readFile(catalogPath, "utf8");
     return DocumentIdentityCatalogSchema.parse(YAML.parse(raw)).items;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      await ensureCatalogProjectionFromBookHotplugPackages(graphVault);
+      try {
+        const raw = await readFile(catalogPath, "utf8");
+        return DocumentIdentityCatalogSchema.parse(YAML.parse(raw)).items;
+      } catch (retryError) {
+        if ((retryError as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw new GraphVaultCatalogError(catalogPath, retryError);
+      }
+    }
     throw new GraphVaultCatalogError(catalogPath, error);
   }
 }

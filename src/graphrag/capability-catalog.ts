@@ -1,3 +1,4 @@
+import { existsSync, readdirSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
@@ -34,6 +35,24 @@ import {
   updateYamlUnknownDurable,
 } from "../job-state/durable-state-store.js";
 import { sanitizeVaultMetadata } from "../vault/metadata.js";
+import {
+  ensureCatalogProjectionFromBookHotplugPackages,
+  rebuildCatalogFromBookHotplugPackages,
+} from "./book-hotplug-catalog.js";
+import { readHotplugPackageUnknown } from "./book-hotplug-package-readonly.js";
+import {
+  listPublishedHotplugBookIds,
+  projectHotplugBookJob,
+  projectHotplugDocumentIdentity,
+} from "./book-hotplug-package-projection.js";
+import { validateHotplugRuntimeQueryGate } from "./book-hotplug-runtime-gate.js";
+import {
+  resolveBookManifestPath,
+  resolveBookPublishReadyPath,
+  resolveBookRunDir,
+  resolveBookStateFile,
+  rewriteLegacyGraphArtifactPath,
+} from "./book-package-layout.js";
 
 const QUERY_READY_PRODUCER_REQUIRED_KINDS = {
   graph_extract: GRAPH_EXTRACT_CORE_ARTIFACT_KINDS,
@@ -192,16 +211,38 @@ async function loadRunRecordCandidates(
   graphVault: string,
   book: BookJob,
 ): Promise<CheckpointCandidate[]> {
+  const runDir = resolveBookRunDir(graphVault, book.bookId);
+  const records: Array<BookJobRunRecord | null> = [];
+  if (existsSync(runDir)) {
+    const runFiles = readdirSync(runDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".yaml"))
+      .map((entry) => entry.name)
+      .sort((left, right) => left.localeCompare(right));
+    for (const runFile of runFiles) {
+      const raw = await readPackageYaml(join(runDir, runFile));
+      const result = BookJobRunRecordSchema.safeParse(raw);
+      records.push(
+        result.success && result.data.bookId === book.bookId
+          ? result.data
+          : null,
+      );
+    }
+  }
+  if (records.some((record) => record != null)) {
+    return records
+      .filter((record): record is BookJobRunRecord => record != null)
+      .map((record) => runRecordToCheckpointCandidate(record, book));
+  }
+
   const catalogRaw = await readYaml(join(graphVault, "catalog", "runs.yaml"));
   const catalogResult = BookJobRunCatalogSchema.safeParse(catalogRaw);
   if (!catalogResult.success) return [];
 
-  const records: Array<BookJobRunRecord | null> = [];
   for (const item of catalogResult.data.items.filter((entry) =>
     entry.bookId === book.bookId
   )) {
-    const raw = await readYaml(
-      join(graphVault, "books", book.bookId, "runs", `${item.runId}.yaml`),
+    const raw = await readPackageYaml(
+      join(resolveBookRunDir(graphVault, book.bookId), `${item.runId}.yaml`),
     );
     const result = BookJobRunRecordSchema.safeParse(raw);
     records.push(result.success ? result.data : null);
@@ -215,8 +256,8 @@ async function loadCheckpointCandidates(
   graphVault: string,
   book: BookJob,
 ): Promise<CheckpointCandidate[] | null> {
-  const checkpointsRaw = await readYaml(
-    join(graphVault, "books", book.bookId, "checkpoints.yaml"),
+  const checkpointsRaw = await readPackageYaml(
+    resolveBookStateFile(graphVault, book.bookId, "checkpoints.yaml"),
   );
   const checkpointsResult = BookJobCheckpointListSchema.safeParse(checkpointsRaw);
   if (!checkpointsResult.success) return null;
@@ -232,8 +273,8 @@ async function loadCurrentCheckpointCandidates(
   graphVault: string,
   bookId: string,
 ): Promise<CheckpointCandidate[] | null> {
-  const checkpointsRaw = await readYaml(
-    join(graphVault, "books", bookId, "checkpoints.yaml"),
+  const checkpointsRaw = await readPackageYaml(
+    resolveBookStateFile(graphVault, bookId, "checkpoints.yaml"),
   );
   const checkpointsResult = BookJobCheckpointListSchema.safeParse(checkpointsRaw);
   if (!checkpointsResult.success) return null;
@@ -345,8 +386,24 @@ type CapabilityScope = {
   sourceIds: ReadonlySet<string>;
 };
 
+async function loadBookForQueryReadyLineage(
+  graphVault: string,
+  bookId: string,
+): Promise<BookJob | null> {
+  const hotplugBook = await projectHotplugBookJob(graphVault, bookId);
+  if (hotplugBook != null) return hotplugBook;
+  const booksRaw = await readYaml(join(graphVault, "catalog", "books.yaml"));
+  const booksResult = BookJobCatalogSchema.safeParse(booksRaw);
+  if (!booksResult.success) return null;
+  return booksResult.data.items.find((item) => item.bookId === bookId) ?? null;
+}
+
 async function readYaml(path: string): Promise<unknown | null> {
   return readYamlUnknownDurable(path);
+}
+
+async function readPackageYaml(path: string): Promise<unknown | null> {
+  return readHotplugPackageUnknown(path);
 }
 
 async function readYamlUnlocked(path: string): Promise<unknown | null> {
@@ -428,14 +485,38 @@ function methodCapabilities(
   ];
 }
 
+async function hasQueryReadyHotplugPackage(graphVault: string): Promise<boolean> {
+  const booksDir = join(graphVault, "books");
+  if (!existsSync(booksDir)) return false;
+  const bookIds = readdirSync(booksDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort((left, right) => left.localeCompare(right));
+  for (const bookId of bookIds) {
+    if (!existsSync(resolveBookPublishReadyPath(graphVault, bookId))) continue;
+    const manifest = await readPackageYaml(
+      resolveBookManifestPath(graphVault, bookId),
+    );
+    if (
+      manifest != null &&
+      typeof manifest === "object" &&
+      (manifest as { kind?: unknown }).kind === "qmd_graphrag_book_package" &&
+      (manifest as { graphrag?: { queryReady?: unknown } }).graphrag
+        ?.queryReady === true
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export async function projectQueryReadyLineage(
   graphVault: string,
   bookId: string,
 ): Promise<QueryReadyLineageProjection | null> {
-  const booksRaw = await readYaml(join(graphVault, "catalog", "books.yaml"));
-  const booksResult = BookJobCatalogSchema.safeParse(booksRaw);
-  if (!booksResult.success) return null;
-  const book = booksResult.data.items.find((item) => item.bookId === bookId);
+  const runtimeGate = await validateHotplugRuntimeQueryGate({ graphVault, bookId });
+  if (!runtimeGate.ok) return null;
+  const book = await loadBookForQueryReadyLineage(graphVault, bookId);
   if (
     book == null ||
     book.stageFingerprints == null ||
@@ -444,11 +525,16 @@ export async function projectQueryReadyLineage(
     return null;
   }
 
-  const artifactsRaw = await readYaml(join(graphVault, "books", bookId, "artifacts.yaml"));
+  const artifactsRaw = await readPackageYaml(
+    resolveBookStateFile(graphVault, bookId, "artifacts.yaml"),
+  );
   if (artifactsRaw == null) return null;
   const artifactsResult = BookArtifactManifestListSchema.safeParse(artifactsRaw);
   if (!artifactsResult.success) return null;
-  const artifacts = artifactsResult.data.items;
+  const artifacts = artifactsResult.data.items.map((artifact) => ({
+    ...artifact,
+    path: rewriteLegacyGraphArtifactPath(bookId, artifact.path),
+  }));
   const currentCheckpoints = await loadCurrentCheckpointCandidates(graphVault, bookId);
   if (currentCheckpoints == null) return null;
   const candidates = await loadCheckpointCandidates(graphVault, book);
@@ -651,15 +737,33 @@ async function deriveCapabilitiesFromBookState(
   graphVault: string,
   scope: CapabilityScope,
 ): Promise<GraphCapability[]> {
-  const booksRaw = await readYaml(join(graphVault, "catalog", "books.yaml"));
-  if (booksRaw == null) return [];
-  const books = BookJobCatalogSchema.parse(booksRaw).items;
-  const identityRaw = await readYaml(
-    join(graphVault, "catalog", "document-identity-map.yaml"),
-  );
-  const identities = identityRaw == null
+  const hotplugBookIds = await listPublishedHotplugBookIds(graphVault);
+  const hotplugBooks = (
+    await Promise.all(hotplugBookIds.map((bookId) =>
+      projectHotplugBookJob(graphVault, bookId)
+    ))
+  ).filter((book): book is BookJob => book != null);
+  const booksRaw = hotplugBooks.length > 0
+    ? null
+    : await readYaml(join(graphVault, "catalog", "books.yaml"));
+  const books = hotplugBooks.length > 0
+    ? hotplugBooks
+    : booksRaw == null
+      ? []
+      : BookJobCatalogSchema.parse(booksRaw).items;
+  const identityRaw = hotplugBooks.length > 0
+    ? null
+    : await readYaml(join(graphVault, "catalog", "document-identity-map.yaml"));
+  const catalogIdentities = identityRaw == null
     ? []
     : DocumentIdentityCatalogSchema.parse(identityRaw).items;
+  const hotplugIdentities = new Map(
+    (await Promise.all(books.map((book) =>
+      projectHotplugDocumentIdentity(graphVault, book.bookId)
+    )))
+      .filter((identity): identity is DocumentIdentityMap => identity != null)
+      .map((identity) => [identity.canonicalBookId, identity]),
+  );
   const capabilities: GraphCapability[] = [];
 
   for (const book of books) {
@@ -679,13 +783,14 @@ async function deriveCapabilitiesFromBookState(
 
     const expectedContentHash = book.normalizedContentHash ?? book.sourceHash;
     const expectedSourceId = `sha256:${book.sourceHash}`;
-    const identity = identities.find((item) =>
-      item.canonicalBookId === book.bookId &&
-      item.sourceId === expectedSourceId &&
-      item.sourceHash === book.sourceHash &&
-      item.documentId === book.documentId &&
-      item.contentHash === expectedContentHash
-    );
+    const identity = hotplugIdentities.get(book.bookId) ??
+      catalogIdentities.find((item) =>
+        item.canonicalBookId === book.bookId &&
+        item.sourceId === expectedSourceId &&
+        item.sourceHash === book.sourceHash &&
+        item.documentId === book.documentId &&
+        item.contentHash === expectedContentHash
+      );
     if (
       identity == null ||
       identity.metadata?.qmdCorpusRegistered !== true ||
@@ -701,6 +806,9 @@ async function deriveCapabilitiesFromBookState(
     const sourceName = typeof book.metadata?.sourceName === "string"
       ? book.metadata.sourceName
       : undefined;
+    const projectionSource = hotplugIdentities.has(book.bookId)
+      ? "book_hotplug_manifest"
+      : "book_state";
 
     capabilities.push(...methodCapabilities({
       schemaVersion: SchemaVersion,
@@ -713,7 +821,7 @@ async function deriveCapabilitiesFromBookState(
       artifactIds: lineageArtifactIds,
       createdAt: new Date(0).toISOString(),
       metadata: sanitizeVaultMetadata({
-        projectionSource: "book_state",
+        projectionSource,
         ...(sourceName ? { sourceName } : {}),
       }),
     }));
@@ -722,14 +830,21 @@ async function deriveCapabilitiesFromBookState(
   return capabilities;
 }
 
-export async function loadGraphCapabilities(
-  input: ResolveGraphCapabilitiesInput,
+function filterCapabilitiesByScope(
+  capabilities: readonly GraphCapability[],
+  scope: CapabilityScope,
+): GraphCapability[] {
+  return capabilities
+    .filter((capability) => capability.ready)
+    .filter((capability) =>
+      matchesRequestedScope(capability, scope.bookIds, scope.documentIds, scope.sourceIds)
+    );
+}
+
+async function loadGraphCapabilitiesFromProjection(
+  graphVault: string,
+  scope: CapabilityScope,
 ): Promise<GraphCapability[]> {
-  const graphVault = resolve(input.graphVault);
-  const bookIds = normalizeIdentitySet(input.bookIds);
-  const documentIds = normalizeIdentitySet(input.documentIds);
-  const sourceIds = normalizeIdentitySet(input.sourceIds);
-  const scope = { bookIds, documentIds, sourceIds };
   const explicit = await loadExplicitCapabilityCatalog(graphVault);
   const [derived, validatedExplicit] = await Promise.all([
     deriveCapabilitiesFromBookState(graphVault, scope),
@@ -751,11 +866,26 @@ export async function loadGraphCapabilities(
   }
   const capabilities = [...byCapabilityId.values()];
 
-  return capabilities
-    .filter((capability) => capability.ready)
-    .filter((capability) =>
-      matchesRequestedScope(capability, bookIds, documentIds, sourceIds)
-    );
+  return filterCapabilitiesByScope(capabilities, scope);
+}
+
+export async function loadGraphCapabilities(
+  input: ResolveGraphCapabilitiesInput,
+): Promise<GraphCapability[]> {
+  const graphVault = resolve(input.graphVault);
+  await ensureCatalogProjectionFromBookHotplugPackages(graphVault);
+  const bookIds = normalizeIdentitySet(input.bookIds);
+  const documentIds = normalizeIdentitySet(input.documentIds);
+  const sourceIds = normalizeIdentitySet(input.sourceIds);
+  const scope = { bookIds, documentIds, sourceIds };
+  const capabilities = await loadGraphCapabilitiesFromProjection(graphVault, scope);
+  if (capabilities.length > 0 || !(await hasQueryReadyHotplugPackage(graphVault))) {
+    return capabilities;
+  }
+  const rebuilt = await rebuildCatalogFromBookHotplugPackages(graphVault);
+  const rebuiltCapabilities = filterCapabilitiesByScope(rebuilt.capabilities, scope);
+  if (rebuiltCapabilities.length > 0) return rebuiltCapabilities;
+  return loadGraphCapabilitiesFromProjection(graphVault, scope);
 }
 
 export async function loadGraphQueryCapabilities(
