@@ -1,0 +1,96 @@
+{
+  "schemaVersion": "1.0.0",
+  "taskId": "graphrag-book-output-context-checksum-missing",
+  "runId": "20260529_r1",
+  "status": "open",
+  "phase": "design_audit_passed",
+  "triggeredBy": {
+    "batchRunId": "epub-batch-20260529-203000-full-real",
+    "failedStage": "runner_start",
+    "failure": "durable checksum missing for book output context.json during read-only runner_start preflight",
+    "primaryTarget": "graph_vault/books/book-9f587b71073a-ad95ce2f/output/context.json",
+    "sidecarTarget": "graph_vault/books/book-9f587b71073a-ad95ce2f/output/context.json.sha256"
+  },
+  "observedAt": "2026-05-30T03:28:21.485Z",
+  "observedEvidence": {
+    "manifest": "graph_vault/catalog/batch-runs/epub-batch-20260529-203000-full-real/manifest.json",
+    "status": "graph_vault/catalog/batch-runs/epub-batch-20260529-203000-full-real/status.json",
+    "recoverySummary": "graph_vault/catalog/batch-runs/epub-batch-20260529-203000-full-real/recovery-summary.json",
+    "events": "graph_vault/catalog/batch-runs/epub-batch-20260529-203000-full-real/events.jsonl"
+  },
+  "observedCounts": {
+    "totalItems": 38,
+    "pendingItems": 38,
+    "completedItems": 0,
+    "failedItems": 0,
+    "activeProviderSlots": 0,
+    "activeSubprocesses": 0,
+    "activeBookLeases": 0,
+    "startupScopeCount": 162,
+    "startupTargetCount": 222,
+    "startupDegradedTargetCount": 197,
+    "startupMutationCount": 0
+  },
+  "primaryFailure": {
+    "failureKind": "local_state_integrity",
+    "localFailureClass": "durable_checksum_missing",
+    "recoveryDecision": "stop_until_fixed",
+    "failedStage": "runner_start",
+    "targetLocator": "graph_vault/books/book-9f587b71073a-ad95ce2f/output/context.json",
+    "sidecarTargetLocator": "graph_vault/books/book-9f587b71073a-ad95ce2f/output/context.json.sha256",
+    "sidecarKind": "checksum",
+    "lane": "checkpointWriterLane",
+    "targetMappingOwner": "graphOutputProducer",
+    "durableMode": "read_only_blocking_diagnostic",
+    "normalRunnerAction": "no_book_scoped_mutation",
+    "nextOperatorAction": "run_explicit_repair"
+  },
+  "designAnchor": {
+    "path": "docs/architecture/graphrag-parallel-runner.type-dd.yaml",
+    "relevantRules": [
+      "runner_start read-only blocking diagnostic for book-scoped durable targets",
+      "explicit repair or migrate-only boundary for book-scoped durable repair",
+      "checksum sidecar and checksum meta recovery",
+      "normal runner mutation budget for book-scoped targets is zero"
+    ]
+  },
+  "requiredLoop": {
+    "designAuditAgents": 3,
+    "fixedAuditScope": "book output context.json missing checksum sidecar blocks runner_start",
+    "nextStep": "repair migrate-only boundary implementation, then run implementation audit"
+  },
+  "createdAt": "2026-05-30T03:33:00.000Z",
+  "designAudit": {
+    "run": "r1",
+    "verdict": "pass",
+    "completedAt": "2026-05-30T03:39:36.720Z",
+    "fixedAuditScope": "book output context.json missing checksum sidecar blocks runner_start",
+    "agents": [
+      {
+        "agentId": "agent-a",
+        "verdict": "pass",
+        "report": "audits/graphrag-book-output-context-checksum-missing-run_20260529_r1__open/agent-a/design-audit-r1.md"
+      },
+      {
+        "agentId": "agent-b",
+        "verdict": "pass",
+        "report": "audits/graphrag-book-output-context-checksum-missing-run_20260529_r1__open/agent-b/design-audit-r1.md"
+      },
+      {
+        "agentId": "agent-c",
+        "verdict": "pass",
+        "report": "audits/graphrag-book-output-context-checksum-missing-run_20260529_r1__open/agent-c/design-audit-r1.md"
+      }
+    ],
+    "decision": "continue implementation under existing Type DD; no Type DD patch required",
+    "designAnchor": {
+      "path": "docs/architecture/graphrag-parallel-runner.type-dd.yaml",
+      "relevantRules": [
+        "runner_start read-only blocking diagnostic for book-scoped durable targets",
+        "explicit repair or migrate-only boundary for book-scoped durable repair",
+        "checksum sidecar and checksum meta recovery",
+        "normal runner mutation budget for book-scoped targets is zero"
+      ]
+    }
+  }
+}
