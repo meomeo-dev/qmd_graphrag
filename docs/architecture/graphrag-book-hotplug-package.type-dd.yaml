@@ -119,9 +119,9 @@ currentStateSnapshot:
   observedAt: "2026-06-03"
   vaultRoot: graph_vault
   booksDirectory: graph_vault/books
-  observedBookDirectoryCount: 72
+  observedBookDirectoryCount: 38
   implementationVerification:
-    backfillRunId: hotplug-backfill-20260603012939480
+    backfillRunId: hotplug-backfill-20260603104306017
     command: >
       node scripts/graphrag/backfill-hotplug-packages.mjs
       --state-root graph_vault --only-missing --rebuild-catalog --fail-fast
@@ -132,14 +132,14 @@ currentStateSnapshot:
       packageResultsValid: 38
       catalogBookCount: 38
       catalogIdentityCount: 38
-      catalogCapabilityCount: 30
+      catalogCapabilityCount: 38
     packageValidation:
       mountedHotplugPackages: 38
       validateBookHotplugPackagePassed: 38
       qualityGatePassed: 38
       runtimeGatePresent: 38
-      queryReady: 30
-      visibleNotQueryReady: 8
+      queryReady: 38
+      visibleNotQueryReady: 0
   currentCompletedRun:
     runId: epub-batch-20260530235947-full-real-env-clean
     completedBookCount: 38
@@ -329,6 +329,12 @@ atomicPackageLifecycle:
       book only after validateBookHotplugPackage passes and the gate records
       copyDistributionAllowed=true. If validation fails, the rerun fails closed
       and writes a failed quality gate.
+    refreshRule: >
+      --force is verify-only for an already valid package. --refresh-existing is
+      required to rebuild an existing BOOK_MANIFEST.json after package-local
+      evidence changes, such as restored producer run records. The refreshed
+      package must pass live validation before PUBLISH_READY.json remains
+      visible.
     publishFailureRule: >
       A failed candidate or live validation removes PUBLISH_READY.json and its
       sidecars before raising a failure, preventing accidental mount or copy

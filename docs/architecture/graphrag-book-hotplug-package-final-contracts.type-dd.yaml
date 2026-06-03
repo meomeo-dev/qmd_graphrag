@@ -788,6 +788,16 @@ producerCreationQualityGateContract:
       failOutcome: >
         Remove publish marker on live validation failure and report bounded
         diagnostics.
+    refreshExistingPackage:
+      phase: backfill_package_validation
+      passCondition: >
+        Explicit --refresh-existing rebuilds an already valid package manifest
+        after local package evidence has changed, then validates the rebuilt
+        BOOK_MANIFEST.json and PUBLISH_READY.json before publication. Plain
+        --force remains verify-only for existing valid packages.
+      failOutcome: >
+        Remove publish marker on live validation failure, keep diagnostics
+        bounded, and do not project a refreshed package into catalog.
   evidenceFiles:
   - state/hotplug-quality-gate.json
   - state/hotplug-quality-gate.json.sha256
@@ -812,17 +822,18 @@ producerCreationQualityGateContract:
     - existing package validation fails during --only-missing resume
     - forbidden sensitive material is present in package root
   implementationEvidence:
-    realBackfillRun: hotplug-backfill-20260603012939480
+    realBackfillRun: hotplug-backfill-20260603104306017
     observedBooks: 38
     verifiedAlreadyMigrated: 38
     failed: 0
     catalogProjection:
       bookCount: 38
       identityCount: 38
-      capabilityCount: 30
+      capabilityCount: 38
     tests:
     - test/graphrag-book-hotplug-backfill.test.ts
     - test/graphrag-book-hotplug-catalog.test.ts
+    - test/graphrag-book-hotplug-refresh-existing.test.ts
 qmdAvailabilityReasonMatrix:
   principle: 'qmd availability is a reasoned state matrix, not only a small list of state
     names. Each state fixes mount visibility, GraphRAG-only query, qmd retrieval, rebuild

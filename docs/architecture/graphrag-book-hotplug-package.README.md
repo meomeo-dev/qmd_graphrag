@@ -61,14 +61,20 @@ GraphRAG/qmd 产物，但在 `--only-missing` 跳过前必须通过
 这些 gate 文件是包内可复制的质量证据，但不进入 `BOOK_MANIFEST.files`
 文件闭包，因此刷新 gate 不改变 `packageGeneration`。
 
+默认 `--force` 对已有效的书包仍是验证模式（verify-only）。当恢复了
+包内 producer run evidence、需要重算 `BOOK_MANIFEST.json` 的
+`queryReady` 状态时，必须显式使用 `--refresh-existing`，刷新后仍需
+通过 live package validation 才会保留 `PUBLISH_READY.json`。
+
 真实 vault 检查点：
 
-- backfill run: `hotplug-backfill-20260603012939480`
+- backfill run: `hotplug-backfill-20260603104306017`
 - discovered: `38`
 - skipped after validation: `38`
 - failed: `0`
 - catalog projection: `bookCount=38`, `identityCount=38`,
-  `capabilityCount=30`
+  `capabilityCount=38`
 
-`graph_vault/books` 下仍可存在没有 `BOOK_MANIFEST.json` 的历史目录。
-这类目录不是 hotplug 包，不会被挂载，也不会进入 catalog projection。
+`graph_vault/books` 下当前保留 38 个 hotplug package live root。
+每个 live root 均有 `BOOK_MANIFEST.json`、`PUBLISH_READY.json`、质量门
+和 runtime gate，并满足 copy distribution 与 query-ready 投影要求。

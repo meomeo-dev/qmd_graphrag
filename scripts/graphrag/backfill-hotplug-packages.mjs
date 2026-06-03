@@ -223,6 +223,7 @@ async function main() {
       "book-id": { type: "string" },
       "only-missing": { type: "boolean", default: true },
       "force": { type: "boolean", default: false },
+      "refresh-existing": { type: "boolean", default: false },
       "rebuild-catalog": { type: "boolean", default: false },
       "fail-fast": { type: "boolean", default: false },
       "resume-interrupted": { type: "boolean", default: false },
@@ -236,6 +237,7 @@ async function main() {
     : String(values["book-id"]);
   const onlyMissing = Boolean(values["only-missing"]);
   const force = Boolean(values.force);
+  const refreshExisting = Boolean(values["refresh-existing"]);
   const rebuildCatalog = Boolean(values["rebuild-catalog"]);
   const failFast = Boolean(values["fail-fast"]);
   const resumeInterrupted = Boolean(values["resume-interrupted"]);
@@ -475,7 +477,7 @@ async function main() {
         now,
       });
       summary.quarantineResults.push(quarantine);
-      const reusableExistingValidation = existingValidation?.ok
+      const reusableExistingValidation = !refreshExisting && existingValidation?.ok
         ? existingValidation
         : null;
       const validation = reusableExistingValidation ?? backfillBookPackage({
@@ -505,12 +507,15 @@ async function main() {
           throw new Error(diagnostics.join(","));
         }
       }
+      const packageAction = reusableExistingValidation != null
+        ? "verified_existing"
+        : refreshExisting && existingValidation?.ok
+          ? "refreshed_existing"
+          : "backfilled";
       summary.processed += 1;
       summary.processedItems.push({
         bookId: book.bookId,
-        action: reusableExistingValidation == null
-          ? "backfilled"
-          : "verified_existing",
+        action: packageAction,
         manifestPath: relative(root, manifestPath),
         publishReadyPath: relative(root, publishReadyPath),
       });
@@ -522,9 +527,7 @@ async function main() {
       console.log(
         JSON.stringify({
           bookId: book.bookId,
-          status: reusableExistingValidation == null
-            ? "backfilled"
-            : "verified_existing",
+          status: packageAction,
           manifestPath: relative(root, manifestPath),
           publishReadyPath: relative(root, publishReadyPath),
         }),
