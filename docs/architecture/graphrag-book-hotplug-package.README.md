@@ -47,3 +47,28 @@ baseline，未新增、删除、重排、重命名维度，也未改变任何 `p
    pre-publish validation、qmd availability、GraphRAG manifest-first resolver
    和 migration rerun/cleanup contracts。
 4. 后续实现审计应继续复用固定 baseline，防止审计标准漂移。
+
+## 当前实现检查点
+
+当前实现要求书籍创建、legacy backfill 和恢复跳过路径都经过同一套
+hotplug package 质量门（quality gate）。已完成书可以避免重新生成
+GraphRAG/qmd 产物，但在 `--only-missing` 跳过前必须通过
+`validateBookHotplugPackage`，并刷新：
+
+- `state/hotplug-quality-gate.json`
+- `state/hotplug-runtime-gate.json`
+
+这些 gate 文件是包内可复制的质量证据，但不进入 `BOOK_MANIFEST.files`
+文件闭包，因此刷新 gate 不改变 `packageGeneration`。
+
+真实 vault 检查点：
+
+- backfill run: `hotplug-backfill-20260603012939480`
+- discovered: `38`
+- skipped after validation: `38`
+- failed: `0`
+- catalog projection: `bookCount=38`, `identityCount=38`,
+  `capabilityCount=30`
+
+`graph_vault/books` 下仍可存在没有 `BOOK_MANIFEST.json` 的历史目录。
+这类目录不是 hotplug 包，不会被挂载，也不会进入 catalog projection。

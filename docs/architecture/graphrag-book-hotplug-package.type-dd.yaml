@@ -116,10 +116,30 @@ supplementalTypeDD:
       only and must not be used as public implementation entrypoints.
 
 currentStateSnapshot:
-  observedAt: "2026-06-01"
+  observedAt: "2026-06-03"
   vaultRoot: graph_vault
   booksDirectory: graph_vault/books
   observedBookDirectoryCount: 72
+  implementationVerification:
+    backfillRunId: hotplug-backfill-20260603012939480
+    command: >
+      node scripts/graphrag/backfill-hotplug-packages.mjs
+      --state-root graph_vault --only-missing --rebuild-catalog --fail-fast
+    result:
+      discovered: 38
+      skippedAlreadyMigratedAfterValidation: 38
+      failed: 0
+      packageResultsValid: 38
+      catalogBookCount: 38
+      catalogIdentityCount: 38
+      catalogCapabilityCount: 30
+    packageValidation:
+      mountedHotplugPackages: 38
+      validateBookHotplugPackagePassed: 38
+      qualityGatePassed: 38
+      runtimeGatePresent: 38
+      queryReady: 30
+      visibleNotQueryReady: 8
   currentCompletedRun:
     runId: epub-batch-20260530235947-full-real-env-clean
     completedBookCount: 38
@@ -154,11 +174,32 @@ currentStateSnapshot:
       can miss qmd, output, and distribution_manifest.json. They are treated as
       non-current build residues until an explicit archive or repair workflow is
       designed.
+    mountPolicy: >
+      Directories without BOOK_MANIFEST.json and PUBLISH_READY.json are not
+      mounted, not projected into catalog, and not valid distribution packages.
+      Their differing shape is expected legacy residue, not a hotplug package
+      shape variant.
   observedDirectoryShapeCounts:
     input: 72
     runs: 72
     output: 48
     qmd: 38
+  publishedHotplugShape:
+    count: 38
+    requiredTopLevelEntries:
+      - BOOK_MANIFEST.json
+      - BOOK_MANIFEST.json.sha256
+      - BOOK_MANIFEST.json.sha256.meta.json
+      - PUBLISH_READY.json
+      - PUBLISH_READY.json.sha256
+      - PUBLISH_READY.json.sha256.meta.json
+      - source/
+      - input/
+      - qmd/
+      - graphrag/
+      - state/
+      - output/
+      - runs/
 
 targetContract:
   packageAuthority:
@@ -259,6 +300,39 @@ atomicPackageLifecycle:
       Shared packages are immutable after publish. Runtime writes, local query
       caches, repair diagnostics, and import state are stored under
       runtimeStateRoot or catalog scan state, not inside the package root.
+  creationQualityGate:
+    principle: >
+      Every book creation or migration publish is a package quality gate
+      boundary. A book may be skipped on resume only after the existing package
+      validates against the same hotplug package validator used for new
+      packages.
+    phases:
+      - pre_publish_source_truth
+      - pre_live_publish_package_validation
+      - post_live_publish_package_validation
+      - backfill_existing_package_validation
+      - backfill_package_validation
+    evidenceFiles:
+      - state/hotplug-quality-gate.json
+      - state/hotplug-quality-gate.json.sha256
+      - state/hotplug-quality-gate.json.sha256.meta.json
+      - state/hotplug-runtime-gate.json
+      - state/hotplug-runtime-gate.json.sha256
+      - state/hotplug-runtime-gate.json.sha256.meta.json
+    distributionRule: >
+      Quality gate files are package-local evidence for copy/distribution
+      readiness. They are written with checksums, but they are excluded from
+      BOOK_MANIFEST.files so refreshing the gate does not change package
+      identity or packageGeneration.
+    skipRule: >
+      --only-missing may skip BOOK_MANIFEST generation for an already migrated
+      book only after validateBookHotplugPackage passes and the gate records
+      copyDistributionAllowed=true. If validation fails, the rerun fails closed
+      and writes a failed quality gate.
+    publishFailureRule: >
+      A failed candidate or live validation removes PUBLISH_READY.json and its
+      sidecars before raising a failure, preventing accidental mount or copy
+      distribution.
 
 mountScanTransactionModel:
   principle: >
@@ -381,6 +455,16 @@ targetDirectoryLayout:
       description: >
         job、checkpoint、artifact 等书级构建状态。导出包只包含脱敏后的
         final state snapshot；运行时 import 状态不写入包内。
+    - path: state/hotplug-quality-gate.json
+      role: package_quality_gate_evidence
+      description: >
+        单本书复制分发质量门结果。该文件可随验证刷新，但不参与
+        BOOK_MANIFEST.files 文件闭包。
+    - path: state/hotplug-runtime-gate.json
+      role: runtime_mount_gate_evidence
+      description: >
+        单本书挂载和查询状态转换证据。该文件可随验证刷新，但不参与
+        BOOK_MANIFEST.files 文件闭包。
   optional:
     - path: qmd/index/qmd_book_index.sqlite
       role: book_scoped_qmd_index
@@ -696,6 +780,8 @@ securityExportPolicy:
     - BOOK_MANIFEST.json.sha256
     - BOOK_MANIFEST.json.sha256.meta.json
     - PUBLISH_READY.json
+    - PUBLISH_READY.json.sha256
+    - PUBLISH_READY.json.sha256.meta.json
     - source/**
     - input/**
     - qmd/**
@@ -869,6 +955,8 @@ versionAndMigrationModel:
       - migrations/{migrationId}/manifest-diff.yaml
       - migrations/{migrationId}/validation.yaml
       - migrations/{migrationId}/commit-record.yaml
+      - migrations/{migrationId}/resume-plan.yaml
+      - migrations/{migrationId}/rollback-record.yaml
     requiredFields:
       - migrationId
       - sourceBookId
@@ -881,6 +969,9 @@ versionAndMigrationModel:
       - excludedFiles
       - residueAction
       - rollbackAvailable
+      - resumeAction
+      - rollbackAction
+      - catalogRebuild
   rollbackContract:
     beforePublish: delete_staging_only
     afterPublishBeforeProjection: remove_new_live_root_and_restore_previous
@@ -1049,6 +1140,29 @@ catalogProjectionSchemas:
         source: BOOK_MANIFEST.graphrag.producerRunIds
       - field: artifactClosureDigest
         source: graphRagArtifactMetadataContract.closureDigest
+  qmdProjectionYaml:
+    path: graph_vault/catalog/qmd-projection.yaml
+    recordKey: bookId
+    sourceRule: >
+      Projection records are rebuilt from BOOK_MANIFEST.json and package-local
+      qmd/qmd_build_manifest.json. Stale qmd-book-projections/{bookId} roots
+      that are absent from the current mounted book set are removed during
+      rebuild and listed in removedStaleProjectionRoots.
+    fields:
+      - field: bookId
+        source: BOOK_MANIFEST.identity.bookId
+      - field: packageGeneration
+        source: BOOK_MANIFEST.identity.packageGeneration
+      - field: normalizedHash
+        source: BOOK_MANIFEST.input.normalizedHash
+      - field: normalizedPath
+        source: BOOK_MANIFEST.input.canonicalNormalizedPath
+      - field: qmdReadyState
+        source: BOOK_MANIFEST.qmd.qmdReadyState
+      - field: qmdBuildManifestPath
+        source: BOOK_MANIFEST.qmd.buildManifestPath
+      - field: manifestSha256
+        source: BOOK_MANIFEST.checksums.manifestSha256
   conflictIndex:
     path: graph_vault/catalog/book-conflicts.yaml
     indexes:
@@ -1655,16 +1769,77 @@ graphRagArtifactMetadataContract:
     - graphProjectionVersion
     - packageLayoutVersion
     - runtimeReaderVersion
+  producerRunSemanticBinding:
+    readonlyRule: >
+      Runtime query gate must read package manifests, artifact metadata,
+      runtime compatibility, and producer run summaries without creating
+      locks, recovery files, repair sidecars, caches, or any other local
+      runtime state inside graph_vault/books/{bookId}.
+    requiredChecks:
+      - producer run record exists for every manifest producerRunId.
+      - runId and bookId match BOOK_MANIFEST identity.
+      - run status is succeeded for query-ready packages.
+      - every required artifact metadata row carries createdAt,
+        stageFingerprint, and providerFingerprint.
+      - non-derived artifact metadata rows are covered by run.artifactIds or by
+        durable output refresh evidence keyed by stage, artifact kind, and
+        checksum.
+      - producerStep, stageFingerprint, and providerFingerprint are bound to
+        producer run fields or output manifest provider fingerprint.
+      - runtime compatibility package schema, layout version, qmd schema,
+        GraphRAG artifact schema, minimum runtime version, provider
+        fingerprint, and embedding dimension match BOOK_MANIFEST and
+        qmd_output_manifest.json.
+    historicalCompatibility:
+      manifestDerivedRows: >
+        Existing manifest-derived metadata rows can carry query_ready file
+        fingerprints while referencing legacy graph_extract producer evidence.
+        Their file integrity remains enforced by required file checksums and
+        artifact metadata closure digest, so runtime gate must not reject them
+        solely for historical producerStep mismatch.
   negativeTests:
     requiredCases:
       - missing required artifact metadata row
       - artifact metadata sha mismatch
       - producer output hash missing file entry
       - file entry missing producer output hash
+      - runtime compatibility output manifest schema digest mismatch
+      - runtime compatibility parquet schema digest mismatch
+      - runtime compatibility lancedb schema digest mismatch
+      - runtime compatibility artifact metadata schema digest mismatch
+      - runtime compatibility layout mismatch
+      - runtime compatibility embedding dimension mismatch
+      - artifact metadata missing stage fingerprint
+      - artifact metadata missing provider fingerprint
       - lancedb embedding dimension mismatch
       - parquet schema digest mismatch
       - stale packageGeneration in query capability
       - cross-book artifact path
+      - producer run artifactIds forged
+      - producer run provider fingerprint forged
+      - runtime query gate writes .lock into readonly package root
+  stableDiagnostics:
+    - runtime_compatibility_digest_mismatch:outputManifestSchemaDigest
+    - runtime_compatibility_digest_mismatch:parquetSchemaDigest
+    - runtime_compatibility_digest_mismatch:lancedbSchemaDigest
+    - runtime_compatibility_digest_mismatch:artifactMetadataSchemaDigest
+    - runtime_compatibility_package_schema_mismatch
+    - runtime_compatibility_layout_mismatch
+    - runtime_compatibility_qmd_index_schema_mismatch
+    - runtime_compatibility_graphrag_artifact_schema_mismatch
+    - runtime_compatibility_artifact_schema_mismatch
+    - runtime_compatibility_min_runtime_mismatch
+    - runtime_compatibility_provider_fingerprint_mismatch
+    - runtime_compatibility_embedding_dimension_mismatch
+    - artifact_metadata_missing_stage_fingerprint:{path}
+    - artifact_metadata_missing_provider_fingerprint:{path}
+    - producer_run_record_invalid:{runId}
+    - producer_run_book_mismatch:{runId}
+    - producer_run_status_not_succeeded:{runId}
+    - producer_run_artifact_binding_mismatch:{runId}
+    - producer_run_stage_mismatch:{runId}
+    - producer_run_stage_fingerprint_mismatch:{runId}
+    - producer_run_provider_fingerprint_mismatch:{runId}
 
 sensitiveMaterialTaxonomy:
   principle: >

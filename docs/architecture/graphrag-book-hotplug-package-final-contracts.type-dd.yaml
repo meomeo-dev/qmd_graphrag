@@ -745,6 +745,84 @@ importerPrePublishValidationContract:
     - direct copy invalid candidate does not project into catalog
     - staged import writes diagnostics outside package root
     - mount scan revalidates successfully imported package
+producerCreationQualityGateContract:
+  principle: >
+    Book production, legacy backfill, and resume flows must prove single-book
+    hotplug package quality before a book is considered copy-distributable.
+    A previously completed book may avoid expensive regeneration, but it may
+    not bypass package validation.
+  gates:
+    prePublishSourceTruth:
+      phase: pre_publish_source_truth
+      passCondition: source closure and migration source truth allow manifest generation
+      failOutcome: >
+        Write failed state/hotplug-quality-gate.json, do not create
+        BOOK_MANIFEST.json or PUBLISH_READY.json in a live root.
+    preLivePublishCandidate:
+      phase: pre_live_publish_package_validation
+      passCondition: >
+        Candidate root containing current package directories plus candidate
+        BOOK_MANIFEST.json and PUBLISH_READY.json passes
+        validateBookHotplugPackage.
+      failOutcome: >
+        Write failed quality/runtime gates, keep live root unmounted, and do
+        not publish PUBLISH_READY.json.
+    postLivePublish:
+      phase: post_live_publish_package_validation
+      passCondition: live root passes validateBookHotplugPackage after manifest write
+      failOutcome: >
+        Remove PUBLISH_READY.json and sidecars, write failed gates, and raise a
+        validation failure.
+    backfillExistingPackage:
+      phase: backfill_existing_package_validation
+      passCondition: >
+        Existing BOOK_MANIFEST.json, sidecars, PUBLISH_READY.json, and package
+        closure pass validateBookHotplugPackage before --only-missing skips
+        regeneration.
+      failOutcome: >
+        Write failed gates and fail closed. The package is not silently treated
+        as already migrated.
+    backfillPackage:
+      phase: backfill_package_validation
+      passCondition: newly built or force-verified package passes validation
+      failOutcome: >
+        Remove publish marker on live validation failure and report bounded
+        diagnostics.
+  evidenceFiles:
+  - state/hotplug-quality-gate.json
+  - state/hotplug-quality-gate.json.sha256
+  - state/hotplug-quality-gate.json.sha256.meta.json
+  - state/hotplug-runtime-gate.json
+  - state/hotplug-runtime-gate.json.sha256
+  - state/hotplug-runtime-gate.json.sha256.meta.json
+  evidenceClosureRule: >
+    Gate evidence is package-local and copyable, but it is excluded from
+    BOOK_MANIFEST.files. Refreshing gate evidence must not change
+    packageGeneration, manifestSha256, or required artifact checksums.
+  copyDistributionDecision:
+    allowedWhen:
+    - validateBookHotplugPackage.ok is true
+    - hotplug-quality-gate.status is passed
+    - hotplug-quality-gate.copyDistributionAllowed is true
+    - PUBLISH_READY.json and sidecars match BOOK_MANIFEST checksums
+    deniedWhen:
+    - source truth gate fails
+    - candidate package validation fails
+    - live package validation fails
+    - existing package validation fails during --only-missing resume
+    - forbidden sensitive material is present in package root
+  implementationEvidence:
+    realBackfillRun: hotplug-backfill-20260603012939480
+    observedBooks: 38
+    verifiedAlreadyMigrated: 38
+    failed: 0
+    catalogProjection:
+      bookCount: 38
+      identityCount: 38
+      capabilityCount: 30
+    tests:
+    - test/graphrag-book-hotplug-backfill.test.ts
+    - test/graphrag-book-hotplug-catalog.test.ts
 qmdAvailabilityReasonMatrix:
   principle: 'qmd availability is a reasoned state matrix, not only a small list of state
     names. Each state fixes mount visibility, GraphRAG-only query, qmd retrieval, rebuild
@@ -966,8 +1044,46 @@ manifestFirstDirectQueryResolver:
   - validate artifact metadata rows
   - validate producer lineage summaries
   - validate schema compatibility
+  - validate runtime compatibility package schema, layout, qmd schema,
+    GraphRAG artifact schema, minimum runtime version, provider fingerprint,
+    and embedding dimension against BOOK_MANIFEST and qmd_output_manifest.json
   - compute query_ready or visible_not_query_ready
   - use catalog projection only as a cache if it agrees with manifest digest
+  readonlyPackageRule: >
+    Manifest-first query validation reads BOOK_MANIFEST.json, GraphRAG artifact
+    metadata, runtime compatibility, and producer run summaries as immutable
+    package files. It must not create durable locks, recovery files, repair
+    sidecars, local caches, or any other runtime state under
+    graph_vault/books/{bookId}.
+  producerLineageBinding:
+    requiredChecks:
+    - producer run file exists for every BOOK_MANIFEST.graphrag.producerRunIds
+    - run.runId equals the manifest producerRunId entry
+    - run.bookId equals BOOK_MANIFEST.identity.bookId
+    - run.status is succeeded for query-ready packages
+    - real artifact metadata rows produced by a run are covered by
+      run.artifactIds
+    - durable output refresh rows may bind by stage, artifact kind, and checksum
+      when later GraphRAG stages refresh shared files such as stats.json
+    - artifact metadata producerStep matches the run stage, except historical
+      manifest-derived rows whose file closure is validated by checksum and
+      closure digest
+    - artifact metadata rows for required artifacts include stageFingerprint
+      and providerFingerprint
+    - artifact metadata stageFingerprint matches run metadata.stageFingerprint
+      or run.inputFingerprint for real artifacts
+    - artifact metadata providerFingerprint matches the run metadata provider
+      fingerprint, or the output manifest provider fingerprint when run
+      metadata omits it
+  producerLineageDiagnostics:
+  - missing_producer_run:{runId}
+  - producer_run_record_invalid:{runId}
+  - producer_run_book_mismatch:{runId}
+  - producer_run_status_not_succeeded:{runId}
+  - producer_run_artifact_binding_mismatch:{runId}
+  - producer_run_stage_mismatch:{runId}
+  - producer_run_stage_fingerprint_mismatch:{runId}
+  - producer_run_provider_fingerprint_mismatch:{runId}
   cacheMismatchPolicy: 'If catalog projection is missing, stale, or disagrees with the current
     manifest digest, direct query readiness is decided from manifest and package artifacts.
     The stale cache is invalidated and must not override manifest, hash, schema, or lineage
@@ -987,6 +1103,10 @@ manifestFirstDirectQueryResolver:
     - stale graph-capabilities cache cannot mark failed manifest as ready
     - missing artifact metadata row returns visible_not_query_ready
     - provider roots absent does not fail manifest-first query gate
+    - manifest-first query gate does not write .lock or runtime files into the
+      readonly package root
+    - forged producer run artifactIds return visible_not_query_ready
+    - forged producer run provider fingerprint returns visible_not_query_ready
 graphRagArtifactGateStateMachine:
   principle: 'GraphRAG artifact readiness has one state machine covering copy, validation,
     mount visibility, query readiness, quarantine, diagnostics, and rollback.
@@ -1209,6 +1329,36 @@ migrationRerunIdempotencyContract:
   - migrations/{migrationId}/checkpoint.yaml
   - migrations/{migrationId}/validation.yaml
   - migrations/{migrationId}/commit-record.yaml
+  - migrations/{migrationId}/resume-plan.yaml
+  - migrations/{migrationId}/rollback-record.yaml
+  evidenceFiles:
+    resumePlan:
+      path: migrations/{migrationId}/resume-plan.yaml
+      requiredFields:
+      - migrationId
+      - status
+      - resumable
+      - nextAction
+      - partialMigrationCount
+      - failedInterruptedCount
+      - repairRequiredCount
+      - pendingBookIds
+      - processedBookIds
+      - skippedBookIds
+      - failureBookIds
+    rollbackRecord:
+      path: migrations/{migrationId}/rollback-record.yaml
+      requiredFields:
+      - migrationId
+      - status
+      - rollbackRequired
+      - rollbackAvailable
+      - restoreCatalogProjection
+      - removePublishedBookIds
+      - preservePublishedBookIds
+      - failureBookIds
+      - quarantineRoots
+      - completedAt
   tests:
     requiredCases:
     - rerun already_migrated performs verify-only
@@ -1343,6 +1493,29 @@ fixedBaselineTestContracts:
     - artifact gate covers copied to query_ready transitions
     - lineage missing returns visible_not_query_ready
     - checksum mismatch quarantines candidate
+    - runtime compatibility semantic digest mismatch fails closed
+  stableDiagnostics:
+    - runtime_compatibility_digest_mismatch:outputManifestSchemaDigest
+    - runtime_compatibility_digest_mismatch:parquetSchemaDigest
+    - runtime_compatibility_digest_mismatch:lancedbSchemaDigest
+    - runtime_compatibility_digest_mismatch:artifactMetadataSchemaDigest
+    - runtime_compatibility_package_schema_mismatch
+    - runtime_compatibility_layout_mismatch
+    - runtime_compatibility_qmd_index_schema_mismatch
+    - runtime_compatibility_graphrag_artifact_schema_mismatch
+    - runtime_compatibility_artifact_schema_mismatch
+    - runtime_compatibility_min_runtime_mismatch
+    - runtime_compatibility_provider_fingerprint_mismatch
+    - runtime_compatibility_embedding_dimension_mismatch
+    - artifact_metadata_missing_stage_fingerprint:{path}
+    - artifact_metadata_missing_provider_fingerprint:{path}
+    - producer_run_record_invalid:{runId}
+    - producer_run_book_mismatch:{runId}
+    - producer_run_status_not_succeeded:{runId}
+    - producer_run_artifact_binding_mismatch:{runId}
+    - producer_run_stage_mismatch:{runId}
+    - producer_run_stage_fingerprint_mismatch:{runId}
+    - producer_run_provider_fingerprint_mismatch:{runId}
   migrationCleanup:
     requiredCases:
     - source closure missing forbids manifest generation
