@@ -117,7 +117,10 @@ async function writeValidatedQueryReadyArtifacts(
     query_ready: "stage-query-ready",
   };
   await mkdir(join(root, "catalog"), { recursive: true });
-  await mkdir(join(root, "books", bookId, "output"), { recursive: true });
+  await mkdir(join(root, "books", bookId, "graphrag", "output"), {
+    recursive: true,
+  });
+  await mkdir(join(root, "books", bookId, "state"), { recursive: true });
   const booksPath = join(root, "catalog", "books.yaml");
   let booksCatalog: { schemaVersion: string; items: Array<Record<string, unknown>> };
   try {
@@ -176,17 +179,17 @@ async function writeValidatedQueryReadyArtifacts(
   ] as const;
   for (const [fileName] of graphExtractFiles) {
     await writeFile(
-      join(root, "books", bookId, "output", fileName),
+      join(root, "books", bookId, "graphrag", "output", fileName),
       MinimalParquetFixture,
     );
   }
   await writeFile(
-    join(root, "books", bookId, "output", "context.json"),
+    join(root, "books", bookId, "graphrag", "output", "context.json"),
     "{}",
     "utf8",
   );
   await writeFile(
-    join(root, "books", bookId, "output", "stats.json"),
+    join(root, "books", bookId, "graphrag", "output", "stats.json"),
     JSON.stringify({ schemaVersion: SchemaVersion, bookId, documents: 1 }),
     "utf8",
   );
@@ -198,7 +201,7 @@ async function writeValidatedQueryReadyArtifacts(
     "artifact-graph-stats-json",
   ];
   await writeFile(
-    join(root, "books", bookId, "checkpoints.yaml"),
+    join(root, "books", bookId, "state", "checkpoints.yaml"),
     `
 schemaVersion: ${SchemaVersion}
 items:
@@ -258,17 +261,17 @@ ${graphExtractArtifactIds.map((artifactId) => `      - ${artifactId}`).join("\n"
     "utf8",
   );
   await writeFile(
-    join(root, "books", bookId, "output", "community_reports.parquet"),
+    join(root, "books", bookId, "graphrag", "output", "community_reports.parquet"),
     MinimalParquetFixture,
   );
-  const lancedbPath = join(root, "books", bookId, "output", "lancedb");
+  const lancedbPath = join(root, "books", bookId, "graphrag", "output", "lancedb");
   await writeCompleteLanceDbFixture(lancedbPath);
   const reportHash = await hashFile(
-    join(root, "books", bookId, "output", "community_reports.parquet"),
+    join(root, "books", bookId, "graphrag", "output", "community_reports.parquet"),
   );
   const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
   await writeFile(
-    join(root, "books", bookId, "artifacts.yaml"),
+    join(root, "books", bookId, "state", "artifacts.yaml"),
     `
 schemaVersion: ${SchemaVersion}
 items:
@@ -277,8 +280,8 @@ ${(await Promise.all(graphExtractFiles.map(async ([fileName, kind]) => `  - sche
     bookId: ${bookId}
     stage: graph_extract
     kind: ${kind}
-    path: books/${bookId}/output/${fileName}
-    contentHash: ${await hashFile(join(root, "books", bookId, "output", fileName))}
+    path: books/${bookId}/graphrag/output/${fileName}
+    contentHash: ${await hashFile(join(root, "books", bookId, "graphrag", "output", fileName))}
     stageFingerprint: stage-graph-extract
     providerFingerprint: ${providerFingerprint}
     producerRunId: run-graph-extract
@@ -290,8 +293,8 @@ ${(await Promise.all(graphExtractFiles.map(async ([fileName, kind]) => `  - sche
     bookId: ${bookId}
     stage: graph_extract
     kind: graphrag_context_json
-    path: books/${bookId}/output/context.json
-    contentHash: ${await hashFile(join(root, "books", bookId, "output", "context.json"))}
+    path: books/${bookId}/graphrag/output/context.json
+    contentHash: ${await hashFile(join(root, "books", bookId, "graphrag", "output", "context.json"))}
     stageFingerprint: stage-graph-extract
     providerFingerprint: ${providerFingerprint}
     producerRunId: run-graph-extract
@@ -303,8 +306,8 @@ ${(await Promise.all(graphExtractFiles.map(async ([fileName, kind]) => `  - sche
     bookId: ${bookId}
     stage: graph_extract
     kind: graphrag_stats_json
-    path: books/${bookId}/output/stats.json
-    contentHash: ${await hashFile(join(root, "books", bookId, "output", "stats.json"))}
+    path: books/${bookId}/graphrag/output/stats.json
+    contentHash: ${await hashFile(join(root, "books", bookId, "graphrag", "output", "stats.json"))}
     stageFingerprint: stage-graph-extract
     providerFingerprint: ${providerFingerprint}
     producerRunId: run-graph-extract
@@ -316,7 +319,7 @@ ${(await Promise.all(graphExtractFiles.map(async ([fileName, kind]) => `  - sche
     bookId: ${bookId}
     stage: community_report
     kind: graphrag_community_reports_parquet
-    path: books/${bookId}/output/community_reports.parquet
+    path: books/${bookId}/graphrag/output/community_reports.parquet
     contentHash: ${reportHash}
     stageFingerprint: stage-community-report
     providerFingerprint: ${providerFingerprint}
@@ -329,7 +332,7 @@ ${(await Promise.all(graphExtractFiles.map(async ([fileName, kind]) => `  - sche
     bookId: ${bookId}
     stage: embed
     kind: lancedb_index
-    path: books/${bookId}/output/lancedb
+    path: books/${bookId}/graphrag/output/lancedb
     contentHash: ${lancedbHash}
     stageFingerprint: stage-embed
     providerFingerprint: ${providerFingerprint}
@@ -682,6 +685,58 @@ describe("unified query routing", () => {
     expect(answer.evidence[0]?.graphCapabilityId).toBe("cap-1");
   });
 
+  test("sanitizes provider-owned GraphRAG evidence locators", async () => {
+    const answer = await routeQuery(request(), {
+      searchQmd: async (qmdRequest) => ({
+        schemaVersion: SchemaVersion,
+        query: qmdRequest.query,
+        results: [candidate()],
+      }),
+      resolveGraphCapabilities: async () => new Map([capability()]),
+      queryGraphRag: async () => ({
+        schemaVersion: SchemaVersion,
+        method: "local",
+        responseText: "Graph answer",
+        evidence: [
+          graphEvidence({
+            locator: {
+              path: "/Users/local/project/graph_vault/books/book-1/private.md",
+              uri: "https://internal.example.local/private/source",
+              lineStart: 9,
+              lineEnd: 12,
+            },
+            metadata: {
+              title: "Portable graph evidence",
+              requestDataDir: "/Users/local/project/graph_vault/books/book-1",
+              rawProviderResponse: { path: "/private/provider/cache.json" },
+            },
+          }),
+          graphEvidence({
+            evidenceId: "cap-2",
+            locator: {
+              path: "books/book-1/graphrag/output/community_reports.parquet",
+              uri: "urn:qmd:book-1:evidence:cap-2",
+              lineStart: 3,
+            },
+          }),
+        ],
+      }),
+    });
+
+    expect(answer.evidence[0]?.locator).toEqual({ lineStart: 9, lineEnd: 12 });
+    expect(answer.evidence[0]?.metadata).toEqual({
+      title: "Portable graph evidence",
+    });
+    expect(answer.evidence[1]?.locator).toEqual({
+      path: "books/book-1/graphrag/output/community_reports.parquet",
+      uri: "urn:qmd:book-1:evidence:cap-2",
+      lineStart: 3,
+    });
+    expect(JSON.stringify(answer)).not.toContain("/Users/local/project");
+    expect(JSON.stringify(answer)).not.toContain("internal.example.local");
+    expect(JSON.stringify(answer)).not.toContain("provider/cache");
+  });
+
   test("converts malformed graph provider responses to typed errors", async () => {
     await expect(routeQuery(request(), {
       searchQmd: async (qmdRequest) => ({
@@ -813,6 +868,28 @@ describe("unified query routing", () => {
 
     expect(answer.answerText).toBe("Graph answer from capability scope");
     expect(answer.routeDecision.candidateEvidenceIds).toEqual(["graph:cap-1"]);
+  });
+
+  test("accepts explicit graphrag responses with null evidence quotes", async () => {
+    const answer = await routeQuery(request({ requestedRoute: "graphrag" }), {
+      searchQmd: async () => {
+        throw new Error("explicit GraphRAG scope must not depend on qmd top-k");
+      },
+      resolveGraphScopeCapabilities: async () => capability()[1],
+      queryGraphRag: async () => ({
+        schemaVersion: SchemaVersion,
+        method: "global",
+        responseText: "Graph answer from capability scope",
+        evidence: [
+          graphEvidence({
+            quote: null,
+          }),
+        ],
+      } as never),
+    });
+
+    expect(answer.answerText).toBe("Graph answer from capability scope");
+    expect(answer.evidence[0]?.quote).toBeUndefined();
   });
 
   test("parses unified query request and qmd result at route boundary", async () => {
@@ -1148,7 +1225,7 @@ items:
     const root = await mkdtemp(join(tmpdir(), "qmd-vault-capability-bad-stage-"));
     await writeValidatedQueryReadyArtifacts(root, "book-1");
     await writeFile(
-      join(root, "books", "book-1", "artifacts.yaml"),
+      join(root, "books", "book-1", "state", "artifacts.yaml"),
       `
 schemaVersion: ${SchemaVersion}
 items:
@@ -1157,9 +1234,16 @@ items:
     bookId: book-1
     stage: query_ready
     kind: graphrag_community_reports_parquet
-    path: books/book-1/output/community_reports.parquet
+    path: books/book-1/graphrag/output/community_reports.parquet
     contentHash: ${(await hashFile(
-      join(root, "books", "book-1", "output", "community_reports.parquet"),
+      join(
+        root,
+        "books",
+        "book-1",
+        "graphrag",
+        "output",
+        "community_reports.parquet",
+      ),
     ))}
     producerRunId: run-1
     createdAt: 2026-05-21T00:00:00.000Z
@@ -1168,9 +1252,9 @@ items:
     bookId: book-1
     stage: query_ready
     kind: lancedb_index
-    path: books/book-1/output/lancedb
+    path: books/book-1/graphrag/output/lancedb
     contentHash: ${(await hashLanceDbDirectoryContents(
-      join(root, "books", "book-1", "output", "lancedb"),
+      join(root, "books", "book-1", "graphrag", "output", "lancedb"),
     ))}
     producerRunId: run-1
     createdAt: 2026-05-21T00:00:00.000Z
@@ -1197,17 +1281,29 @@ items:
 
   test("rejects explicit graph capabilities without query-ready checkpoint", async () => {
     const root = await mkdtemp(join(tmpdir(), "qmd-vault-capability-no-checkpoint-"));
-    await mkdir(join(root, "books", "book-1", "output"), { recursive: true });
+    await mkdir(
+      join(root, "books", "book-1", "graphrag", "output"),
+      { recursive: true },
+    );
+    await mkdir(join(root, "books", "book-1", "state"), { recursive: true });
     await writeFile(
-      join(root, "books", "book-1", "output", "community_reports.parquet"),
+      join(
+        root,
+        "books",
+        "book-1",
+        "graphrag",
+        "output",
+        "community_reports.parquet",
+      ),
       "reports",
       "utf8",
     );
-    await mkdir(join(root, "books", "book-1", "output", "lancedb"), {
-      recursive: true,
-    });
+    await mkdir(
+      join(root, "books", "book-1", "graphrag", "output", "lancedb"),
+      { recursive: true },
+    );
     await writeFile(
-      join(root, "books", "book-1", "artifacts.yaml"),
+      join(root, "books", "book-1", "state", "artifacts.yaml"),
       `
 schemaVersion: ${SchemaVersion}
 items:
@@ -1216,7 +1312,7 @@ items:
     bookId: book-1
     stage: community_report
     kind: graphrag_community_reports_parquet
-    path: books/book-1/output/community_reports.parquet
+    path: books/book-1/graphrag/output/community_reports.parquet
     contentHash: report-hash
     producerRunId: run-1
     createdAt: 2026-05-21T00:00:00.000Z
@@ -1225,7 +1321,7 @@ items:
     bookId: book-1
     stage: embed
     kind: lancedb_index
-    path: books/book-1/output/lancedb
+    path: books/book-1/graphrag/output/lancedb
     contentHash: lancedb-hash
     producerRunId: run-1
     createdAt: 2026-05-21T00:00:00.000Z
@@ -1243,7 +1339,7 @@ items:
     const root = await mkdtemp(join(tmpdir(), "qmd-vault-capability-bad-kind-"));
     await writeValidatedQueryReadyArtifacts(root, "book-1");
     await writeFile(
-      join(root, "books", "book-1", "artifacts.yaml"),
+      join(root, "books", "book-1", "state", "artifacts.yaml"),
       `
 schemaVersion: ${SchemaVersion}
 items:
@@ -1252,7 +1348,7 @@ items:
     bookId: book-1
     stage: community_report
     kind: query_snapshot
-    path: books/book-1/output/community_reports.parquet
+    path: books/book-1/graphrag/output/community_reports.parquet
     contentHash: report-hash
     producerRunId: run-1
     createdAt: 2026-05-21T00:00:00.000Z
@@ -1261,7 +1357,7 @@ items:
     bookId: book-1
     stage: embed
     kind: lancedb_index
-    path: books/book-1/output/lancedb
+    path: books/book-1/graphrag/output/lancedb
     contentHash: lancedb-hash
     producerRunId: run-1
     createdAt: 2026-05-21T00:00:00.000Z
@@ -1279,7 +1375,7 @@ items:
     const root = await mkdtemp(join(tmpdir(), "qmd-vault-capability-bad-path-"));
     await writeValidatedQueryReadyArtifacts(root, "book-1");
     await writeFile(
-      join(root, "books", "book-1", "artifacts.yaml"),
+      join(root, "books", "book-1", "state", "artifacts.yaml"),
       `
 schemaVersion: ${SchemaVersion}
 items:
@@ -1297,7 +1393,7 @@ items:
     bookId: book-1
     stage: query_ready
     kind: lancedb_index
-    path: books/book-1/output/lancedb
+    path: books/book-1/graphrag/output/lancedb
     contentHash: lancedb-hash
     producerRunId: run-1
     createdAt: 2026-05-21T00:00:00.000Z

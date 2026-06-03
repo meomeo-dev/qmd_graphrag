@@ -258,10 +258,11 @@ export async function writeProviderAuthReopenGraphFixture(input: {
   stateRoot: string;
   bookId: string;
   sourceHash: string;
+  contentHash?: string;
 }): Promise<void> {
-  const outputRel = join("books", input.bookId, "output");
+  const outputRel = join("books", input.bookId, "graphrag", "output");
   const outputDir = join(input.stateRoot, outputRel);
-  const contentHash = input.sourceHash;
+  const contentHash = input.contentHash ?? input.sourceHash;
   const documentId = `doc-${input.sourceHash.slice(0, 12)}`;
   const stageFingerprints = {
     ingest: "fp-ingest",
@@ -323,6 +324,12 @@ export async function writeProviderAuthReopenGraphFixture(input: {
   );
   await mkdir(join(input.stateRoot, "catalog"), { recursive: true });
   await mkdir(join(input.stateRoot, "books", input.bookId), { recursive: true });
+  await mkdir(join(input.stateRoot, "books", input.bookId, "state"), {
+    recursive: true,
+  });
+  await mkdir(join(input.stateRoot, "books", input.bookId, "graphrag", "runs"), {
+    recursive: true,
+  });
   const booksPath = join(input.stateRoot, "catalog", "books.yaml");
   const existingBooks = existsSync(booksPath)
     ? YAML.parse(readFileSync(booksPath, "utf8"))
@@ -357,11 +364,11 @@ export async function writeProviderAuthReopenGraphFixture(input: {
     },
   );
   await writeDurableYamlFixture(
-    join(input.stateRoot, "books", input.bookId, "artifacts.yaml"),
+    join(input.stateRoot, "books", input.bookId, "state", "artifacts.yaml"),
     { schemaVersion: SchemaVersion, items: graphArtifacts },
   );
   await writeDurableYamlFixture(
-    join(input.stateRoot, "books", input.bookId, "checkpoints.yaml"),
+    join(input.stateRoot, "books", input.bookId, "state", "checkpoints.yaml"),
     {
       schemaVersion: SchemaVersion,
       items: [
@@ -424,6 +431,59 @@ export async function writeProviderAuthReopenGraphFixture(input: {
       ],
     },
   );
+  for (const run of [
+    {
+      runId: "run-graph-extract",
+      stage: "graph_extract",
+      artifactIds: [
+        artifactIds.documents, artifactIds.textUnits, artifactIds.entities,
+        artifactIds.relationships, artifactIds.communities,
+        artifactIds.context, artifactIds.stats,
+      ],
+    },
+    {
+      runId: "run-community-report",
+      stage: "community_report",
+      artifactIds: [artifactIds.reports],
+    },
+    {
+      runId: "run-embed",
+      stage: "embed",
+      artifactIds: [artifactIds.lancedb],
+    },
+    {
+      runId: "run-query-ready",
+      stage: "query_ready",
+      artifactIds: [artifactIds.reports, artifactIds.lancedb],
+    },
+  ]) {
+    await writeDurableYamlFixture(
+      join(
+        input.stateRoot,
+        "books",
+        input.bookId,
+        "graphrag",
+        "runs",
+        `${run.runId}.yaml`,
+      ),
+      {
+        schemaVersion: SchemaVersion,
+        runId: run.runId,
+        bookId: input.bookId,
+        stage: run.stage,
+        status: "succeeded",
+        attemptCount: 1,
+        startedAt: "2026-05-23T00:00:00.000Z",
+        finishedAt: "2026-05-23T00:00:01.000Z",
+        inputFingerprint: stageFingerprints[run.stage as keyof typeof stageFingerprints],
+        artifactIds: run.artifactIds,
+        metadata: {
+          stageFingerprint: stageFingerprints[run.stage as keyof typeof stageFingerprints],
+          providerFingerprint,
+        },
+      },
+    );
+  }
 }
 
 export async function writeProviderAuthStoppedBatchFixture(input: {

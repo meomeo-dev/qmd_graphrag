@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,6 +41,7 @@ type Workspace = {
   configDir: string;
   graphVault: string;
   fakeBridge: string;
+  bridgeRequestLog: string;
 };
 
 const workspaces: Workspace[] = [];
@@ -60,6 +61,7 @@ async function runQmd(
       INDEX_PATH: workspace.dbPath,
       QMD_CONFIG_DIR: workspace.configDir,
       QMD_GRAPHRAG_PYTHON: workspace.fakeBridge,
+      QMD_FAKE_BRIDGE_REQUEST_LOG: workspace.bridgeRequestLog,
       PWD: workspace.root,
       QMD_DOCTOR_DEVICE_PROBE: "0",
     },
@@ -93,6 +95,13 @@ process.stdin.on("end", () => {
   if (command !== "graphrag_query") {
     console.error("unsupported command");
     process.exit(1);
+  }
+  if (process.env.QMD_FAKE_BRIDGE_REQUEST_LOG) {
+    require("node:fs").appendFileSync(
+      process.env.QMD_FAKE_BRIDGE_REQUEST_LOG,
+      JSON.stringify({ command, request }) + "\\n",
+      "utf8"
+    );
   }
   const scope = request.capabilityScope || {};
   const artifactIds = scope.artifactIds || [];
@@ -129,6 +138,16 @@ process.stdin.on("end", () => {
     "utf8",
   );
   await chmod(path, 0o755);
+}
+
+async function readLastBridgeRequest(
+  workspace: Workspace,
+): Promise<Record<string, unknown>> {
+  const raw = await readFile(workspace.bridgeRequestLog, "utf8");
+  const lastLine = raw.trim().split(/\r?\n/u).at(-1);
+  if (lastLine == null) throw new Error("missing fake bridge request log");
+  const entry = JSON.parse(lastLine) as { request?: Record<string, unknown> };
+  return entry.request ?? {};
 }
 
 async function writeLanceDbFixture(root: string): Promise<void> {
@@ -208,8 +227,14 @@ async function writeGraphBookFixture(
   graphVault: string,
   input: Omit<GraphBookFixture, "reportHash" | "lancedbHash">,
 ): Promise<GraphBookFixture> {
-  const outputDir = join(graphVault, "books", input.bookId, "output");
+  const outputDir = join(graphVault, "books", input.bookId, "graphrag", "output");
   await mkdir(outputDir, { recursive: true });
+  await mkdir(join(graphVault, "books", input.bookId, "state"), {
+    recursive: true,
+  });
+  await mkdir(join(graphVault, "books", input.bookId, "graphrag", "runs"), {
+    recursive: true,
+  });
   const reportPath = join(outputDir, "community_reports.parquet");
   const lancedbPath = join(outputDir, "lancedb");
   for (const [fileName] of GraphExtractArtifactKinds) {
@@ -230,7 +255,7 @@ async function writeGraphBookFixture(
   };
 
   await writeFile(
-    join(graphVault, "books", fixture.bookId, "checkpoints.yaml"),
+    join(graphVault, "books", fixture.bookId, "state", "checkpoints.yaml"),
     YAML.stringify({
       schemaVersion: SchemaVersion,
       items: [
@@ -243,7 +268,7 @@ async function writeGraphBookFixture(
     "utf8",
   );
   await writeFile(
-    join(graphVault, "books", fixture.bookId, "artifacts.yaml"),
+    join(graphVault, "books", fixture.bookId, "state", "artifacts.yaml"),
     YAML.stringify({
       schemaVersion: SchemaVersion,
       items: [
@@ -254,7 +279,7 @@ async function writeGraphBookFixture(
             bookId: fixture.bookId,
             stage: "graph_extract",
             kind,
-            path: `books/${fixture.bookId}/output/${fileName}`,
+            path: `books/${fixture.bookId}/graphrag/output/${fileName}`,
             contentHash: await hashFile(join(outputDir, fileName)),
             stageFingerprint: fixture.stageFingerprints.graph_extract,
             providerFingerprint: fixture.providerFingerprint,
@@ -269,7 +294,7 @@ async function writeGraphBookFixture(
           bookId: fixture.bookId,
           stage: "graph_extract",
           kind: "graphrag_context_json",
-          path: `books/${fixture.bookId}/output/context.json`,
+          path: `books/${fixture.bookId}/graphrag/output/context.json`,
           contentHash: await hashFile(join(outputDir, "context.json")),
           stageFingerprint: fixture.stageFingerprints.graph_extract,
           providerFingerprint: fixture.providerFingerprint,
@@ -283,7 +308,7 @@ async function writeGraphBookFixture(
           bookId: fixture.bookId,
           stage: "graph_extract",
           kind: "graphrag_stats_json",
-          path: `books/${fixture.bookId}/output/stats.json`,
+          path: `books/${fixture.bookId}/graphrag/output/stats.json`,
           contentHash: await hashFile(join(outputDir, "stats.json")),
           stageFingerprint: fixture.stageFingerprints.graph_extract,
           providerFingerprint: fixture.providerFingerprint,
@@ -297,7 +322,7 @@ async function writeGraphBookFixture(
           bookId: fixture.bookId,
           stage: "community_report",
           kind: "graphrag_community_reports_parquet",
-          path: `books/${fixture.bookId}/output/community_reports.parquet`,
+          path: `books/${fixture.bookId}/graphrag/output/community_reports.parquet`,
           contentHash: fixture.reportHash,
           stageFingerprint: fixture.stageFingerprints.community_report,
           providerFingerprint: fixture.providerFingerprint,
@@ -311,7 +336,7 @@ async function writeGraphBookFixture(
           bookId: fixture.bookId,
           stage: "embed",
           kind: "lancedb_index",
-          path: `books/${fixture.bookId}/output/lancedb`,
+          path: `books/${fixture.bookId}/graphrag/output/lancedb`,
           contentHash: fixture.lancedbHash,
           stageFingerprint: fixture.stageFingerprints.embed,
           providerFingerprint: fixture.providerFingerprint,
@@ -324,6 +349,57 @@ async function writeGraphBookFixture(
     "utf8",
   );
 
+  for (const run of [
+    {
+      runId: fixture.runIds.graph_extract,
+      stage: "graph_extract",
+      artifactIds: fixture.graphExtractArtifactIds,
+    },
+    {
+      runId: fixture.runIds.community_report,
+      stage: "community_report",
+      artifactIds: [fixture.reportArtifactId],
+    },
+    {
+      runId: fixture.runIds.embed,
+      stage: "embed",
+      artifactIds: [fixture.lancedbArtifactId],
+    },
+    {
+      runId: fixture.runIds.query_ready,
+      stage: "query_ready",
+      artifactIds: [fixture.reportArtifactId, fixture.lancedbArtifactId],
+    },
+  ]) {
+    await writeFile(
+      join(
+        graphVault,
+        "books",
+        fixture.bookId,
+        "graphrag",
+        "runs",
+        `${run.runId}.yaml`,
+      ),
+      YAML.stringify({
+        schemaVersion: SchemaVersion,
+        runId: run.runId,
+        bookId: fixture.bookId,
+        stage: run.stage,
+        status: "succeeded",
+        attemptCount: 1,
+        startedAt: "2026-05-22T00:00:00.000Z",
+        finishedAt: "2026-05-22T00:00:01.000Z",
+        inputFingerprint: fixture.stageFingerprints[run.stage],
+        artifactIds: run.artifactIds,
+        metadata: {
+          stageFingerprint: fixture.stageFingerprints[run.stage],
+          providerFingerprint: fixture.providerFingerprint,
+        },
+      }),
+      "utf8",
+    );
+  }
+
   return fixture;
 }
 
@@ -335,6 +411,7 @@ async function createWorkspace(options: {
   const configDir = join(root, "config");
   const graphVault = join(root, "graph_vault");
   const fakeBridge = join(root, "fake-graphrag-bridge.js");
+  const bridgeRequestLog = join(root, "fake-graphrag-bridge-requests.jsonl");
   await mkdir(configDir, { recursive: true });
   await mkdir(join(root, "docs"), { recursive: true });
   await writeFakeBridge(fakeBridge);
@@ -626,7 +703,14 @@ async function createWorkspace(options: {
     "utf8",
   );
 
-  const workspace = { root, dbPath, configDir, graphVault, fakeBridge };
+  const workspace = {
+    root,
+    dbPath,
+    configDir,
+    graphVault,
+    fakeBridge,
+    bridgeRequestLog,
+  };
   workspaces.push(workspace);
   return workspace;
 }
@@ -660,6 +744,11 @@ describe("CLI GraphRAG unified route", () => {
     expect(answer.evidence[0].quote).toContain("Graph-only CLI");
     expect(answer.routeDecision.selectedBookIds).toEqual(["book-cli"]);
     expect(answer.evidence[0].metadata?.title).toBe("CLI Graph Community Report");
+    expect(answer.evidence[0].metadata?.requestDataDir).toBeUndefined();
+    const bridgeRequest = await readLastBridgeRequest(workspace);
+    expect(bridgeRequest.dataDir).toBe(
+      join(workspace.graphVault, "books", "book-cli", "graphrag", "output"),
+    );
     expect(JSON.stringify(answer)).not.toContain(workspace.graphVault);
   }, 30000);
 
@@ -709,7 +798,7 @@ describe("CLI GraphRAG unified route", () => {
     expect(files.stdout).toContain("sha256:");
     expect(files.stdout).toContain("artifact-cli-report");
     expect(files.stdout).not.toContain(workspace.graphVault);
-  }, 30000);
+  }, 60000);
 
   test("qmd query --mode auto upgrades to GraphRAG when coverage and intent match", async () => {
     const workspace = await createWorkspace();
@@ -753,12 +842,14 @@ describe("CLI GraphRAG unified route", () => {
       workspace.graphVault,
       "books",
       "book-cli",
+      "state",
       "artifacts.yaml",
     );
     const checkpointsPath = join(
       workspace.graphVault,
       "books",
       "book-cli",
+      "state",
       "checkpoints.yaml",
     );
     for (const path of [artifactsPath, checkpointsPath]) {
@@ -840,8 +931,45 @@ describe("CLI GraphRAG unified route", () => {
     const answer = JSON.parse(result.stdout);
     expect(answer.routeDecision.selectedBookIds).toEqual(["book-cli-second"]);
     expect(answer.evidence[0].bookId).toBe("book-cli-second");
+    expect(answer.evidence[0].metadata?.requestDataDir).toBeUndefined();
+    const bridgeRequest = await readLastBridgeRequest(workspace);
+    expect(bridgeRequest.dataDir).toBe(
+      join(workspace.graphVault, "books", "book-cli-second", "graphrag", "output"),
+    );
     expect(JSON.stringify(answer)).not.toContain(workspace.graphVault);
   }, 30000);
+
+  test("qmd query --graphrag recreates managed settings projection for a fresh vault",
+    async () => {
+      const workspace = await createWorkspace();
+      const settingsPath = join(workspace.graphVault, "settings.yaml");
+      const checksumPath = `${settingsPath}.sha256`;
+      const checksumMetaPath = `${checksumPath}.meta.json`;
+
+      for (const path of [settingsPath, checksumPath, checksumMetaPath]) {
+        if (existsSync(path)) {
+          await rm(path, { force: true });
+        }
+      }
+
+      const result = await runQmd(workspace, [
+        "query",
+        "--graphrag",
+        "--json",
+        "--no-rerank",
+        "How do architecture decisions relate across chapters?",
+      ]);
+
+      expect(result.exitCode, result.stderr).toBe(0);
+      const answer = JSON.parse(result.stdout);
+      expect(answer.routeDecision.selectedRoute).toBe("graphrag");
+      expect(answer.answerText).toBe("GraphRAG CLI answer from fake bridge");
+
+      const settingsRaw = await readFile(settingsPath, "utf8");
+      expect(settingsRaw).toContain("managed_by: qmd_graphrag");
+      expect(existsSync(checksumPath)).toBe(true);
+      expect(existsSync(checksumMetaPath)).toBe(true);
+    }, 30000);
 
   test("qmd query --mode auto rejects ambiguous multi-book graph upgrade", async () => {
     const workspace = await createWorkspace({ includeSecondGraphReadyBook: true });

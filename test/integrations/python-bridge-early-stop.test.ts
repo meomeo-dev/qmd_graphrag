@@ -195,6 +195,81 @@ describe("Python bridge GraphRAG stage early stop", () => {
     }
   });
 
+  test("projects provider env vars from project dotenv into python bridge child",
+    async () => {
+      const workspace = await createWorkspace();
+      const qmdDir = join(workspace, ".qmd");
+      await mkdir(qmdDir, { recursive: true });
+      await writeFile(join(qmdDir, "index.yml"), "collections: {}\n", "utf8");
+      await writeFile(
+        join(workspace, ".env"),
+        [
+          "OPENAI_API_KEY=dotenv-openai-key",
+          "OPENAI_BASE_URL=http://127.0.0.1:19999",
+          "JINA_API_KEY=dotenv-jina-key",
+          "JINA_API_BASE=https://dotenv.example.invalid",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      const envDumpPath = join(workspace, "env-dump.json");
+      const previousEnv = {
+        OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+        OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
+        JINA_API_KEY: process.env.JINA_API_KEY,
+        JINA_API_BASE: process.env.JINA_API_BASE,
+      };
+      try {
+        process.env.OPENAI_API_KEY = "parent-openai-key";
+        process.env.OPENAI_BASE_URL = "http://127.0.0.1:18888";
+        process.env.JINA_API_KEY = "parent-jina-key";
+        process.env.JINA_API_BASE = "https://parent.example.invalid";
+        const fakeBridge = await writeFakeBridge(
+          workspace,
+          [
+            `const dumpPath = ${JSON.stringify(envDumpPath)};`,
+            "const { writeFileSync } = await import('node:fs');",
+            "writeFileSync(dumpPath, JSON.stringify({",
+            "  openaiApiKey: process.env.OPENAI_API_KEY ?? null,",
+            "  openaiBaseUrl: process.env.OPENAI_BASE_URL ?? null,",
+            "  jinaApiKey: process.env.JINA_API_KEY ?? null,",
+            "  jinaApiBase: process.env.JINA_API_BASE ?? null,",
+            "}), 'utf8');",
+            "process.stdout.write(JSON.stringify({",
+            `  schemaVersion: ${JSON.stringify(SchemaVersion)},`,
+            "  method: 'standard',",
+            "  outputs: [{ workflow: 'extract_graph', hasError: false, stateKeys: [] }],",
+            "}));",
+          ].join("\n"),
+        );
+
+        await callPythonBridge({
+          command: "graphrag_index",
+          pythonBin: fakeBridge,
+          workingDirectory: workspace,
+          request: {},
+          responseSchema: GraphRagIndexResponseSchema,
+        });
+
+        const dumped = JSON.parse(await readFile(envDumpPath, "utf8")) as Record<
+          string,
+          string | null
+        >;
+        expect(dumped).toEqual({
+          openaiApiKey: "dotenv-openai-key",
+          openaiBaseUrl: "http://127.0.0.1:19999",
+          jinaApiKey: "dotenv-jina-key",
+          jinaApiBase: "https://dotenv.example.invalid",
+        });
+      } finally {
+        for (const [key, value] of Object.entries(previousEnv)) {
+          if (value == null) delete process.env[key];
+          else process.env[key] = value;
+        }
+        await rm(workspace, { recursive: true, force: true });
+      }
+    });
+
   test("ignores old partial-output log history before the current offset", async () => {
     const workspace = await createWorkspace();
     const reportDir = join(workspace, "reports");
