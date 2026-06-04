@@ -610,31 +610,12 @@ const durableTargetMappingTable = [
     preflightScopes: [{ path: "graph_vault/books/{bookId}/state" }],
   },
   {
-    pattern: /^graph_vault\/books\/[^/]+\/output\/qmd_output_manifest\.json$/,
-    lane: "checkpointWriterLane",
-    durableKind: "json",
-    targetMappingOwner: "graphOutputProducer",
-    preflightScopes: [
-      { path: "graph_vault/books/{bookId}/output", recursive: true },
-    ],
-  },
-  {
     pattern: /^graph_vault\/books\/[^/]+\/graphrag\/output\/qmd_output_manifest\.json$/,
     lane: "checkpointWriterLane",
     durableKind: "json",
     targetMappingOwner: "graphOutputProducer",
     preflightScopes: [
       { path: "graph_vault/books/{bookId}/graphrag/output", recursive: true },
-    ],
-  },
-  {
-    pattern:
-      /^graph_vault\/books\/[^/]+\/output\/qmd_graph_text_unit_identity\.json$/,
-    lane: "checkpointWriterLane",
-    durableKind: "json",
-    targetMappingOwner: "graphOutputProducer",
-    preflightScopes: [
-      { path: "graph_vault/books/{bookId}/output", recursive: true },
     ],
   },
   {
@@ -648,30 +629,12 @@ const durableTargetMappingTable = [
     ],
   },
   {
-    pattern: /^graph_vault\/books\/[^/]+\/output\/context\.json$/,
-    lane: "checkpointWriterLane",
-    durableKind: "json",
-    targetMappingOwner: "graphOutputProducer",
-    preflightScopes: [
-      { path: "graph_vault/books/{bookId}/output", recursive: true },
-    ],
-  },
-  {
     pattern: /^graph_vault\/books\/[^/]+\/graphrag\/output\/context\.json$/,
     lane: "checkpointWriterLane",
     durableKind: "json",
     targetMappingOwner: "graphOutputProducer",
     preflightScopes: [
       { path: "graph_vault/books/{bookId}/graphrag/output", recursive: true },
-    ],
-  },
-  {
-    pattern: /^graph_vault\/books\/[^/]+\/output\/stats\.json$/,
-    lane: "checkpointWriterLane",
-    durableKind: "json",
-    targetMappingOwner: "graphOutputProducer",
-    preflightScopes: [
-      { path: "graph_vault/books/{bookId}/output", recursive: true },
     ],
   },
   {
@@ -705,16 +668,6 @@ const durableTargetMappingTable = [
   },
   {
     pattern:
-      /^graph_vault\/books\/[^/]+\/output\/lancedb\/[^/]+\.lance\/qmd_row_count\.json$/,
-    lane: "checkpointWriterLane",
-    durableKind: "json",
-    targetMappingOwner: "artifactValidation",
-    preflightScopes: [
-      { path: "graph_vault/books/{bookId}/output", recursive: true },
-    ],
-  },
-  {
-    pattern:
       /^graph_vault\/books\/[^/]+\/graphrag\/output\/lancedb\/[^/]+\.lance\/qmd_row_count\.json$/,
     lane: "checkpointWriterLane",
     durableKind: "json",
@@ -722,13 +675,6 @@ const durableTargetMappingTable = [
     preflightScopes: [
       { path: "graph_vault/books/{bookId}/graphrag/output", recursive: true },
     ],
-  },
-  {
-    pattern: /^graph_vault\/output\/lancedb\/[^/]+\.lance\/qmd_row_count\.json$/,
-    lane: "checkpointWriterLane",
-    durableKind: "json",
-    targetMappingOwner: "artifactValidation",
-    preflightScopes: [{ path: "graph_vault/output", recursive: true }],
   },
   {
     pattern: /(?:^|\/)\.qmd\/index\.sqlite$/,
@@ -821,16 +767,6 @@ const durableDirectoryFsyncScopeTable = [
     pattern: /^graph_vault\/books\/[^/]+\/qmd$/,
     lane: "checkpointWriterLane",
     targetMappingOwner: "qmd",
-  },
-  {
-    pattern: /^graph_vault\/books\/[^/]+\/output(?:\/.*)?$/,
-    lane: "checkpointWriterLane",
-    targetMappingOwner: "graphOutputProducer",
-  },
-  {
-    pattern: /^graph_vault\/output\/lancedb\/[^/]+\.lance$/,
-    lane: "checkpointWriterLane",
-    targetMappingOwner: "artifactValidation",
   },
   {
     pattern: /^graph_vault\/dspy(?:\/.*)?$/,
@@ -1348,11 +1284,6 @@ const GraphRagOutputProducerManifestSchema = z.object({
   producerRunId: z.string().min(1),
   stageProducerRunIds: z.record(z.string(), z.string().min(1)),
 });
-const GraphRagOutputProducerManifestLegacySchema =
-  GraphRagOutputProducerManifestSchema.omit({ outputDir: true }).extend({
-    outputDir: z.string().min(1),
-    stageProducerRunIds: z.record(z.string(), z.string().min(1)).optional(),
-  });
 const BatchItemCheckpointBaseSchema = z.object({
   schemaVersion: z.literal(SchemaVersion),
   itemId: z.string().min(1),
@@ -5274,7 +5205,6 @@ function ensureDirs() {
   }
   mkdirSync(batchRoot, { recursive: true });
   mkdirSync(itemRoot, { recursive: true });
-  mkdirSync(join(stateRoot, "input"), { recursive: true });
 }
 
 function parseDotenvText(text) {
@@ -5846,10 +5776,7 @@ function graphOutputArtifactForDurableTarget(path) {
   if (match == null) return null;
   const [, bookId] = match;
   const artifactCatalog = readYamlSchemaIfExists(
-    firstExistingPath([
-      join(stateRoot, "books", bookId, "state", "artifacts.yaml"),
-      join(stateRoot, "books", bookId, "artifacts.yaml"),
-    ]) ?? join(stateRoot, "books", bookId, "state", "artifacts.yaml"),
+    join(stateRoot, "books", bookId, "state", "artifacts.yaml"),
     BookArtifactManifestListSchema,
   );
   const artifacts = artifactCatalog?.items ?? [];
@@ -5881,10 +5808,7 @@ function graphOutputArtifactsForDurableTarget(path) {
   if (match == null) return [];
   const [, bookId] = match;
   const artifactCatalog = readYamlSchemaIfExists(
-    firstExistingPath([
-      join(stateRoot, "books", bookId, "state", "artifacts.yaml"),
-      join(stateRoot, "books", bookId, "artifacts.yaml"),
-    ]) ?? join(stateRoot, "books", bookId, "state", "artifacts.yaml"),
+    join(stateRoot, "books", bookId, "state", "artifacts.yaml"),
     BookArtifactManifestListSchema,
   );
   const artifacts = artifactCatalog?.items ?? [];
@@ -6029,7 +5953,6 @@ function repairKnownMutableGraphOutputStatsQuarantines(items, scanStats) {
         "output",
         "stats.json",
       ),
-      join(stateRoot, "books", item.bookId, "output", "stats.json"),
     ]) {
       if (seen.has(statsPath)) continue;
       seen.add(statsPath);
@@ -8483,7 +8406,10 @@ function normalizedPathFor(
   bookId,
 ) {
   const catalogItem = catalogByHash.get(catalogKey(sourceHash, sourceIdentityPath));
-  if (typeof catalogItem?.normalizedPath === "string") {
+  if (
+    typeof catalogItem?.normalizedPath === "string" &&
+    catalogItem.normalizedPath.startsWith(`books/${bookId}/input/`)
+  ) {
     return join(stateRoot, catalogItem.normalizedPath);
   }
   const stem = basename(sourcePath, ".epub");
@@ -9305,8 +9231,7 @@ function readGraphOutputProducerManifest(path) {
   const raw = statusJson ? readDurableJsonReadOnly(path) : readJson(path);
   const current = GraphRagOutputProducerManifestSchema.safeParse(raw);
   if (current.success) return current.data;
-  const legacy = GraphRagOutputProducerManifestLegacySchema.safeParse(raw);
-  return legacy.success ? legacy.data : null;
+  return null;
 }
 
 function firstExistingPath(paths) {
@@ -9381,17 +9306,14 @@ function hotplugRuntimeGatePath(item) {
 }
 
 function graphOutputProducerManifestPath(item) {
-  return firstExistingPath([
-    join(
-      stateRoot,
-      "books",
-      item.bookId,
-      "graphrag",
-      "output",
-      "qmd_output_manifest.json",
-    ),
-    join(stateRoot, "books", item.bookId, "output", "qmd_output_manifest.json"),
-  ]);
+  return join(
+    stateRoot,
+    "books",
+    item.bookId,
+    "graphrag",
+    "output",
+    "qmd_output_manifest.json",
+  );
 }
 
 function qmdBuildArtifactId(item, normalizedContentHash) {
@@ -9745,10 +9667,7 @@ function validateArtifactContent(artifact, bookId) {
 
 function readGraphJob(item) {
   const bookScopedJob = readYamlSchemaIfExists(
-    firstExistingPath([
-      join(stateRoot, "books", item.bookId, "state", "job.yaml"),
-      join(stateRoot, "books", item.bookId, "job.yaml"),
-    ]),
+    join(stateRoot, "books", item.bookId, "state", "job.yaml"),
     BookJobSchema,
   );
   if (bookScopedJob?.sourceHash === item.sourceHash) return bookScopedJob;
@@ -9873,13 +9792,10 @@ function selectValidStageArtifacts({
       invalidReasons.push(`stage_artifact_corpus_mismatch:${stage}`);
       continue;
     }
-    const graphOutputPrefixes = [
-      `books/${item.bookId}/graphrag/output`,
-      `books/${item.bookId}/output`,
-    ];
+    const graphOutputPrefix = `books/${item.bookId}/graphrag/output`;
     const isBookScoped = stage === "embed"
-      ? graphOutputPrefixes.some((prefix) => artifact.path === `${prefix}/lancedb`)
-      : graphOutputPrefixes.some((prefix) => artifact.path.startsWith(`${prefix}/`));
+      ? artifact.path === `${graphOutputPrefix}/lancedb`
+      : artifact.path.startsWith(`${graphOutputPrefix}/`);
     if (!isBookScoped) {
       invalidReasons.push("stage_artifact_not_book_scoped");
       continue;
@@ -10022,17 +9938,11 @@ function validateGraphStageEvidence({
 function graphBuildEvidence(item) {
   const checkedAt = now();
   const checkpointCatalog = readYamlSchemaIfExists(
-    firstExistingPath([
-      join(stateRoot, "books", item.bookId, "state", "checkpoints.yaml"),
-      join(stateRoot, "books", item.bookId, "checkpoints.yaml"),
-    ]),
+    join(stateRoot, "books", item.bookId, "state", "checkpoints.yaml"),
     BookJobCheckpointListSchema,
   );
   const artifactCatalog = readYamlSchemaIfExists(
-    firstExistingPath([
-      join(stateRoot, "books", item.bookId, "state", "artifacts.yaml"),
-      join(stateRoot, "books", item.bookId, "artifacts.yaml"),
-    ]),
+    join(stateRoot, "books", item.bookId, "state", "artifacts.yaml"),
     BookArtifactManifestListSchema,
   );
   const checkpoints = checkpointCatalog?.items ?? [];
@@ -10135,56 +10045,6 @@ function graphBuildEvidence(item) {
     stage: "query_ready",
     artifactIds: checkpointArtifactIds(queryReady),
   };
-}
-
-function migrateGraphOutputProducerManifests(items = discoverItems(), checkpoints = new Map()) {
-  for (const item of items) {
-    const checkpoint = checkpoints.get(item.itemId);
-    if (
-      !shouldScanBookScopedStartupTarget({
-        statusJson,
-        migrateOnly,
-        checkpointStatus: checkpoint?.status,
-      })
-    ) {
-      continue;
-    }
-    const manifestPath = graphOutputProducerManifestPath(item);
-    if (!existsSync(manifestPath)) continue;
-    let parsed;
-    try {
-      parsed = readGraphOutputProducerManifest(manifestPath);
-    } catch {
-      continue;
-    }
-    if (parsed == null || typeof parsed.outputDir !== "string") continue;
-    const expectedLocator = graphRagBookOutputLocator(item.bookId);
-    if (parsed.outputDir === expectedLocator) continue;
-    const resolvedOutputDir = resolve(parsed.outputDir);
-    const expectedOutputDirs = [
-      resolve(stateRoot, "books", item.bookId, "output"),
-      resolve(stateRoot, "books", item.bookId, "graphrag", "output"),
-    ];
-    if (!expectedOutputDirs.includes(resolvedOutputDir)) continue;
-    const migrated = GraphRagOutputProducerManifestSchema.parse({
-      ...parsed,
-      outputDir: expectedLocator,
-    });
-    writeTypedJson(
-      manifestPath,
-      GraphRagOutputProducerManifestSchema,
-      migrated,
-    );
-    event({
-      itemId: item.itemId,
-      event: "graph_output_manifest_migrated",
-      status: "pending",
-      metadata: {
-        manifestLocator: `graph_vault/${expectedLocator}/qmd_output_manifest.json`,
-        outputDir: expectedLocator,
-      },
-    });
-  }
 }
 
 function qmdCommandCheckEvidence(checkpoint) {
@@ -14054,7 +13914,6 @@ async function main() {
     item.itemId,
     loadCheckpoint(item, completedSeed),
   ]));
-  if (!statusJson) migrateGraphOutputProducerManifests(items, checkpoints);
   manifest = updateManifest(manifest, Array.from(checkpoints.values()));
   if (!statusJson && batchStopRequested) {
     manifest = persistBatchStopManifest(

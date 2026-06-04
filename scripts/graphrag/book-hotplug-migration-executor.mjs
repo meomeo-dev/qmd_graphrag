@@ -81,7 +81,7 @@ function writeExecutionRecord(stateRoot, migrationId, value) {
 }
 
 function stagingRootFor(stateRoot, bookId) {
-  return join(stateRoot, ".staging", "book-hotplug-migrations", bookId);
+  return join(stateRoot, "catalog", ".staging", "book-hotplug-migrations", bookId);
 }
 
 function executionItemBase(stateRoot, item) {

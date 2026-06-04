@@ -98,7 +98,6 @@ export async function projectDocumentIdentityFromBookState(
     metadata: {
       qmdCorpusRegistered: true,
       projectionSource: "book_state",
-      legacyGraphIdentityNormalizedPath: identity.normalizedPath,
     },
   });
   return parsed.success ? parsed.data : null;

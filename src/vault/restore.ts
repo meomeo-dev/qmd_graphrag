@@ -178,16 +178,8 @@ async function missingCapabilityPortablePaths(
   ];
 
   for (const bookId of bookIds) {
-    const checkpointsPath = await pathExists(
-      join(graphVault, "books", bookId, "state", "checkpoints.yaml"),
-    )
-      ? `books/${bookId}/state/checkpoints.yaml`
-      : `books/${bookId}/checkpoints.yaml`;
-    const artifactsPath = await pathExists(
-      join(graphVault, "books", bookId, "state", "artifacts.yaml"),
-    )
-      ? `books/${bookId}/state/artifacts.yaml`
-      : `books/${bookId}/artifacts.yaml`;
+    const checkpointsPath = `books/${bookId}/state/checkpoints.yaml`;
+    const artifactsPath = `books/${bookId}/state/artifacts.yaml`;
     const checkpointsRaw = await readYaml(join(graphVault, checkpointsPath));
     const artifactsRaw = await readYaml(join(graphVault, artifactsPath));
 
@@ -376,7 +368,7 @@ export async function restoreFromVault(
   const parsed = VaultRestoreRequestSchema.parse(request);
   const graphVault = resolve(parsed.graphVault);
   const requiredPaths = [
-    "input",
+    "books",
     "catalog/sources.yaml",
     "catalog/document-identity-map.yaml",
   ];
@@ -495,8 +487,8 @@ export async function restoreFromVault(
     const store = createStore(parsed.targetIndexPath);
     try {
       upsertStoreCollection(store.db, "books", {
-        path: join(graphVault, "input"),
-        pattern: "**/*.md",
+        path: join(graphVault, "books"),
+        pattern: "**/input/*.md",
         context: {
           "/": "Restored graph_vault normalized books.",
         },
@@ -550,10 +542,19 @@ export async function restoreFromVault(
           continue;
         }
 
+        if (
+          identity.canonicalBookId == null ||
+          !normalizedPath.startsWith(`books/${identity.canonicalBookId}/input/`)
+        ) {
+          failedItems.push({
+            itemId: identity.documentId,
+            stage: "restore_document",
+            redactedMessage: "normalizedPath must use books/{bookId}/input/{file}",
+          });
+          continue;
+        }
         const title = extractTitle(content, normalizedPath);
-        const relativeInputPath = normalizedPath.startsWith("input/")
-          ? normalizedPath.slice("input/".length)
-          : normalizedPath;
+        const relativeInputPath = normalizedPath.slice("books/".length);
         insertContent(store.db, identity.contentHash, content, now);
         insertDocument(
           store.db,

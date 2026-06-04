@@ -238,20 +238,7 @@ const DurableTargetMappingTable = [
     targetMappingOwner: "bookHotplugPackage",
   },
   {
-    pattern: /\/graph_vault\/books\/[^/]+\/output\/qmd_output_manifest\.json$/,
-    lane: "checkpointWriterLane",
-    durableKind: "json",
-    targetMappingOwner: "graphOutputProducer",
-  },
-  {
     pattern: /\/graph_vault\/books\/[^/]+\/graphrag\/output\/qmd_output_manifest\.json$/,
-    lane: "checkpointWriterLane",
-    durableKind: "json",
-    targetMappingOwner: "graphOutputProducer",
-  },
-  {
-    pattern:
-      /\/graph_vault\/books\/[^/]+\/output\/qmd_graph_text_unit_identity\.json$/,
     lane: "checkpointWriterLane",
     durableKind: "json",
     targetMappingOwner: "graphOutputProducer",
@@ -264,19 +251,7 @@ const DurableTargetMappingTable = [
     targetMappingOwner: "graphOutputProducer",
   },
   {
-    pattern: /\/graph_vault\/books\/[^/]+\/output\/context\.json$/,
-    lane: "checkpointWriterLane",
-    durableKind: "json",
-    targetMappingOwner: "graphOutputProducer",
-  },
-  {
     pattern: /\/graph_vault\/books\/[^/]+\/graphrag\/output\/context\.json$/,
-    lane: "checkpointWriterLane",
-    durableKind: "json",
-    targetMappingOwner: "graphOutputProducer",
-  },
-  {
-    pattern: /\/graph_vault\/books\/[^/]+\/output\/stats\.json$/,
     lane: "checkpointWriterLane",
     durableKind: "json",
     targetMappingOwner: "graphOutputProducer",
@@ -303,13 +278,6 @@ const DurableTargetMappingTable = [
   },
   {
     pattern:
-      /\/graph_vault\/books\/[^/]+\/output\/qmd_durable_output_repair\.json$/,
-    lane: "checkpointWriterLane",
-    durableKind: "json",
-    targetMappingOwner: "graphOutputProducer",
-  },
-  {
-    pattern:
       /\/graph_vault\/books\/[^/]+\/graphrag\/output\/qmd_durable_output_repair\.json$/,
     lane: "checkpointWriterLane",
     durableKind: "json",
@@ -317,20 +285,7 @@ const DurableTargetMappingTable = [
   },
   {
     pattern:
-      /\/graph_vault\/books\/[^/]+\/output\/lancedb\/[^/]+\.lance\/qmd_row_count\.json$/,
-    lane: "checkpointWriterLane",
-    durableKind: "json",
-    targetMappingOwner: "artifactValidation",
-  },
-  {
-    pattern:
       /\/graph_vault\/books\/[^/]+\/graphrag\/output\/lancedb\/[^/]+\.lance\/qmd_row_count\.json$/,
-    lane: "checkpointWriterLane",
-    durableKind: "json",
-    targetMappingOwner: "artifactValidation",
-  },
-  {
-    pattern: /\/graph_vault\/output\/lancedb\/[^/]+\.lance\/qmd_row_count\.json$/,
     lane: "checkpointWriterLane",
     durableKind: "json",
     targetMappingOwner: "artifactValidation",

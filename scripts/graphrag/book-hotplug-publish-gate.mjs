@@ -28,7 +28,7 @@ export function validateHotplugPackagePublishCandidate(input) {
   const stateRoot = resolve(input.stateRoot);
   const bookRoot = resolve(stateRoot, "books", input.bookId);
   const stagingBase = input.stagingRoot ??
-    join(stateRoot, ".staging", "hotplug-publish-gate");
+    join(stateRoot, "catalog", ".staging", "hotplug-publish-gate");
   const candidateRoot = join(
     stagingBase,
     `${input.bookId}-${randomUUID().replace(/-/gu, "")}`,

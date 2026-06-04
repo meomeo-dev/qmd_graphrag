@@ -37,7 +37,6 @@ import {
   createRunId,
   hashFile,
   hashText,
-  normalizeBookSlug,
 } from "./fingerprint.js";
 import {
   chunkDocument,
@@ -690,19 +689,6 @@ async function materializeNormalizedInputInVault(input: {
   return { path: targetPath, content, contentHash };
 }
 
-async function canonicalizeLegacyWorkspaceLayout(input: {
-  repo: FileBookJobStateRepository;
-  stateRootDir: string;
-  sourceIdentityPath: string;
-  sourceHash: string;
-  bookId: string;
-}): Promise<void> {
-  const legacyBookId = `${normalizeBookSlug(input.sourceIdentityPath)}-${
-    input.sourceHash.slice(0, 12)
-  }`;
-  await input.repo.remapBookIdentity(legacyBookId, input.bookId);
-}
-
 async function maybeArtifactForPath(
   path: string,
   stage: BookStage,
@@ -1095,12 +1081,13 @@ export async function registerQmdCorpusDocument(input: {
             },
           });
           const now = new Date().toISOString();
+          if (!input.job.normalizedPath?.startsWith("books/")) {
+            throw new Error(
+              `qmd corpus registration requires books/{bookId}/input path: ${input.job.bookId}`,
+            );
+          }
           const normalizedRelativePath =
-            input.job.normalizedPath?.startsWith("books/")
-              ? input.job.normalizedPath.slice("books/".length)
-              : input.job.normalizedPath?.startsWith("input/")
-                ? input.job.normalizedPath.slice("input/".length)
-                : input.job.normalizedPath ?? basename(input.normalizedPath);
+            input.job.normalizedPath.slice("books/".length);
           insertContent(store.db, contentHash, content, now);
           insertDocument(
             store.db,
@@ -2178,13 +2165,6 @@ export async function syncGraphRagBookWorkspace(
     GRAPHRAG_NORMALIZATION_POLICY_VERSION,
   );
   const bookId = buildBookIdFromSourceHash(sourceIdentityPath, sourceHash);
-  await canonicalizeLegacyWorkspaceLayout({
-    repo,
-    stateRootDir: input.stateRootDir,
-    sourceIdentityPath,
-    sourceHash,
-    bookId,
-  });
   const normalizedInput = await materializeNormalizedInputInVault({
     normalizedPath: incomingNormalizedPath,
     stateRootDir: input.stateRootDir,

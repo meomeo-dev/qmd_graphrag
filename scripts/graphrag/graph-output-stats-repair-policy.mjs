@@ -65,7 +65,7 @@ export function graphOutputStatsCorruptSortKey(corruptPath) {
 function graphOutputStatsTarget(path, stateRoot) {
   if (typeof path !== "string" || typeof stateRoot !== "string") return null;
   const stateRelativeLocator = relative(stateRoot, path).split(sep).join("/");
-  const match = /^books\/([^/]+)\/output\/stats\.json$/u
+  const match = /^books\/([^/]+)\/graphrag\/output\/stats\.json$/u
     .exec(stateRelativeLocator);
   if (match == null) return null;
   return {

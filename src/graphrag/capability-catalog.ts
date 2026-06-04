@@ -58,7 +58,6 @@ import {
   resolveBookPublishReadyPath,
   resolveBookRunDir,
   resolveBookStateFile,
-  rewriteLegacyGraphArtifactPath,
 } from "./book-package-layout.js";
 
 const QUERY_READY_PRODUCER_REQUIRED_KINDS = {
@@ -550,10 +549,7 @@ export async function projectQueryReadyLineage(
   if (artifactsRaw == null) return null;
   const artifactsResult = BookArtifactManifestListSchema.safeParse(artifactsRaw);
   if (!artifactsResult.success) return null;
-  const artifacts = artifactsResult.data.items.map((artifact) => ({
-    ...artifact,
-    path: rewriteLegacyGraphArtifactPath(bookId, artifact.path),
-  }));
+  const artifacts = artifactsResult.data.items;
   const currentCheckpoints = await loadCurrentCheckpointCandidates(graphVault, bookId);
   if (currentCheckpoints == null) return null;
   const candidates = await loadCheckpointCandidates(graphVault, book);

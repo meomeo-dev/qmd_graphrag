@@ -1,5 +1,3 @@
-import { basename } from "node:path";
-
 export const qmdIndexWriterCommandCheckNames = Object.freeze([
   "qmd-pull",
   "qmd-update",
@@ -21,7 +19,9 @@ export function qmdBooksUriForNormalizedPath(normalizedPath) {
   if (match != null) {
     return `qmd://books/${match[1]}/input/${match[2]}`;
   }
-  return `qmd://books/${basename(normalizedPath)}`;
+  throw new Error(
+    `normalized path must use books/{bookId}/input/{file}: ${normalized}`,
+  );
 }
 
 export function qmdMultiGetJsonArgsForNormalizedPath(normalizedPath) {

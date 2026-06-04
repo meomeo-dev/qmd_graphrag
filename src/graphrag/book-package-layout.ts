@@ -45,8 +45,7 @@ export async function resolveBookGraphRagDataDir(
     }
   }
   const hotplugOutputDir = join(bookRoot, "graphrag", "output");
-  if (existsSync(hotplugOutputDir)) return hotplugOutputDir;
-  return join(bookRoot, "output");
+  return hotplugOutputDir;
 }
 
 export function resolveBookStateFile(
@@ -55,9 +54,7 @@ export function resolveBookStateFile(
   fileName: BookStateFileName,
 ): string {
   const bookRoot = resolveBookRoot(graphVaultInput, bookId);
-  const hotplugPath = join(bookRoot, "state", fileName);
-  if (existsSync(hotplugPath)) return hotplugPath;
-  return join(bookRoot, fileName);
+  return join(bookRoot, "state", fileName);
 }
 
 export function resolveBookRunDir(
@@ -65,29 +62,9 @@ export function resolveBookRunDir(
   bookId: string,
 ): string {
   const bookRoot = resolveBookRoot(graphVaultInput, bookId);
-  const hotplugRunDir = join(bookRoot, "graphrag", "runs");
-  if (existsSync(hotplugRunDir)) return hotplugRunDir;
-  return join(bookRoot, "runs");
+  return join(bookRoot, "graphrag", "runs");
 }
 
 export function bookScopedGraphOutputBases(bookId: string): string[] {
-  return [
-    `books/${bookId}/graphrag/output`,
-    `books/${bookId}/output`,
-  ];
-}
-
-export function rewriteLegacyGraphArtifactPath(
-  bookId: string,
-  artifactPath: string,
-): string {
-  const legacyBase = `books/${bookId}/output`;
-  const hotplugBase = `books/${bookId}/graphrag/output`;
-  if (artifactPath === legacyBase || artifactPath.startsWith(`${legacyBase}/`)) {
-    return artifactPath.replace(legacyBase, hotplugBase);
-  }
-  if (artifactPath === "output" || artifactPath.startsWith("output/")) {
-    return artifactPath.replace(/^output\b/u, "graphrag/output");
-  }
-  return artifactPath;
+  return [`books/${bookId}/graphrag/output`];
 }

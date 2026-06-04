@@ -489,7 +489,6 @@ export async function rebuildCatalogFromBookHotplugPackages(
         metadata: {
           qmdCorpusRegistered: true,
           projectionSource: "book_hotplug_manifest",
-          legacyGraphIdentityNormalizedPath: graphIdentity.normalizedPath,
         },
       });
       capabilityCandidates.push({ manifest, identity: graphIdentity });

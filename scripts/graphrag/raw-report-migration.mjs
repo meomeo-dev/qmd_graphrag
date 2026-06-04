@@ -67,11 +67,6 @@ export function bookScopedRawReportDirectories(stateRoot, bookId) {
       sourceLocator: `graph_vault/books/${bookId}/graphrag/output/reports`,
       targetScope: `${bookId}-graphrag-output-reports`,
     },
-    {
-      reportsDir: join(stateRoot, "books", bookId, "output", "reports"),
-      sourceLocator: `graph_vault/books/${bookId}/output/reports`,
-      targetScope: `${bookId}-output-reports`,
-    },
   ];
 }
 

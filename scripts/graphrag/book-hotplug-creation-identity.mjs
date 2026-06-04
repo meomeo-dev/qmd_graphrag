@@ -64,8 +64,7 @@ function sidecarsPresent(path) {
 }
 
 function readGraphManifest(bookRoot) {
-  return readJsonOptional(graphOutputManifestPath(join(bookRoot, "graphrag", "output"))) ??
-    readJsonOptional(graphOutputManifestPath(join(bookRoot, "output")));
+  return readJsonOptional(graphOutputManifestPath(join(bookRoot, "graphrag", "output")));
 }
 
 function readBookJob(stateRoot, bookId, sourceHash) {
@@ -241,7 +240,6 @@ export function ensureBookCreationGraphTextUnitIdentity(input) {
   const targetPath = graphIdentitySidecarPath(outputDir);
   const candidates = [
     readJsonOptional(targetPath),
-    readJsonOptional(graphIdentitySidecarPath(join(bookRoot, "output"))),
     identityFromCatalog({ ...input, stateRoot, bookRoot }, expected),
     testFallbackIdentity(input, expected),
   ];

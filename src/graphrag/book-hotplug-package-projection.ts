@@ -252,7 +252,6 @@ export async function projectHotplugDocumentIdentity(
     metadata: {
       qmdCorpusRegistered: true,
       projectionSource: "book_hotplug_manifest",
-      legacyGraphIdentityNormalizedPath: identity.normalizedPath,
     },
   });
   return parsed.success ? parsed.data : null;

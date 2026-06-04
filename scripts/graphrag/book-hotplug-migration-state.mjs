@@ -125,51 +125,26 @@ function maybeFileEvidence(stateRoot, path) {
   };
 }
 
-function targetHotplugPathForLegacyFile(bookRoot, filePath) {
-  const relativePath = toPosixPath(relative(bookRoot, filePath));
-  if (relativePath.startsWith("output/")) {
-    return join(bookRoot, "graphrag", relativePath);
-  }
-  if (relativePath.startsWith("runs/")) {
-    return join(bookRoot, "graphrag", relativePath);
-  }
-  if (["job.yaml", "artifacts.yaml", "checkpoints.yaml"].includes(relativePath)) {
-    return join(bookRoot, "state", relativePath);
-  }
-  return join(bookRoot, relativePath);
-}
-
 function copyMapEntriesForBook(input) {
   const roots = [
     join(input.bookRoot, "source"),
     join(input.bookRoot, "input"),
     join(input.bookRoot, "qmd"),
-    join(input.bookRoot, "output"),
-    join(input.bookRoot, "runs"),
+    join(input.bookRoot, "graphrag", "output"),
+    join(input.bookRoot, "graphrag", "runs"),
+    join(input.bookRoot, "state"),
   ];
-  const looseStateFiles = ["job.yaml", "artifacts.yaml", "checkpoints.yaml"]
-    .map((name) => join(input.bookRoot, name))
-    .filter((path) => safeStat(path)?.isFile());
-  const files = [
-    ...roots.flatMap((root) => listFilesRecursive(root)),
-    ...looseStateFiles,
-  ].sort((left, right) => left.localeCompare(right));
+  const files = roots
+    .flatMap((root) => listFilesRecursive(root))
+    .sort((left, right) => left.localeCompare(right));
   return files.map((sourcePath) => {
-    const targetPath = targetHotplugPathForLegacyFile(input.bookRoot, sourcePath);
     const source = maybeFileEvidence(input.stateRoot, sourcePath);
-    const target = maybeFileEvidence(input.stateRoot, targetPath);
     return {
-      operation: sourcePath === targetPath ? "preserve_in_place" : "copy_to_hotplug_layout",
+      operation: "preserve_in_place",
       source,
-      target: target ?? {
-        locator: toPosixPath(relative(input.stateRoot, targetPath)),
-        bytes: null,
-        sha256: null,
-      },
-      commitStatus: target == null ? "pending" : "committed",
-      rollbackAction: sourcePath === targetPath
-        ? "none_preserved_in_place"
-        : "remove_target_copy_preserve_source",
+      target: source,
+      commitStatus: "committed",
+      rollbackAction: "none_preserved_in_place",
     };
   });
 }
@@ -207,7 +182,12 @@ function candidatePackagePaths(input, locator) {
   const normalized = toPosixPath(locator);
   const stripped = stripBookPrefix(input.bookId, normalized);
   const candidates = [];
-  if (!normalized.startsWith("/") && !/^[A-Za-z]:\//u.test(normalized)) {
+  const packageRelativeInput = normalized.startsWith("input/");
+  if (
+    !packageRelativeInput &&
+    !normalized.startsWith("/") &&
+    !/^[A-Za-z]:\//u.test(normalized)
+  ) {
     candidates.push(join(input.stateRoot, normalized));
   }
   if (stripped !== normalized || stripped.startsWith("input/")) {
@@ -215,7 +195,6 @@ function candidatePackagePaths(input, locator) {
   }
   if (normalized.includes("/input/") || normalized.startsWith("input/")) {
     candidates.push(join(input.bookRoot, "input", basename(normalized)));
-    candidates.push(join(input.stateRoot, "input", basename(normalized)));
   }
   candidates.push(join(input.bookRoot, normalized));
   return [...new Set(candidates)];
@@ -234,7 +213,6 @@ function locateCanonicalInput(input, distribution, qmdManifest) {
     distribution?.portability?.canonicalNormalizedPath,
     qmdManifest?.canonicalBookNormalizedPath,
     qmdManifest?.normalizedPath,
-    distribution?.portability?.legacyNormalizedPath,
   ].filter((locator) => typeof locator === "string" && locator.length > 0);
   for (const locator of locators) {
     const match = firstReadableFile(candidatePackagePaths(input, locator));
@@ -260,14 +238,8 @@ function locateCanonicalInput(input, distribution, qmdManifest) {
     };
 }
 
-function sourceClosureEvidence(input, distribution) {
-  const roots = [
-    join(input.bookRoot, "source"),
-    join(input.stateRoot, "sources", input.bookId),
-  ];
-  if (typeof distribution?.portability?.sourceRoot === "string") {
-    roots.push(join(input.stateRoot, distribution.portability.sourceRoot));
-  }
+function sourceClosureEvidence(input) {
+  const roots = [join(input.bookRoot, "source")];
   const files = [];
   for (const root of [...new Set(roots)]) {
     for (const path of listFilesRecursive(root)) {
@@ -309,11 +281,9 @@ function runEvidence(input, distribution, graphOutputManifest) {
   const present = [];
   const missing = [];
   for (const runId of [...declared].sort()) {
-    const candidates = [
-      join(input.bookRoot, "graphrag", "runs", `${runId}.yaml`),
-      join(input.bookRoot, "runs", `${runId}.yaml`),
-    ];
-    if (candidates.some((path) => existsSync(path))) present.push(runId);
+    if (existsSync(join(input.bookRoot, "graphrag", "runs", `${runId}.yaml`))) {
+      present.push(runId);
+    }
     else missing.push(runId);
   }
   return {
@@ -328,15 +298,13 @@ function runEvidence(input, distribution, graphOutputManifest) {
 }
 
 function artifactChecksumEvidence(input) {
-  const parsed = readYamlOptional(join(input.bookRoot, "state", "artifacts.yaml")) ??
-    readYamlOptional(join(input.bookRoot, "artifacts.yaml"));
+  const parsed = readYamlOptional(join(input.bookRoot, "state", "artifacts.yaml"));
   const items = Array.isArray(parsed?.items) ? parsed.items : [];
   const graphItems = items.filter((item) => {
     if (item == null || typeof item !== "object") return false;
     if (item.bookId !== input.bookId) return false;
     if (typeof item.path !== "string") return false;
-    return item.path.includes(`/output/`) ||
-      item.path.includes(`/graphrag/output/`);
+    return item.path.includes(`/graphrag/output/`);
   });
   const withHash = graphItems.filter((item) =>
     typeof item.contentHash === "string" && item.contentHash.length > 0
@@ -382,6 +350,7 @@ function classifyBookDirectory(input) {
   const publishReadyPath = join(input.bookRoot, "PUBLISH_READY.json");
   const stagingRoot = join(
     input.stateRoot,
+    "catalog",
     ".staging",
     "book-hotplug-migrations",
     input.bookId,
@@ -392,8 +361,6 @@ function classifyBookDirectory(input) {
     join(input.bookRoot, "qmd", "qmd_build_manifest.json"),
   );
   const graphOutputManifest = readJsonOptional(
-    join(input.bookRoot, "output", "qmd_output_manifest.json"),
-  ) ?? readJsonOptional(
     join(input.bookRoot, "graphrag", "output", "qmd_output_manifest.json"),
   );
   const diagnostics = [];
@@ -424,7 +391,7 @@ function classifyBookDirectory(input) {
   }
   const canonicalInput = locateCanonicalInput(input, distribution, qmdManifest);
   if (!canonicalInput.ok) diagnostics.push("migration_canonical_input_missing");
-  const sourceClosure = sourceClosureEvidence(input, distribution);
+  const sourceClosure = sourceClosureEvidence(input);
   if (!sourceClosure.ok) diagnostics.push("migration_source_closure_missing");
   const producer = runEvidence(input, distribution, graphOutputManifest);
   if (!producer.ok) diagnostics.push("migration_producer_lineage_missing");
@@ -467,7 +434,7 @@ function classifyBookDirectory(input) {
     : hasStagingRoot && !hasHotplugManifest
       ? "partial_migration"
       : eligible
-        ? hasHotplugManifest ? "already_migrated" : "legacy_only"
+        ? hasHotplugManifest ? "already_migrated" : "package_ready_for_publish"
         : distribution == null ? "residue_quarantined" : "repair_required";
   return {
     schemaVersion: SchemaVersion,
@@ -716,8 +683,8 @@ export function writeHotplugMigrationRunEvidence(input) {
     alreadyMigrated: classifications.filter((item) =>
       item.migrationState === "already_migrated"
     ).length,
-    legacyOnly: classifications.filter((item) =>
-      item.migrationState === "legacy_only"
+    readyForPublish: classifications.filter((item) =>
+      item.migrationState === "package_ready_for_publish"
     ).length,
     repairRequired: classifications.filter((item) =>
       item.migrationState === "repair_required"
@@ -740,7 +707,7 @@ export function writeHotplugMigrationRunEvidence(input) {
     sourceTruthGate: [
       "distribution_manifest.json with checksum sidecars",
       "canonical input closure",
-      "package or legacy source closure",
+      "package source closure",
       "qmd build manifest",
       "GraphRAG output manifest",
       "producer run evidence",
@@ -773,12 +740,12 @@ export function writeHotplugMigrationRunEvidence(input) {
         ? "committed"
         : "planned",
       mappedRoots: [
-        { from: "source legacy closure", to: "source/" },
+        { from: "source/", to: "source/" },
         { from: "input/", to: "input/" },
         { from: "qmd/", to: "qmd/" },
-        { from: "output/", to: "graphrag/output/" },
-        { from: "runs/", to: "graphrag/runs/" },
-        { from: "job/artifacts/checkpoints", to: "state/" },
+        { from: "graphrag/output/", to: "graphrag/output/" },
+        { from: "graphrag/runs/", to: "graphrag/runs/" },
+        { from: "state/", to: "state/" },
       ],
       files: copyMapEntriesForBook({
         stateRoot,
@@ -899,7 +866,7 @@ export function writeHotplugMigrationRunEvidence(input) {
     quarantinedResidues: input.quarantineResults ?? [],
     catalogRebuild: input.catalogRebuild ?? null,
     rollbackAvailable: true,
-    legacyEvidencePreserved: true,
+    packageEvidencePreserved: true,
     completedAt: input.completedAt ?? nowDefault(),
   };
   const rollbackRecord = {
@@ -917,7 +884,7 @@ export function writeHotplugMigrationRunEvidence(input) {
     preservePublishedBookIds: classifications
       .filter((item) =>
         item.migrationState === "already_migrated" ||
-        item.migrationState === "legacy_only"
+        item.migrationState === "package_ready_for_publish"
       )
       .map((item) => item.bookId),
     failureBookIds: (input.failures ?? []).map((item) => item.bookId),
@@ -942,14 +909,14 @@ export function writeHotplugMigrationRunEvidence(input) {
       previousManifestSha256: item.oldManifestSha256,
       currentManifestSha256: item.existingBookManifestSha256,
       publishMarkerExpected: item.migrationState === "already_migrated" ||
-        item.migrationState === "legacy_only",
+        item.migrationState === "package_ready_for_publish",
       actionOnFailure: item.migrationState === "partial_migration"
         ? "delete_or_resume_staging_only"
         : item.migrationState === "failed_interrupted"
           ? "remove_publish_marker_and_require_manual_decision"
           : item.rollbackAvailable
             ? "restore_previous_projection_generation"
-            : "preserve_legacy_evidence",
+            : "preserve_package_evidence",
     })),
     processed: input.processed ?? [],
     failed: input.failures ?? [],

@@ -1,8 +1,6 @@
 import {
   copyFile,
   mkdir,
-  readFile,
-  rename,
   stat,
   writeFile,
 } from "node:fs/promises";
@@ -16,8 +14,6 @@ import {
   resolve,
 } from "node:path";
 
-import YAML from "yaml";
-
 import {
   BookArtifactManifestListSchema,
   BookArtifactManifestSchema,
@@ -29,7 +25,6 @@ import {
   BookJobRunRecordSchema,
   BookJobSchema,
   BookResumePlanSchema,
-  BookStageSchema,
   BookStageOrder,
   type BookArtifactKind,
   type BookArtifactManifest,
@@ -57,19 +52,16 @@ import {
   type SourceDocumentCatalog,
 } from "../contracts/corpus.js";
 import {
-  buildBookId,
   buildBookIdFromSourceHash,
   buildDocumentId,
   createDeterministicHash,
   createRunId,
   hashFile,
-  normalizeBookSlug,
   toIsoTimestamp,
 } from "./fingerprint.js";
 import {
   readYamlFileDurable,
   readYamlFileDurableUnlocked,
-  readYamlUnknownDurableUnlocked,
   updateYamlFileDurable,
   updateYamlUnknownDurable,
   writeYamlFileDurable,
@@ -82,6 +74,11 @@ import {
   type GraphEnhancementState,
 } from "../contracts/graph-enhancement.js";
 import { recordGraphCapability } from "../graphrag/capability-catalog.js";
+import {
+  assertBookArtifactPath,
+  assertBookPackageInputPath,
+  assertBookPackageSourcePath,
+} from "../graphrag/book-package-path-policy.js";
 import {
   hasAbsolutePathSyntax,
   isPortableVaultRelativePath,
@@ -345,18 +342,6 @@ async function readYamlFile<T>(
   return readYamlFileDurable(path, schema, fallback);
 }
 
-async function readFirstYamlFile<T>(
-  paths: readonly string[],
-  schema: { parse(input: unknown): T },
-  fallback: T,
-): Promise<T> {
-  for (const path of paths) {
-    if (!existsSync(path)) continue;
-    return readYamlFile(path, schema, fallback);
-  }
-  return readYamlFile(paths[0]!, schema, fallback);
-}
-
 async function readYamlFileUnlocked<T>(
   path: string,
   schema: { parse(input: unknown): T },
@@ -365,55 +350,16 @@ async function readYamlFileUnlocked<T>(
   return readYamlFileDurableUnlocked(path, schema, fallback);
 }
 
-function migrateLegacyBookJob(value: unknown): BookJob {
-  const raw = value as Record<string, unknown>;
-  const normalizedPath = typeof raw.normalizedPath === "string"
-    ? raw.normalizedPath
-    : typeof (raw.metadata as Record<string, unknown> | undefined)?.normalizedPath === "string"
-      ? String((raw.metadata as Record<string, unknown>).normalizedPath)
-      : typeof raw.sourcePath === "string"
-        ? raw.sourcePath
-        : "unknown";
-  const contentHash = typeof raw.normalizedContentHash === "string"
-    ? raw.normalizedContentHash
-    : String(raw.sourceHash ?? "");
-  return BookJobSchema.parse({
-    ...raw,
-    documentId: typeof raw.documentId === "string" && raw.documentId
-      ? raw.documentId
-      : buildDocumentId({
-          sourceId: `sha256:${String(raw.sourceHash ?? "")}`,
-          contentHash,
-          normalizationPolicyVersion:
-            typeof raw.normalizationPolicyVersion === "string"
-              ? raw.normalizationPolicyVersion
-              : NormalizationPolicyVersion,
-        }),
-    normalizedPath: typeof raw.normalizedPath === "string"
-      ? normalizePortableVaultRelativePath(raw.normalizedPath)
-      : undefined,
-  });
-}
-
 async function readBookJobCatalogFile(path: string): Promise<BookJobCatalog> {
   return updateYamlUnknownDurable(
     path,
-    () => readBookJobCatalogFileUnlocked(path),
+    () => readYamlFileUnlocked(
+      path,
+      BookJobCatalogSchema,
+      EMPTY_BOOK_CATALOG,
+    ),
     (current) => current,
   );
-}
-
-async function readBookJobCatalogFileUnlocked(
-  path: string,
-): Promise<BookJobCatalog> {
-  const parsed = await readYamlUnknownDurableUnlocked(path) as {
-    items?: unknown[];
-  } | null;
-  const items = (parsed?.items ?? []).map((item) => migrateLegacyBookJob(item));
-  return BookJobCatalogSchema.parse({
-    schemaVersion: SchemaVersion,
-    items,
-  });
 }
 
 async function writeYamlFile(path: string, value: unknown): Promise<void> {
@@ -442,7 +388,11 @@ async function updateBookJobCatalogFile(
 ): Promise<BookJobCatalog> {
   return updateYamlUnknownDurable(
     path,
-    () => readBookJobCatalogFileUnlocked(path),
+    () => readYamlFileUnlocked(
+      path,
+      BookJobCatalogSchema,
+      EMPTY_BOOK_CATALOG,
+    ),
     update,
   );
 }
@@ -489,14 +439,6 @@ function createArtifactLogicalKey(input: {
   ]);
 }
 
-function stripKnownSourceExtension(path: string): string {
-  return path.replace(/\.(epub|md|markdown|txt)$/iu, "");
-}
-
-function archiveSafeTimestamp(): string {
-  return toIsoTimestamp().replace(/[:.]/gu, "-");
-}
-
 function createArtifactId(input: {
   bookId: string;
   stage: BookStage;
@@ -526,172 +468,6 @@ function assertHighCostFingerprint(input: {
   throw new Error(
     `${input.subject} for high-cost stage ${input.stage} requires ${missing.join(", ")}`,
   );
-}
-
-function canonicalizeArtifact(
-  artifact: BookArtifactManifest,
-  bookId: string,
-  oldBookId?: string,
-): BookArtifactManifest {
-  const canonicalPath = oldBookId == null
-    ? artifact.path
-    : artifact.path.replaceAll(`books/${oldBookId}/`, `books/${bookId}/`);
-  const canonical = { ...artifact, bookId, path: canonicalPath };
-  return {
-    ...canonical,
-    artifactId: createArtifactId(canonical),
-  };
-}
-
-function canonicalSourcePathForBook(
-  bookId: string,
-  sourcePath: string,
-): string {
-  const extension = extname(sourcePath) || ".epub";
-  return normalizePortableVaultRelativePath(
-    join("books", bookId, "source", `source${extension}`),
-  );
-}
-
-function canonicalizeBookJobLayout(job: BookJob, bookId: string): BookJob {
-  const sourcePath = canonicalSourcePathForBook(bookId, job.sourcePath);
-  const normalizedPath = job.normalizedPath == null
-    ? undefined
-    : normalizePortableVaultRelativePath(
-        job.normalizedPath.startsWith("books/")
-          ? job.normalizedPath.replace(
-              /^books\/[^/]+\//u,
-              `books/${bookId}/`,
-            )
-          : join("books", bookId, job.normalizedPath),
-      );
-  return BookJobSchema.parse({
-    ...job,
-    bookId,
-    sourcePath,
-    normalizedPath,
-    metadata: mergeJobMetadata(job.metadata, {
-      sourcePath,
-      ...(normalizedPath ? { normalizedPath } : {}),
-    }),
-  });
-}
-
-function migrateLegacyArtifactManifest(
-  value: unknown,
-  bookId: string,
-): BookArtifactManifest {
-  const raw = value as Record<string, unknown>;
-  const metadata = raw.metadata as Record<string, unknown> | undefined;
-  const stage = BookStageSchema.parse(raw.stage);
-  const contentHash = String(raw.contentHash ?? "");
-  const stageFingerprint =
-    typeof raw.stageFingerprint === "string"
-      ? raw.stageFingerprint
-      : typeof metadata?.stageFingerprint === "string"
-        ? metadata.stageFingerprint
-      : HIGH_COST_STAGES.has(stage)
-        ? createDeterministicHash(["legacy-stage", bookId, stage, contentHash])
-        : undefined;
-  const providerFingerprint =
-    typeof raw.providerFingerprint === "string"
-      ? raw.providerFingerprint
-      : typeof metadata?.providerFingerprint === "string"
-        ? metadata.providerFingerprint
-      : HIGH_COST_STAGES.has(stage)
-        ? createDeterministicHash(["legacy-provider", bookId, stage])
-        : undefined;
-  return BookArtifactManifestSchema.parse({
-    ...raw,
-    bookId: typeof raw.bookId === "string" ? raw.bookId : bookId,
-    stageFingerprint,
-    providerFingerprint,
-  });
-}
-
-function migrateLegacyArtifactManifestList(
-  value: unknown,
-  bookId: string,
-): BookArtifactManifestList {
-  const raw = value as Record<string, unknown>;
-  const items = Array.isArray(raw.items) ? raw.items : [];
-  return BookArtifactManifestListSchema.parse({
-    schemaVersion: SchemaVersion,
-    items: items.map((item) => migrateLegacyArtifactManifest(item, bookId)),
-  });
-}
-
-function migrateLegacyStageCheckpoint(
-  value: unknown,
-  input: {
-    bookId: string;
-    artifacts?: readonly BookArtifactManifest[];
-    job?: BookJob | null;
-  },
-): BookJobStageCheckpoint | null {
-  const raw = value as Record<string, unknown>;
-  const stage = BookStageSchema.parse(raw.stage);
-  const artifactIds = Array.isArray(raw.artifactIds)
-    ? raw.artifactIds.map(String)
-    : [];
-  const stageArtifacts = (input.artifacts ?? []).filter((artifact) =>
-    artifact.stage === stage && artifactIds.includes(artifact.artifactId)
-  );
-  const firstArtifact = stageArtifacts[0];
-  const contentHash = typeof raw.contentHash === "string"
-    ? raw.contentHash
-    : firstArtifact?.contentHash;
-  const stageFingerprint = typeof raw.stageFingerprint === "string"
-    ? raw.stageFingerprint
-    : firstArtifact?.stageFingerprint ??
-      input.job?.stageFingerprints?.[stage] ??
-      (HIGH_COST_STAGES.has(stage) && contentHash
-        ? createDeterministicHash(["legacy-stage", input.bookId, stage, contentHash])
-        : undefined);
-  const providerFingerprint = typeof raw.providerFingerprint === "string"
-    ? raw.providerFingerprint
-    : firstArtifact?.providerFingerprint ??
-      input.job?.providerFingerprint ??
-      (HIGH_COST_STAGES.has(stage)
-        ? createDeterministicHash(["legacy-provider", input.bookId, stage])
-        : undefined);
-  if (HIGH_COST_STAGES.has(stage) && contentHash == null) {
-    return null;
-  }
-  return BookJobStageCheckpointSchema.parse({
-    ...raw,
-    bookId: typeof raw.bookId === "string" ? raw.bookId : input.bookId,
-    contentHash,
-    stageFingerprint,
-    providerFingerprint,
-    artifactIds,
-  });
-}
-
-function migrateLegacyStageCheckpointList(
-  value: unknown,
-  input: {
-    bookId: string;
-    artifacts?: readonly BookArtifactManifest[];
-    job?: BookJob | null;
-  },
-): BookJobCheckpointList {
-  const raw = value as Record<string, unknown>;
-  const items = Array.isArray(raw.items) ? raw.items : [];
-  const migrated = items
-    .map((item) => migrateLegacyStageCheckpoint(item, input))
-    .filter((item): item is BookJobStageCheckpoint => item != null);
-  return BookJobCheckpointListSchema.parse({
-    schemaVersion: SchemaVersion,
-    items: migrated,
-  });
-}
-
-function remapArtifactIds(
-  artifactIds: string[],
-  artifactIdMap: Map<string, string>,
-): string[] {
-  return artifactIds.map((artifactId) => artifactIdMap.get(artifactId) ?? artifactId);
 }
 
 function mergeJobMetadata(
@@ -844,37 +620,8 @@ function readBatchBookLease(path: string): BatchBookLease | null {
   return null;
 }
 
-function checkpointRank(checkpoint: BookJobStageCheckpoint): number {
-  if (checkpoint.status === "succeeded") return 4;
-  if (checkpoint.status === "running") return 3;
-  if (checkpoint.status === "failed") return 2;
-  return 1;
-}
-
 function checkpointTimestamp(checkpoint: BookJobStageCheckpoint): string {
   return checkpoint.finishedAt ?? checkpoint.startedAt ?? "";
-}
-
-function latestCheckpointByStage(
-  checkpoints: BookJobStageCheckpoint[],
-): BookJobStageCheckpoint[] {
-  const byStage = new Map<BookStage, BookJobStageCheckpoint>();
-  for (const checkpoint of checkpoints) {
-    const existing = byStage.get(checkpoint.stage);
-    if (
-      existing == null ||
-      checkpointRank(checkpoint) > checkpointRank(existing) ||
-      (
-        checkpointRank(checkpoint) === checkpointRank(existing) &&
-        checkpointTimestamp(checkpoint) > checkpointTimestamp(existing)
-      )
-    ) {
-      byStage.set(checkpoint.stage, checkpoint);
-    }
-  }
-  return [...byStage.values()].sort((left, right) =>
-    stageIndex(left.stage) - stageIndex(right.stage),
-  );
 }
 
 function buildResumePlan(
@@ -1275,17 +1022,11 @@ export class FileBookJobStateRepository {
     const now = toIsoTimestamp();
     const bookId = buildBookIdFromSourceHash(sourceIdentityPath, sourceHash);
     this.assertBatchBookLease(bookId);
-    await this.migrateLegacyBookId(
-      sourcePath,
-      sourceIdentityPath,
-      sourceHash,
-      bookId,
-    );
     const existing = await this.getBookJob(bookId);
     const normalizedPath = input.normalizedPath != null
-      ? normalizePortableVaultRelativePath(input.normalizedPath)
+      ? assertBookPackageInputPath(input.normalizedPath, bookId)
       : input.metadata?.normalizedPath != null
-        ? normalizePortableVaultRelativePath(String(input.metadata.normalizedPath))
+        ? assertBookPackageInputPath(String(input.metadata.normalizedPath), bookId)
         : existing?.normalizedPath;
     const contentHash = input.normalizedContentHash
       ?? existing?.normalizedContentHash
@@ -1304,7 +1045,10 @@ export class FileBookJobStateRepository {
         sourcePath,
         sourceHash,
         bookId,
-        normalizePortableVaultRelativePath(input.canonicalSourcePath),
+        assertBookPackageSourcePath(
+          input.canonicalSourcePath,
+          bookId,
+        ),
       )
       : await this.resolveReusableSourcePath(
         sourcePath,
@@ -1414,7 +1158,7 @@ export class FileBookJobStateRepository {
           return existingSourcePath;
         }
       } catch {
-        // Missing or stale legacy source locator is rematerialized below.
+        // Missing or stale package source locator is rematerialized below.
       }
     }
     return this.materializeSource(sourcePath, sourceHash, bookId);
@@ -1593,195 +1337,6 @@ export class FileBookJobStateRepository {
     );
   }
 
-  async remapBookIdentity(oldBookId: string, newBookId: string): Promise<void> {
-    await this.ensureLayout();
-    if (oldBookId === newBookId) return;
-    this.assertBatchBookLease(newBookId);
-
-    const oldDir = this.bookDir(oldBookId);
-    const newDir = this.bookDir(newBookId);
-    let oldExists = false;
-    try {
-      await stat(oldDir);
-      oldExists = true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-
-    if (!oldExists) {
-      await this.rewriteLegacyCatalogReferences(oldBookId, newBookId);
-      await this.removeLegacyBookCatalogEntries(oldBookId, newBookId);
-      return;
-    }
-
-    let newExists = false;
-    try {
-      await stat(newDir);
-      newExists = true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        throw error;
-      }
-    }
-
-    if (newExists) {
-      await this.mergeLegacyBookDirectory(oldBookId, newBookId);
-      await this.archiveLegacyBookDirectory(oldBookId, newBookId);
-    } else {
-      await rename(oldDir, newDir);
-      await this.rewriteLegacyBookState(newBookId, oldBookId);
-    }
-    await this.canonicalizeLegacySourceDirectory(oldBookId, newBookId);
-    await this.rewriteLegacyCatalogReferences(oldBookId, newBookId);
-    await this.removeLegacyBookCatalogEntries(oldBookId, newBookId);
-  }
-
-  private async mergeLegacyBookDirectory(
-    oldBookId: string,
-    newBookId: string,
-  ): Promise<void> {
-    const oldArtifacts = await readYamlFile(
-      this.firstExistingArtifactManifestPath(oldBookId),
-      { parse: (value) => migrateLegacyArtifactManifestList(value, oldBookId) },
-      EMPTY_ARTIFACT_LIST,
-    );
-    const newArtifacts = await readYamlFile(
-      this.firstExistingArtifactManifestPath(newBookId),
-      BookArtifactManifestListSchema,
-      EMPTY_ARTIFACT_LIST,
-    );
-    const artifactIdMap = new Map<string, string>();
-    const canonicalOldArtifacts = oldArtifacts.items.map((artifact) => {
-      const canonical = canonicalizeArtifact(artifact, newBookId, oldBookId);
-      artifactIdMap.set(artifact.artifactId, canonical.artifactId);
-      return canonical;
-    });
-    await writeYamlFile(this.artifactManifestPath(newBookId), {
-      schemaVersion: SchemaVersion,
-      items: dedupeArtifacts([...newArtifacts.items, ...canonicalOldArtifacts]),
-    });
-
-    const oldCheckpoints = await readYamlFile(
-      this.firstExistingStageCheckpointPath(oldBookId),
-      {
-        parse: (value) => migrateLegacyStageCheckpointList(value, {
-          bookId: oldBookId,
-          artifacts: oldArtifacts.items,
-        }),
-      },
-      EMPTY_CHECKPOINT_LIST,
-    );
-    const newCheckpoints = await readYamlFile(
-      this.firstExistingStageCheckpointPath(newBookId),
-      BookJobCheckpointListSchema,
-      EMPTY_CHECKPOINT_LIST,
-    );
-    const mergedCheckpoints = [...newCheckpoints.items];
-    for (const checkpoint of oldCheckpoints.items) {
-      mergedCheckpoints.push(BookJobStageCheckpointSchema.parse({
-        ...checkpoint,
-        bookId: newBookId,
-        artifactIds: remapArtifactIds(checkpoint.artifactIds, artifactIdMap),
-      }));
-    }
-    await writeYamlFile(this.stageCheckpointPath(newBookId), {
-      schemaVersion: SchemaVersion,
-      items: latestCheckpointByStage(mergedCheckpoints),
-    });
-
-    await this.mergeLegacyRunRecords(
-      oldBookId,
-      newBookId,
-      artifactIdMap,
-      checkpointRunIds(oldCheckpoints.items),
-    );
-    await this.rewriteLegacyRunRecords(
-      newBookId,
-      artifactIdMap,
-      checkpointRunIds(newCheckpoints.items),
-    );
-  }
-
-  private async archiveLegacyBookDirectory(
-    oldBookId: string,
-    newBookId: string,
-  ): Promise<void> {
-    const legacyDir = this.bookDir(oldBookId);
-    try {
-      await stat(legacyDir);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-      throw error;
-    }
-
-    const archiveDir = join(
-      this.rootDir,
-      "archive",
-      "legacy-books",
-      `${oldBookId}-to-${newBookId}-${archiveSafeTimestamp()}`,
-    );
-    await ensureDir(dirname(archiveDir));
-    await rename(legacyDir, archiveDir);
-  }
-
-  private async canonicalizeLegacySourceDirectory(
-    oldBookId: string,
-    newBookId: string,
-  ): Promise<void> {
-    const legacyDir = join(this.rootDir, "sources", oldBookId);
-    const stableDir = join(this.rootDir, "sources", newBookId);
-    try {
-      await stat(legacyDir);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-      throw error;
-    }
-
-    try {
-      await stat(stableDir);
-      const archiveDir = join(
-        this.rootDir,
-        "archive",
-        "legacy-sources",
-        `${oldBookId}-to-${newBookId}-${archiveSafeTimestamp()}`,
-      );
-      await ensureDir(dirname(archiveDir));
-      await rename(legacyDir, archiveDir);
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-
-    await ensureDir(dirname(stableDir));
-    await rename(legacyDir, stableDir);
-  }
-
-  private async mergeLegacyRunRecords(
-    oldBookId: string,
-    newBookId: string,
-    artifactIdMap: Map<string, string>,
-    runIds: readonly string[],
-  ): Promise<void> {
-    const uniqueRunIds = [...new Set(runIds)];
-    if (uniqueRunIds.length === 0) return;
-    for (const runId of uniqueRunIds) {
-      const sourcePath = this.firstExistingRunRecordPath(oldBookId, runId);
-      const record = await readYamlFile(
-        sourcePath,
-        BookJobRunRecordSchema,
-        null,
-      );
-      if (record == null) {
-        continue;
-      }
-      await writeYamlFile(this.runRecordPath(newBookId, runId), {
-        ...record,
-        bookId: newBookId,
-        artifactIds: remapArtifactIds(record.artifactIds, artifactIdMap),
-      });
-    }
-  }
-
   async recordDocumentChunks(input: RecordDocumentChunksInput): Promise<void> {
     await this.ensureLayout();
     await this.assertBatchBookLeaseForDocument(input.documentId, input.contentHash);
@@ -1868,11 +1423,11 @@ export class FileBookJobStateRepository {
     await this.ensureLayout();
     const parsed = BookJobSchema.parse({
       ...job,
-      sourcePath: normalizePortableVaultRelativePath(job.sourcePath),
+      sourcePath: assertBookPackageSourcePath(job.sourcePath, job.bookId),
       sourceIdentityPath: job.sourceIdentityPath,
       normalizedPath: job.normalizedPath == null
         ? undefined
-        : normalizePortableVaultRelativePath(job.normalizedPath),
+        : assertBookPackageInputPath(job.normalizedPath, job.bookId),
       metadata: sanitizeVaultMetadata(job.metadata),
     });
     this.assertBatchBookLease(parsed.bookId);
@@ -1889,9 +1444,11 @@ export class FileBookJobStateRepository {
   }
 
   async getBookJob(bookId: string): Promise<BookJob | null> {
-    return readFirstYamlFile(this.bookJobReadPaths(bookId), {
-      parse: migrateLegacyBookJob,
-    }, null);
+    return readYamlFile(
+      this.bookJobPath(bookId),
+      BookJobSchema,
+      null,
+    );
   }
 
   async buildGraphEnhancementRequest(
@@ -1998,31 +1555,11 @@ export class FileBookJobStateRepository {
   }
 
   async listStageCheckpoints(bookId: string): Promise<BookJobStageCheckpoint[]> {
-    let list: BookJobCheckpointList;
-    try {
-      list = await readYamlFile(
-        this.firstExistingStageCheckpointPath(bookId),
-        BookJobCheckpointListSchema,
-        EMPTY_CHECKPOINT_LIST,
-      );
-    } catch (error) {
-      if (error instanceof Error && error.name === "ZodError") {
-        const [artifacts, job] = await Promise.all([
-          this.listArtifacts(bookId),
-          this.getBookJob(bookId),
-        ]);
-        const raw = YAML.parse(
-          await readFile(this.firstExistingStageCheckpointPath(bookId), "utf8"),
-        );
-        list = migrateLegacyStageCheckpointList(raw, {
-          bookId,
-          artifacts,
-          job,
-        });
-      } else {
-        throw error;
-      }
-    }
+    const list = await readYamlFile(
+      this.stageCheckpointPath(bookId),
+      BookJobCheckpointListSchema,
+      EMPTY_CHECKPOINT_LIST,
+    );
     const job = await this.getBookJob(bookId);
     return list.items.filter((checkpoint) =>
       checkpoint.bookId === bookId &&
@@ -2199,23 +1736,11 @@ export class FileBookJobStateRepository {
     bookId: string,
     stage?: BookStage,
   ): Promise<BookArtifactManifest[]> {
-    let list: BookArtifactManifestList;
-    try {
-      list = await readYamlFile(
-        this.firstExistingArtifactManifestPath(bookId),
-        BookArtifactManifestListSchema,
-        EMPTY_ARTIFACT_LIST,
-      );
-    } catch (error) {
-      if (error instanceof Error && error.name === "ZodError") {
-        const raw = YAML.parse(
-          await readFile(this.firstExistingArtifactManifestPath(bookId), "utf8"),
-        );
-        list = migrateLegacyArtifactManifestList(raw, bookId);
-      } else {
-        throw error;
-      }
-    }
+    const list = await readYamlFile(
+      this.artifactManifestPath(bookId),
+      BookArtifactManifestListSchema,
+      EMPTY_ARTIFACT_LIST,
+    );
     if (stage == null) {
       return list.items;
     }
@@ -2233,7 +1758,11 @@ export class FileBookJobStateRepository {
     const now = toIsoTimestamp();
 
     const recorded = inputs.map((input) => {
-      const artifactPath = this.relativeToRoot(input.path);
+      const artifactPath = assertBookArtifactPath(
+        this.relativeToRoot(input.path),
+        bookId,
+        input.kind,
+      );
       const stageFingerprint =
         input.stageFingerprint ??
         metadataString(input.metadata, "stageFingerprint") ??
@@ -2378,243 +1907,6 @@ export class FileBookJobStateRepository {
       fingerprints,
       effective.artifactValidity,
     );
-  }
-
-  private async migrateLegacyBookId(
-    sourcePath: string,
-    sourceIdentityPath: string,
-    sourceHash: string,
-    currentBookId: string,
-  ): Promise<void> {
-    for (const legacyBookId of this.legacyBookIdCandidates(
-      sourcePath,
-      sourceIdentityPath,
-      sourceHash,
-    )) {
-      if (legacyBookId === currentBookId) {
-        continue;
-      }
-      const legacyDir = this.bookDir(legacyBookId);
-      try {
-        await stat(legacyDir);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-          continue;
-        }
-        throw error;
-      }
-
-      await this.remapBookIdentity(legacyBookId, currentBookId);
-    }
-  }
-
-  private legacyBookIdCandidates(
-    sourcePath: string,
-    sourceIdentityPath: string,
-    sourceHash: string,
-  ): string[] {
-    const sourceIdentityWithoutKnownExtension =
-      stripKnownSourceExtension(sourceIdentityPath);
-    const sourceIdentityWithoutTrailingDotSegment =
-      sourceIdentityWithoutKnownExtension.replace(/\.[^.]*$/, "");
-    return [
-      buildBookId(sourcePath),
-      buildBookId(sourceIdentityPath),
-      buildBookId(sourceIdentityWithoutKnownExtension),
-      buildBookId(sourceIdentityWithoutTrailingDotSegment),
-      `book-${sourceHash.slice(0, 12)}`,
-      `${normalizeBookSlug(sourcePath)}-${sourceHash.slice(0, 12)}`,
-      `${normalizeBookSlug(sourceIdentityPath)}-${sourceHash.slice(0, 12)}`,
-      `${normalizeBookSlug(sourceIdentityWithoutKnownExtension)}-${sourceHash.slice(
-        0,
-        12,
-      )}`,
-      `${normalizeBookSlug(sourceIdentityWithoutTrailingDotSegment)}-${sourceHash.slice(
-        0,
-        12,
-      )}`,
-    ];
-  }
-
-  private async rewriteLegacyBookState(
-    bookId: string,
-    oldBookId: string,
-  ): Promise<void> {
-    const artifacts = await readYamlFile(
-      this.firstExistingArtifactManifestPath(bookId),
-      { parse: (value) => migrateLegacyArtifactManifestList(value, bookId) },
-      EMPTY_ARTIFACT_LIST,
-    );
-    const artifactIdMap = new Map<string, string>();
-    const canonicalArtifacts = artifacts.items.map((artifact) => {
-      const canonical = canonicalizeArtifact(artifact, bookId, oldBookId);
-      artifactIdMap.set(artifact.artifactId, canonical.artifactId);
-      return canonical;
-    });
-    await writeYamlFile(this.artifactManifestPath(bookId), {
-      schemaVersion: SchemaVersion,
-      items: dedupeArtifacts(canonicalArtifacts),
-    });
-
-    const job = await readYamlFile(
-      this.firstExistingBookJobPath(bookId),
-      BookJobSchema,
-      null,
-    );
-    if (job != null) {
-      await writeYamlFile(this.bookJobPath(bookId), canonicalizeBookJobLayout(
-        job,
-        bookId,
-      ));
-    }
-
-    const checkpoints = await readYamlFile(
-      this.firstExistingStageCheckpointPath(bookId),
-      {
-        parse: (value) => migrateLegacyStageCheckpointList(value, {
-          bookId,
-          artifacts: canonicalArtifacts,
-          job,
-        }),
-      },
-      EMPTY_CHECKPOINT_LIST,
-    );
-    await writeYamlFile(this.stageCheckpointPath(bookId), {
-      schemaVersion: SchemaVersion,
-      items: checkpoints.items.map((checkpoint) => ({
-        ...checkpoint,
-        bookId,
-        artifactIds: remapArtifactIds(checkpoint.artifactIds, artifactIdMap),
-      })),
-    });
-
-    await this.rewriteLegacyRunRecords(
-      bookId,
-      artifactIdMap,
-      checkpointRunIds(checkpoints.items),
-    );
-    await this.removeLegacyBookCatalogEntries(oldBookId, bookId);
-
-    await updateYamlFile(
-      this.runCatalogPath(),
-      BookJobRunCatalogSchema,
-      EMPTY_RUN_CATALOG,
-      (catalog) => {
-        if (!catalog.items.some((item) => item.bookId === oldBookId)) {
-          return catalog;
-        }
-        return {
-          schemaVersion: SchemaVersion,
-          items: catalog.items.map((item) =>
-            item.bookId === oldBookId ? { ...item, bookId } : item
-          ),
-        };
-      },
-    );
-  }
-
-  private async rewriteLegacyCatalogReferences(
-    oldBookId: string,
-    newBookId: string,
-  ): Promise<void> {
-    await updateYamlFile(
-      this.sourceDocumentCatalogPath(),
-      SourceDocumentCatalogSchema,
-      EMPTY_SOURCE_DOCUMENT_CATALOG,
-      (sources) => {
-        if (!sources.items.some((item) => item.metadata?.bookId === oldBookId)) {
-          return sources;
-        }
-        return {
-          schemaVersion: SchemaVersion,
-          items: sources.items.map((item) => ({
-            ...item,
-            metadata: mergeJobMetadata(item.metadata, { bookId: newBookId }),
-          })),
-        };
-      },
-    );
-
-    await updateYamlFile(
-      this.documentIdentityCatalogPath(),
-      DocumentIdentityCatalogSchema,
-      EMPTY_DOCUMENT_IDENTITY_CATALOG,
-      (identities) => {
-        if (!identities.items.some((item) => item.canonicalBookId === oldBookId)) {
-          return identities;
-        }
-        return {
-          schemaVersion: SchemaVersion,
-          items: dedupeDocumentIdentityMaps(
-            identities.items.map((item) =>
-              item.canonicalBookId === oldBookId
-                ? DocumentIdentityMapSchema.parse({
-                    ...item,
-                    canonicalBookId: newBookId,
-                    metadata: mergeJobMetadata(item.metadata, {
-                      bookId: newBookId,
-                    }),
-                  })
-                : item
-            ),
-          ),
-        };
-      },
-    );
-
-    await this.rewriteRunCatalogBookId(oldBookId, newBookId);
-  }
-
-  private async rewriteLegacyRunRecords(
-    bookId: string,
-    artifactIdMap: Map<string, string>,
-    runIds: readonly string[],
-  ): Promise<void> {
-    for (const runId of new Set(runIds)) {
-      const path = this.firstExistingRunRecordPath(bookId, runId);
-      const record = await readYamlFile(path, BookJobRunRecordSchema, null);
-      if (record == null) {
-        continue;
-      }
-      await writeYamlFile(this.runRecordPath(bookId, runId), {
-        ...record,
-        bookId,
-        artifactIds: remapArtifactIds(record.artifactIds, artifactIdMap),
-      });
-    }
-  }
-
-  private async rewriteRunCatalogBookId(
-    oldBookId: string,
-    newBookId: string,
-  ): Promise<void> {
-    await updateYamlFile(
-      this.runCatalogPath(),
-      BookJobRunCatalogSchema,
-      EMPTY_RUN_CATALOG,
-      (catalog) => {
-        if (!catalog.items.some((item) => item.bookId === oldBookId)) {
-          return catalog;
-        }
-        return {
-          schemaVersion: SchemaVersion,
-          items: catalog.items.map((item) =>
-            item.bookId === oldBookId ? { ...item, bookId: newBookId } : item
-          ),
-        };
-      },
-    );
-  }
-
-  private async removeLegacyBookCatalogEntries(
-    oldBookId: string,
-    newBookId: string,
-  ): Promise<void> {
-    await updateBookJobCatalogFile(this.bookCatalogPath(), (catalog) => {
-      const items = catalog.items.filter((item) => item.bookId !== oldBookId);
-      if (items.length === catalog.items.length) return catalog;
-      return { schemaVersion: SchemaVersion, items };
-    });
   }
 
   private async buildArtifactValidity(
@@ -3019,7 +2311,7 @@ export class FileBookJobStateRepository {
       }
       seenRunIds.add(runId);
       const record = await readYamlFile(
-        this.firstExistingRunRecordPath(bookId, runId),
+        this.runRecordPath(bookId, runId),
         BookJobRunRecordSchema,
         null,
       );
@@ -3383,57 +2675,12 @@ export class FileBookJobStateRepository {
     return join(this.bookDir(bookId), "state", "job.yaml");
   }
 
-  private legacyBookJobPath(bookId: string): string {
-    return join(this.bookDir(bookId), "job.yaml");
-  }
-
-  private bookJobReadPaths(bookId: string): string[] {
-    return [this.bookJobPath(bookId), this.legacyBookJobPath(bookId)];
-  }
-
-  private firstExistingBookJobPath(bookId: string): string {
-    return this.bookJobReadPaths(bookId).find((path) => existsSync(path)) ??
-      this.bookJobPath(bookId);
-  }
-
   private stageCheckpointPath(bookId: string): string {
     return join(this.bookDir(bookId), "state", "checkpoints.yaml");
   }
 
-  private legacyStageCheckpointPath(bookId: string): string {
-    return join(this.bookDir(bookId), "checkpoints.yaml");
-  }
-
-  private stageCheckpointReadPaths(bookId: string): string[] {
-    return [
-      this.stageCheckpointPath(bookId),
-      this.legacyStageCheckpointPath(bookId),
-    ];
-  }
-
-  private firstExistingStageCheckpointPath(bookId: string): string {
-    return this.stageCheckpointReadPaths(bookId).find((path) => existsSync(path)) ??
-      this.stageCheckpointPath(bookId);
-  }
-
   private artifactManifestPath(bookId: string): string {
     return join(this.bookDir(bookId), "state", "artifacts.yaml");
-  }
-
-  private legacyArtifactManifestPath(bookId: string): string {
-    return join(this.bookDir(bookId), "artifacts.yaml");
-  }
-
-  private artifactManifestReadPaths(bookId: string): string[] {
-    return [
-      this.artifactManifestPath(bookId),
-      this.legacyArtifactManifestPath(bookId),
-    ];
-  }
-
-  private firstExistingArtifactManifestPath(bookId: string): string {
-    return this.artifactManifestReadPaths(bookId).find((path) => existsSync(path)) ??
-      this.artifactManifestPath(bookId);
   }
 
   private runRecordPath(bookId: string, runId: string): string {
@@ -3445,28 +2692,12 @@ export class FileBookJobStateRepository {
     );
   }
 
-  private legacyRunRecordPath(bookId: string, runId: string): string {
-    return join(this.bookDir(bookId), "runs", `${runId}.yaml`);
-  }
-
-  private runRecordReadPaths(bookId: string, runId: string): string[] {
-    return [
-      this.runRecordPath(bookId, runId),
-      this.legacyRunRecordPath(bookId, runId),
-    ];
-  }
-
-  private firstExistingRunRecordPath(bookId: string, runId: string): string {
-    return this.runRecordReadPaths(bookId, runId)
-      .find((path) => existsSync(path)) ?? this.runRecordPath(bookId, runId);
-  }
-
   private async readRunRecord(
     bookId: string,
     runId: string,
   ): Promise<BookJobRunRecord | null> {
-    return readFirstYamlFile(
-      this.runRecordReadPaths(bookId, runId),
+    return readYamlFile(
+      this.runRecordPath(bookId, runId),
       BookJobRunRecordSchema,
       null,
     );

@@ -149,121 +149,6 @@ function listForbiddenPackagePaths(bookRoot) {
     .sort((left, right) => left.localeCompare(right));
 }
 
-function ensureFileCopied(sourcePath, targetPath) {
-  if (!existsSync(sourcePath)) return false;
-  mkdirSync(dirname(targetPath), { recursive: true });
-  if (!existsSync(targetPath)) copyFileSync(sourcePath, targetPath);
-  return true;
-}
-
-function rewriteLegacyGraphArtifactPath(bookId, artifactPath) {
-  if (typeof artifactPath !== "string") return artifactPath;
-  const legacyBase = `books/${bookId}/output`;
-  const hotplugBase = `books/${bookId}/graphrag/output`;
-  if (
-    artifactPath === legacyBase ||
-    artifactPath.startsWith(`${legacyBase}/`)
-  ) {
-    return artifactPath.replace(legacyBase, hotplugBase);
-  }
-  if (artifactPath === "output" || artifactPath.startsWith("output/")) {
-    return artifactPath.replace(/^output\b/u, "graphrag/output");
-  }
-  return artifactPath;
-}
-
-function rewriteLegacyArtifactStatePaths(stateArtifactsPath, bookId) {
-  if (!existsSync(stateArtifactsPath)) return false;
-  const parsed = YAML.parse(readFileSync(stateArtifactsPath, "utf8"));
-  if (parsed == null || typeof parsed !== "object" || !Array.isArray(parsed.items)) {
-    return false;
-  }
-  let changed = false;
-  const items = parsed.items.map((item) => {
-    if (item == null || typeof item !== "object") return item;
-    const nextPath = rewriteLegacyGraphArtifactPath(bookId, item.path);
-    if (nextPath === item.path) return item;
-    changed = true;
-    return { ...item, path: nextPath };
-  });
-  if (!changed) return false;
-  const text = YAML.stringify({ ...parsed, items });
-  writeHotplugTextAtomic(stateArtifactsPath, text, {
-    operationId: `rewrite-legacy-artifact-paths-${bookId}`,
-    runnerSessionId: "book-hotplug-package",
-    targetLocator: `books/${bookId}/state/artifacts.yaml`,
-  });
-  const checksum = sha256Text(text);
-  writeHotplugTextAtomic(`${stateArtifactsPath}.sha256`, `${checksum}\n`, {
-    operationId: `rewrite-legacy-artifact-paths-${bookId}-checksum`,
-    runnerSessionId: "book-hotplug-package",
-    targetLocator: `books/${bookId}/state/artifacts.yaml.sha256`,
-  });
-  writeHotplugTextAtomic(
-    `${stateArtifactsPath}.sha256.meta.json`,
-    `${JSON.stringify({
-      checksum,
-      targetLocator: `books/${bookId}/state/artifacts.yaml`,
-      checksumPath: `books/${bookId}/state/artifacts.yaml.sha256`,
-      checksumRecoveryDecision: "committed",
-      commitState: "committed",
-      operationId: `rewrite-legacy-artifact-paths-${bookId}`,
-      runnerSessionId: "book-hotplug-package",
-      committedAt: new Date().toISOString(),
-    }, null, 2)}\n`,
-    {
-      operationId: `rewrite-legacy-artifact-paths-${bookId}-meta`,
-      runnerSessionId: "book-hotplug-package",
-      targetLocator: `books/${bookId}/state/artifacts.yaml.sha256.meta.json`,
-    },
-  );
-  return true;
-}
-
-function ensureLegacySourceClosure(input) {
-  const sourceRoot = join(input.stateRoot, "sources", input.bookId);
-  const packageSourceRoot = join(input.bookRoot, "source");
-  const copied = [];
-  if (listFilesRecursive(packageSourceRoot, { bookRoot: input.bookRoot }).length > 0) {
-    return copied;
-  }
-  for (const sourcePath of listFilesRecursive(sourceRoot, { bookRoot: sourceRoot })) {
-    const relativePath = relative(sourceRoot, sourcePath);
-    const targetPath = join(packageSourceRoot, relativePath);
-    if (ensureFileCopied(sourcePath, targetPath)) copied.push(targetPath);
-  }
-  return copied;
-}
-
-function ensureLegacyLayoutCompatibility(input) {
-  const copiedSourceFiles = ensureLegacySourceClosure(input);
-  const legacyOutputRoot = join(input.bookRoot, "output");
-  const graphRagOutputRoot = join(input.bookRoot, "graphrag", "output");
-  const graphRagRunsRoot = join(input.bookRoot, "graphrag", "runs");
-  const stateRoot = join(input.bookRoot, "state");
-
-  for (const outputPath of listFilesRecursive(legacyOutputRoot, {
-    bookRoot: input.bookRoot,
-  })) {
-    const relativePath = relative(legacyOutputRoot, outputPath);
-    ensureFileCopied(outputPath, join(graphRagOutputRoot, relativePath));
-  }
-  for (const runPath of listFilesRecursive(join(input.bookRoot, "runs"), {
-    bookRoot: input.bookRoot,
-  })) {
-    const relativePath = relative(join(input.bookRoot, "runs"), runPath);
-    ensureFileCopied(runPath, join(graphRagRunsRoot, relativePath));
-  }
-  for (const name of ["job.yaml", "artifacts.yaml", "checkpoints.yaml"]) {
-    ensureFileCopied(join(input.bookRoot, name), join(stateRoot, name));
-  }
-  rewriteLegacyArtifactStatePaths(
-    join(stateRoot, "artifacts.yaml"),
-    input.bookId,
-  );
-  return { copiedSourceFiles };
-}
-
 function inferRole(path) {
   if (path.startsWith("source/")) return "source";
   if (path.startsWith("input/")) return "normalized_input";
@@ -549,7 +434,6 @@ function manifestWithChecksum(manifest) {
 export function buildBookHotplugManifest(input) {
   const stateRoot = resolve(input.stateRoot);
   const bookRoot = resolve(stateRoot, "books", input.bookId);
-  ensureLegacyLayoutCompatibility({ ...input, stateRoot, bookRoot });
 
   const qmdManifest = readQmdBuildManifest(bookRoot);
   const graphOutputDir = join(bookRoot, "graphrag", "output");
@@ -685,7 +569,6 @@ export function buildBookHotplugManifest(input) {
         "provider-requests/**",
         "provider-responses/**",
         "graphrag/output/reports/**",
-        "output/reports/**",
         "**/*.corrupt-*",
         "**/.durable-recovery.jsonl",
         "**/logs/**",
@@ -706,8 +589,6 @@ export function buildBookHotplugManifest(input) {
       distributionManifestPath: existsSync(join(bookRoot, "distribution_manifest.json"))
         ? "distribution_manifest.json"
         : undefined,
-      legacyOutputPath: existsSync(join(bookRoot, "output")) ? "output" : undefined,
-      legacyRunsPath: existsSync(join(bookRoot, "runs")) ? "runs" : undefined,
     },
   };
   return manifestWithChecksum(withoutUndefined(manifest)).manifest;
