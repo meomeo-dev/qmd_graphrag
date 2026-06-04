@@ -178,8 +178,16 @@ async function missingCapabilityPortablePaths(
   ];
 
   for (const bookId of bookIds) {
-    const checkpointsPath = `books/${bookId}/checkpoints.yaml`;
-    const artifactsPath = `books/${bookId}/artifacts.yaml`;
+    const checkpointsPath = await pathExists(
+      join(graphVault, "books", bookId, "state", "checkpoints.yaml"),
+    )
+      ? `books/${bookId}/state/checkpoints.yaml`
+      : `books/${bookId}/checkpoints.yaml`;
+    const artifactsPath = await pathExists(
+      join(graphVault, "books", bookId, "state", "artifacts.yaml"),
+    )
+      ? `books/${bookId}/state/artifacts.yaml`
+      : `books/${bookId}/artifacts.yaml`;
     const checkpointsRaw = await readYaml(join(graphVault, checkpointsPath));
     const artifactsRaw = await readYaml(join(graphVault, artifactsPath));
 

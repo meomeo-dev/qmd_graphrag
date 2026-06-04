@@ -345,6 +345,18 @@ async function readYamlFile<T>(
   return readYamlFileDurable(path, schema, fallback);
 }
 
+async function readFirstYamlFile<T>(
+  paths: readonly string[],
+  schema: { parse(input: unknown): T },
+  fallback: T,
+): Promise<T> {
+  for (const path of paths) {
+    if (!existsSync(path)) continue;
+    return readYamlFile(path, schema, fallback);
+  }
+  return readYamlFile(paths[0]!, schema, fallback);
+}
+
 async function readYamlFileUnlocked<T>(
   path: string,
   schema: { parse(input: unknown): T },
@@ -529,6 +541,40 @@ function canonicalizeArtifact(
     ...canonical,
     artifactId: createArtifactId(canonical),
   };
+}
+
+function canonicalSourcePathForBook(
+  bookId: string,
+  sourcePath: string,
+): string {
+  const extension = extname(sourcePath) || ".epub";
+  return normalizePortableVaultRelativePath(
+    join("books", bookId, "source", `source${extension}`),
+  );
+}
+
+function canonicalizeBookJobLayout(job: BookJob, bookId: string): BookJob {
+  const sourcePath = canonicalSourcePathForBook(bookId, job.sourcePath);
+  const normalizedPath = job.normalizedPath == null
+    ? undefined
+    : normalizePortableVaultRelativePath(
+        job.normalizedPath.startsWith("books/")
+          ? job.normalizedPath.replace(
+              /^books\/[^/]+\//u,
+              `books/${bookId}/`,
+            )
+          : join("books", bookId, job.normalizedPath),
+      );
+  return BookJobSchema.parse({
+    ...job,
+    bookId,
+    sourcePath,
+    normalizedPath,
+    metadata: mergeJobMetadata(job.metadata, {
+      sourcePath,
+      ...(normalizedPath ? { normalizedPath } : {}),
+    }),
+  });
 }
 
 function migrateLegacyArtifactManifest(
@@ -1334,7 +1380,7 @@ export class FileBookJobStateRepository {
     const extension = extname(sourcePath) || ".epub";
     const targetRelativePath = targetPathOverride
       ?? normalizePortableVaultRelativePath(
-        join("sources", bookId, `source${extension}`),
+        join("books", bookId, "source", `source${extension}`),
       );
     const targetPath = this.absoluteFromRoot(targetRelativePath);
     await ensureDir(dirname(targetPath));
@@ -1357,7 +1403,12 @@ export class FileBookJobStateRepository {
     bookId: string,
     existingSourcePath: string | undefined,
   ): Promise<string> {
-    if (existingSourcePath && isPortableVaultRelativePath(existingSourcePath)) {
+    const expectedPrefix = `books/${bookId}/source/`;
+    if (
+      existingSourcePath &&
+      isPortableVaultRelativePath(existingSourcePath) &&
+      normalizePortableVaultRelativePath(existingSourcePath).startsWith(expectedPrefix)
+    ) {
       try {
         if ((await hashFile(this.absoluteFromRoot(existingSourcePath))) === sourceHash) {
           return existingSourcePath;
@@ -1590,12 +1641,12 @@ export class FileBookJobStateRepository {
     newBookId: string,
   ): Promise<void> {
     const oldArtifacts = await readYamlFile(
-      this.artifactManifestPath(oldBookId),
+      this.firstExistingArtifactManifestPath(oldBookId),
       { parse: (value) => migrateLegacyArtifactManifestList(value, oldBookId) },
       EMPTY_ARTIFACT_LIST,
     );
     const newArtifacts = await readYamlFile(
-      this.artifactManifestPath(newBookId),
+      this.firstExistingArtifactManifestPath(newBookId),
       BookArtifactManifestListSchema,
       EMPTY_ARTIFACT_LIST,
     );
@@ -1611,7 +1662,7 @@ export class FileBookJobStateRepository {
     });
 
     const oldCheckpoints = await readYamlFile(
-      this.stageCheckpointPath(oldBookId),
+      this.firstExistingStageCheckpointPath(oldBookId),
       {
         parse: (value) => migrateLegacyStageCheckpointList(value, {
           bookId: oldBookId,
@@ -1621,7 +1672,7 @@ export class FileBookJobStateRepository {
       EMPTY_CHECKPOINT_LIST,
     );
     const newCheckpoints = await readYamlFile(
-      this.stageCheckpointPath(newBookId),
+      this.firstExistingStageCheckpointPath(newBookId),
       BookJobCheckpointListSchema,
       EMPTY_CHECKPOINT_LIST,
     );
@@ -1713,9 +1764,8 @@ export class FileBookJobStateRepository {
   ): Promise<void> {
     const uniqueRunIds = [...new Set(runIds)];
     if (uniqueRunIds.length === 0) return;
-    await ensureDir(join(this.bookDir(newBookId), "runs"));
     for (const runId of uniqueRunIds) {
-      const sourcePath = this.runRecordPath(oldBookId, runId);
+      const sourcePath = this.firstExistingRunRecordPath(oldBookId, runId);
       const record = await readYamlFile(
         sourcePath,
         BookJobRunRecordSchema,
@@ -1839,7 +1889,7 @@ export class FileBookJobStateRepository {
   }
 
   async getBookJob(bookId: string): Promise<BookJob | null> {
-    return readYamlFile(this.bookJobPath(bookId), {
+    return readFirstYamlFile(this.bookJobReadPaths(bookId), {
       parse: migrateLegacyBookJob,
     }, null);
   }
@@ -1951,7 +2001,7 @@ export class FileBookJobStateRepository {
     let list: BookJobCheckpointList;
     try {
       list = await readYamlFile(
-        this.stageCheckpointPath(bookId),
+        this.firstExistingStageCheckpointPath(bookId),
         BookJobCheckpointListSchema,
         EMPTY_CHECKPOINT_LIST,
       );
@@ -1962,7 +2012,7 @@ export class FileBookJobStateRepository {
           this.getBookJob(bookId),
         ]);
         const raw = YAML.parse(
-          await readFile(this.stageCheckpointPath(bookId), "utf8"),
+          await readFile(this.firstExistingStageCheckpointPath(bookId), "utf8"),
         );
         list = migrateLegacyStageCheckpointList(raw, {
           bookId,
@@ -2152,14 +2202,14 @@ export class FileBookJobStateRepository {
     let list: BookArtifactManifestList;
     try {
       list = await readYamlFile(
-        this.artifactManifestPath(bookId),
+        this.firstExistingArtifactManifestPath(bookId),
         BookArtifactManifestListSchema,
         EMPTY_ARTIFACT_LIST,
       );
     } catch (error) {
       if (error instanceof Error && error.name === "ZodError") {
         const raw = YAML.parse(
-          await readFile(this.artifactManifestPath(bookId), "utf8"),
+          await readFile(this.firstExistingArtifactManifestPath(bookId), "utf8"),
         );
         list = migrateLegacyArtifactManifestList(raw, bookId);
       } else {
@@ -2391,7 +2441,7 @@ export class FileBookJobStateRepository {
     oldBookId: string,
   ): Promise<void> {
     const artifacts = await readYamlFile(
-      this.artifactManifestPath(bookId),
+      this.firstExistingArtifactManifestPath(bookId),
       { parse: (value) => migrateLegacyArtifactManifestList(value, bookId) },
       EMPTY_ARTIFACT_LIST,
     );
@@ -2406,17 +2456,20 @@ export class FileBookJobStateRepository {
       items: dedupeArtifacts(canonicalArtifacts),
     });
 
-    const job = await readYamlFile(this.bookJobPath(bookId), BookJobSchema, null);
+    const job = await readYamlFile(
+      this.firstExistingBookJobPath(bookId),
+      BookJobSchema,
+      null,
+    );
     if (job != null) {
-      await writeYamlFile(this.bookJobPath(bookId), {
-        ...job,
+      await writeYamlFile(this.bookJobPath(bookId), canonicalizeBookJobLayout(
+        job,
         bookId,
-        metadata: mergeJobMetadata(job.metadata),
-      });
+      ));
     }
 
     const checkpoints = await readYamlFile(
-      this.stageCheckpointPath(bookId),
+      this.firstExistingStageCheckpointPath(bookId),
       {
         parse: (value) => migrateLegacyStageCheckpointList(value, {
           bookId,
@@ -2518,12 +2571,12 @@ export class FileBookJobStateRepository {
     runIds: readonly string[],
   ): Promise<void> {
     for (const runId of new Set(runIds)) {
-      const path = this.runRecordPath(bookId, runId);
+      const path = this.firstExistingRunRecordPath(bookId, runId);
       const record = await readYamlFile(path, BookJobRunRecordSchema, null);
       if (record == null) {
         continue;
       }
-      await writeYamlFile(path, {
+      await writeYamlFile(this.runRecordPath(bookId, runId), {
         ...record,
         bookId,
         artifactIds: remapArtifactIds(record.artifactIds, artifactIdMap),
@@ -2965,9 +3018,8 @@ export class FileBookJobStateRepository {
         continue;
       }
       seenRunIds.add(runId);
-      const recordPath = this.runRecordPath(bookId, runId);
       const record = await readYamlFile(
-        recordPath,
+        this.firstExistingRunRecordPath(bookId, runId),
         BookJobRunRecordSchema,
         null,
       );
@@ -3239,6 +3291,30 @@ export class FileBookJobStateRepository {
     }
   }
 
+  async publishQueryReadyGraphCapabilities(bookId: string): Promise<void> {
+    const job = await this.getBookJob(bookId);
+    if (job == null) {
+      throw new Error(`query_ready capability publish requires book state: ${bookId}`);
+    }
+    const checkpoint = (await this.listStageCheckpoints(bookId)).find((item) =>
+      item.stage === "query_ready" && item.status === "succeeded"
+    );
+    if (checkpoint == null) {
+      throw new Error(
+        `query_ready capability publish requires succeeded checkpoint: ${bookId}`,
+      );
+    }
+    const artifacts = await this.listArtifacts(bookId);
+    await this.validateQueryReadyProducerStages(job, artifacts);
+    await this.validateQueryReadyArtifacts({
+      job,
+      artifactIds: checkpoint.artifactIds,
+      artifacts,
+    });
+    await this.validateQueryReadyGraphIdentity(job);
+    await this.publishGraphCapabilities(job, checkpoint, toIsoTimestamp());
+  }
+
   private async validateQueryReadyGraphIdentity(job: BookJob): Promise<void> {
     const contentHash = job.normalizedContentHash ?? job.sourceHash;
     const catalog = await readYamlFile(
@@ -3304,27 +3380,93 @@ export class FileBookJobStateRepository {
   }
 
   private bookJobPath(bookId: string): string {
+    return join(this.bookDir(bookId), "state", "job.yaml");
+  }
+
+  private legacyBookJobPath(bookId: string): string {
     return join(this.bookDir(bookId), "job.yaml");
   }
 
+  private bookJobReadPaths(bookId: string): string[] {
+    return [this.bookJobPath(bookId), this.legacyBookJobPath(bookId)];
+  }
+
+  private firstExistingBookJobPath(bookId: string): string {
+    return this.bookJobReadPaths(bookId).find((path) => existsSync(path)) ??
+      this.bookJobPath(bookId);
+  }
+
   private stageCheckpointPath(bookId: string): string {
+    return join(this.bookDir(bookId), "state", "checkpoints.yaml");
+  }
+
+  private legacyStageCheckpointPath(bookId: string): string {
     return join(this.bookDir(bookId), "checkpoints.yaml");
   }
 
+  private stageCheckpointReadPaths(bookId: string): string[] {
+    return [
+      this.stageCheckpointPath(bookId),
+      this.legacyStageCheckpointPath(bookId),
+    ];
+  }
+
+  private firstExistingStageCheckpointPath(bookId: string): string {
+    return this.stageCheckpointReadPaths(bookId).find((path) => existsSync(path)) ??
+      this.stageCheckpointPath(bookId);
+  }
+
   private artifactManifestPath(bookId: string): string {
+    return join(this.bookDir(bookId), "state", "artifacts.yaml");
+  }
+
+  private legacyArtifactManifestPath(bookId: string): string {
     return join(this.bookDir(bookId), "artifacts.yaml");
   }
 
+  private artifactManifestReadPaths(bookId: string): string[] {
+    return [
+      this.artifactManifestPath(bookId),
+      this.legacyArtifactManifestPath(bookId),
+    ];
+  }
+
+  private firstExistingArtifactManifestPath(bookId: string): string {
+    return this.artifactManifestReadPaths(bookId).find((path) => existsSync(path)) ??
+      this.artifactManifestPath(bookId);
+  }
+
   private runRecordPath(bookId: string, runId: string): string {
+    return join(
+      this.bookDir(bookId),
+      "graphrag",
+      "runs",
+      `${runId}.yaml`,
+    );
+  }
+
+  private legacyRunRecordPath(bookId: string, runId: string): string {
     return join(this.bookDir(bookId), "runs", `${runId}.yaml`);
+  }
+
+  private runRecordReadPaths(bookId: string, runId: string): string[] {
+    return [
+      this.runRecordPath(bookId, runId),
+      this.legacyRunRecordPath(bookId, runId),
+    ];
+  }
+
+  private firstExistingRunRecordPath(bookId: string, runId: string): string {
+    return this.runRecordReadPaths(bookId, runId)
+      .find((path) => existsSync(path)) ?? this.runRecordPath(bookId, runId);
   }
 
   private async readRunRecord(
     bookId: string,
     runId: string,
   ): Promise<BookJobRunRecord | null> {
-    return readYamlFile(
-      this.runRecordPath(bookId, runId),
+    return readFirstYamlFile(
+      this.runRecordReadPaths(bookId, runId),
       BookJobRunRecordSchema,
       null,
     );

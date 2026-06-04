@@ -547,7 +547,7 @@ def _load_checkpoints(root_dir: Path, book_id: str) -> list[dict[str, Any]]:
     except Exception as error:  # noqa: BLE001
         raise RuntimeError("PyYAML is required to enforce GraphRAG capability scope") from error
 
-    checkpoints_path = root_dir / "books" / book_id / "checkpoints.yaml"
+    checkpoints_path = _book_state_yaml_path(root_dir, book_id, "checkpoints.yaml")
     if not checkpoints_path.exists():
         return []
     checkpoints = yaml.safe_load(checkpoints_path.read_text(encoding="utf-8")) or {}
@@ -556,6 +556,14 @@ def _load_checkpoints(root_dir: Path, book_id: str) -> list[dict[str, Any]]:
         for item in checkpoints.get("items", [])
         if isinstance(item, dict)
     ]
+
+
+def _book_state_yaml_path(root_dir: Path, book_id: str, file_name: str) -> Path:
+    book_root = root_dir / "books" / book_id
+    current = book_root / "state" / file_name
+    if current.exists():
+        return current
+    return book_root / file_name
 
 
 def _expected_book_content_hash(book: dict[str, Any]) -> str:
@@ -851,7 +859,7 @@ def _project_query_ready_lineage(
         return None
     if not isinstance(book.get("providerFingerprint"), str):
         return None
-    if not (root_dir / "books" / book_id / "checkpoints.yaml").exists():
+    if not _book_state_yaml_path(root_dir, book_id, "checkpoints.yaml").exists():
         return None
 
     artifacts_by_id = _load_artifacts_by_id(root_dir, [book_id])
@@ -1361,8 +1369,8 @@ def _validate_query_ready_artifacts(
     except Exception as error:  # noqa: BLE001
         raise RuntimeError("PyYAML is required to enforce GraphRAG capability scope") from error
 
-    checkpoints_path = root_dir / "books" / book_id / "checkpoints.yaml"
-    artifacts_path = root_dir / "books" / book_id / "artifacts.yaml"
+    checkpoints_path = _book_state_yaml_path(root_dir, book_id, "checkpoints.yaml")
+    artifacts_path = _book_state_yaml_path(root_dir, book_id, "artifacts.yaml")
     if not checkpoints_path.exists() or not artifacts_path.exists():
         return False
 
@@ -1523,11 +1531,17 @@ def _validate_artifact_subset(
         portable_path = _normalize_vault_relative_path(path)
         if portable_path is None:
             return False
-        expected_prefix = f"books/{book_id}/output/"
+        expected_prefixes = (
+            f"books/{book_id}/graphrag/output/",
+            f"books/{book_id}/output/",
+        )
         if kind == "lancedb_index":
-            if portable_path != f"books/{book_id}/output/lancedb":
+            if portable_path not in {
+                f"books/{book_id}/graphrag/output/lancedb",
+                f"books/{book_id}/output/lancedb",
+            }:
                 return False
-        elif not portable_path.startswith(expected_prefix):
+        elif not portable_path.startswith(expected_prefixes):
             return False
         artifact_path = (root_dir / portable_path).resolve()
         try:
@@ -1590,7 +1604,7 @@ def _load_artifacts_by_id(root_dir: Path, book_ids: list[str]) -> dict[str, dict
 
     artifacts_by_id: dict[str, dict[str, Any]] = {}
     for book_id in book_ids:
-        path = root_dir / "books" / book_id / "artifacts.yaml"
+        path = _book_state_yaml_path(root_dir, book_id, "artifacts.yaml")
         if not path.exists():
             continue
         payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}

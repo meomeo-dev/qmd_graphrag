@@ -173,11 +173,17 @@ export function graphRagBookOutputDir(input: {
   stateRootDir: string;
   bookId: string;
 }): string {
-  return join(resolve(input.stateRootDir), "books", input.bookId, "output");
+  return join(
+    resolve(input.stateRootDir),
+    "books",
+    input.bookId,
+    "graphrag",
+    "output",
+  );
 }
 
 function graphRagBookOutputLocator(bookId: string): string {
-  return `books/${bookId}/output`;
+  return `books/${bookId}/graphrag/output`;
 }
 
 type GraphRagOutputProducerManifest = {
@@ -621,7 +627,12 @@ async function materializeSourceInVault(input: {
   bookId: string;
 }): Promise<string> {
   const extension = extname(input.sourcePath) || ".epub";
-  const sourceDir = join(resolve(input.stateRootDir), "sources", input.bookId);
+  const sourceDir = join(
+    resolve(input.stateRootDir),
+    "books",
+    input.bookId,
+    "source",
+  );
   const vaultSourcePath = join(sourceDir, `source${extension}`);
   await mkdir(sourceDir, { recursive: true });
 
@@ -636,6 +647,47 @@ async function materializeSourceInVault(input: {
 
   await copyFile(input.sourcePath, vaultSourcePath);
   return vaultSourcePath;
+}
+
+async function materializeNormalizedInputInVault(input: {
+  normalizedPath: string;
+  stateRootDir: string;
+  bookId: string;
+  normalizationPolicyVersion: string;
+}): Promise<{
+  path: string;
+  content: string;
+  contentHash: string;
+}> {
+  const sourcePath = resolve(input.normalizedPath);
+  const inputDir = graphRagBookInputDir({
+    stateRootDir: input.stateRootDir,
+    bookId: input.bookId,
+  });
+  const targetPath = join(inputDir, basename(sourcePath));
+  const content = await readFile(sourcePath, "utf8");
+  const contentHash = await hashContent(
+    content,
+    input.normalizationPolicyVersion,
+  );
+  if (resolve(sourcePath) === resolve(targetPath)) {
+    return { path: targetPath, content, contentHash };
+  }
+  await mkdir(inputDir, { recursive: true });
+  try {
+    const existing = await readFile(targetPath, "utf8");
+    const existingHash = await hashContent(
+      existing,
+      input.normalizationPolicyVersion,
+    );
+    if (existingHash === contentHash) {
+      return { path: targetPath, content: existing, contentHash };
+    }
+  } catch {
+    // Missing or unreadable materialized input is replaced below.
+  }
+  await writeFile(targetPath, content, "utf8");
+  return { path: targetPath, content, contentHash };
 }
 
 async function canonicalizeLegacyWorkspaceLayout(input: {
@@ -1036,16 +1088,19 @@ export async function registerQmdCorpusDocument(input: {
         try {
           input.repo.assertCurrentBatchBookLease(input.job.bookId);
           upsertStoreCollection(store.db, "books", {
-            path: join(resolve(input.stateRootDir), "input"),
-            pattern: "**/*.md",
+            path: join(resolve(input.stateRootDir), "books"),
+            pattern: "**/input/*.md",
             context: {
               "/": "Normalized books available to qmd and GraphRAG.",
             },
           });
           const now = new Date().toISOString();
-          const normalizedRelativePath = input.job.normalizedPath?.startsWith("input/")
-            ? input.job.normalizedPath.slice("input/".length)
-            : input.job.normalizedPath ?? basename(input.normalizedPath);
+          const normalizedRelativePath =
+            input.job.normalizedPath?.startsWith("books/")
+              ? input.job.normalizedPath.slice("books/".length)
+              : input.job.normalizedPath?.startsWith("input/")
+                ? input.job.normalizedPath.slice("input/".length)
+                : input.job.normalizedPath ?? basename(input.normalizedPath);
           insertContent(store.db, contentHash, content, now);
           insertDocument(
             store.db,
@@ -2100,7 +2155,7 @@ export async function syncGraphRagBookWorkspace(
   const repo = new FileBookJobStateRepository(input.stateRootDir);
   const sourcePath = resolve(input.sourcePath);
   const sourceIdentityPath = input.sourceIdentityPath ?? basename(sourcePath);
-  const normalizedPath = resolve(input.normalizedPath);
+  const incomingNormalizedPath = resolve(input.normalizedPath);
   const bootstrapRunId = createRunId("bootstrap");
   const settingsPath = resolve(input.settingsPath);
 
@@ -2111,15 +2166,37 @@ export async function syncGraphRagBookWorkspace(
       settingsPath,
     });
 
-  const [sourceHash, normalizedContentHash, promptFingerprint, settings] =
+  const [sourceHash, incomingNormalizedContent, promptFingerprint, settings] =
     await Promise.all([
       hashFile(sourcePath),
-      readFile(normalizedPath, "utf8").then((content) =>
-        hashContent(content, GRAPHRAG_NORMALIZATION_POLICY_VERSION)
-      ),
+      readFile(incomingNormalizedPath, "utf8"),
       hashDirectoryContents(resolve(input.promptsDir)),
       parseSettingsFingerprint(settingsPath),
     ]);
+  const normalizedContentHash = await hashContent(
+    incomingNormalizedContent,
+    GRAPHRAG_NORMALIZATION_POLICY_VERSION,
+  );
+  const bookId = buildBookIdFromSourceHash(sourceIdentityPath, sourceHash);
+  await canonicalizeLegacyWorkspaceLayout({
+    repo,
+    stateRootDir: input.stateRootDir,
+    sourceIdentityPath,
+    sourceHash,
+    bookId,
+  });
+  const normalizedInput = await materializeNormalizedInputInVault({
+    normalizedPath: incomingNormalizedPath,
+    stateRootDir: input.stateRootDir,
+    bookId,
+    normalizationPolicyVersion: GRAPHRAG_NORMALIZATION_POLICY_VERSION,
+  });
+  const normalizedPath = normalizedInput.path;
+  if (normalizedInput.contentHash !== normalizedContentHash) {
+    throw new Error(
+      `materialized normalized input hash mismatch: ${bookId}`,
+    );
+  }
 
   const promptFingerprintByStage: Record<BookStage, string> = {
     ingest: createDeterministicHash(["ingest", "no-prompt"]),
@@ -2154,21 +2231,12 @@ export async function syncGraphRagBookWorkspace(
     stageConfigFingerprint: settings.stageConfigFingerprint,
     providerBoundaryFingerprint: settings.providerBoundaryFingerprint,
   });
-  const bookId = buildBookIdFromSourceHash(sourceIdentityPath, sourceHash);
   const vaultSourcePath = await materializeSourceInVault({
     sourcePath,
     sourceHash,
     stateRootDir: input.stateRootDir,
     bookId,
   });
-  await canonicalizeLegacyWorkspaceLayout({
-    repo,
-    stateRootDir: input.stateRootDir,
-    sourceIdentityPath,
-    sourceHash,
-    bookId,
-  });
-
   const job = await repo.registerBookSource({
     sourcePath,
     sourceIdentityPath,
@@ -2225,7 +2293,7 @@ export async function syncGraphRagBookWorkspace(
     : null;
 
   const artifacts = await collectWorkspaceArtifacts(
-    { ...input, outputDir },
+    { ...input, normalizedPath, outputDir },
     vaultSourcePath,
     bootstrapRunId,
     stageFingerprints,

@@ -109,7 +109,7 @@ const DurableTargetMappingTable = [
       /\/graph_vault\/books\/[^/]+\/state\/(?:job|artifacts|checkpoints)\.yaml$/,
     lane: "checkpointWriterLane",
     durableKind: "yaml",
-    targetMappingOwner: "bookHotplugPackage",
+    targetMappingOwner: "repository",
   },
   {
     pattern: /\/graph_vault\/books\/[^/]+\/state\/hotplug-quality-gate\.json$/,
@@ -133,7 +133,7 @@ const DurableTargetMappingTable = [
     pattern: /\/graph_vault\/books\/[^/]+\/graphrag\/runs\/[^/]+\.yaml$/,
     lane: "checkpointWriterLane",
     durableKind: "yaml",
-    targetMappingOwner: "bookHotplugPackage",
+    targetMappingOwner: "repository",
   },
   {
     pattern: /\/graph_vault\/settings\.yaml$/,
