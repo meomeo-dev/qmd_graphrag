@@ -579,8 +579,8 @@ explicit --config
 ```yaml
 collections:
   books:
-    path: graph_vault/input
-    pattern: "**/*.md"
+    path: graph_vault/books
+    pattern: "**/input/*.md"
     context:
       /: Normalized books available to qmd and GraphRAG.
 
@@ -670,7 +670,8 @@ marker 且未被判定为 user-owned settings file，fingerprint mismatch 必须
 受管投影；否则 fail-closed，返回 machine-readable recovery reason。该修复必须
 幂等：重复同一 `runId` resume 产生相同 projected content、source fingerprint 和
 recovery decision。重写 `settings.yaml` 不得删除、迁移、清空或标记 stale 任何
-`graph_vault/books/<bookId>/output` 下的 book-scoped GraphRAG 产物。
+`graph_vault/books/<bookId>/graphrag/output` 下的 book-scoped
+GraphRAG 产物。
 
 DSPy offline optimization 使用同一个 OpenAI Responses provider projection。
 `qmd dspy optimize-query-prompt` 将 `.qmd/index.yml` 的 `providers.openai` 和
@@ -690,7 +691,7 @@ bridge 将该投影传给 GEPA runner。GEPA runner 只允许 `endpoint=/respons
 `graph_vault` 是可迁移持久化单元。迁移后通过 `restore-from-vault` 从以下
 材料重建 qmd index、capability mirror 和查询加速缓存：
 
-- `graph_vault/input`
+- `graph_vault/books`
 - `graph_vault/catalog/sources.yaml`
 - `graph_vault/catalog/document-identity-map.yaml`
 - `graph_vault/catalog/graph-capabilities.yaml`
@@ -772,15 +773,13 @@ GraphRAG capability。
 
 active vault 目录必须保持 canonical：
 
-- `graph_vault/books/<bookId>` 和 `graph_vault/sources/<bookId>` 使用
+- `graph_vault/books/<bookId>` 使用
   `book-<sourceHash前12位>-<sourceIdentityPathHash前8位>`。
 - 同一 `sourceHash + sourceIdentityPath` 可推导出的路径型、文件名型、截断
-  书名型 legacy 目录必须合并到 canonical 目录。任意同 hash 但不同
-  source identity 的目录不得被宽扫描误合并。
-- 合并后 legacy 目录移动到 `graph_vault/archive/legacy-books/` 或
-  `graph_vault/archive/legacy-sources/`，不留在 active 区。
-- 合并必须重写 job、checkpoint、artifact、run record、run catalog 和 typed
-  catalog 中的 `bookId` 与 artifact 引用。
+  书名型 legacy 目录不得作为 active 输入；当前开发期旧布局必须
+  fail-closed，并通过新书包流程重建 canonical 目录。
+- 根级 `graph_vault/input`、`graph_vault/sources`、`graph_vault/archive`
+  不属于 active 区，不作为恢复或发布输入。
 - artifact identity 不包含 artifact path、runId 或设备 locator。
 
 query-ready 判定规则：

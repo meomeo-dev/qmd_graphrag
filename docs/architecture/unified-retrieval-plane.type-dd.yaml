@@ -520,7 +520,7 @@ typed_buses:
           - contentHash
           - normalizedPath
         repair_evidence_sidecar: >-
-          graph_vault/books/<book_id>/output/qmd_graph_text_unit_identity.json
+          graph_vault/books/<book_id>/graphrag/output/qmd_graph_text_unit_identity.json
           is derived repair evidence from validated GraphRAG output. It is not
           the query capability source of truth; it reconstructs
           DocumentIdentityMap when catalog projection is missing or stale.
@@ -653,7 +653,7 @@ typed_buses:
       - name: graph_enhancement_state
         schema: src/contracts/graph-enhancement.ts#GraphEnhancementStateSchema
         envelope: src/contracts/graph-enhancement.ts#GraphEnhancementStateEnvelopeSchema
-        storage: graph_vault/books/<book_id>/job.yaml plus checkpoints and artifacts
+        storage: graph_vault/books/<book_id>/state/job.yaml plus state/checkpoints.yaml and state/artifacts.yaml
         producers:
           - src/job-state/repository.ts#FileBookJobStateRepository.getGraphEnhancementState
         consumers:
@@ -689,7 +689,7 @@ typed_buses:
           - python/qmd_graphrag/bridge.py#_run_graphrag_index
         storage_contract:
           input_dir: graph_vault/books/<book_id>/input
-          data_dir: graph_vault/books/<book_id>/output
+          data_dir: graph_vault/books/<book_id>/graphrag/output
           report_dir: <log_root>/graphrag-reports/<book_id>/<stage>
           bridge_projection: >-
             inputDir and dataDir become GraphRAG input_storage,
@@ -1169,7 +1169,7 @@ typed_buses:
       - name: book_stage_checkpoint_list
         schema: src/contracts/book-job.ts#BookJobCheckpointListSchema
         envelope: src/contracts/book-job.ts#BookJobCheckpointListEnvelopeSchema
-        storage: graph_vault/books/<book_id>/checkpoints.yaml
+        storage: graph_vault/books/<book_id>/state/checkpoints.yaml
         producers:
           - src/job-state/repository.ts#FileBookJobStateRepository.startStage
           - src/job-state/repository.ts#FileBookJobStateRepository.completeStage
@@ -1190,7 +1190,7 @@ typed_buses:
       - name: book_artifact_manifest_list
         schema: src/contracts/book-job.ts#BookArtifactManifestListSchema
         envelope: src/contracts/book-job.ts#BookArtifactManifestListEnvelopeSchema
-        storage: graph_vault/books/<book_id>/artifacts.yaml
+        storage: graph_vault/books/<book_id>/state/artifacts.yaml
         producers:
           - src/job-state/repository.ts#FileBookJobStateRepository.recordArtifacts
         consumers:
@@ -1324,7 +1324,7 @@ config_projection:
     non_destructive_repair_rule: >-
       Settings projection repair changes only graph_vault/settings.yaml and
       its temporary atomic-write file. It must not delete, migrate, truncate,
-      or mark stale any graph_vault/books/<book_id>/output artifact.
+      or mark stale any graph_vault/books/<book_id>/graphrag/output artifact.
     secret_policy: env_placeholder_only
   runtime_env:
     required_names:
@@ -1719,8 +1719,8 @@ state_and_recovery:
       graph artifact.
     producer_manifest_portability_rule: >-
       qmd_output_manifest.json stores graph output location as the vault-relative
-      locator books/<book_id>/output and records stageProducerRunIds so one
-      stage run cannot claim artifacts created by another stage.
+      locator books/<book_id>/graphrag/output and records stageProducerRunIds
+      so one stage run cannot claim artifacts created by another stage.
     producer_lineage_rule: >-
       GraphRAG build success requires qmd_output_manifest.json, high-cost stage
       checkpoints, and high-cost artifacts to agree on bookId, sourceHash,
@@ -1739,8 +1739,9 @@ state_and_recovery:
       pyarrow is available.
     query_ready_scope_rule: >-
       query_ready checkpoints publish graph capabilities only from book-scoped
-      GraphRAG artifacts under books/<book_id>/output. Shared graph_vault/output
-      artifacts are invalid for query_ready capability publication.
+      GraphRAG artifacts under books/<book_id>/graphrag/output.
+      Shared graph_vault/output artifacts are invalid for query_ready capability
+      publication.
       query_ready also requires completed and validated graph_extract,
       community_report, and embed producer checkpoints before publishing
       capability.
@@ -1847,7 +1848,7 @@ state_and_recovery:
     request_schema: src/contracts/vault.ts#VaultRestoreRequestSchema
     report_schema: src/contracts/vault.ts#VaultRestoreReportSchema
     inputs:
-      - graph_vault/input
+      - graph_vault/books
       - graph_vault/catalog/sources.yaml
       - graph_vault/catalog/document-identity-map.yaml
       - graph_vault/catalog/graph-capabilities.yaml
@@ -1995,8 +1996,10 @@ design_decisions:
       entries supplement only capability semantic keys that are absent from the
       derived set and never overwrite matching bookId/kind/method entries.
   normalized_book_materialization:
-    canonical: graph_vault/input
-    qmd_collection_role: qmd registers graph_vault/input as a normal collection.
+    canonical: graph_vault/books/<book_id>/input
+    qmd_collection_role: >
+      qmd registers graph_vault/books with pattern **/input/*.md as the books
+      collection. Root-level graph_vault/input is a forbidden historical path.
   graphrag_context_normalization:
     answer_contract: GraphRAG evidence is normalized into EvidenceRef.
     provider_detail: >-

@@ -21,7 +21,8 @@ scope:
   excluded:
     - 多个独立 OS 级 batch-epub-workflow 进程写入同一个 runId。
     - 多台机器共同写入同一个 stateRoot。
-    - 多本书共享同一个 graph_vault/output 作为 GraphRAG 工作输出目录。
+    - 多本书共享同一个 graph_vault/output 作为 GraphRAG 工作输出目录；
+      该根级目录属于禁止历史路径。
     - 绕过 qmd 或 GraphRAG 真实构建的模拟完成状态。
 
 productionContract:
@@ -229,9 +230,9 @@ resourceControls:
     checkpointWriterLane:
       capacity: 1
       protects:
-        - graph_vault/books/**/job.yaml
-        - graph_vault/books/**/artifacts.yaml
-        - graph_vault/books/**/checkpoints.yaml
+        - graph_vault/books/**/state/job.yaml
+        - graph_vault/books/**/state/artifacts.yaml
+        - graph_vault/books/**/state/checkpoints.yaml
         - graph_vault/books/**/runs/*.yaml
         - graph_vault/catalog/batch-runs/**/book-leases/*.json
         - item checkpoint files under batch run state
@@ -389,10 +390,6 @@ resourceControls:
           recursion: >
             recursive family scope; includes output/lancedb/*.lance directory
             fsyncs for qmd_row_count.json and other production output sidecars.
-        - scope: graph_vault/output/lancedb/*.lance
-          lane: checkpointWriterLane
-          owner: artifactValidation
-          directoryDurableKind: directory
         - scope: graph_vault/dspy
           lane: catalogWriterLane
           owner: dspyPolicyStore
@@ -441,7 +438,7 @@ resourceControls:
         owner: qmdProjectionCatalog
         laneTimeoutMs: 120000
         releaseOn: [commit, error, cancellation, lease_loss, timeout]
-      - target: graph_vault/books/{bookId}/job.yaml
+      - target: graph_vault/books/{bookId}/state/job.yaml
         lane: checkpointWriterLane
         durableKind: yaml
         owner: repository
@@ -625,12 +622,6 @@ resourceControls:
           not apply this writable repair outside the explicit migrate-only
           boundary.
       - target: graph_vault/books/{bookId}/graphrag/output/lancedb/*.lance/qmd_row_count.json
-        lane: checkpointWriterLane
-        durableKind: json
-        owner: artifactValidation
-        laneTimeoutMs: 120000
-        releaseOn: [commit, error, cancellation, lease_loss, timeout]
-      - target: graph_vault/output/lancedb/*.lance/qmd_row_count.json
         lane: checkpointWriterLane
         durableKind: json
         owner: artifactValidation
@@ -1026,8 +1017,8 @@ resourceControls:
             rename ENOENT 必须选择一个 causeMatrix cause；证据不足时使用
             filesystem_or_external_mutation，并仍保持 local_state_integrity 与
             stop_until_fixed。不得降级为 unknown、provider transient 或业务失败。
-            implementation MAY retain legacy aliases only as compatibility metadata,
-            but renameCause 必须使用 temp_collision、reconciler_mistaken_deletion、
+            implementation MUST NOT retain legacy aliases as compatibility metadata;
+            renameCause 必须使用 temp_collision、reconciler_mistaken_deletion、
             concurrent_takeover、generation_advanced 或
             filesystem_or_external_mutation 之一。
           requiredEvidence:
@@ -1636,11 +1627,10 @@ failureRecovery:
         status 精确过滤后的有界当前候选。历史 root runs/*.yaml 的全量
         repair、checksum backfill、checksum meta backfill、quarantine 或
         corrupt rename 只能发生在 explicit repair 或 migrate-only 边界内。
-      - normal registerBookSource 的 legacy bookId migration 不得全量扫描或
-        重写 graph_vault/books/{bookId}/graphrag/runs/*.yaml。run record
-        remap 只能处理 old/new checkpoints 明确引用的 runId；历史 root
-        runs/*.yaml 仅作为 legacy read compatibility，repair/backfill 只能
-        进入 explicit repair 或 migrate-only 边界。
+      - normal registerBookSource 不得执行 legacy bookId migration，不得
+        全量扫描或重写 graph_vault/books/{bookId}/graphrag/runs/*.yaml。
+        run record 只允许从 state/checkpoints.yaml 当前引用的 runId 有界读取；
+        历史 root runs/*.yaml 是禁止旧阶段产物，只能由显式清理流程隔离或删除。
       - normal resume 对 superseded running run 的 abandon 清理只能基于
         catalog 中 status=running 的有界条目写入 abandoned 记录；不得为清理
         历史 running 候选而先读取或 reconcile 旧 run record primary target。
@@ -1716,9 +1706,9 @@ failureRecovery:
         - normal resume 不得把历史 runs/*.yaml 全库扫描作为每本书恢复前置
           条件；resume plan 只能读取 checkpoint 引用的 run record，或有界读取
           当前 stage/status 需要接管、abandon 或验证的 run record。
-        - normal registerBookSource legacy migration 只能读写 checkpoint 引用的
-          run record；旧目录合并与 stable 目录重写均不得 readdir(runs) 作为
-          默认路径。
+        - normal registerBookSource 不得执行 legacy migration；只能读写
+          state/checkpoints.yaml 当前引用的 run record，旧目录合并与 stable
+          目录重写均不得 readdir(runs) 作为默认路径。
         - normal resume 的 abandon-running 清理不得读取历史 run record 内容；
           对 catalog 中有界 running 候选可直接以 catalog evidence 写入
           abandoned 终态 run record。
@@ -2298,9 +2288,9 @@ validationRequirements:
       graphrag/output/、graphrag/runs/{producerRunId}.yaml 及其 checksum
       sidecars。
     - distribution_manifest.json 必须声明 canonicalNormalizedPath 指向
-      books/{bookId}/input/{file}.md；若历史 qmd_build_manifest 仍引用根级
-      input/{file}.md，则必须同时记录 legacyNormalizedPath 并复制 canonical
-      book-scoped input，使单书包不依赖 graph_vault/input 全局目录。
+      books/{bookId}/input/{file}.md。根级 input/{file}.md 和
+      graph_vault/input 全局目录是禁止历史路径，runner 不得记录
+      legacyNormalizedPath，也不得复制或复用该目录。
     - distribution_manifest.json 必须显式排除 .env、provider request/response
       payload、非本书 batch logs、非当前 book/source 目录与 `.corrupt-*`
       quarantine 文件；缺失 producer run record 必须进入
@@ -2378,9 +2368,9 @@ validationRequirements:
         - no durable subprocess failure is reported as unknown
     - case: book_scoped_yaml_rename_enoent_resume_child
       evidence:
-        - injected rename ENOENT targets graph_vault/books/{bookId}/job.yaml
-        - injected rename ENOENT targets graph_vault/books/{bookId}/checkpoints.yaml
-        - injected rename ENOENT targets graph_vault/books/{bookId}/artifacts.yaml
+        - injected rename ENOENT targets graph_vault/books/{bookId}/state/job.yaml
+        - injected rename ENOENT targets graph_vault/books/{bookId}/state/checkpoints.yaml
+        - injected rename ENOENT targets graph_vault/books/{bookId}/state/artifacts.yaml
         - injected rename ENOENT targets primary YAML, not .sha256 sidecars
         - failure occurs inside resume-book-* child process
         - commandCheck includes failedSyscall rename and errno ENOENT
@@ -2491,8 +2481,8 @@ validationRequirements:
           target write and parent directory fsync to checkpointWriterLane
         - graph_vault/books/{bookId}/graphrag/output/lancedb/*.lance/qmd_row_count.json
           parent directory fsync is covered by recursive book output scope
-        - graph_vault/output/lancedb/*.lance/qmd_row_count.json parent directory
-          fsync maps to checkpointWriterLane and artifactValidation
+        - root-level graph_vault/output/lancedb is not a supported durable
+          target and must fail closed.
     - case: directory_fsync_read_only_projection_fail_closed
       evidence:
         - status-json read-only reports missing checksum meta with

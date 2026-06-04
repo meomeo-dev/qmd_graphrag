@@ -178,8 +178,8 @@ GraphRAG default-loaded config 比较。
 source fingerprint mismatch 是可恢复 drift：执行器安全重写该受管投影并继续
 当前 book resume。缺少 managed marker、目标为 user-owned settings file 或 source
 config invalid 时必须 fail-closed，不覆盖用户文件。该修复只允许改写
-`graph_vault/settings.yaml`，不得删除或污染 `graph_vault/books/<bookId>/output`
-下的 GraphRAG 产物。
+`graph_vault/settings.yaml`，不得删除或污染
+`graph_vault/books/<bookId>/graphrag/output` 下的 GraphRAG 产物。
 
 - `JINA_API_KEY`
 - `OPENAI_API_KEY` 或其他 completion provider 对应 key

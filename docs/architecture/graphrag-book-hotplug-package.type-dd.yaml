@@ -146,22 +146,21 @@ currentStateSnapshot:
     completedBookShape:
       requiredDirectories:
         - input
-        - output
         - qmd
-        - runs
+        - graphrag/output
+        - graphrag/runs
+        - source
+        - state
       requiredFiles:
-        - job.yaml
-        - artifacts.yaml
-        - checkpoints.yaml
+        - state/job.yaml
+        - state/artifacts.yaml
+        - state/checkpoints.yaml
         - distribution_manifest.json
         - distribution_manifest.json.sha256
         - distribution_manifest.json.sha256.meta.json
       externalRootsReferenced:
-        - graph_vault/sources/{bookId}
-        - graph_vault/input
         - graph_vault/catalog
     currentLimitations:
-      - source files are outside the book root under graph_vault/sources/{bookId}.
       - global catalog and qmd indexes remain outside the book package.
       - distribution_manifest.json is a distribution closure record, not a mount
         authority.
@@ -198,8 +197,6 @@ currentStateSnapshot:
       - qmd/
       - graphrag/
       - state/
-      - output/
-      - runs/
 
 targetContract:
   packageAuthority:
@@ -242,8 +239,8 @@ atomicPackageLifecycle:
     never projected into catalog or qmd indexes.
   writableRoots:
     liveRoot: graph_vault/books/{bookId}
-    importStagingRoot: graph_vault/.staging/imports/{importId}/{bookId}
-    buildStagingRoot: graph_vault/.staging/builds/{runId}/{bookId}
+    importStagingRoot: graph_vault/catalog/.staging/imports/{importId}/{bookId}
+    buildStagingRoot: graph_vault/catalog/.staging/builds/{runId}/{bookId}
     quarantineRoot: graph_vault/.quarantine/books/{reason}/{timestamp}-{bookId}
     runtimeStateRoot: graph_vault/.local/book-runtime/{bookId}
   publishProtocol:
@@ -549,8 +546,9 @@ bookManifestSchema:
         - normalizedHash
         - normalizedBytes
       contract: >
-        canonicalNormalizedPath must be inside input/. Legacy graph_vault/input
-        paths are compatibility metadata only.
+        canonicalNormalizedPath must be inside input/. Root-level
+        graph_vault/input paths are forbidden historical paths and must fail
+        validation instead of being treated as compatibility metadata.
     qmd:
       requiredFields:
         - buildManifestPath
@@ -599,7 +597,6 @@ bookManifestSchema:
         - "provider-requests/**"
         - "provider-responses/**"
         - "graphrag/output/reports/**"
-        - "output/reports/**"
         - "**/*.corrupt-*"
         - "**/.durable-recovery.jsonl"
         - "**/logs/**"
@@ -740,22 +737,23 @@ distributionManifestMigration:
   currentKind: book_distribution_manifest
   targetFile: BOOK_MANIFEST.json
   migrationRules:
-    - Move source closure from graph_vault/sources/{bookId} into
-      graph_vault/books/{bookId}/source.
-    - Move GraphRAG output from output/ to graphrag/output, or maintain a
-      compatibility symlink/locator during one migration version.
-    - Move producer run evidence from runs/ to graphrag/runs, or maintain a
-      compatibility locator during one migration version.
-    - Move job.yaml, checkpoints.yaml, and artifacts.yaml into state/.
+    - Treat graph_vault/input, graph_vault/sources, and graph_vault/archive as
+      forbidden historical active roots.
+    - Require source closure under graph_vault/books/{bookId}/source.
+    - Require GraphRAG output under graphrag/output.
+    - Require producer run evidence under graphrag/runs.
+    - Require job.yaml, checkpoints.yaml, and artifacts.yaml under state/.
     - Keep input/ as the canonical normalized input root.
-    - Regenerate package-relative file entries and checksums after all moves.
-    - Preserve distribution_manifest.json as legacy evidence until the next
-      successful BOOK_MANIFEST.json audit.
+    - Regenerate package-relative file entries and checksums from the new
+      layout only.
+    - Preserve distribution_manifest.json as migration evidence only; it is not
+      a compatibility authority.
   compatibilityBridge:
     rule: >
-      A current completed book with distribution_manifest.json can be treated as
-      exportable but not hot-plug authoritative. The export command must build a
-      temporary BOOK_MANIFEST.json before producing a portable package.
+      Compatibility bridges for root-level input, root-level sources, root-level
+      archive, root output, root runs, or root state files are forbidden in the
+      current development contract. Such shapes are repair inputs, not
+      publishable packages.
 
 mountLifecycle:
   installByCopy:
@@ -943,13 +941,13 @@ versionAndMigrationModel:
     currentBookCriteria:
       - distribution_manifest.json exists and checksum sidecars validate.
       - qmd/qmd_build_manifest.json exists.
-      - output/qmd_output_manifest.json exists.
+      - graphrag/output/qmd_output_manifest.json exists.
       - input canonical normalized file exists.
-      - required producer run evidence is present or explainably compatible.
+      - required producer run evidence exists under graphrag/runs.
     residueCriteria:
       - no valid distribution_manifest.json
       - missing qmd directory
-      - missing output manifest
+      - missing graphrag/output manifest
       - stale bookId for a sourceHash that has a newer completed book
       - incomplete legacy checkpoint without completed query_ready
     priorityRule: >
@@ -1399,29 +1397,30 @@ largeLibraryDegradationAndMetrics:
 
 upgradePathMatrix:
   principle: >
-    Every supported legacy package shape must resolve to an explicit upgrade
-    path. Unknown or unsupported shapes fail closed or become visible but not
-    query-ready with machine-readable diagnostics.
+    Every supported package shape must resolve to an explicit validation path.
+    Development-stage legacy roots are not compatibility targets; unknown or
+    unsupported shapes fail closed or become repair-required with
+    machine-readable diagnostics.
   legacyVersionDetection:
     states:
       - current_hotplug_v1
-      - legacy_distribution_manifest_v1
-      - legacy_book_root_without_manifest
-      - legacy_partial_qmd_only
-      - legacy_partial_graphrag_only
+      - deprecated_distribution_manifest_only
+      - deprecated_book_root_without_manifest
+      - deprecated_partial_qmd_only
+      - deprecated_partial_graphrag_only
       - residue_duplicate_source
       - unsupported_unknown
       - repairable_incomplete
     detectionInputs:
       - distribution_manifest.json
       - distribution_manifest.json.sha256
-      - job.yaml
-      - artifacts.yaml
-      - checkpoints.yaml
+      - state/job.yaml
+      - state/artifacts.yaml
+      - state/checkpoints.yaml
       - input/**
       - qmd/qmd_build_manifest.json
-      - output/qmd_output_manifest.json
-      - runs/*.yaml
+      - graphrag/output/qmd_output_manifest.json
+      - graphrag/runs/*.yaml
   pathRows:
     - from: current_hotplug_v1
       to: mount_as_is
@@ -1430,8 +1429,8 @@ upgradePathMatrix:
       steps:
         - run mount scan validation
       failureOutcome: quarantine_mount_candidate
-    - from: legacy_distribution_manifest_v1
-      to: book-hotplug-v1
+    - from: deprecated_distribution_manifest_only
+      to: repair_required
       preconditions:
         - distribution manifest and sidecars validate.
         - qmd build manifest exists.
@@ -1439,24 +1438,19 @@ upgradePathMatrix:
         - canonical input exists.
       steps:
         - classify current versus residue.
-        - copy source closure into source/.
-        - move or copy qmd into qmd/.
-        - move or copy output into graphrag/output/.
-        - move or copy runs into graphrag/runs/.
-        - move job, checkpoints, artifacts into state/.
-        - generate BOOK_MANIFEST.json.
-        - regenerate checksums and PUBLISH_READY.json.
-        - publish through atomic lifecycle.
+        - require source/, state/, graphrag/output/, and graphrag/runs/ under
+          the book root before publishing.
+        - reject root-level graph_vault/input, graph_vault/sources, and
+          graph_vault/archive as active inputs.
       failureOutcome: repair_required
-    - from: legacy_partial_qmd_only
-      to: visible_not_query_ready
+    - from: deprecated_partial_qmd_only
+      to: repair_required
       preconditions:
         - qmd manifest and canonical input validate.
       steps:
-        - package qmd and input closure.
-        - mark graphRagReadyState as artifact_missing.
+        - require an explicit rebuild into book-hotplug-v1 layout.
       failureOutcome: residue_quarantined
-    - from: legacy_partial_graphrag_only
+    - from: deprecated_partial_graphrag_only
       to: repair_required
       preconditions:
         - GraphRAG output manifest exists but input or qmd closure is missing.
@@ -1619,8 +1613,6 @@ lockLeaseAndStagingCleanup:
     onRepeatedChange: defer_to_next_scan_generation
   stagingCleanup:
     roots:
-      - graph_vault/.staging/imports
-      - graph_vault/.staging/builds
       - graph_vault/catalog/.staging
     states:
       - active
@@ -1860,11 +1852,10 @@ sensitiveMaterialTaxonomy:
     runtimeReports:
       patterns:
         - "graphrag/output/reports/**"
-        - "output/reports/**"
       rule: >
-        Raw GraphRAG runtime reports and query logs must be migrated to the
-        runner log root before package publication. They are never declared in
-        BOOK_MANIFEST.files and fail closed if present in the package root.
+        Raw GraphRAG runtime reports and query logs are local runtime evidence.
+        They are never declared in BOOK_MANIFEST.files and fail closed if
+        present in the package root.
     providerPayloads:
       patterns:
         - "**/provider-requests/**"
@@ -2127,8 +2118,8 @@ implementationPlan:
       lineage, duplicate residue, and unsupported legacy package shapes.
     - qmd default export excludes local projections unless an explicit repack
       creates a new packageGeneration.
-    - Compatibility bridge locators expire after one successful
-      BOOK_MANIFEST audit and are removed by default during repack.
+    - Legacy bridge locators are forbidden in current hotplug-v1 packages and
+      must fail validation rather than be exported or repacked.
 
 openQuestions:
   - id: qmd_book_index_format

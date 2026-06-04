@@ -131,8 +131,8 @@ schemaVersionUpgradeMatrix:
       qmdIndexSchema: qmd-build-manifest-v1
       graphRagArtifactSchema: qmd-output-manifest-v1
       producerLineageSchema: producer-runs-yaml-v1
-    outcome: migrate_to_hotplug_v1
-    requiredAction: run_full_legacy_distribution_migration
+    outcome: fail_closed_repair_required
+    requiredAction: rebuild_or_repair_into_book_hotplug_v1_layout
     failureOutcome: repair_required
   - id: qmd_index_schema_v0
     from:
@@ -141,9 +141,9 @@ schemaVersionUpgradeMatrix:
       qmdIndexSchema: qmd-index-unknown-or-v0
       graphRagArtifactSchema: qmd-output-manifest-v1
       producerLineageSchema: producer-runs-yaml-v1
-    outcome: rebuild_qmd_projection
-    requiredAction: discard_legacy_qmd_index_and_rebuild_external_projection
-    failureOutcome: visible_not_qmd_ready
+    outcome: fail_closed_repair_required
+    requiredAction: rebuild_or_repair_into_book_hotplug_v1_layout
+    failureOutcome: repair_required
   - id: graphrag_output_schema_v0
     from:
       packageSchemaVersion: distribution_manifest_1.0.0
@@ -151,8 +151,8 @@ schemaVersionUpgradeMatrix:
       qmdIndexSchema: qmd-build-manifest-v1
       graphRagArtifactSchema: graphrag-output-unknown-or-v0
       producerLineageSchema: producer-runs-yaml-v1
-    outcome: visible_not_query_ready
-    requiredAction: preserve_as_repair_evidence_and_require_graphrag_rebuild
+    outcome: fail_closed_repair_required
+    requiredAction: rebuild_or_repair_into_book_hotplug_v1_layout
     failureOutcome: repair_required
   - id: producer_lineage_missing
     from:
@@ -161,8 +161,8 @@ schemaVersionUpgradeMatrix:
       qmdIndexSchema: qmd-build-manifest-v1
       graphRagArtifactSchema: qmd-output-manifest-v1
       producerLineageSchema: missing
-    outcome: visible_not_query_ready
-    requiredAction: mark_producer_provenance_missing
+    outcome: fail_closed_repair_required
+    requiredAction: rebuild_or_repair_into_book_hotplug_v1_layout
     failureOutcome: repair_required
   - id: unsupported_legacy_schema
     from:
@@ -442,28 +442,21 @@ qmdDiagnosticsSchema:
     - repack includes local projection with new generation
     - stale idempotency key cancelled
 compatibilityBridgeLifecycle:
-  principle: 'Legacy compatibility locators and symlinks are temporary migration aids. They
-    must have explicit creation, validation, expiry, and removal rules.
+  principle: 'Legacy compatibility locators and symlinks are not part of the current
+    hotplug-v1 publication contract. They must be rejected during validation instead
+    of being retained as migration aids.
 
     '
   allowedBridgeTypes:
-  - legacy_output_locator
-  - legacy_runs_locator
-  - legacy_source_locator
   - internal_relative_symlink
   lifecycleStates:
-  - created
-  - validated
-  - used_for_one_migration_version
-  - deprecated
-  - removed
   - rejected
   rules:
-  - Bridges must be package-relative and may not point outside the package.
-  - Bridges are not allowed in exported hotplug-v1 packages by default.
-  - Bridges expire after one successful BOOK_MANIFEST audit.
+  - Legacy output, runs, source, root input, root sources, and root archive
+    locators are rejected.
+  - Internal relative symlinks may only exist when they are checksum-bound,
+    package-relative, and cannot escape the package root.
   - Symlink bridges require checksum-bound target metadata.
-  - Repack removes bridge locators unless compatibility export is explicit.
   evidenceFields:
   - bridgeId
   - bridgeType
@@ -667,12 +660,10 @@ manifestSensitivitySchema:
     forbiddenPatterns:
     - pattern: graphrag/output/reports/**
       reason: runtime_graph_report_log_not_distribution_artifact
-    - pattern: output/reports/**
-      reason: legacy_runtime_graph_report_log_not_distribution_artifact
     rule: >
       GraphRAG runtime report directories and query logs are not part of the
-      portable package closure. A publisher must migrate them to the runner
-      log root before generating BOOK_MANIFEST.json, and validation fails closed
+      portable package closure. A publisher must remove them from the package
+      root before generating BOOK_MANIFEST.json, and validation fails closed
       with forbidden_sensitive_material if they remain in the package root or
       are declared in BOOK_MANIFEST.files.
   manifestValidationTests:
@@ -696,7 +687,7 @@ importerPrePublishValidationContract:
     '
   workflows:
     stagedImport:
-      stagingRoot: graph_vault/.staging/imports/{importId}/{bookId}
+      stagingRoot: graph_vault/catalog/.staging/imports/{importId}/{bookId}
       liveRoot: graph_vault/books/{bookId}
       requiredPrePublishChecks:
       - complete file copy into stagingRoot
@@ -1262,7 +1253,7 @@ migrationSourceTruthFailClosedTable:
     mayGenerateBookManifest: true
     manifestRestriction: qmd.indexPolicy must be reindex_on_mount
     diagnosticCode: migration_qmd_build_manifest_missing
-  - evidence: output/qmd_output_manifest.json
+  - evidence: graphrag/output/qmd_output_manifest.json
     requiredForAuthoritativeManifest: true
     missingOutcome: visible_not_query_ready
     mayGenerateBookManifest: true
@@ -1273,7 +1264,7 @@ migrationSourceTruthFailClosedTable:
     missingOutcome: repair_required
     mayGenerateBookManifest: false
     diagnosticCode: migration_canonical_input_missing
-  - evidence: runs/*.yaml producer lineage
+  - evidence: graphrag/runs/*.yaml producer lineage
     requiredForAuthoritativeManifest: true
     missingOutcome: visible_not_query_ready
     mayGenerateBookManifest: true
@@ -1301,7 +1292,7 @@ migrationRerunIdempotencyContract:
 
     '
   stateDetectionKeys:
-  - legacyRoot
+  - packageRoot
   - targetBookId
   - sourceHash
   - oldManifestSha256
@@ -1330,12 +1321,12 @@ migrationRerunIdempotencyContract:
       - staging or quarantine record exists
       rerunBehavior: require explicit resume_or_restart decision
       mayOverwriteUserMetadata: false
-    legacy_only:
+    package_ready_for_publish:
       detection:
-      - legacy root exists
+      - package root exists
       - no target live root
       - no staging checkpoint for same sourceHash
-      rerunBehavior: start_new_staged_migration
+      rerunBehavior: start_new_staged_publish_validation
       mayOverwriteUserMetadata: false
   metadataProtection:
     protectedPaths:
