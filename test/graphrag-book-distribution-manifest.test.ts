@@ -10,15 +10,17 @@ describe("GraphRAG book distribution manifest", () => {
       const tmpRoot = await mkProjectTmpDir("qmd-book-distribution-manifest-");
       const stateRoot = join(tmpRoot, "graph_vault");
       const bookId = "book-abc12345-12345678";
-      const normalizedPath = join(stateRoot, "input", "book.md");
-      await mkdir(join(stateRoot, "input"), { recursive: true });
-      await mkdir(join(stateRoot, "sources", bookId), { recursive: true });
-      await mkdir(join(stateRoot, "books", bookId, "output"), { recursive: true });
+      const bookRoot = join(stateRoot, "books", bookId);
+      const normalizedPath = join(bookRoot, "input", "book.md");
+      await mkdir(join(bookRoot, "input"), { recursive: true });
+      await mkdir(join(bookRoot, "source"), { recursive: true });
+      await mkdir(join(bookRoot, "graphrag", "output"), { recursive: true });
+      await mkdir(join(bookRoot, "state"), { recursive: true });
       await writeFile(normalizedPath, "# Book\n", "utf8");
-      await writeFile(join(stateRoot, "sources", bookId, "source.epub"), "epub", "utf8");
-      await writeFile(join(stateRoot, "books", bookId, "job.yaml"), "items: []\n", "utf8");
+      await writeFile(join(bookRoot, "source", "source.epub"), "epub", "utf8");
+      await writeFile(join(bookRoot, "state", "job.yaml"), "items: []\n", "utf8");
       await writeFile(
-        join(stateRoot, "books", bookId, "output", "qmd_output_manifest.json"),
+        join(bookRoot, "graphrag", "output", "qmd_output_manifest.json"),
         "{}\n",
         "utf8",
       );
@@ -46,7 +48,6 @@ describe("GraphRAG book distribution manifest", () => {
         bookId,
         portability: {
           canonicalNormalizedPath: `books/${bookId}/input/book.md`,
-          legacyNormalizedPath: "input/book.md",
         },
         producerEvidence: {
           outputProducerRunId: "run-query-ready",

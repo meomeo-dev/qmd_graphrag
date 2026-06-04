@@ -35,19 +35,15 @@ async function writeValidatedGraphVault(root: string): Promise<{
   const reportArtifactId = "artifact-report-1";
   const lancedbArtifactId = "artifact-lancedb-1";
   await mkdir(join(root, "catalog"), { recursive: true });
-  const lancedbPath = join(root, "books", "book-1", "output", "lancedb");
+  await mkdir(join(root, "books", "book-1", "state"), { recursive: true });
+  const outputDir = join(root, "books", "book-1", "graphrag", "output");
+  const lancedbPath = join(outputDir, "lancedb");
   await writeCompleteLanceDbFixture(lancedbPath);
-  await writeFile(
-    join(root, "books", "book-1", "output", "community_reports.parquet"),
-    "reports",
-    "utf8",
-  );
-  const reportHash = await hashFile(
-    join(root, "books", "book-1", "output", "community_reports.parquet"),
-  );
+  await writeFile(join(outputDir, "community_reports.parquet"), "reports", "utf8");
+  const reportHash = await hashFile(join(outputDir, "community_reports.parquet"));
   const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
   await writeFile(
-    join(root, "books", "book-1", "checkpoints.yaml"),
+    join(root, "books", "book-1", "state", "checkpoints.yaml"),
     `
 schemaVersion: ${SchemaVersion}
 items:
@@ -65,7 +61,7 @@ items:
     "utf8",
   );
   await writeFile(
-    join(root, "books", "book-1", "artifacts.yaml"),
+    join(root, "books", "book-1", "state", "artifacts.yaml"),
     `
 schemaVersion: ${SchemaVersion}
 items:
@@ -74,7 +70,7 @@ items:
     bookId: book-1
     stage: community_report
     kind: graphrag_community_reports_parquet
-    path: books/book-1/output/community_reports.parquet
+    path: books/book-1/graphrag/output/community_reports.parquet
     contentHash: ${reportHash}
     producerRunId: run-1
     createdAt: 2026-05-21T00:00:00.000Z
@@ -83,7 +79,7 @@ items:
     bookId: book-1
     stage: embed
     kind: lancedb_index
-    path: books/book-1/output/lancedb
+    path: books/book-1/graphrag/output/lancedb
     contentHash: ${lancedbHash}
     producerRunId: run-1
     createdAt: 2026-05-21T00:00:00.000Z
@@ -356,7 +352,14 @@ describe("GraphRAG provider cost accounting", () => {
 
   test("records index lineage only from explicit index scope", async () => {
     const graphVault = await mkdtemp(join(tmpdir(), "qmd-graphrag-cost-index-"));
-    const reportDir = join(graphVault, "books", "book-index", "output", "reports");
+    const reportDir = join(
+      graphVault,
+      "books",
+      "book-index",
+      "graphrag",
+      "output",
+      "reports",
+    );
     const { reportArtifactId, lancedbArtifactId } =
       await writeValidatedGraphVault(graphVault);
     mockedBridge.mockResolvedValueOnce({
@@ -487,7 +490,14 @@ describe("GraphRAG provider cost accounting", () => {
 
   test("rejects GraphRAG index responses with workflow errors", async () => {
     const graphVault = await mkdtemp(join(tmpdir(), "qmd-graphrag-cost-index-"));
-    const reportDir = join(graphVault, "books", "book-index", "output", "reports");
+    const reportDir = join(
+      graphVault,
+      "books",
+      "book-index",
+      "graphrag",
+      "output",
+      "reports",
+    );
     mockedBridge.mockResolvedValueOnce({
       schemaVersion: SchemaVersion,
       method: "standard",

@@ -10,6 +10,7 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
@@ -89,8 +90,15 @@ function stableTextHash(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+async function expectedBookId(
+  sourcePath: string,
+  sourceIdentityPath = sourcePath.split("/").pop() ?? sourcePath,
+): Promise<string> {
+  return buildBookIdFromSourceHash(sourceIdentityPath, await hashFile(sourcePath));
+}
+
 function bookScopedOutputDir(graphVault: string, bookId: string): string {
-  return join(graphVault, "books", bookId, "output");
+  return join(graphVault, "books", bookId, "graphrag", "output");
 }
 
 async function writeGraphExtractArtifacts(
@@ -275,7 +283,7 @@ async function prepareQueryReadyCapabilityFixture(root: string): Promise<{
     sourceHash: job.sourceHash,
     documentId: job.documentId,
     contentHash: "normalized-content-hash",
-    normalizedPath: "input/book.md",
+    normalizedPath: `books/${job.bookId}/input/book.md`,
     graphDocumentId: "graph-doc-1",
     graphTextUnitIds: ["tu-1"],
   });
@@ -313,9 +321,7 @@ describe("FileBookJobStateRepository", () => {
       });
 
       expect(job.bookId).toMatch(/^book-[a-f0-9]{12}-[a-f0-9]{8}$/);
-      expect(job.sourcePath).toMatch(
-        /^sources\/book-[a-f0-9]{12}-[a-f0-9]{8}\/source\.epub$/,
-      );
+      expect(job.sourcePath).toBe(`books/${job.bookId}/source/source.epub`);
       expect(job.sourcePath).not.toContain(root);
       expect(job.overallStatus).toBe("pending");
 
@@ -691,9 +697,10 @@ describe("FileBookJobStateRepository", () => {
       const graphVault = join(root, "graph_vault");
       const repo = new FileBookJobStateRepository(graphVault);
       const sourcePath = join(root, "book.epub");
-      const normalizedPath = join(graphVault, "input", "book.md");
-      await mkdir(dirname(normalizedPath), { recursive: true });
       await writeFile(sourcePath, "fixture epub content", "utf8");
+      const bookId = await expectedBookId(sourcePath);
+      const normalizedPath = join(graphVault, "books", bookId, "input", "book.md");
+      await mkdir(dirname(normalizedPath), { recursive: true });
       await writeFile(normalizedPath, "# Book\n\nfixture epub content\n", "utf8");
       const normalizedText = await readFile(normalizedPath, "utf8");
       const job = await repo.registerBookSource({
@@ -953,13 +960,15 @@ describe("FileBookJobStateRepository", () => {
       const graphVault = join(root, "graph_vault");
       const repo = new FileBookJobStateRepository(graphVault);
       const sourcePath = join(root, "book.epub");
-      await mkdir(join(graphVault, "input"), { recursive: true });
       await writeFile(sourcePath, "fixture epub content", "utf8");
-      await writeFile(join(graphVault, "input", "book.md"), "# Book", "utf8");
+      const bookId = await expectedBookId(sourcePath);
+      const normalizedPath = `books/${bookId}/input/book.md`;
+      await mkdir(join(graphVault, "books", bookId, "input"), { recursive: true });
+      await writeFile(join(graphVault, normalizedPath), "# Book", "utf8");
 
       const job = await repo.registerBookSource({
         sourcePath,
-        normalizedPath: "input/book.md",
+        normalizedPath,
         normalizedContentHash: "normalized-content-hash",
         configFingerprint: "cfg-1",
         promptFingerprint: "prompt-1",
@@ -972,7 +981,7 @@ describe("FileBookJobStateRepository", () => {
         methods: ["local"],
       });
 
-      expect(request.normalizedInputPath).toBe("input/book.md");
+      expect(request.normalizedInputPath).toBe(normalizedPath);
       expect(request.documentId).toBe(job.documentId);
       expect(request.methods).toEqual(["local"]);
 
@@ -1033,7 +1042,7 @@ describe("FileBookJobStateRepository", () => {
         sourceHash: job.sourceHash,
         documentId: job.documentId,
         contentHash: "normalized-content-hash",
-        normalizedPath: "input/book.md",
+        normalizedPath: `books/${job.bookId}/input/book.md`,
         graphDocumentId: "graph-doc-1",
         graphTextUnitIds: ["tu-1"],
       });
@@ -1135,7 +1144,7 @@ describe("FileBookJobStateRepository", () => {
         sourceHash: job.sourceHash,
         documentId: job.documentId,
         contentHash: "normalized-content-hash",
-        normalizedPath: "input/book.md",
+        normalizedPath: `books/${job.bookId}/input/book.md`,
         graphDocumentId: "graph-doc-1",
         graphTextUnitIds: ["tu-1"],
       });
@@ -1165,7 +1174,7 @@ describe("FileBookJobStateRepository", () => {
     }
   });
 
-  test("graph enhancement state rejects legacy query-ready without producer checkpoints", async () => {
+  test("graph enhancement state ignores legacy root query-ready checkpoint", async () => {
     const root = await createFixtureDir();
     try {
       const graphVault = join(root, "graph_vault");
@@ -1214,7 +1223,7 @@ describe("FileBookJobStateRepository", () => {
         sourceHash: job.sourceHash,
         documentId: job.documentId,
         contentHash: "normalized-content-hash",
-        normalizedPath: "input/book.md",
+        normalizedPath: `books/${job.bookId}/input/book.md`,
         graphDocumentId: "graph-doc-1",
         graphTextUnitIds: ["tu-1"],
       });
@@ -1248,7 +1257,7 @@ describe("FileBookJobStateRepository", () => {
 
       const state = await repo.getGraphEnhancementState(job.bookId);
 
-      expect(state.status).toBe("not_ready");
+      expect(state.status).toBe("pending");
       expect(state.capabilityIds).toEqual([]);
       expect(await loadGraphQueryCapabilities({ graphVault })).toEqual([]);
     } finally {
@@ -1256,7 +1265,7 @@ describe("FileBookJobStateRepository", () => {
     }
   });
 
-  test("resume plan rejects legacy query-ready without producer checkpoints", async () => {
+  test("resume plan ignores legacy root query-ready checkpoint", async () => {
     const root = await createFixtureDir();
     try {
       const graphVault = join(root, "graph_vault");
@@ -1329,7 +1338,7 @@ describe("FileBookJobStateRepository", () => {
         item.stage === "query_ready"
       );
 
-      expect(queryReady?.reason).toBe("artifact_missing");
+      expect(queryReady?.reason).toBe("missing");
       expect(plan.completedStages).not.toContain("query_ready");
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -1342,10 +1351,11 @@ describe("FileBookJobStateRepository", () => {
       const repo = new FileBookJobStateRepository(join(root, "graph_vault"));
       const sourcePath = join(root, "book.epub");
       await writeFile(sourcePath, "same source content", "utf8");
+      const bookId = await expectedBookId(sourcePath);
 
       const first = await repo.registerBookSource({
         sourcePath,
-        normalizedPath: "input/edition-a/book.md",
+        normalizedPath: `books/${bookId}/input/edition-a/book.md`,
         normalizedContentHash: "same-normalized-content",
         configFingerprint: "cfg-1",
         promptFingerprint: "prompt-1",
@@ -1353,7 +1363,7 @@ describe("FileBookJobStateRepository", () => {
       });
       const second = await repo.registerBookSource({
         sourcePath,
-        normalizedPath: "input/edition-b/book.md",
+        normalizedPath: `books/${bookId}/input/edition-b/book.md`,
         normalizedContentHash: "same-normalized-content",
         configFingerprint: "cfg-1",
         promptFingerprint: "prompt-1",
@@ -1377,11 +1387,13 @@ describe("FileBookJobStateRepository", () => {
       };
       expect(identities.items).toHaveLength(1);
       expect(identities.items[0]?.documentId).toBe(first.documentId);
-      expect(identities.items[0]?.normalizedPath).toBe("input/edition-b/book.md");
+      expect(identities.items[0]?.normalizedPath).toBe(
+        `books/${first.bookId}/input/edition-b/book.md`,
+      );
       expect(identities.items[0]?.aliases).toEqual(
         expect.arrayContaining([
-          "input/edition-a/book.md",
-          "input/edition-b/book.md",
+          `books/${first.bookId}/input/edition-a/book.md`,
+          `books/${first.bookId}/input/edition-b/book.md`,
         ]),
       );
     } finally {
@@ -1396,10 +1408,12 @@ describe("FileBookJobStateRepository", () => {
       const repo = new FileBookJobStateRepository(graphVault);
       const sourcePath = join(root, "book.epub");
       await writeFile(sourcePath, "same source content", "utf8");
+      const bookId = await expectedBookId(sourcePath);
+      const normalizedPath = `books/${bookId}/input/book.md`;
 
       const job = await repo.registerBookSource({
         sourcePath,
-        normalizedPath: "input/book.md",
+        normalizedPath,
         normalizedContentHash: "same-normalized-content",
         configFingerprint: "cfg-1",
         promptFingerprint: "prompt-1",
@@ -1423,14 +1437,14 @@ describe("FileBookJobStateRepository", () => {
         sourceHash: job.sourceHash,
         documentId: job.documentId,
         contentHash: "same-normalized-content",
-        normalizedPath: "input/book.md",
+        normalizedPath: `books/${job.bookId}/input/book.md`,
         graphDocumentId: "graph-doc-1",
         graphTextUnitIds: ["tu-1"],
       });
 
       await repo.registerBookSource({
         sourcePath,
-        normalizedPath: "input/book.md",
+        normalizedPath,
         normalizedContentHash: "same-normalized-content",
         configFingerprint: "cfg-1",
         promptFingerprint: "prompt-1",
@@ -1530,7 +1544,7 @@ describe("FileBookJobStateRepository", () => {
         overallStatus: "pending",
         createdAt: "2026-05-21T00:00:00.000Z",
         updatedAt: "2026-05-21T00:00:00.000Z",
-      })).rejects.toThrow(/vault-relative/);
+      })).rejects.toThrow(/books\/\{bookId\}\/source/);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1630,22 +1644,20 @@ describe("FileBookJobStateRepository", () => {
     );
   });
 
-  test("stores a caller-provided vault-relative source path", async () => {
+  test("rejects caller-provided historical source roots", async () => {
     const root = await createFixtureDir();
     try {
       const repo = new FileBookJobStateRepository(join(root, "graph_vault"));
       const sourcePath = join(root, "book.epub");
       await writeFile(sourcePath, "fixture epub content", "utf8");
 
-      const job = await repo.registerBookSource({
+      await expect(repo.registerBookSource({
         sourcePath,
         canonicalSourcePath: "sources/book-123/source.epub",
         configFingerprint: "cfg-1",
         promptFingerprint: "prompt-1",
         modelFingerprint: "model-1",
-      });
-
-      expect(job.sourcePath).toBe("sources/book-123/source.epub");
+      })).rejects.toThrow(/books\/\{bookId\}\/source/);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1998,7 +2010,7 @@ describe("FileBookJobStateRepository", () => {
       });
 
       const checkpointRaw = await readFile(
-        join(graphVault, "books", job.bookId, "checkpoints.yaml"),
+        join(graphVault, "books", job.bookId, "state", "checkpoints.yaml"),
         "utf8",
       );
       const runRaw = await readFile(
@@ -2006,6 +2018,7 @@ describe("FileBookJobStateRepository", () => {
           graphVault,
           "books",
           job.bookId,
+          "graphrag",
           "runs",
           "run-extract-redacted.yaml",
         ),
@@ -2038,7 +2051,7 @@ describe("FileBookJobStateRepository", () => {
         promptFingerprint: "prompt-1",
         modelFingerprint: "model-1",
       });
-      const jobPath = join(graphVault, "books", job.bookId, "job.yaml");
+      const jobPath = join(graphVault, "books", job.bookId, "state", "job.yaml");
       const checksumPath = `${jobPath}.sha256`;
 
       await unlink(checksumPath);
@@ -2073,6 +2086,7 @@ describe("FileBookJobStateRepository", () => {
         "graph_vault",
         "books",
         "book-1",
+        "graphrag",
         "output",
         "lancedb",
       );
@@ -2213,8 +2227,15 @@ describe("FileBookJobStateRepository", () => {
         modelFingerprint: "model-1",
       });
 
-      const artifactPath = join(root, "graph_vault", "input", "book.md");
-      await mkdir(join(root, "graph_vault", "input"), { recursive: true });
+      const artifactPath = join(
+        root,
+        "graph_vault",
+        "books",
+        job.bookId,
+        "input",
+        "book.md",
+      );
+      await mkdir(dirname(artifactPath), { recursive: true });
       await writeFile(artifactPath, "# Book", "utf8");
       const artifactHash = await hashFile(artifactPath);
       const first = await repo.recordArtifacts(job.bookId, [
@@ -2298,7 +2319,7 @@ describe("FileBookJobStateRepository", () => {
     }
   });
 
-  test("migrates legacy high-cost artifact fingerprints from metadata", async () => {
+  test("ignores old root artifact manifests instead of migrating fingerprints", async () => {
     const root = await createFixtureDir();
     try {
       const graphVault = join(root, "graph_vault");
@@ -2337,16 +2358,13 @@ describe("FileBookJobStateRepository", () => {
         "utf8",
       );
 
-      const artifacts = await repo.listArtifacts(job.bookId);
-
-      expect(artifacts[0]?.stageFingerprint).toBe("stage-from-metadata");
-      expect(artifacts[0]?.providerFingerprint).toBe("provider-from-metadata");
+      expect(await repo.listArtifacts(job.bookId)).toEqual([]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  test("migrates legacy high-cost checkpoint fingerprints from job state", async () => {
+  test("ignores old root checkpoints instead of migrating fingerprints", async () => {
     const root = await createFixtureDir();
     try {
       const graphVault = join(root, "graph_vault");
@@ -2388,17 +2406,13 @@ describe("FileBookJobStateRepository", () => {
         "utf8",
       );
 
-      const checkpoints = await repo.listStageCheckpoints(job.bookId);
-
-      expect(checkpoints[0]?.contentHash).toBe("normalized-content");
-      expect(checkpoints[0]?.stageFingerprint).toBe("query-ready-from-job");
-      expect(checkpoints[0]?.providerFingerprint).toBe("provider-from-job");
+      expect(await repo.listStageCheckpoints(job.bookId)).toEqual([]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  test("drops legacy high-cost checkpoints missing content hash", async () => {
+  test("keeps old root checkpoints missing content hash inert", async () => {
     const root = await createFixtureDir();
     try {
       const graphVault = join(root, "graph_vault");
@@ -2464,8 +2478,16 @@ describe("FileBookJobStateRepository", () => {
         modelFingerprint: "model-1",
       });
 
-      const artifactPath = join(root, "graph_vault", "output", "entities.parquet");
-      await mkdir(join(root, "graph_vault", "output"), { recursive: true });
+      const artifactPath = join(
+        root,
+        "graph_vault",
+        "books",
+        job.bookId,
+        "graphrag",
+        "output",
+        "entities.parquet",
+      );
+      await mkdir(dirname(artifactPath), { recursive: true });
       await writeMinimalParquetFixture(artifactPath);
       const contentHash = await hashFile(artifactPath);
       const first = await repo.recordArtifacts(job.bookId, [
@@ -2503,11 +2525,7 @@ describe("FileBookJobStateRepository", () => {
     try {
       const repo = new FileBookJobStateRepository(join(root, "graph_vault"));
       const sourcePath = join(root, "book.epub");
-      const artifactPath = join(root, "graph_vault", "input", "book.md");
       await writeFile(sourcePath, "fixture epub content", "utf8");
-      await mkdir(join(root, "graph_vault", "input"), { recursive: true });
-      await writeFile(artifactPath, "# Book", "utf8");
-      const artifactHash = await hashFile(artifactPath);
 
       const job = await repo.registerBookSource({
         sourcePath,
@@ -2515,6 +2533,17 @@ describe("FileBookJobStateRepository", () => {
         promptFingerprint: "prompt-1",
         modelFingerprint: "model-1",
       });
+      const artifactPath = join(
+        root,
+        "graph_vault",
+        "books",
+        job.bookId,
+        "input",
+        "book.md",
+      );
+      await mkdir(dirname(artifactPath), { recursive: true });
+      await writeFile(artifactPath, "# Book", "utf8");
+      const artifactHash = await hashFile(artifactPath);
 
       const [artifact] = await repo.recordArtifacts(job.bookId, [
         {
@@ -2580,6 +2609,7 @@ describe("FileBookJobStateRepository", () => {
         "graph_vault",
         "books",
         job.bookId,
+        "graphrag",
         "output",
         "community_reports.parquet",
       );
@@ -2588,6 +2618,7 @@ describe("FileBookJobStateRepository", () => {
         "graph_vault",
         "books",
         job.bookId,
+        "graphrag",
         "output",
         "lancedb",
       );
@@ -2660,17 +2691,24 @@ describe("FileBookJobStateRepository", () => {
     try {
       const repo = new FileBookJobStateRepository(join(root, "graph_vault"));
       const sourcePath = join(root, "book.epub");
-      const lancedbPath = join(root, "graph_vault", "output", "lancedb");
       await writeFile(sourcePath, "fixture epub content", "utf8");
-      await writeCompleteLanceDbFixture(lancedbPath);
-      const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
-
       const job = await repo.registerBookSource({
         sourcePath,
         configFingerprint: "cfg-1",
         promptFingerprint: "prompt-1",
         modelFingerprint: "model-1",
       });
+      const lancedbPath = join(
+        root,
+        "graph_vault",
+        "books",
+        job.bookId,
+        "graphrag",
+        "output",
+        "lancedb",
+      );
+      await writeCompleteLanceDbFixture(lancedbPath);
+      const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
       const [artifact] = await repo.recordArtifacts(job.bookId, [
         {
           stage: "embed",
@@ -2711,8 +2749,22 @@ describe("FileBookJobStateRepository", () => {
     try {
       const repo = new FileBookJobStateRepository(join(root, "graph_vault"));
       const sourcePath = join(root, "book.epub");
-      const lancedbPath = join(root, "graph_vault", "output", "lancedb");
       await writeFile(sourcePath, "fixture epub content", "utf8");
+      const job = await repo.registerBookSource({
+        sourcePath,
+        configFingerprint: "cfg-1",
+        promptFingerprint: "prompt-1",
+        modelFingerprint: "model-1",
+      });
+      const lancedbPath = join(
+        root,
+        "graph_vault",
+        "books",
+        job.bookId,
+        "graphrag",
+        "output",
+        "lancedb",
+      );
       await writeCompleteLanceDbFixture(lancedbPath);
       const strictSidecar = join(
         lancedbPath,
@@ -2727,12 +2779,6 @@ describe("FileBookJobStateRepository", () => {
       const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
       await rename(strictSidecar, aliasSidecar);
 
-      const job = await repo.registerBookSource({
-        sourcePath,
-        configFingerprint: "cfg-1",
-        promptFingerprint: "prompt-1",
-        modelFingerprint: "model-1",
-      });
       const [artifact] = await repo.recordArtifacts(job.bookId, [
         {
           stage: "embed",
@@ -2884,11 +2930,7 @@ describe("FileBookJobStateRepository", () => {
     try {
       const repo = new FileBookJobStateRepository(join(root, "graph_vault"));
       const sourcePath = join(root, "book.epub");
-      const artifactPath = join(root, "graph_vault", "input", "book.md");
       await writeFile(sourcePath, "fixture epub content", "utf8");
-      await mkdir(join(root, "graph_vault", "input"), { recursive: true });
-      await writeFile(artifactPath, "# Book", "utf8");
-      const originalHash = await hashFile(artifactPath);
 
       const job = await repo.registerBookSource({
         sourcePath,
@@ -2896,6 +2938,17 @@ describe("FileBookJobStateRepository", () => {
         promptFingerprint: "prompt-1",
         modelFingerprint: "model-1",
       });
+      const artifactPath = join(
+        root,
+        "graph_vault",
+        "books",
+        job.bookId,
+        "input",
+        "book.md",
+      );
+      await mkdir(dirname(artifactPath), { recursive: true });
+      await writeFile(artifactPath, "# Book", "utf8");
+      const originalHash = await hashFile(artifactPath);
       const [artifact] = await repo.recordArtifacts(job.bookId, [
         {
           stage: "normalize",
@@ -3183,7 +3236,7 @@ describe("FileBookJobStateRepository", () => {
         sourceHash: job.sourceHash,
         documentId: job.documentId,
         contentHash: "normalized-content-hash",
-        normalizedPath: "input/book.md",
+        normalizedPath: `books/${job.bookId}/input/book.md`,
         graphDocumentId: "graph-doc-1",
         graphTextUnitIds: ["tu-1"],
       });
@@ -3345,7 +3398,7 @@ describe("FileBookJobStateRepository", () => {
         sourceHash: job.sourceHash,
         documentId: job.documentId,
         contentHash: "normalized-content-hash",
-        normalizedPath: "input/book.md",
+        normalizedPath: `books/${job.bookId}/input/book.md`,
         graphDocumentId: "graph-doc-1",
         graphTextUnitIds: ["tu-1"],
       });
@@ -3515,7 +3568,7 @@ describe("FileBookJobStateRepository", () => {
         sourceHash: job.sourceHash,
         documentId: job.documentId,
         contentHash: "normalized-content-hash",
-        normalizedPath: "input/book.md",
+        normalizedPath: `books/${job.bookId}/input/book.md`,
         graphDocumentId: "graph-doc-1",
         graphTextUnitIds: ["tu-1"],
       });
@@ -3943,7 +3996,7 @@ describe("FileBookJobStateRepository", () => {
         sourceHash: job.sourceHash,
         documentId: job.documentId,
         contentHash: "normalized-content-hash",
-        normalizedPath: "input/book.md",
+        normalizedPath: `books/${job.bookId}/input/book.md`,
         graphDocumentId: "graph-doc-1",
         graphTextUnitIds: ["tu-1"],
       });
@@ -4146,7 +4199,7 @@ describe("FileBookJobStateRepository", () => {
         sourceHash: job.sourceHash,
         documentId: job.documentId,
         contentHash: "normalized-content-hash",
-        normalizedPath: "input/book.md",
+        normalizedPath: `books/${job.bookId}/input/book.md`,
         graphDocumentId: "graph-doc-1",
         graphTextUnitIds: ["tu-1"],
       });
@@ -4233,7 +4286,7 @@ describe("FileBookJobStateRepository", () => {
         sourceHash: job.sourceHash,
         documentId: job.documentId,
         contentHash: "normalized-content-hash",
-        normalizedPath: "input/book.md",
+        normalizedPath: `books/${job.bookId}/input/book.md`,
         graphDocumentId: "graph-doc-1",
         graphTextUnitIds: ["tu-1"],
       });
@@ -4259,17 +4312,15 @@ describe("FileBookJobStateRepository", () => {
     }
   });
 
-  test("rejects query-ready checkpoint from shared GraphRAG output", async () => {
+  test("rejects shared GraphRAG output at artifact persistence boundary", async () => {
     const root = await createFixtureDir();
     try {
       const graphVault = join(root, "graph_vault");
       const repo = new FileBookJobStateRepository(graphVault);
       const sourcePath = join(root, "book.epub");
       const reportsPath = join(graphVault, "output", "community_reports.parquet");
-      const lancedbPath = join(graphVault, "output", "lancedb");
       await writeFile(sourcePath, "fixture epub content", "utf8");
       await mkdir(join(graphVault, "output"), { recursive: true });
-      await writeCompleteLanceDbFixture(lancedbPath);
       await writeMinimalParquetFixture(reportsPath);
 
       const job = await repo.registerBookSource({
@@ -4279,12 +4330,7 @@ describe("FileBookJobStateRepository", () => {
         promptFingerprint: "prompt-1",
         modelFingerprint: "model-1",
       });
-      const graphExtractArtifacts = await writeGraphExtractArtifacts(
-        repo,
-        job.bookId,
-        join(graphVault, "output"),
-      );
-      const artifacts = await repo.recordArtifacts(job.bookId, [
+      await expect(repo.recordArtifacts(job.bookId, [
         {
           stage: "community_report",
           kind: "graphrag_community_reports_parquet",
@@ -4292,48 +4338,7 @@ describe("FileBookJobStateRepository", () => {
           contentHash: await hashFile(reportsPath),
           producerRunId: "run-community-report-1",
         },
-        {
-          stage: "embed",
-          kind: "lancedb_index",
-          path: lancedbPath,
-          contentHash: await hashLanceDbDirectoryContents(lancedbPath),
-          producerRunId: "run-embed-1",
-        },
-      ]);
-      await completeGraphQueryProducerStages({
-        repo,
-        bookId: job.bookId,
-        graphExtractArtifactIds: graphExtractArtifacts.map((artifact) =>
-          artifact.artifactId
-        ),
-        reportArtifactId: artifacts[0]!.artifactId,
-        lancedbArtifactId: artifacts[1]!.artifactId,
-      });
-      await repo.recordGraphTextUnitIdentity({
-        schemaVersion: SchemaVersion,
-        bookId: job.bookId,
-        sourceId: `sha256:${job.sourceHash}`,
-        sourceHash: job.sourceHash,
-        documentId: job.documentId,
-        contentHash: "normalized-content-hash",
-        normalizedPath: "input/book.md",
-        graphDocumentId: "graph-doc-1",
-        graphTextUnitIds: ["tu-1"],
-      });
-      await repo.recordQmdCorpusRegistration({
-        documentId: job.documentId,
-        contentHash: "normalized-content-hash",
-        collection: "books",
-        relativePath: "book.md",
-      });
-
-      await expect(repo.completeStage({
-        bookId: job.bookId,
-        stage: "query_ready",
-        runId: "run-query-ready-1",
-        inputFingerprint: "fp-query-ready",
-        artifactIds: artifacts.map((artifact) => artifact.artifactId),
-      })).rejects.toThrow(/query_ready checkpoint requires valid/);
+      ])).rejects.toThrow(/books\/\{bookId\}\/graphrag\/output/);
 
       expect(await repo.getStageCheckpoint(job.bookId, "query_ready")).toBeNull();
       expect(await loadGraphQueryCapabilities({ graphVault })).toEqual([]);
@@ -4402,7 +4407,7 @@ describe("FileBookJobStateRepository", () => {
         sourceHash: job.sourceHash,
         documentId: job.documentId,
         contentHash: "normalized-content-hash",
-        normalizedPath: "input/book.md",
+        normalizedPath: `books/${job.bookId}/input/book.md`,
         graphDocumentId: "graph-doc-1",
         graphTextUnitIds: ["tu-1"],
       });
@@ -4465,11 +4470,11 @@ describe("FileBookJobStateRepository", () => {
       });
 
       const jobRaw = await readFile(
-        join(graphVault, "books", job.bookId, "job.yaml"),
+        join(graphVault, "books", job.bookId, "state", "job.yaml"),
         "utf8",
       );
       const checkpointRaw = await readFile(
-        join(graphVault, "books", job.bookId, "checkpoints.yaml"),
+        join(graphVault, "books", job.bookId, "state", "checkpoints.yaml"),
         "utf8",
       );
 
@@ -4513,7 +4518,7 @@ describe("FileBookJobStateRepository", () => {
         modelFingerprint: "model-1",
       });
 
-      const outputDirA = join(graphVault, "books", jobA.bookId, "output");
+      const outputDirA = bookScopedOutputDir(graphVault, jobA.bookId);
       const reportsA = join(outputDirA, "community_reports.parquet");
       const lancedbA = join(outputDirA, "lancedb");
       await mkdir(outputDirA, {
@@ -4562,7 +4567,7 @@ describe("FileBookJobStateRepository", () => {
         sourceHash: jobA.sourceHash,
         documentId: jobA.documentId,
         contentHash: "normalized-a",
-        normalizedPath: "input/book-a.md",
+        normalizedPath: `books/${jobA.bookId}/input/book-a.md`,
         graphDocumentId: "graph-doc-a",
         graphTextUnitIds: ["tu-a"],
       });
@@ -4615,404 +4620,91 @@ describe("FileBookJobStateRepository", () => {
     }
   });
 
-  test("migrates legacy path book state to portable content identity", async () => {
+  test("rejects legacy root artifact paths at persistence boundary", async () => {
     const root = await createFixtureDir();
     try {
-      const repo = new FileBookJobStateRepository(join(root, "graph_vault"));
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
       const sourcePath = join(root, "book.epub");
-      const artifactPath = join(root, "graph_vault", "input", "book.md");
       await writeFile(sourcePath, "fixture epub content", "utf8");
-      await mkdir(join(root, "graph_vault", "input"), { recursive: true });
-      await writeFile(artifactPath, "# Book", "utf8");
-      const artifactHash = await hashFile(artifactPath);
 
-      const stableJob = await repo.registerBookSource({
+      const job = await repo.registerBookSource({
         sourcePath,
         configFingerprint: "cfg-1",
         promptFingerprint: "prompt-1",
         modelFingerprint: "model-1",
       });
-      const [stableArtifact] = await repo.recordArtifacts(stableJob.bookId, [
+
+      await expect(repo.recordArtifacts(job.bookId, [
         {
           stage: "normalize",
           kind: "normalized_markdown",
-          path: artifactPath,
-          contentHash: artifactHash,
-          producerRunId: "run-normalize-1",
+          path: join(graphVault, "input", "book.md"),
+          contentHash: "hash-normalized",
+          producerRunId: "run-legacy-normalize",
         },
-      ]);
-      await repo.completeStage({
-        bookId: stableJob.bookId,
-        stage: "normalize",
-        runId: "run-normalize-1",
-        inputFingerprint: "fp-normalize-v1",
-        artifactIds: [stableArtifact.artifactId],
-      });
+      ])).rejects.toThrow(/books\/\{bookId\}\/input/);
 
-      const legacyBookId = buildBookId(sourcePath);
-      await rename(
-        join(root, "graph_vault", "books", stableJob.bookId),
-        join(root, "graph_vault", "books", legacyBookId),
-      );
-      const legacyArtifacts = (await readFile(
-        join(root, "graph_vault", "books", legacyBookId, "state", "artifacts.yaml"),
-        "utf8",
-      )).split(stableJob.bookId).join(legacyBookId);
-      await writeYamlFileDurable(
-        join(root, "graph_vault", "books", legacyBookId, "state", "artifacts.yaml"),
-        YAML.parse(legacyArtifacts),
-      );
-      const legacyCheckpoints = (await readFile(
-        join(root, "graph_vault", "books", legacyBookId, "state", "checkpoints.yaml"),
-        "utf8",
-      )).split(stableJob.bookId).join(legacyBookId);
-      await writeYamlFileDurable(
-        join(root, "graph_vault", "books", legacyBookId, "state", "checkpoints.yaml"),
-        YAML.parse(legacyCheckpoints),
-      );
-      const legacyJob = (await readFile(
-        join(root, "graph_vault", "books", legacyBookId, "state", "job.yaml"),
-        "utf8",
-      )).split(stableJob.bookId).join(legacyBookId);
-      await writeYamlFileDurable(
-        join(root, "graph_vault", "books", legacyBookId, "state", "job.yaml"),
-        YAML.parse(legacyJob),
-      );
-
-      const migratedJob = await repo.registerBookSource({
-        sourcePath,
-        configFingerprint: "cfg-1",
-        promptFingerprint: "prompt-1",
-        modelFingerprint: "model-1",
-      });
-      const [migratedArtifact] = await repo.listArtifacts(migratedJob.bookId);
-      const [migratedCheckpoint] = await repo.listStageCheckpoints(
-        migratedJob.bookId,
-      );
-
-      expect(migratedJob.bookId).toBe(stableJob.bookId);
-      expect(migratedArtifact?.bookId).toBe(stableJob.bookId);
-      expect(migratedArtifact?.artifactId).toBe(stableArtifact.artifactId);
-      expect(migratedCheckpoint?.bookId).toBe(stableJob.bookId);
-      expect(migratedCheckpoint?.artifactIds).toEqual([stableArtifact.artifactId]);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  test("merges duplicate legacy book directory when stable directory exists", async () => {
-    const root = await createFixtureDir();
-    try {
-      const graphVault = join(root, "graph_vault");
-      const repo = new FileBookJobStateRepository(graphVault);
-      const sourceName = "A Philosophy of Software Design (John K. Ousterhout).epub";
-      const sourcePath = join(root, sourceName);
-      const stableArtifactPath = join(graphVault, "input", "stable.md");
-      const legacyArtifactPath = join(graphVault, "input", "legacy.md");
-      await writeFile(sourcePath, "fixture epub content", "utf8");
-      await mkdir(join(graphVault, "input"), { recursive: true });
-      await writeFile(stableArtifactPath, "# Stable", "utf8");
-      await writeFile(legacyArtifactPath, "# Legacy", "utf8");
-
-      const stableJob = await repo.registerBookSource({
-        sourcePath,
-        sourceIdentityPath: sourceName,
-        configFingerprint: "cfg-1",
-        promptFingerprint: "prompt-1",
-        modelFingerprint: "model-1",
-      });
-      const legacyBookId = `a-philosophy-of-software-design-john-k-ousterhout-${
-        stableJob.sourceHash.slice(0, 12)
-      }`;
-      const [stableArtifact] = await repo.recordArtifacts(stableJob.bookId, [
+      await expect(repo.recordArtifacts(job.bookId, [
         {
-          stage: "normalize",
-          kind: "normalized_markdown",
-          path: stableArtifactPath,
-          contentHash: await hashFile(stableArtifactPath),
-          producerRunId: "run-stable",
-        },
-      ]);
-      await repo.completeStage({
-        bookId: stableJob.bookId,
-        stage: "normalize",
-        runId: "run-stable",
-        inputFingerprint: "fp-stable",
-        artifactIds: [stableArtifact.artifactId],
-      });
-
-      await mkdir(join(graphVault, "books", legacyBookId, "runs"), {
-        recursive: true,
-      });
-      await mkdir(join(graphVault, "sources", legacyBookId), { recursive: true });
-      await writeFile(
-        join(graphVault, "sources", legacyBookId, "source.epub"),
-        "fixture epub content",
-        "utf8",
-      );
-      await writeFile(
-        join(graphVault, "books", legacyBookId, "job.yaml"),
-        YAML.stringify({
-          ...stableJob,
-          bookId: legacyBookId,
-          sourcePath: `sources/${legacyBookId}/source.epub`,
-        }),
-        "utf8",
-      );
-      await writeFile(
-        join(graphVault, "books", legacyBookId, "artifacts.yaml"),
-        YAML.stringify({
-          schemaVersion: SchemaVersion,
-          items: [
-            {
-              schemaVersion: SchemaVersion,
-              artifactId: "legacy-artifact",
-              bookId: legacyBookId,
-              stage: "graph_extract",
-              kind: "graphrag_documents_parquet",
-              path: "input/legacy.md",
-              contentHash: await hashFile(legacyArtifactPath),
-              producerRunId: "run-legacy",
-              createdAt: "2026-05-21T00:00:00.000Z",
-            },
-          ],
-        }),
-        "utf8",
-      );
-      await writeFile(
-        join(graphVault, "books", legacyBookId, "checkpoints.yaml"),
-        YAML.stringify({
-          schemaVersion: SchemaVersion,
-          items: [
-            {
-              schemaVersion: SchemaVersion,
-              bookId: legacyBookId,
-              stage: "graph_extract",
-              status: "succeeded",
-              attemptCount: 1,
-              runId: "run-legacy",
-              startedAt: "2026-05-21T00:00:00.000Z",
-              finishedAt: "2026-05-21T00:01:00.000Z",
-              inputFingerprint: "fp-legacy",
-              artifactIds: ["legacy-artifact"],
-            },
-          ],
-        }),
-        "utf8",
-      );
-      await writeFile(
-        join(graphVault, "books", legacyBookId, "runs", "run-legacy.yaml"),
-        YAML.stringify({
-          schemaVersion: SchemaVersion,
-          runId: "run-legacy",
-          bookId: legacyBookId,
           stage: "graph_extract",
-          status: "succeeded",
-          attemptCount: 1,
-          startedAt: "2026-05-21T00:00:00.000Z",
-          finishedAt: "2026-05-21T00:01:00.000Z",
-          inputFingerprint: "fp-legacy",
-          artifactIds: ["legacy-artifact"],
-        }),
-        "utf8",
-      );
-
-      const migratedJob = await repo.registerBookSource({
-        sourcePath,
-        sourceIdentityPath: sourceName,
-        configFingerprint: "cfg-2",
-        promptFingerprint: "prompt-2",
-        modelFingerprint: "model-2",
-      });
-      const artifacts = await repo.listArtifacts(stableJob.bookId);
-      const checkpoints = await repo.listStageCheckpoints(stableJob.bookId);
-      const books = YAML.parse(await readFile(
-        join(graphVault, "catalog", "books.yaml"),
-        "utf8",
-      )) as { items: Array<{ bookId: string }> };
-      const legacyRun = YAML.parse(await readFile(
-        join(
-          graphVault,
-          "books",
-          stableJob.bookId,
-          "graphrag",
-          "runs",
-          "run-legacy.yaml",
-        ),
-        "utf8",
-      )) as { bookId: string; artifactIds: string[] };
-
-      expect(migratedJob.bookId).toBe(stableJob.bookId);
-      expect(books.items.map((item) => item.bookId)).toEqual([stableJob.bookId]);
-      expect(artifacts.map((item) => item.bookId)).toEqual([
-        stableJob.bookId,
-        stableJob.bookId,
-      ]);
-      expect(artifacts.some((item) => item.stage === "graph_extract")).toBe(true);
-      expect(checkpoints.map((item) => item.bookId)).toEqual([
-        stableJob.bookId,
-      ]);
-      expect(checkpoints.map((item) => item.stage)).toEqual(["normalize"]);
-      expect(legacyRun.bookId).toBe(stableJob.bookId);
-      expect(legacyRun.artifactIds[0]).not.toBe("legacy-artifact");
-      await expect(access(join(graphVault, "books", legacyBookId))).rejects
-        .toThrow();
-      await expect(access(join(graphVault, "sources", legacyBookId))).rejects
-        .toThrow();
+          kind: "graphrag_stats_json",
+          path: join(graphVault, "books", job.bookId, "output", "stats.json"),
+          contentHash: "hash-stats",
+          stageFingerprint: "fp-graph",
+          providerFingerprint: "provider-fp",
+          producerRunId: "run-legacy-graph",
+        },
+      ])).rejects.toThrow(/books\/\{bookId\}\/graphrag\/output/);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  test("discovers same-identity legacy directory even when catalog is canonical", async () => {
+  test("ignores old identity book roots and keeps canonical package clean", async () => {
     const root = await createFixtureDir();
     try {
       const graphVault = join(root, "graph_vault");
       const repo = new FileBookJobStateRepository(graphVault);
-      const sourcePath = join(root, "source.epub");
-      const legacyArtifactPath = join(graphVault, "input", "legacy.md");
+      const sourcePath = join(root, "book.epub");
       await writeFile(sourcePath, "fixture epub content", "utf8");
-      await mkdir(join(graphVault, "input"), { recursive: true });
-      await writeFile(legacyArtifactPath, "# Legacy", "utf8");
-
-      const stableJob = await repo.registerBookSource({
-        sourcePath,
-        sourceIdentityPath: "source.epub",
-        configFingerprint: "cfg-1",
-        promptFingerprint: "prompt-1",
-        modelFingerprint: "model-1",
-      });
-      const legacyBookId = `source-${stableJob.sourceHash.slice(0, 12)}`;
-      await mkdir(join(graphVault, "books", legacyBookId, "runs"), {
+      const sourceHash = await hashFile(sourcePath);
+      const oldBookId = buildBookId(sourcePath);
+      await mkdir(join(graphVault, "books", oldBookId, "state"), {
         recursive: true,
       });
       await writeFile(
-        join(graphVault, "books", legacyBookId, "job.yaml"),
-        YAML.stringify({
-          ...stableJob,
-          bookId: legacyBookId,
-          sourcePath: `sources/${legacyBookId}/source.epub`,
-        }),
-        "utf8",
-      );
-      await writeFile(
-        join(graphVault, "books", legacyBookId, "artifacts.yaml"),
+        join(graphVault, "books", oldBookId, "state", "job.yaml"),
         YAML.stringify({
           schemaVersion: SchemaVersion,
-          items: [
-            {
-              schemaVersion: SchemaVersion,
-              artifactId: "legacy-artifact",
-              bookId: legacyBookId,
-              stage: "normalize",
-              kind: "normalized_markdown",
-              path: "input/legacy.md",
-              contentHash: await hashFile(legacyArtifactPath),
-              producerRunId: "run-legacy",
-              createdAt: "2026-05-21T00:00:00.000Z",
-            },
-          ],
-        }),
-        "utf8",
-      );
-      await writeFile(
-        join(graphVault, "books", legacyBookId, "checkpoints.yaml"),
-        YAML.stringify({
-          schemaVersion: SchemaVersion,
-          items: [
-            {
-              schemaVersion: SchemaVersion,
-              bookId: legacyBookId,
-              stage: "normalize",
-              status: "succeeded",
-              attemptCount: 1,
-              runId: "run-legacy",
-              startedAt: "2026-05-21T00:00:00.000Z",
-              finishedAt: "2026-05-21T00:01:00.000Z",
-              inputFingerprint: "fp-legacy",
-              artifactIds: ["legacy-artifact"],
-            },
-          ],
+          bookId: oldBookId,
+          documentId: "doc-old",
+          sourcePath: `sources/${oldBookId}/source.epub`,
+          sourceHash,
+          configFingerprint: "cfg-old",
+          promptFingerprint: "prompt-old",
+          modelFingerprint: "model-old",
+          overallStatus: "succeeded",
+          createdAt: "2026-05-21T00:00:00.000Z",
+          updatedAt: "2026-05-21T00:00:00.000Z",
         }),
         "utf8",
       );
 
-      await repo.registerBookSource({
+      const canonicalJob = await repo.registerBookSource({
         sourcePath,
-        sourceIdentityPath: "source.epub",
-        configFingerprint: "cfg-2",
-        promptFingerprint: "prompt-2",
-        modelFingerprint: "model-2",
-      });
-      const artifacts = await repo.listArtifacts(stableJob.bookId);
-      const checkpoints = await repo.listStageCheckpoints(stableJob.bookId);
-
-      expect(artifacts.some((item) => item.kind === "normalized_markdown"))
-        .toBe(true);
-      expect(checkpoints.some((item) => item.runId === "run-legacy")).toBe(false);
-      await expect(access(join(graphVault, "books", legacyBookId))).rejects
-        .toThrow();
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  test("migrates truncated dotted-name book state to full source identity", async () => {
-    const root = await createFixtureDir();
-    try {
-      const repo = new FileBookJobStateRepository(join(root, "graph_vault"));
-      const sourceName = "A Philosophy of Software Design (John K. Ousterhout).epub";
-      const sourcePath = join(root, sourceName);
-      const artifactPath = join(root, "graph_vault", "input", "book.md");
-      await writeFile(sourcePath, "fixture epub content", "utf8");
-      await mkdir(join(root, "graph_vault", "input"), { recursive: true });
-      await writeFile(artifactPath, "# Book", "utf8");
-      const artifactHash = await hashFile(artifactPath);
-
-      const stableJob = await repo.registerBookSource({
-        sourcePath,
-        sourceIdentityPath: sourceName,
         configFingerprint: "cfg-1",
         promptFingerprint: "prompt-1",
         modelFingerprint: "model-1",
       });
-      const [stableArtifact] = await repo.recordArtifacts(stableJob.bookId, [
-        {
-          stage: "normalize",
-          kind: "normalized_markdown",
-          path: artifactPath,
-          contentHash: artifactHash,
-          producerRunId: "run-normalize-1",
-        },
-      ]);
+      const jobs = await repo.listBookJobs();
 
-      const truncatedBookId = `${
-        normalizeBookSlug("A Philosophy of Software Design (John K")
-      }-${stableJob.sourceHash.slice(0, 12)}`;
-      await rename(
-        join(root, "graph_vault", "books", stableJob.bookId),
-        join(root, "graph_vault", "books", truncatedBookId),
-      );
-      for (const fileName of ["artifacts.yaml", "job.yaml"]) {
-        const filePath = join(root, "graph_vault", "books", truncatedBookId, fileName);
-        const raw = (await readFile(filePath, "utf8"))
-          .split(stableJob.bookId)
-          .join(truncatedBookId);
-        await writeFile(filePath, raw, "utf8");
-      }
-
-      const migratedJob = await repo.registerBookSource({
-        sourcePath,
-        sourceIdentityPath: sourceName,
-        configFingerprint: "cfg-1",
-        promptFingerprint: "prompt-1",
-        modelFingerprint: "model-1",
-      });
-      const [migratedArtifact] = await repo.listArtifacts(migratedJob.bookId);
-
-      expect(migratedJob.bookId).toBe(stableJob.bookId);
-      expect(migratedArtifact?.bookId).toBe(stableJob.bookId);
-      expect(migratedArtifact?.artifactId).toBe(stableArtifact.artifactId);
+      expect(canonicalJob.bookId).not.toBe(oldBookId);
+      expect(canonicalJob.sourcePath)
+        .toBe(`books/${canonicalJob.bookId}/source/source.epub`);
+      expect(jobs.map((job) => job.bookId)).toEqual([canonicalJob.bookId]);
+      expect(jobs.some((job) => job.bookId === oldBookId)).toBe(false);
+      expect(existsSync(join(graphVault, "books", oldBookId))).toBe(true);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -60,7 +60,7 @@ async function writeLegacyBackfillFixture(input: {
   const inputText = "# Book\n\nBackfill idempotency.\n";
   const sourceHash = sha256Text(sourceText);
   const normalizedHash = sha256Text(inputText);
-  const sourceRelativePath = `sources/${input.bookId}/source.epub`;
+  const sourceRelativePath = `books/${input.bookId}/source/source.epub`;
   const bookRoot = join(input.stateRoot, "books", input.bookId);
 
   await writeProviderAuthReopenGraphFixture({
@@ -71,10 +71,10 @@ async function writeLegacyBackfillFixture(input: {
   });
   await mkdir(join(bookRoot, "input"), { recursive: true });
   await mkdir(join(bookRoot, "qmd"), { recursive: true });
-  await mkdir(join(input.stateRoot, "sources", input.bookId), { recursive: true });
+  await mkdir(join(input.stateRoot, "books", input.bookId, "source"), { recursive: true });
   await writeFile(join(bookRoot, "input", "book.md"), inputText, "utf8");
   await writeFile(
-    join(input.stateRoot, "sources", input.bookId, "source.epub"),
+    join(input.stateRoot, "books", input.bookId, "source", "source.epub"),
     sourceText,
     "utf8",
   );
@@ -116,7 +116,7 @@ async function writeLegacyBackfillFixture(input: {
     sourceRelativePath,
     portability: {
       closureRoot: `books/${input.bookId}`,
-      sourceRoot: `sources/${input.bookId}`,
+      sourceRoot: `books/${input.bookId}/source`,
       canonicalNormalizedPath: `books/${input.bookId}/input/book.md`,
       qmdBuildManifestPath: `books/${input.bookId}/qmd/qmd_build_manifest.json`,
       graphOutputManifestPath:
@@ -319,6 +319,7 @@ describe("GraphRAG hotplug backfill", () => {
         const bookRoot = join(stateRoot, "books", bookId);
         const stagingRoot = join(
           stateRoot,
+          "catalog",
           ".staging",
           "book-hotplug-migrations",
           bookId,
@@ -420,6 +421,7 @@ describe("GraphRAG hotplug backfill", () => {
         const bookId = "book-resume-protected";
         const stagingState = join(
           stateRoot,
+          "catalog",
           ".staging",
           "book-hotplug-migrations",
           bookId,
@@ -516,10 +518,10 @@ describe("GraphRAG hotplug backfill", () => {
           kind: "book_distribution_manifest",
           bookId,
           sourceHash: sha256Text("different epub"),
-          sourceRelativePath: `sources/${bookId}/source.epub`,
+          sourceRelativePath: `books/${bookId}/source/source.epub`,
           portability: {
             closureRoot: `books/${bookId}`,
-            sourceRoot: `sources/${bookId}`,
+            sourceRoot: `books/${bookId}/source`,
             canonicalNormalizedPath: `books/${bookId}/input/book.md`,
             qmdBuildManifestPath: `books/${bookId}/qmd/qmd_build_manifest.json`,
             graphOutputManifestPath:

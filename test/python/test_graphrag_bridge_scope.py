@@ -177,8 +177,9 @@ def _stage_fingerprints() -> dict[str, str]:
 
 def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> None:
     book_dir = root / "books" / book_id
-    output_dir = book_dir / "output"
+    output_dir = book_dir / "graphrag" / "output"
     lancedb_dir = output_dir / "lancedb"
+    state_dir = book_dir / "state"
     graph_extract_files = [
         ("documents.parquet", "graphrag_documents_parquet"),
         ("text_units.parquet", "graphrag_text_units_parquet"),
@@ -217,7 +218,8 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
     ]
     provider_fingerprint = "provider-openai-responses-jina"
     content_hash = f"content-{book_id.rsplit('-', 1)[-1]}"
-    (book_dir / "checkpoints.yaml").write_text(
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "checkpoints.yaml").write_text(
         yaml.safe_dump(
             {
                 "schemaVersion": "1.0.0",
@@ -283,7 +285,7 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
         ),
         encoding="utf-8",
     )
-    (book_dir / "artifacts.yaml").write_text(
+    (state_dir / "artifacts.yaml").write_text(
         yaml.safe_dump(
             {
                 "schemaVersion": "1.0.0",
@@ -295,7 +297,9 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
                             "bookId": book_id,
                             "stage": "graph_extract",
                             "kind": kind,
-                            "path": f"books/{book_id}/output/{file_name}",
+                            "path": (
+                                f"books/{book_id}/graphrag/output/{file_name}"
+                            ),
                             "contentHash": _hash_file(output_dir / file_name),
                             "stageFingerprint": "stage-graph-extract",
                             "providerFingerprint": provider_fingerprint,
@@ -314,7 +318,7 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
                         "bookId": book_id,
                         "stage": "graph_extract",
                         "kind": "graphrag_context_json",
-                        "path": f"books/{book_id}/output/context.json",
+                        "path": f"books/{book_id}/graphrag/output/context.json",
                         "contentHash": _hash_file(output_dir / "context.json"),
                         "stageFingerprint": "stage-graph-extract",
                         "providerFingerprint": provider_fingerprint,
@@ -328,7 +332,7 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
                         "bookId": book_id,
                         "stage": "graph_extract",
                         "kind": "graphrag_stats_json",
-                        "path": f"books/{book_id}/output/stats.json",
+                        "path": f"books/{book_id}/graphrag/output/stats.json",
                         "contentHash": _hash_file(output_dir / "stats.json"),
                         "stageFingerprint": "stage-graph-extract",
                         "providerFingerprint": provider_fingerprint,
@@ -342,7 +346,10 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
                         "bookId": book_id,
                         "stage": "community_report",
                         "kind": "graphrag_community_reports_parquet",
-                        "path": f"books/{book_id}/output/community_reports.parquet",
+                        "path": (
+                            f"books/{book_id}/graphrag/output/"
+                            "community_reports.parquet"
+                        ),
                         "contentHash": report_hash,
                         "stageFingerprint": "stage-community-report",
                         "providerFingerprint": provider_fingerprint,
@@ -356,7 +363,7 @@ def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> 
                         "bookId": book_id,
                         "stage": "embed",
                         "kind": "lancedb_index",
-                        "path": f"books/{book_id}/output/lancedb",
+                        "path": f"books/{book_id}/graphrag/output/lancedb",
                         "contentHash": lancedb_hash,
                         "stageFingerprint": "stage-embed",
                         "providerFingerprint": provider_fingerprint,
@@ -1542,7 +1549,9 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                 with tempfile.TemporaryDirectory(prefix="qmd-bridge-scope-") as tmp:
                     root = Path(tmp)
                     _write_books(root)
-                    artifacts_path = root / "books" / "book-1" / "artifacts.yaml"
+                    artifacts_path = (
+                        root / "books" / "book-1" / "state" / "artifacts.yaml"
+                    )
                     artifacts = yaml.safe_load(
                         artifacts_path.read_text(encoding="utf-8")
                     )

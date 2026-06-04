@@ -645,13 +645,13 @@ describe("GraphRAG EPUB batch runner - Status Recovery", () => {
     await rm(tmpRoot, { recursive: true, force: true });
   });
 
-  test("migrate-only rewrites absolute GraphRAG output manifests to locators", async () => {
-    const tmpRoot = await mkProjectTmpDir("qmd-batch-migrate-output-manifest-");
+  test("migrate-only leaves legacy GraphRAG output manifests stale", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-batch-legacy-output-manifest-");
     const sourceDir = join(tmpRoot, "source");
     const stateRoot = join(tmpRoot, "graph_vault");
     const logRoot = join(tmpRoot, "logs");
     const configDir = join(tmpRoot, "config");
-    const runId = "migrate-output-manifest-fixture";
+    const runId = "legacy-output-manifest-fixture";
     const sourceBytes = "absolute output manifest";
     const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
     const sourcePath = join(sourceDir, "Book.epub");
@@ -664,7 +664,7 @@ describe("GraphRAG EPUB batch runner - Status Recovery", () => {
     const itemId = `item-${sourceHash.slice(0, 12)}-${
       createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
     }`;
-    const outputRel = join("books", bookId, "output");
+    const outputRel = join("books", bookId, "graphrag", "output");
     const outputDir = join(stateRoot, outputRel);
     await mkdir(join(stateRoot, "catalog", "batch-runs", runId, "items"), {
       recursive: true,
@@ -776,9 +776,8 @@ describe("GraphRAG EPUB batch runner - Status Recovery", () => {
     );
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toBe("");
-    expect(manifest.outputDir).toBe(`books/${bookId}/output`);
-    expect(JSON.stringify(manifest)).not.toContain(tmpRoot);
-    expect(eventsRaw).toContain("graph_output_manifest_migrated");
+    expect(manifest.outputDir).toBe(outputDir);
+    expect(eventsRaw).not.toContain("graph_output_manifest_migrated");
   });
 
   test("status-json emits recovery summary without running work", async () => {

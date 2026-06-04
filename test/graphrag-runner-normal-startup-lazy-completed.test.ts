@@ -1,18 +1,12 @@
 import { describe, expect, test } from "vitest";
 import { mkdir, rm, writeFile } from "fs/promises";
 import { existsSync, readFileSync } from "fs";
-import { createHash } from "crypto";
-import { join, relative } from "path";
-import { hostname } from "os";
+import { join } from "path";
 import { SchemaVersion } from "../src/contracts/common.ts";
 import {
-  batchBookId,
   mkProjectTmpDir,
-  passedBatchCommandChecks,
-  projectRoot,
   runBatchWorkflow,
-  stableTextHash,
-  writeDurableJsonFixture,
+  writeCompletedGraphBatchFixture,
 } from "./helpers/graphrag-runner-harness.ts";
 
 describe("GraphRAG EPUB batch runner - normal startup lazy completed load", () => {
@@ -27,44 +21,15 @@ describe("GraphRAG EPUB batch runner - normal startup lazy completed load", () =
     const invocationDir = join(tmpRoot, "invocations");
 
     try {
-      const sourceBytes = "legacy completed item without live evidence";
-      const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
-      const sourcePath = join(sourceDir, "Book.epub");
-      const sourceRelativePath = relative(projectRoot, sourcePath);
-      const itemId = `item-${sourceHash.slice(0, 12)}-${
-        stableTextHash(sourceRelativePath).slice(0, 8)
-      }`;
-      const bookId = batchBookId(sourceHash, sourceRelativePath);
-
-      await mkdir(sourceDir, { recursive: true });
-      await mkdir(configDir, { recursive: true });
-      await mkdir(join(batchRoot, "items"), { recursive: true });
+      const { bookId, itemId } = await writeCompletedGraphBatchFixture({
+        tmpRoot,
+        sourceDir,
+        stateRoot,
+        configDir,
+        runId,
+        sourceBytes: "completed item with query-ready package evidence",
+      });
       await mkdir(invocationDir, { recursive: true });
-      await writeFile(sourcePath, sourceBytes);
-      await writeFile(join(configDir, "index.yml"), "collections: {}\n");
-      const normalizedPath = join(stateRoot, "input", "book.md");
-      await mkdir(join(stateRoot, "input"), { recursive: true });
-      await writeFile(normalizedPath, "# Book\n\nSoftware design complexity.\n");
-      await mkdir(join(stateRoot, "books", bookId, "output"), { recursive: true });
-      await writeDurableJsonFixture(
-        join(stateRoot, "books", bookId, "output", "qmd_output_manifest.json"),
-        {
-          schemaVersion: SchemaVersion,
-          bookId,
-          sourceHash,
-          documentId: `doc-${sourceHash.slice(0, 12)}`,
-          contentHash: sourceHash,
-          stageFingerprints: {},
-          providerFingerprint: "provider-fp",
-          outputDir: `books/${bookId}/output`,
-          producerRunId: "run-query-ready",
-          stageProducerRunIds: {
-            graph_extract: "run-graph-extract",
-            community_report: "run-community-report",
-            embed: "run-embed",
-          },
-        },
-      );
 
       const resumeScript = join(tmpRoot, "fail-if-resume-called.mjs");
       const qmdScript = join(tmpRoot, "fail-if-qmd-called.mjs");
@@ -83,77 +48,6 @@ describe("GraphRAG EPUB batch runner - normal startup lazy completed load", () =
           "writeFileSync(process.env.QMD_CALLED_PATH, 'called\\n');",
           "process.exit(7);",
         ].join("\n"),
-      );
-
-      await writeDurableJsonFixture(
-        join(batchRoot, "manifest.json"),
-        {
-          schemaVersion: SchemaVersion,
-          runId,
-          status: "completed",
-          sourceRootName: "source",
-          stateRootLocator: ".tmp-tests/unused/graph_vault",
-          qmdIndexLocator: ".tmp-tests/unused/index.sqlite",
-          configLocator: ".tmp-tests/unused/config/index.yml",
-          totalItems: 1,
-          pendingItems: 0,
-          runningItems: 0,
-          completedItems: 1,
-          skippedItems: 0,
-          importedCompletedItems: 0,
-          failedItems: 0,
-          startedAt: "2026-05-23T00:00:00.000Z",
-          updatedAt: "2026-05-23T00:01:00.000Z",
-          completedAt: "2026-05-23T00:01:00.000Z",
-          itemIds: [itemId],
-        },
-      );
-      await writeDurableJsonFixture(
-        join(batchRoot, "items", `${itemId}.json`),
-        {
-          schemaVersion: SchemaVersion,
-          itemId,
-          runId,
-          status: "completed",
-          sourceName: "Book.epub",
-          sourceRelativePath,
-          sourceIdentityPath: sourceRelativePath,
-          sourceHash,
-          normalizedPath: relative(projectRoot, normalizedPath),
-          bookId,
-          attempts: 1,
-          completedAt: "2026-05-23T00:01:00.000Z",
-          commandChecks: passedBatchCommandChecks(),
-        },
-      );
-      const completedBookCheckpointPath = join(
-        stateRoot,
-        "books",
-        bookId,
-        "checkpoints.yaml",
-      );
-      const completedBookLockPath = `${completedBookCheckpointPath}.lock`;
-      await mkdir(join(stateRoot, "books", bookId), { recursive: true });
-      await writeFile(
-        completedBookLockPath,
-        `${JSON.stringify({
-          runnerSessionId: "completed-book-live-lock-session",
-          ownerPid: process.pid,
-          ownerHost: hostname(),
-          lockPath: relative(projectRoot, completedBookLockPath),
-          targetLocator: relative(projectRoot, completedBookCheckpointPath),
-          lane: "checkpointWriterLane",
-          targetMappingOwner: "repository",
-          durableKind: "json-lock",
-          releaseOn: "commit_or_rollback",
-          generation: 1,
-          fencingTokenHash: createHash("sha256")
-            .update("completed-book-live-lock-fence")
-            .digest("hex"),
-          operationId: "completed-book-live-lock-op",
-          createdAt: "2026-05-23T00:00:00.000Z",
-          expiresAt: "2099-01-01T00:00:00.000Z",
-        }, null, 2)}\n`,
       );
 
       const result = await runBatchWorkflow({
@@ -202,9 +96,9 @@ describe("GraphRAG EPUB batch runner - normal startup lazy completed load", () =
       expect(checkpoint).toMatchObject({
         status: "completed",
       });
-      expect(checkpoint.qmdBuildStatus).toBeUndefined();
-      expect(checkpoint.graphBuildStatus).toBeUndefined();
-      expect(checkpoint.graphQueryStatus).toBeUndefined();
+      expect(checkpoint.qmdBuildStatus).toMatchObject({ status: "succeeded" });
+      expect(checkpoint.graphBuildStatus).toMatchObject({ status: "succeeded" });
+      expect(checkpoint.graphQueryStatus).toMatchObject({ status: "succeeded" });
       expect(events.some((event) => event.event === "item_skip_completed"))
         .toBe(true);
       expect(events.some((event) => event.event === "batch_completed"))
@@ -222,7 +116,6 @@ describe("GraphRAG EPUB batch runner - normal startup lazy completed load", () =
         itemId,
         portability: {
           canonicalNormalizedPath: `books/${bookId}/input/book.md`,
-          legacyNormalizedPath: "input/book.md",
         },
         exclusions: expect.arrayContaining([
           ".env",
@@ -234,7 +127,6 @@ describe("GraphRAG EPUB batch runner - normal startup lazy completed load", () =
       );
       expect(existsSync(join(invocationDir, "resume-called.txt"))).toBe(false);
       expect(existsSync(join(invocationDir, "qmd-called.txt"))).toBe(false);
-      expect(existsSync(completedBookLockPath)).toBe(true);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }

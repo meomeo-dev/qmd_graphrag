@@ -120,12 +120,12 @@ async function writeQueryReadyPackage(input: {
   });
   await mkdir(join(bookRoot, "input"), { recursive: true });
   await mkdir(join(bookRoot, "qmd"), { recursive: true });
-  await mkdir(join(input.stateRoot, "sources", input.bookId), {
+  await mkdir(join(input.stateRoot, "books", input.bookId, "source"), {
     recursive: true,
   });
   await writeFile(join(bookRoot, "input", "book.md"), inputText, "utf8");
   await writeFile(
-    join(input.stateRoot, "sources", input.bookId, "source.epub"),
+    join(input.stateRoot, "books", input.bookId, "source", "source.epub"),
     sourceText,
     "utf8",
   );
@@ -133,7 +133,7 @@ async function writeQueryReadyPackage(input: {
     schemaVersion: "1.0.0",
     kind: "qmd_build_manifest",
     bookId: input.bookId,
-    sourceRelativePath: `sources/${input.bookId}/source.epub`,
+    sourceRelativePath: `books/${input.bookId}/source/source.epub`,
     sourceHash,
     canonicalBookNormalizedPath: `books/${input.bookId}/input/book.md`,
     normalizedContentHash: normalizedHash,
@@ -159,7 +159,7 @@ async function writeQueryReadyPackage(input: {
     stateRoot: input.stateRoot,
     bookId: input.bookId,
     sourceHash,
-    sourceRelativePath: `sources/${input.bookId}/source.epub`,
+    sourceRelativePath: `books/${input.bookId}/source/source.epub`,
     now: () => "2026-06-02T00:00:00.000Z",
     toolVersion: "test",
   });

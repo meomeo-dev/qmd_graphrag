@@ -61,7 +61,7 @@ async function writeRefreshExistingFixture(input: {
   const sourceHash = sha256Text(sourceText);
   const normalizedHash = sha256Text(inputText);
   const bookRoot = join(input.stateRoot, "books", input.bookId);
-  const sourceRelativePath = `sources/${input.bookId}/source.epub`;
+  const sourceRelativePath = `books/${input.bookId}/source/source.epub`;
 
   await writeProviderAuthReopenGraphFixture({
     stateRoot: input.stateRoot,
@@ -71,12 +71,12 @@ async function writeRefreshExistingFixture(input: {
   });
   await mkdir(join(bookRoot, "input"), { recursive: true });
   await mkdir(join(bookRoot, "qmd"), { recursive: true });
-  await mkdir(join(input.stateRoot, "sources", input.bookId), {
+  await mkdir(join(input.stateRoot, "books", input.bookId, "source"), {
     recursive: true,
   });
   await writeFile(join(bookRoot, "input", "book.md"), inputText, "utf8");
   await writeFile(
-    join(input.stateRoot, "sources", input.bookId, "source.epub"),
+    join(input.stateRoot, "books", input.bookId, "source", "source.epub"),
     sourceText,
     "utf8",
   );
@@ -118,7 +118,7 @@ async function writeRefreshExistingFixture(input: {
     sourceRelativePath,
     portability: {
       closureRoot: `books/${input.bookId}`,
-      sourceRoot: `sources/${input.bookId}`,
+      sourceRoot: `books/${input.bookId}/source`,
       canonicalNormalizedPath: `books/${input.bookId}/input/book.md`,
       qmdBuildManifestPath: `books/${input.bookId}/qmd/qmd_build_manifest.json`,
       graphOutputManifestPath:

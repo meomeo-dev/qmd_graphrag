@@ -632,11 +632,11 @@ describe("syncGraphRagBookWorkspace", () => {
       });
       const jobRaw = await readFile(join(graphVault, "catalog", "books.yaml"), "utf8");
       const artifacts = YAML.parse(await readFile(
-        join(graphVault, "books", recovered.job.bookId, "artifacts.yaml"),
+        join(graphVault, "books", recovered.job.bookId, "state", "artifacts.yaml"),
         "utf8",
       )) as { items: Array<{ stage: string; providerFingerprint?: string }> };
       const checkpoints = YAML.parse(await readFile(
-        join(graphVault, "books", recovered.job.bookId, "checkpoints.yaml"),
+        join(graphVault, "books", recovered.job.bookId, "state", "checkpoints.yaml"),
         "utf8",
       )) as { items: Array<{ stage: string; providerFingerprint?: string }> };
       const highCostStages = new Set([
@@ -859,7 +859,14 @@ describe("syncGraphRagBookWorkspace", () => {
   test("rejects GraphRAG stage reports with provider or partial-output errors", async () => {
     const root = await createWorkspace();
     try {
-      const outputDir = join(root, "graph_vault", "books", "book-1", "output");
+      const outputDir = join(
+        root,
+        "graph_vault",
+        "books",
+        "book-1",
+        "graphrag",
+        "output",
+      );
       const reportDir = join(outputDir, "reports");
       await mkdir(reportDir, { recursive: true });
       const logPath = join(reportDir, "indexing-engine.log");
@@ -924,7 +931,14 @@ describe("syncGraphRagBookWorkspace", () => {
   test("cleans only failed stage-owned GraphRAG residual outputs before retry", async () => {
     const root = await createWorkspace();
     try {
-      const outputDir = join(root, "graph_vault", "books", "book-1", "output");
+      const outputDir = join(
+        root,
+        "graph_vault",
+        "books",
+        "book-1",
+        "graphrag",
+        "output",
+      );
       await mkdir(join(outputDir, "lancedb", "table.lance"), { recursive: true });
       await writeFile(join(outputDir, "documents.parquet"), "documents", "utf8");
       await writeFile(join(outputDir, "text_units.parquet"), "text units", "utf8");
@@ -961,7 +975,14 @@ describe("syncGraphRagBookWorkspace", () => {
   test("does not clean residual outputs after non-retryable stage failure", async () => {
     const root = await createWorkspace();
     try {
-      const outputDir = join(root, "graph_vault", "books", "book-1", "output");
+      const outputDir = join(
+        root,
+        "graph_vault",
+        "books",
+        "book-1",
+        "graphrag",
+        "output",
+      );
       await mkdir(outputDir, { recursive: true });
       await writeFile(join(outputDir, "community_reports.parquet"), "keep", "utf8");
 
@@ -1788,7 +1809,9 @@ describe("syncGraphRagBookWorkspace", () => {
         join(outputDir, "qmd_output_manifest.json"),
         "utf8",
       ));
-      expect(manifest.outputDir).toBe(`books/${initial.job.bookId}/output`);
+      expect(manifest.outputDir).toBe(
+        `books/${initial.job.bookId}/graphrag/output`,
+      );
       expect(manifest.outputDir).not.toContain(root);
       expect(manifest.stageProducerRunIds).toMatchObject({
         graph_extract: "graph-run",
@@ -1852,7 +1875,7 @@ describe("syncGraphRagBookWorkspace", () => {
           contentHash: "stale-content",
           stageFingerprints: initial.stageFingerprints,
           providerFingerprint: initial.job.providerFingerprint,
-          outputDir: "books/book-stale/output",
+          outputDir: "books/book-stale/graphrag/output",
           producerRunId: "stale-query-ready",
           stageProducerRunIds: {
             graph_extract: "stale-graph-extract",
@@ -2625,9 +2648,19 @@ describe("syncGraphRagBookWorkspace", () => {
       await writeFile(normalizedPath, "# Book\n\nNormalized content", "utf8");
       await writeManagedGraphRagSettings({ config: projectConfig, graphVault });
       await writeFile(join(graphVault, "prompts", "extract_graph.txt"), "prompt", "utf8");
-      await mkdir(join(graphVault, "books", "unrelated", "output"), { recursive: true });
+      await mkdir(
+        join(graphVault, "books", "unrelated", "graphrag", "output"),
+        { recursive: true },
+      );
       await writeFile(
-        join(graphVault, "books", "unrelated", "output", "keep.txt"),
+        join(
+          graphVault,
+          "books",
+          "unrelated",
+          "graphrag",
+          "output",
+          "keep.txt",
+        ),
         "keep",
         "utf8",
       );
@@ -2661,7 +2694,14 @@ describe("syncGraphRagBookWorkspace", () => {
         reason: "managed_projection_rewritten",
       });
       await expect(readFile(
-        join(graphVault, "books", "unrelated", "output", "keep.txt"),
+        join(
+          graphVault,
+          "books",
+          "unrelated",
+          "graphrag",
+          "output",
+          "keep.txt",
+        ),
         "utf8",
       )).resolves.toBe("keep");
 
@@ -3338,13 +3378,10 @@ describe("syncGraphRagBookWorkspace", () => {
     const root = await createWorkspace();
     try {
       const graphVault = join(root, "graph_vault");
-      await mkdir(join(graphVault, "books", "book-1", "output"), {
-        recursive: true,
-      });
       const repo = new FileBookJobStateRepository(graphVault);
       const sourcePath = join(root, "book.epub");
       await writeFile(sourcePath, "epub-bytes", "utf8");
-      await repo.registerBookSource({
+      const job = await repo.registerBookSource({
         sourcePath,
         sourceIdentityPath: "book.epub",
         configFingerprint: "cfg-1",
@@ -3354,11 +3391,22 @@ describe("syncGraphRagBookWorkspace", () => {
         providerFingerprint: "provider-1",
         normalizedContentHash: "content-1",
       });
-      const [oldArtifact] = await repo.recordArtifacts("book-1", [
+      await mkdir(
+        join(graphVault, "books", job.bookId, "graphrag", "output"),
+        { recursive: true },
+      );
+      const [oldArtifact] = await repo.recordArtifacts(job.bookId, [
         {
           stage: "graph_extract",
           kind: "graphrag_documents_parquet",
-          path: join(graphVault, "books", "book-1", "output", "missing.parquet"),
+          path: join(
+            graphVault,
+            "books",
+            job.bookId,
+            "graphrag",
+            "output",
+            "missing.parquet",
+          ),
           contentHash: "missing-hash",
           stageFingerprint: "fp-graph",
           providerFingerprint: "provider-1",
@@ -3368,7 +3416,7 @@ describe("syncGraphRagBookWorkspace", () => {
 
       await expect(assertGraphRagStageArtifactsReady({
         stateRootDir: graphVault,
-        bookId: "book-1",
+        bookId: job.bookId,
         stage: "graph_extract",
         producerRunId: "new-run",
         artifacts: [oldArtifact!],

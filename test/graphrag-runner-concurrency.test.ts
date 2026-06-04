@@ -207,7 +207,7 @@ describe("GraphRAG EPUB batch runner - Concurrency And Coordination", () => {
             .update(readFileSync(sourcePath))
             .digest("hex");
           const bookId = batchBookId(sourceHash, relative(projectRoot, sourcePath));
-          const exactTarget = join(stateRoot, "books", bookId, targetName);
+          const exactTarget = join(stateRoot, "books", bookId, "state", targetName);
 
           const result = await runBatchWorkflow({
             tmpRoot,
@@ -266,7 +266,7 @@ describe("GraphRAG EPUB batch runner - Concurrency And Coordination", () => {
               item.itemId === checkpoint.itemId &&
               item.localFailureClass === "durable_temp_rename_enoent",
           );
-          const targetSuffix = `/graph_vault/books/${bookId}/${targetName}`;
+          const targetSuffix = `/graph_vault/books/${bookId}/state/${targetName}`;
 
           expect(result.exitCode).not.toBe(0);
           expect(result.stderr).toBe("");
@@ -339,7 +339,7 @@ describe("GraphRAG EPUB batch runner - Concurrency And Coordination", () => {
         "  retryable: false,",
         "  recoveryDecision: 'stop_until_fixed',",
         "  failedStage: 'resume-book-1',",
-        "  targetLocator: 'graph_vault/books/book/checkpoints.yaml',",
+        "  targetLocator: 'graph_vault/books/book/state/checkpoints.yaml',",
         "  tempId: 'tmp-partial',",
         "  operationId: 'op-partial',",
         "  failedSyscall: 'rename',",

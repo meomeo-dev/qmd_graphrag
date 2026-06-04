@@ -87,8 +87,8 @@ describe("GraphRAG runner resume run record scope", () => {
     }
   });
 
-  test("legacy migration only reads checkpoint-referenced run records", async () => {
-    const root = await mkdtemp(join(tmpdir(), "qmd-graphrag-legacy-run-scope-"));
+  test("old root run records remain inert and are not compatibility-migrated", async () => {
+    const root = await mkdtemp(join(tmpdir(), "qmd-graphrag-old-run-scope-"));
     try {
       const graphVault = join(root, "graph_vault");
       const repo = new FileBookJobStateRepository(graphVault);
@@ -190,27 +190,20 @@ describe("GraphRAG runner resume run record scope", () => {
         modelFingerprint: "model-2",
       });
 
-      const migratedRun = YAML.parse(await readFile(
-        join(graphVault, "books", stableJob.bookId, "runs", "run-legacy-current.yaml"),
+      await expect(readFile(
+        join(
+          graphVault,
+          "books",
+          stableJob.bookId,
+          "graphrag",
+          "runs",
+          "run-legacy-current.yaml",
+        ),
         "utf8",
-      )) as { bookId: string; artifactIds: string[] };
-      expect(migratedRun.bookId).toBe(stableJob.bookId);
-      expect(migratedRun.artifactIds[0]).not.toBe("legacy-artifact");
-
-      const legacyRunDir = join(graphVault, "archive", "legacy-books");
-      const archives = await readdir(legacyRunDir);
-      expect(archives.length).toBe(1);
-      const archivedDamagedRun = join(
-        legacyRunDir,
-        archives[0]!,
-        "runs",
-        "run-unrelated-damaged.yaml",
-      );
-      expect(await readFile(archivedDamagedRun, "utf8")).toBe("not: [valid");
-      const archivedRunFiles = await readdir(join(legacyRunDir, archives[0]!, "runs"));
-      expect(archivedRunFiles.some((entry) =>
-        entry.startsWith("run-unrelated-damaged.yaml.corrupt-")
-      )).toBe(false);
+      )).rejects.toThrow();
+      await expect(readFile(join(graphVault, "archive", "legacy-books"), "utf8"))
+        .rejects.toThrow();
+      expect(await readFile(unrelatedRunPath, "utf8")).toBe("not: [valid");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -344,7 +344,14 @@ describe("GraphRAG runner durable preflight", () => {
         const sourceRelativePath = relative(projectRoot, sourcePath);
         const itemId = batchItemId(sourceHash, sourceRelativePath);
         const bookId = batchBookId(sourceHash, sourceRelativePath);
-        const mappedYamlPath = join(stateRoot, "books", bookId, "runs", "legacy.yaml");
+        const mappedYamlPath = join(
+          stateRoot,
+          "books",
+          bookId,
+          "graphrag",
+          "runs",
+          "legacy.yaml",
+        );
         await writeDurableTextFixture(mappedYamlPath, [
           "schemaVersion: 1.0.0",
           "runId: legacy",
@@ -550,7 +557,14 @@ describe("GraphRAG runner durable preflight", () => {
         const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
         const sourceRelativePath = relative(projectRoot, fixture.sourcePath);
         const bookId = batchBookId(sourceHash, sourceRelativePath);
-        const targetPath = join(stateRoot, "books", bookId, "runs", "temp.yaml");
+        const targetPath = join(
+          stateRoot,
+          "books",
+          bookId,
+          "graphrag",
+          "runs",
+          "temp.yaml",
+        );
         await writeDurableTextFixture(targetPath, "stage: ingest\n");
         const tempPath = `${targetPath}.tmp-startup-readonly`;
         await writeFile(tempPath, "stale temp\n", "utf8");
@@ -633,7 +647,14 @@ describe("GraphRAG runner durable preflight", () => {
         const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
         const sourceRelativePath = relative(projectRoot, fixture.sourcePath);
         const bookId = batchBookId(sourceHash, sourceRelativePath);
-        const contextPath = join(stateRoot, "books", bookId, "output", "context.json");
+        const contextPath = join(
+          stateRoot,
+          "books",
+          bookId,
+          "graphrag",
+          "output",
+          "context.json",
+        );
         const contextText = "{}\n";
         await mkdir(dirname(contextPath), { recursive: true });
         await writeFile(contextPath, contextText, "utf8");
@@ -723,13 +744,20 @@ describe("GraphRAG runner durable preflight", () => {
           .digest("hex");
         const sourceRelativePath = relative(projectRoot, fixture.sourcePath);
         const bookId = batchBookId(sourceHash, sourceRelativePath);
-        const statsPath = join(stateRoot, "books", bookId, "output", "stats.json");
+        const statsPath = join(
+          stateRoot,
+          "books",
+          bookId,
+          "graphrag",
+          "output",
+          "stats.json",
+        );
         const oldStats = "{ \"old\": true }\n";
         const newStats = "{ \"new\": true }\n";
         await writeDurableTextFixture(statsPath, oldStats);
         await writeFile(statsPath, newStats, "utf8");
         await writeDurableTextFixture(
-          join(stateRoot, "books", bookId, "artifacts.yaml"),
+          join(stateRoot, "books", bookId, "state", "artifacts.yaml"),
           [
             "schemaVersion: 1.0.0",
             "items:",
@@ -738,7 +766,7 @@ describe("GraphRAG runner durable preflight", () => {
             `    bookId: ${bookId}`,
             "    stage: graph_extract",
             "    kind: graphrag_stats_json",
-            "    path: " + `books/${bookId}/output/stats.json`,
+            "    path: " + `books/${bookId}/graphrag/output/stats.json`,
             `    contentHash: ${sha256Text(newStats)}`,
             "    stageFingerprint: graph-stage",
             "    providerFingerprint: provider-fingerprint",
@@ -914,7 +942,14 @@ describe("GraphRAG runner durable preflight", () => {
           .digest("hex");
         const sourceRelativePath = relative(projectRoot, fixture.sourcePath);
         const bookId = batchBookId(sourceHash, sourceRelativePath);
-        const statsPath = join(stateRoot, "books", bookId, "output", "stats.json");
+        const statsPath = join(
+          stateRoot,
+          "books",
+          bookId,
+          "graphrag",
+          "output",
+          "stats.json",
+        );
         const oldStats = "{ \"workflows\": { \"extract_graph\": { \"overall\": 1 } } }\n";
         const newStats = [
           "{",
@@ -937,7 +972,7 @@ describe("GraphRAG runner durable preflight", () => {
         await writeFile(`${statsPath}.corrupt-1780302661869`, newStats, "utf8");
         await rm(statsPath, { force: true });
         await writeDurableTextFixture(
-          join(stateRoot, "books", bookId, "artifacts.yaml"),
+          join(stateRoot, "books", bookId, "state", "artifacts.yaml"),
           [
             "schemaVersion: 1.0.0",
             "items:",
@@ -946,7 +981,7 @@ describe("GraphRAG runner durable preflight", () => {
             `    bookId: ${bookId}`,
             "    stage: graph_extract",
             "    kind: graphrag_stats_json",
-            "    path: " + `books/${bookId}/output/stats.json`,
+            "    path: " + `books/${bookId}/graphrag/output/stats.json`,
             `    contentHash: ${sha256Text(oldStats)}`,
             "    stageFingerprint: graph-stage",
             "    providerFingerprint: provider-fingerprint",
@@ -1017,8 +1052,22 @@ describe("GraphRAG runner durable preflight", () => {
         const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
         const sourceRelativePath = relative(projectRoot, fixture.sourcePath);
         const bookId = batchBookId(sourceHash, sourceRelativePath);
-        const firstPath = join(stateRoot, "books", bookId, "runs", "a.yaml");
-        const secondPath = join(stateRoot, "books", bookId, "runs", "b.yaml");
+        const firstPath = join(
+          stateRoot,
+          "books",
+          bookId,
+          "graphrag",
+          "runs",
+          "a.yaml",
+        );
+        const secondPath = join(
+          stateRoot,
+          "books",
+          bookId,
+          "graphrag",
+          "runs",
+          "b.yaml",
+        );
         await writeDurableTextFixture(firstPath, "stage: a\n");
         await writeDurableTextFixture(secondPath, "stage: b\n");
         await writeFile(`${firstPath}.lock`, `${JSON.stringify({
@@ -1092,7 +1141,14 @@ describe("GraphRAG runner durable preflight", () => {
           .digest("hex");
         const sourceRelativePath = relative(projectRoot, fixture.sourcePath);
         const bookId = batchBookId(sourceHash, sourceRelativePath);
-        const runStatePath = join(stateRoot, "books", bookId, "runs", "stale.yaml");
+        const runStatePath = join(
+          stateRoot,
+          "books",
+          bookId,
+          "graphrag",
+          "runs",
+          "stale.yaml",
+        );
         const lockPath = `${runStatePath}.lock`;
         await writeDurableTextFixture(runStatePath, "stage: stale-lock\n");
         await writeFile(lockPath, `${JSON.stringify({

@@ -640,7 +640,7 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
     const itemId = `item-${sourceHash.slice(0, 12)}-${
       createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
     }`;
-    const outputRel = join("books", bookId, "output");
+    const outputRel = join("books", bookId, "graphrag", "output");
     const outputDir = join(stateRoot, outputRel);
     const documentId = `doc-${sourceHash.slice(0, 12)}`;
     const contentHash = sourceHash;
@@ -672,7 +672,7 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
     await mkdir(outputDir, { recursive: true });
     await writeFile(sourcePath, sourceBytes);
     await writeFile(join(configDir, "index.yml"), "collections: {}\n");
-    const normalizedPath = join(stateRoot, "input", "book.md");
+    const normalizedPath = join(stateRoot, "books", bookId, "input", "book.md");
     await writeQmdBuildFixture({
       tmpRoot,
       stateRoot,
@@ -712,7 +712,7 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
         contentHash,
         stageFingerprints,
         providerFingerprint,
-        outputDir: `books/${bookId}/output`,
+        outputDir: `books/${bookId}/graphrag/output`,
         producerRunId: "run-query-ready",
         stageProducerRunIds: {
           graph_extract: "run-graph-extract",
@@ -747,11 +747,11 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
       },
     );
     await writeDurableYamlFixture(
-      join(stateRoot, "books", bookId, "artifacts.yaml"),
+      join(stateRoot, "books", bookId, "state", "artifacts.yaml"),
       { schemaVersion: SchemaVersion, items: graphArtifacts },
     );
     await writeDurableYamlFixture(
-      join(stateRoot, "books", bookId, "checkpoints.yaml"),
+      join(stateRoot, "books", bookId, "state", "checkpoints.yaml"),
       {
         schemaVersion: SchemaVersion,
         items: [
@@ -1138,7 +1138,7 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
     const itemId = `item-${sourceHash.slice(0, 12)}-${
       createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
     }`;
-    const outputRel = join("books", bookId, "output");
+    const outputRel = join("books", bookId, "graphrag", "output");
     const outputDir = join(stateRoot, outputRel);
     const documentId = `doc-${sourceHash.slice(0, 12)}`;
     const contentHash = sourceHash;
@@ -1170,7 +1170,7 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
     await mkdir(outputDir, { recursive: true });
     await writeFile(sourcePath, sourceBytes);
     await writeFile(join(configDir, "index.yml"), "collections: {}\n");
-    const normalizedPath = join(stateRoot, "input", "book.md");
+    const normalizedPath = join(stateRoot, "books", bookId, "input", "book.md");
     await writeQmdBuildFixture({
       tmpRoot,
       stateRoot,
@@ -1210,7 +1210,7 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
         contentHash,
         stageFingerprints,
         providerFingerprint,
-        outputDir: `books/${bookId}/output`,
+        outputDir: `books/${bookId}/graphrag/output`,
         producerRunId: "run-query-ready",
         stageProducerRunIds: {
           graph_extract: "run-graph-extract",
@@ -1245,11 +1245,11 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
       },
     );
     await writeDurableYamlFixture(
-      join(stateRoot, "books", bookId, "artifacts.yaml"),
+      join(stateRoot, "books", bookId, "state", "artifacts.yaml"),
       { schemaVersion: SchemaVersion, items: graphArtifacts },
     );
     await writeDurableYamlFixture(
-      join(stateRoot, "books", bookId, "checkpoints.yaml"),
+      join(stateRoot, "books", bookId, "state", "checkpoints.yaml"),
       {
         schemaVersion: SchemaVersion,
         items: [

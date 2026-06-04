@@ -148,7 +148,7 @@ describe("GraphRAG EPUB batch runner - Redaction", () => {
     const itemId = `item-${sourceHash.slice(0, 12)}-${
       createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
     }`;
-    const outputRel = join("books", bookId, "output");
+    const outputRel = join("books", bookId, "graphrag", "output");
     const outputDir = join(stateRoot, outputRel);
     const documentId = `doc-${sourceHash.slice(0, 12)}`;
     const contentHash = sourceHash;
@@ -260,11 +260,11 @@ describe("GraphRAG EPUB batch runner - Redaction", () => {
       },
     );
     await writeDurableYamlFixture(
-      join(stateRoot, "books", bookId, "artifacts.yaml"),
+      join(stateRoot, "books", bookId, "state", "artifacts.yaml"),
       { schemaVersion: SchemaVersion, items: graphArtifacts },
     );
     await writeDurableYamlFixture(
-      join(stateRoot, "books", bookId, "checkpoints.yaml"),
+      join(stateRoot, "books", bookId, "state", "checkpoints.yaml"),
       {
         schemaVersion: SchemaVersion,
         items: [
@@ -411,11 +411,11 @@ describe("GraphRAG EPUB batch runner - Redaction", () => {
       qmdBuildStatus: { status: "succeeded" },
       graphBuildStatus: {
         status: "stale",
-        stage: "community_report",
+        stage: "query_ready",
       },
     });
     expect(summary.items[0].graphBuildStatus.reason).toMatch(
-      /stage_artifact_producer_run_mismatch:community_report/u,
+      /stage_artifact_producer_run_mismatch:query_ready/u,
     );
     expect(checkpoint.status).toBe("completed");
     expect(eventsExist).toBe(false);
@@ -483,12 +483,12 @@ describe("GraphRAG EPUB batch runner - Redaction", () => {
     expect(manifest).toMatchObject({
       status: "failed",
       totalItems: 2,
-      pendingItems: 0,
+      pendingItems: 1,
       runningItems: 0,
       completedItems: 0,
       skippedItems: 0,
       importedCompletedItems: 2,
-      failedItems: 2,
+      failedItems: 1,
       expectedCommandCheckCount: 27,
     });
     expect(checkpoints).toHaveLength(2);

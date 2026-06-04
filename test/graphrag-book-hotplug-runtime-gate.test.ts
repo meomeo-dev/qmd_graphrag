@@ -127,7 +127,7 @@ async function writeQueryReadyHotplugPackageFixture(input: {
   await mkdir(join(input.stateRoot, "books", input.bookId, "qmd"), {
     recursive: true,
   });
-  await mkdir(join(input.stateRoot, "sources", input.bookId), {
+  await mkdir(join(input.stateRoot, "books", input.bookId, "source"), {
     recursive: true,
   });
   await writeFile(
@@ -136,7 +136,7 @@ async function writeQueryReadyHotplugPackageFixture(input: {
     "utf8",
   );
   await writeFile(
-    join(input.stateRoot, "sources", input.bookId, "source.epub"),
+    join(input.stateRoot, "books", input.bookId, "source", "source.epub"),
     sourceText,
     "utf8",
   );
@@ -155,7 +155,7 @@ async function writeQueryReadyHotplugPackageFixture(input: {
       runId: "run-runtime-gate",
       bookId: input.bookId,
       sourceName: "Book.epub",
-      sourceRelativePath: `sources/${input.bookId}/source.epub`,
+      sourceRelativePath: `books/${input.bookId}/source/source.epub`,
       sourceHash,
       canonicalBookNormalizedPath: `books/${input.bookId}/input/book.md`,
       normalizedContentHash: normalizedHash,
@@ -189,7 +189,7 @@ async function writeQueryReadyHotplugPackageFixture(input: {
     stateRoot: input.stateRoot,
     bookId: input.bookId,
     sourceHash,
-    sourceRelativePath: `sources/${input.bookId}/source.epub`,
+    sourceRelativePath: `books/${input.bookId}/source/source.epub`,
     now: () => "2026-06-02T00:00:00.000Z",
     toolVersion: "test",
   });

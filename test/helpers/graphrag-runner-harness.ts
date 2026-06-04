@@ -791,7 +791,7 @@ export async function writeCompletedGraphBatchFixture(input: {
   await mkdir(outputDir, { recursive: true });
   await writeFile(sourcePath, input.sourceBytes);
   await writeFile(join(input.configDir, "index.yml"), "collections: {}\n");
-  const normalizedPath = join(input.stateRoot, "input", "book.md");
+  const normalizedPath = join(input.stateRoot, "books", bookId, "input", "book.md");
   await writeQmdBuildFixture({
     tmpRoot: input.tmpRoot,
     stateRoot: input.stateRoot,
@@ -838,6 +838,20 @@ export async function writeCompletedGraphBatchFixture(input: {
         community_report: "run-community-report",
         embed: "run-embed",
       },
+    },
+  );
+  await writeDurableJsonFixture(
+    join(outputDir, "qmd_graph_text_unit_identity.json"),
+    {
+      schemaVersion: SchemaVersion,
+      bookId,
+      sourceId: `sha256:${sourceHash}`,
+      sourceHash,
+      documentId,
+      contentHash,
+      normalizedPath: `books/${bookId}/input/book.md`,
+      graphDocumentId: `graph-doc-${bookId}`,
+      graphTextUnitIds: [`tu-${bookId}`],
     },
   );
   await mkdir(join(input.stateRoot, "books", bookId), { recursive: true });

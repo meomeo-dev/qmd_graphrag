@@ -41,9 +41,9 @@ describe("GraphRAG runner qmd validation policy", () => {
     expect(qmdValidationOutputMaxBufferBytes).toBeLessThanOrEqual(1024 * 1024);
   });
 
-  test("book URI falls back for legacy normalized input paths", () => {
-    expect(qmdBooksUriForNormalizedPath(
+  test("book URI rejects legacy root normalized input paths", () => {
+    expect(() => qmdBooksUriForNormalizedPath(
       "/tmp/qmd/graph_vault/input/Clean Architecture.md",
-    )).toBe("qmd://books/Clean Architecture.md");
+    )).toThrow("books/{bookId}/input/{file}");
   });
 });

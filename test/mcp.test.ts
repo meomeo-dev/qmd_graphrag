@@ -22,6 +22,7 @@ import { syncConfigToDb } from "../src/store";
 import { SchemaVersion } from "../src/contracts/common";
 import { hashLanceDbDirectoryContents } from "../src/job-state/artifact-validation";
 import { hashFile } from "../src/job-state/fingerprint";
+import { writeMinimalParquetFixture } from "./helpers/graphrag-runner-harness";
 
 // =============================================================================
 // Test Database Setup
@@ -908,12 +909,50 @@ import { enableProductionMode } from "../src/store";
 
 async function writeHttpGraphVaultFixture(root: string): Promise<void> {
   const bookId = "book-mcp";
-  const reportArtifactId = "artifact-mcp-report";
-  const lancedbArtifactId = "artifact-mcp-lancedb";
-  const lancedbPath = join(root, "books", bookId, "output", "lancedb");
+  const stageFingerprints = {
+    ingest: "stage-ingest",
+    normalize: "stage-normalize",
+    graph_extract: "stage-graph-extract",
+    community_report: "stage-community-report",
+    embed: "stage-embed",
+    query_ready: "stage-query-ready",
+  };
+  const providerFingerprint = "provider-openai-responses-jina";
+  const sourceHash = "source-mcp";
+  const contentHash = "hash1";
+  const artifactIds = {
+    documents: "artifact-mcp-documents",
+    textUnits: "artifact-mcp-text-units",
+    entities: "artifact-mcp-entities",
+    relationships: "artifact-mcp-relationships",
+    communities: "artifact-mcp-communities",
+    context: "artifact-mcp-context",
+    stats: "artifact-mcp-stats",
+    report: "artifact-mcp-report",
+    lancedb: "artifact-mcp-lancedb",
+  };
+  const outputDir = join(root, "books", bookId, "graphrag", "output");
+  const lancedbPath = join(outputDir, "lancedb");
 
   await mkdir(join(root, "catalog"), { recursive: true });
-  await mkdir(join(root, "books", bookId, "output"), { recursive: true });
+  await mkdir(outputDir, { recursive: true });
+  await mkdir(join(root, "books", bookId, "input"), { recursive: true });
+  await mkdir(join(root, "books", bookId, "source"), { recursive: true });
+  await mkdir(join(root, "books", bookId, "state"), { recursive: true });
+  await writeFile(join(root, "books", bookId, "input", "book.md"), "# Book\n", "utf8");
+  await writeFile(join(root, "books", bookId, "source", "source.epub"), "epub", "utf8");
+  const graphExtractFiles = [
+    ["documents", "graphrag_documents_parquet", "documents.parquet"],
+    ["textUnits", "graphrag_text_units_parquet", "text_units.parquet"],
+    ["entities", "graphrag_entities_parquet", "entities.parquet"],
+    ["relationships", "graphrag_relationships_parquet", "relationships.parquet"],
+    ["communities", "graphrag_communities_parquet", "communities.parquet"],
+  ] as const;
+  for (const [, , fileName] of graphExtractFiles) {
+    await writeMinimalParquetFixture(join(outputDir, fileName));
+  }
+  await writeFile(join(outputDir, "context.json"), "{}", "utf8");
+  await writeFile(join(outputDir, "stats.json"), "{}", "utf8");
   for (const tableName of [
     "entity_description.lance",
     "community_full_content.lance",
@@ -935,58 +974,168 @@ async function writeHttpGraphVaultFixture(root: string): Promise<void> {
     );
   }
 
-  const reportPath = join(root, "books", bookId, "output", "community_reports.parquet");
-  await writeFile(reportPath, "reports", "utf8");
+  const reportPath = join(outputDir, "community_reports.parquet");
+  await writeMinimalParquetFixture(reportPath);
   const reportHash = await hashFile(reportPath);
   const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
+  const graphExtractArtifacts = [];
+  for (const [key, kind, fileName] of graphExtractFiles) {
+    const artifactId = artifactIds[key];
+    graphExtractArtifacts.push({
+      artifactId,
+      kind,
+      path: `books/${bookId}/graphrag/output/${fileName}`,
+      contentHash: await hashFile(join(outputDir, fileName)),
+    });
+  }
+  graphExtractArtifacts.push(
+    {
+      artifactId: artifactIds.context,
+      kind: "graphrag_context_json",
+      path: `books/${bookId}/graphrag/output/context.json`,
+      contentHash: await hashFile(join(outputDir, "context.json")),
+    },
+    {
+      artifactId: artifactIds.stats,
+      kind: "graphrag_stats_json",
+      path: `books/${bookId}/graphrag/output/stats.json`,
+      contentHash: await hashFile(join(outputDir, "stats.json")),
+    },
+  );
 
   await writeFile(
-    join(root, "books", bookId, "checkpoints.yaml"),
+    join(root, "books", bookId, "state", "job.yaml"),
+    `
+schemaVersion: ${SchemaVersion}
+bookId: ${bookId}
+documentId: hash1
+sourcePath: books/${bookId}/source/source.epub
+sourceIdentityPath: source.epub
+sourceHash: ${sourceHash}
+normalizedContentHash: ${contentHash}
+normalizedPath: books/${bookId}/input/book.md
+normalizationPolicyVersion: graphrag-normalized-markdown-v1
+configFingerprint: cfg
+promptFingerprint: prompt
+modelFingerprint: model
+stageFingerprints:
+  ingest: ${stageFingerprints.ingest}
+  normalize: ${stageFingerprints.normalize}
+  graph_extract: ${stageFingerprints.graph_extract}
+  community_report: ${stageFingerprints.community_report}
+  embed: ${stageFingerprints.embed}
+  query_ready: ${stageFingerprints.query_ready}
+providerFingerprint: ${providerFingerprint}
+overallStatus: succeeded
+createdAt: 2026-05-21T00:00:00.000Z
+updatedAt: 2026-05-21T00:00:00.000Z
+`,
+    "utf8",
+  );
+
+  await writeFile(
+    join(root, "books", bookId, "state", "checkpoints.yaml"),
     `
 schemaVersion: ${SchemaVersion}
 items:
+  - schemaVersion: ${SchemaVersion}
+    bookId: ${bookId}
+    stage: graph_extract
+    status: succeeded
+    attemptCount: 1
+    runId: run-graph-extract
+    inputFingerprint: ${stageFingerprints.graph_extract}
+    contentHash: hash1
+    stageFingerprint: ${stageFingerprints.graph_extract}
+    providerFingerprint: ${providerFingerprint}
+    artifactIds:
+${graphExtractArtifacts.map((artifact) => `      - ${artifact.artifactId}`).join("\n")}
+    finishedAt: 2026-05-21T00:00:00.000Z
+  - schemaVersion: ${SchemaVersion}
+    bookId: ${bookId}
+    stage: community_report
+    status: succeeded
+    attemptCount: 1
+    runId: run-community-report
+    inputFingerprint: ${stageFingerprints.community_report}
+    contentHash: hash1
+    stageFingerprint: ${stageFingerprints.community_report}
+    providerFingerprint: ${providerFingerprint}
+    artifactIds:
+      - ${artifactIds.report}
+    finishedAt: 2026-05-21T00:00:00.000Z
+  - schemaVersion: ${SchemaVersion}
+    bookId: ${bookId}
+    stage: embed
+    status: succeeded
+    attemptCount: 1
+    runId: run-embed
+    inputFingerprint: ${stageFingerprints.embed}
+    contentHash: hash1
+    stageFingerprint: ${stageFingerprints.embed}
+    providerFingerprint: ${providerFingerprint}
+    artifactIds:
+      - ${artifactIds.lancedb}
+    finishedAt: 2026-05-21T00:00:00.000Z
   - schemaVersion: ${SchemaVersion}
     bookId: ${bookId}
     stage: query_ready
     status: succeeded
     attemptCount: 1
-    inputFingerprint: fp
+    inputFingerprint: ${stageFingerprints.query_ready}
     contentHash: hash1
-    stageFingerprint: stage-query-ready
-    providerFingerprint: provider-openai-responses-jina
+    stageFingerprint: ${stageFingerprints.query_ready}
+    providerFingerprint: ${providerFingerprint}
     artifactIds:
-      - ${reportArtifactId}
-      - ${lancedbArtifactId}
+      - ${artifactIds.report}
+      - ${artifactIds.lancedb}
     finishedAt: 2026-05-21T00:00:00.000Z
 `,
     "utf8",
   );
   await writeFile(
-    join(root, "books", bookId, "artifacts.yaml"),
+    join(root, "books", bookId, "state", "artifacts.yaml"),
     `
 schemaVersion: ${SchemaVersion}
 items:
+${graphExtractArtifacts.map((artifact) => `  - schemaVersion: ${SchemaVersion}
+    artifactId: ${artifact.artifactId}
+    bookId: ${bookId}
+    stage: graph_extract
+    kind: ${artifact.kind}
+    path: ${artifact.path}
+    contentHash: ${artifact.contentHash}
+    stageFingerprint: ${stageFingerprints.graph_extract}
+    providerFingerprint: ${providerFingerprint}
+    producerRunId: run-graph-extract
+    metadata:
+      corpusContentHash: ${contentHash}
+    createdAt: 2026-05-21T00:00:00.000Z`).join("\n")}
   - schemaVersion: ${SchemaVersion}
-    artifactId: ${reportArtifactId}
+    artifactId: ${artifactIds.report}
     bookId: ${bookId}
     stage: community_report
     kind: graphrag_community_reports_parquet
-    path: books/${bookId}/output/community_reports.parquet
+    path: books/${bookId}/graphrag/output/community_reports.parquet
     contentHash: ${reportHash}
-    stageFingerprint: stage-community-report
-    providerFingerprint: provider-openai-responses-jina
-    producerRunId: run-1
+    stageFingerprint: ${stageFingerprints.community_report}
+    providerFingerprint: ${providerFingerprint}
+    producerRunId: run-community-report
+    metadata:
+      corpusContentHash: ${contentHash}
     createdAt: 2026-05-21T00:00:00.000Z
   - schemaVersion: ${SchemaVersion}
-    artifactId: ${lancedbArtifactId}
+    artifactId: ${artifactIds.lancedb}
     bookId: ${bookId}
     stage: embed
     kind: lancedb_index
-    path: books/${bookId}/output/lancedb
+    path: books/${bookId}/graphrag/output/lancedb
     contentHash: ${lancedbHash}
-    stageFingerprint: stage-embed
-    providerFingerprint: provider-openai-responses-jina
-    producerRunId: run-1
+    stageFingerprint: ${stageFingerprints.embed}
+    providerFingerprint: ${providerFingerprint}
+    producerRunId: run-embed
+    metadata:
+      corpusContentHash: ${contentHash}
     createdAt: 2026-05-21T00:00:00.000Z
 `,
     "utf8",
@@ -1006,8 +1155,8 @@ items:
     ready: true
     readinessSource: validated_checkpoint_plus_validated_manifest
     artifactIds:
-      - ${reportArtifactId}
-      - ${lancedbArtifactId}
+      - ${artifactIds.report}
+      - ${artifactIds.lancedb}
     createdAt: 2026-05-21T00:00:00.000Z
 `,
     "utf8",
@@ -1024,7 +1173,7 @@ items:
     documentId: hash1
     contentHash: hash1
     normalizationPolicyVersion: graphrag-normalized-markdown-v1
-    normalizedPath: input/${bookId}.md
+    normalizedPath: books/${bookId}/input/book.md
     chunkIds: []
     graphDocumentId: graph-doc-mcp
     graphTextUnitIds:

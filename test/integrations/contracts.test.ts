@@ -382,8 +382,8 @@ function durableEvidenceFixture(
     localFailureClass: "durable_temp_rename_enoent",
     recoveryDecision: "stop_until_fixed",
     failedStage: "resume-book-1",
-    targetLocator: "graph_vault/books/book-fixture/job.yaml",
-    redactedEvidenceLocator: "books/book-fixture/job.yaml",
+    targetLocator: "graph_vault/books/book-fixture/state/job.yaml",
+    redactedEvidenceLocator: "books/book-fixture/state/job.yaml",
     lane: "checkpointWriterLane",
     targetMappingOwner: "repository",
     laneTimeoutMs: 120000,
@@ -396,11 +396,11 @@ function durableEvidenceFixture(
     completedPublishRule: "forbidden",
     checksumRecoveryDecision: "sidecar_repaired",
     durableMode: "strict",
-    primaryTargetLocator: "graph_vault/books/book-fixture/job.yaml",
+    primaryTargetLocator: "graph_vault/books/book-fixture/state/job.yaml",
     auxiliaryTargetLocator:
-      "graph_vault/books/book-fixture/job.yaml.tmp-1.owner.json",
+      "graph_vault/books/book-fixture/state/job.yaml.tmp-1.owner.json",
     auxiliarySidecarKind: "temp_owner",
-    sidecarTargetLocator: "graph_vault/books/book-fixture/job.yaml.sha256",
+    sidecarTargetLocator: "graph_vault/books/book-fixture/state/job.yaml.sha256",
     sidecarKind: "checksum",
     checksumExpected: null,
     checksumActual: "actual-checksum",
@@ -411,7 +411,7 @@ function durableEvidenceFixture(
     normalRunnerAction: "no_book_scoped_mutation",
     scannedTargetCount: 1,
     degradedTargetCount: 1,
-    sampleTargetLocators: ["graph_vault/books/book-fixture/job.yaml"],
+    sampleTargetLocators: ["graph_vault/books/book-fixture/state/job.yaml"],
     scanTruncated: false,
     maxRunnerStartScannedTargets: 200,
     maxRunnerStartReportedSamples: 10,
@@ -458,7 +458,13 @@ async function writeGraphExtractCoreFixture(input: {
   path: string;
   contentHash: string;
 }>> {
-  const outputDir = join(input.graphVault, "books", input.bookId, "output");
+  const outputDir = join(
+    input.graphVault,
+    "books",
+    input.bookId,
+    "graphrag",
+    "output",
+  );
   await mkdir(outputDir, { recursive: true });
   const parquetSpecs = [
     ["documents", "graphrag_documents_parquet", "documents.parquet"],
@@ -475,7 +481,7 @@ async function writeGraphExtractCoreFixture(input: {
 
   const artifacts = [];
   for (const [name, kind, fileName] of parquetSpecs) {
-    const path = `books/${input.bookId}/output/${fileName}`;
+    const path = `books/${input.bookId}/graphrag/output/${fileName}`;
     artifacts.push({
       artifactId: `${input.artifactPrefix}-${name}`,
       kind,
@@ -483,14 +489,14 @@ async function writeGraphExtractCoreFixture(input: {
       contentHash: await hashFile(join(input.graphVault, path)),
     });
   }
-  const contextPath = `books/${input.bookId}/output/context.json`;
+  const contextPath = `books/${input.bookId}/graphrag/output/context.json`;
   artifacts.push({
     artifactId: `${input.artifactPrefix}-context`,
     kind: "graphrag_context_json",
     path: contextPath,
     contentHash: await hashFile(join(input.graphVault, contextPath)),
   });
-  const statsPath = `books/${input.bookId}/output/stats.json`;
+  const statsPath = `books/${input.bookId}/graphrag/output/stats.json`;
   artifacts.push({
     artifactId: `${input.artifactPrefix}-stats`,
     kind: "graphrag_stats_json",
@@ -1408,7 +1414,7 @@ describe("Provider contracts", () => {
         bookId: "book-1",
         stage: "embed",
         kind: "lancedb_index",
-        path: "books/book-1/output/lancedb",
+        path: "books/book-1/graphrag/output/lancedb",
         contentHash: "sha256:artifact",
         producerRunId: "run-1",
         createdAt: "2026-05-21T00:00:00.000Z",
@@ -1881,8 +1887,8 @@ describe("Data bus contracts", () => {
         targetCount: 1,
         degradedTargetCount: 1,
         mutationCount: 0,
-        firstSample: "graph_vault/books/book-fixture/job.yaml",
-        lastSample: "graph_vault/books/book-fixture/job.yaml",
+        firstSample: "graph_vault/books/book-fixture/state/job.yaml",
+        lastSample: "graph_vault/books/book-fixture/state/job.yaml",
         firstBlocker: DurableStateDiagnosticSchema.parse(durableNull),
         decision: "blocked_before_claim",
         recoveryDecision: "stop_until_fixed",
@@ -2518,7 +2524,7 @@ describe("Data bus contracts", () => {
         bookId: "book-1",
         stage: "graph_extract",
         kind: "graphrag_stats_json",
-        path: "books/book-1/output/stats.json",
+        path: "books/book-1/graphrag/output/stats.json",
         contentHash: "sha256:artifact",
         stageFingerprint: "stage-graph-extract",
         providerFingerprint: "provider-openai-responses-jina",
@@ -2689,7 +2695,7 @@ describe("Data bus contracts", () => {
             bookId: "book-1",
             stage: "graph_extract",
             kind: "graphrag_stats_json",
-            path: "books/book-1/output/stats.json",
+            path: "books/book-1/graphrag/output/stats.json",
             contentHash: "sha256:stats",
             stageFingerprint: "stage-graph-extract",
             providerFingerprint: "provider-openai-responses-jina",
@@ -2703,7 +2709,7 @@ describe("Data bus contracts", () => {
             bookId: "book-1",
             stage: "community_report",
             kind: "graphrag_community_reports_parquet",
-            path: "books/book-1/output/community_reports.parquet",
+            path: "books/book-1/graphrag/output/community_reports.parquet",
             contentHash: "sha256:community-report",
             stageFingerprint: "stage-community-report",
             providerFingerprint: "provider-openai-responses-jina",
@@ -2717,7 +2723,7 @@ describe("Data bus contracts", () => {
             bookId: "book-1",
             stage: "embed",
             kind: "lancedb_index",
-            path: "books/book-1/output/lancedb",
+            path: "books/book-1/graphrag/output/lancedb",
             contentHash: "sha256:lancedb",
             stageFingerprint: "stage-embed",
             providerFingerprint: "provider-openai-responses-jina",
@@ -2957,7 +2963,7 @@ describe("Vault contracts", () => {
     expect(report.portable).toBe(false);
     expect(report.documentsPortable).toBe(false);
     expect(report.capabilitiesPortable).toBe(true);
-    expect(report.missingRequiredPaths).toContain("input");
+    expect(report.missingRequiredPaths).toContain("books");
     expect(report.missingRequiredPaths).toContain("catalog/sources.yaml");
     expect(report.missingRequiredPaths).toContain(
       "catalog/document-identity-map.yaml",
@@ -2966,7 +2972,9 @@ describe("Vault contracts", () => {
 
   test("reports portable vault counts from typed catalogs", async () => {
     const graphVault = await mkdtemp(join(tmpdir(), "qmd-vault-portable-"));
-    await mkdir(join(graphVault, "input"), { recursive: true });
+    await mkdir(join(graphVault, "books", "book-123", "input"), {
+      recursive: true,
+    });
     await mkdir(join(graphVault, "catalog"), { recursive: true });
     await writeFile(join(graphVault, "catalog", "sources.yaml"), `
 schemaVersion: ${SchemaVersion}
@@ -2975,7 +2983,7 @@ items:
     sourceId: sha256:source
     sourceHash: sha256:source
     sourceName: book.epub
-    sourceRelativePath: sources/book.epub
+    sourceRelativePath: books/book-123/source/book.epub
     mediaType: application/epub+zip
     sizeBytes: 12
 `);
@@ -2993,7 +3001,7 @@ items:
     normalizationPolicyVersion: v1
     chunkIds: []
     metadata:
-      normalizedPath: input/book.md
+      normalizedPath: books/book-123/input/book.md
 `,
     );
 
@@ -3022,7 +3030,9 @@ items:
 
   test("does not report graph-capable vault portable without book state", async () => {
     const graphVault = await mkdtemp(join(tmpdir(), "qmd-vault-capability-audit-"));
-    await mkdir(join(graphVault, "input"), { recursive: true });
+    await mkdir(join(graphVault, "books", "book-123", "input"), {
+      recursive: true,
+    });
     await mkdir(join(graphVault, "catalog"), { recursive: true });
     await writeFile(join(graphVault, "catalog", "sources.yaml"), `
 schemaVersion: ${SchemaVersion}
@@ -3031,7 +3041,7 @@ items:
     sourceId: sha256:source
     sourceHash: source
     sourceName: book.epub
-    sourceRelativePath: sources/book.epub
+    sourceRelativePath: books/book-123/source/book.epub
 `);
     await writeFile(
       join(graphVault, "catalog", "document-identity-map.yaml"),
@@ -3050,7 +3060,7 @@ items:
     graphTextUnitIds:
       - tu-123
     metadata:
-      normalizedPath: input/book.md
+      normalizedPath: books/book-123/input/book.md
 `,
     );
 
@@ -3066,8 +3076,8 @@ items:
     expect(report.missingRequiredPaths).toEqual(
       expect.arrayContaining([
         "catalog/books.yaml",
-        "books/book-123/checkpoints.yaml",
-        "books/book-123/artifacts.yaml",
+        "books/book-123/state/checkpoints.yaml",
+        "books/book-123/state/artifacts.yaml",
         "catalog/graph-capabilities.yaml",
       ]),
     );
@@ -3075,10 +3085,15 @@ items:
 
   test("restore audit rejects invalid raw graph capability catalog entries", async () => {
     const graphVault = await mkdtemp(join(tmpdir(), "qmd-vault-raw-cap-audit-"));
-    await mkdir(join(graphVault, "input"), { recursive: true });
+    await mkdir(join(graphVault, "books", "book-123", "input"), {
+      recursive: true,
+    });
+    await mkdir(join(graphVault, "books", "book-123", "state"), {
+      recursive: true,
+    });
     await mkdir(join(graphVault, "catalog"), { recursive: true });
     await writeFile(
-      join(graphVault, "input", "book.md"),
+      join(graphVault, "books", "book-123", "input", "book.md"),
       "# Test Book\n\nGraphRAG restore smoke content.",
       "utf8",
     );
@@ -3091,7 +3106,7 @@ items:
     sourceId: sha256:source
     sourceHash: source
     sourceName: book.epub
-    sourceRelativePath: sources/book/source.epub
+    sourceRelativePath: books/book-123/source/source.epub
 `);
     await writeFile(join(graphVault, "catalog", "books.yaml"), `
 schemaVersion: ${SchemaVersion}
@@ -3099,10 +3114,10 @@ items:
   - schemaVersion: ${SchemaVersion}
     bookId: book-123
     documentId: book-123
-    sourcePath: sources/book/source.epub
+    sourcePath: books/book-123/source/source.epub
     sourceHash: source
     normalizedContentHash: ${contentHash}
-    normalizedPath: input/book.md
+    normalizedPath: books/book-123/input/book.md
     configFingerprint: cfg
     promptFingerprint: prompt
     modelFingerprint: model
@@ -3119,20 +3134,19 @@ items:
     createdAt: 2026-05-21T00:00:00.000Z
     updatedAt: 2026-05-21T00:00:00.000Z
 `);
-    const lancedbPath = join(graphVault, "books", "book-123", "output", "lancedb");
+    const outputDir = join(graphVault, "books", "book-123", "graphrag", "output");
+    const lancedbPath = join(outputDir, "lancedb");
     await writeCompleteLanceDbFixture(lancedbPath);
-    await mkdir(join(graphVault, "books", "book-123", "output"), {
+    await mkdir(outputDir, {
       recursive: true,
     });
     await writeFile(
-      join(graphVault, "books", "book-123", "output", "community_reports.parquet"),
+      join(outputDir, "community_reports.parquet"),
       MinimalParquetFixture,
     );
-    const reportHash = await hashFile(
-      join(graphVault, "books", "book-123", "output", "community_reports.parquet"),
-    );
+    const reportHash = await hashFile(join(outputDir, "community_reports.parquet"));
     const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
-    await writeFile(join(graphVault, "books", "book-123", "checkpoints.yaml"), `
+    await writeFile(join(graphVault, "books", "book-123", "state", "checkpoints.yaml"), `
 schemaVersion: ${SchemaVersion}
 items:
   - schemaVersion: ${SchemaVersion}
@@ -3175,7 +3189,7 @@ items:
       - artifact-2
     finishedAt: 2026-05-21T00:00:00.000Z
 `);
-    await writeFile(join(graphVault, "books", "book-123", "artifacts.yaml"), `
+    await writeFile(join(graphVault, "books", "book-123", "state", "artifacts.yaml"), `
 schemaVersion: ${SchemaVersion}
 items:
   - schemaVersion: ${SchemaVersion}
@@ -3183,7 +3197,7 @@ items:
     bookId: book-123
     stage: community_report
     kind: graphrag_community_reports_parquet
-    path: books/book-123/output/community_reports.parquet
+    path: books/book-123/graphrag/output/community_reports.parquet
     contentHash: ${reportHash}
     stageFingerprint: stage-community-report
     providerFingerprint: provider-openai-responses-jina
@@ -3196,7 +3210,7 @@ items:
     bookId: book-123
     stage: embed
     kind: lancedb_index
-    path: books/book-123/output/lancedb
+    path: books/book-123/graphrag/output/lancedb
     contentHash: ${lancedbHash}
     stageFingerprint: stage-embed
     providerFingerprint: provider-openai-responses-jina
@@ -3215,7 +3229,7 @@ items:
     canonicalBookId: book-123
     contentHash: ${contentHash}
     normalizationPolicyVersion: v1
-    normalizedPath: input/book.md
+    normalizedPath: books/book-123/input/book.md
     chunkIds: []
     graphDocumentId: graph-doc-123
     graphTextUnitIds:
@@ -3264,7 +3278,12 @@ items:
     const targetIndexPath = join(graphVault, "restored.sqlite");
     const normalizedContent = "# Test Book\n\nGraphRAG restore smoke content.";
     const contentHash = await hashContent(normalizedContent, "v1");
-    await mkdir(join(graphVault, "input"), { recursive: true });
+    await mkdir(join(graphVault, "books", "book-123", "input"), {
+      recursive: true,
+    });
+    await mkdir(join(graphVault, "books", "book-123", "state"), {
+      recursive: true,
+    });
     await mkdir(join(graphVault, "catalog"), { recursive: true });
     await writeFile(
       join(graphVault, "catalog", "books.yaml"),
@@ -3274,10 +3293,10 @@ items:
   - schemaVersion: ${SchemaVersion}
     bookId: book-123
     documentId: book-123
-    sourcePath: sources/book/source.epub
+    sourcePath: books/book-123/source/source.epub
     sourceHash: source
     normalizedContentHash: ${contentHash}
-    normalizedPath: input/book.md
+    normalizedPath: books/book-123/input/book.md
     configFingerprint: cfg
     promptFingerprint: prompt
     modelFingerprint: model
@@ -3296,14 +3315,15 @@ items:
 `,
     );
     await writeFile(
-      join(graphVault, "input", "book.md"),
+      join(graphVault, "books", "book-123", "input", "book.md"),
       normalizedContent,
       "utf8",
     );
-    const lancedbPath = join(graphVault, "books", "book-123", "output", "lancedb");
+    const outputDir = join(graphVault, "books", "book-123", "graphrag", "output");
+    const lancedbPath = join(outputDir, "lancedb");
     await writeCompleteLanceDbFixture(lancedbPath);
     await writeFile(
-      join(graphVault, "books", "book-123", "output", "community_reports.parquet"),
+      join(outputDir, "community_reports.parquet"),
       MinimalParquetFixture,
     );
     const graphExtractArtifacts = await writeGraphExtractCoreFixture({
@@ -3311,12 +3331,10 @@ items:
       bookId: "book-123",
       artifactPrefix: "artifact-graph",
     });
-    const reportHash = await hashFile(
-      join(graphVault, "books", "book-123", "output", "community_reports.parquet"),
-    );
+    const reportHash = await hashFile(join(outputDir, "community_reports.parquet"));
     const lancedbHash = await hashLanceDbDirectoryContents(lancedbPath);
     await writeFile(
-      join(graphVault, "books", "book-123", "checkpoints.yaml"),
+      join(graphVault, "books", "book-123", "state", "checkpoints.yaml"),
       `
 schemaVersion: ${SchemaVersion}
 items:
@@ -3376,7 +3394,7 @@ ${graphExtractArtifacts.map((artifact) => `      - ${artifact.artifactId}`).join
       "utf8",
     );
     await writeFile(
-      join(graphVault, "books", "book-123", "artifacts.yaml"),
+      join(graphVault, "books", "book-123", "state", "artifacts.yaml"),
       `
 schemaVersion: ${SchemaVersion}
 items:
@@ -3398,7 +3416,7 @@ ${graphExtractArtifacts.map((artifact) => `  - schemaVersion: ${SchemaVersion}
     bookId: book-123
     stage: community_report
     kind: graphrag_community_reports_parquet
-    path: books/book-123/output/community_reports.parquet
+    path: books/book-123/graphrag/output/community_reports.parquet
     contentHash: ${reportHash}
     stageFingerprint: stage-community-report
     providerFingerprint: provider-openai-responses-jina
@@ -3411,7 +3429,7 @@ ${graphExtractArtifacts.map((artifact) => `  - schemaVersion: ${SchemaVersion}
     bookId: book-123
     stage: embed
     kind: lancedb_index
-    path: books/book-123/output/lancedb
+    path: books/book-123/graphrag/output/lancedb
     contentHash: ${lancedbHash}
     stageFingerprint: stage-embed
     providerFingerprint: provider-openai-responses-jina
@@ -3429,7 +3447,7 @@ items:
     sourceId: sha256:source
     sourceHash: source
     sourceName: book.epub
-    sourceRelativePath: sources/book/source.epub
+    sourceRelativePath: books/book-123/source/source.epub
 `);
     await writeFile(
       join(graphVault, "catalog", "document-identity-map.yaml"),
@@ -3448,7 +3466,7 @@ items:
     graphTextUnitIds:
       - tu-123
     metadata:
-      normalizedPath: input/book.md
+      normalizedPath: books/book-123/input/book.md
       qmdCorpusRegistered: true
 `,
     );
@@ -3545,8 +3563,8 @@ items:
     const restoredStore = createStore(targetIndexPath);
     try {
       const document = restoredStore.db.prepare(
-        "SELECT hash FROM documents WHERE collection = 'books' AND path = 'book.md'",
-      ).get() as { hash: string } | undefined;
+        "SELECT hash FROM documents WHERE collection = 'books' AND path = ?",
+      ).get("book-123/input/book.md") as { hash: string } | undefined;
       const capabilities = restoredStore.db.prepare(`
         SELECT capability_id, content_hash
         FROM qmd_graph_capabilities
@@ -3570,10 +3588,12 @@ items:
   test("rejects restore when normalized content hash differs from identity map", async () => {
     const graphVault = await mkdtemp(join(tmpdir(), "qmd-vault-restore-bad-hash-"));
     const targetIndexPath = join(graphVault, "restored.sqlite");
-    await mkdir(join(graphVault, "input"), { recursive: true });
+    await mkdir(join(graphVault, "books", "book-123", "input"), {
+      recursive: true,
+    });
     await mkdir(join(graphVault, "catalog"), { recursive: true });
     await writeFile(
-      join(graphVault, "input", "book.md"),
+      join(graphVault, "books", "book-123", "input", "book.md"),
       "# Test Book\n\nChanged restore content.",
       "utf8",
     );
@@ -3599,7 +3619,7 @@ items:
     normalizationPolicyVersion: v1
     chunkIds: []
     metadata:
-      normalizedPath: input/book.md
+      normalizedPath: books/book-123/input/book.md
 `,
     );
     await writeFile(
@@ -3651,8 +3671,16 @@ items:
   test("redacts absolute paths and secrets from restore audit failures", async () => {
     const graphVault = await mkdtemp(join(tmpdir(), "qmd-vault-redact-"));
     const targetIndexPath = join(graphVault, "restored.sqlite");
-    const secretPath = join(graphVault, "input", "missing.md");
-    await mkdir(join(graphVault, "input"), { recursive: true });
+    const secretPath = join(
+      graphVault,
+      "books",
+      "book-123",
+      "input",
+      "missing.md",
+    );
+    await mkdir(join(graphVault, "books", "book-123", "input"), {
+      recursive: true,
+    });
     await mkdir(join(graphVault, "catalog"), { recursive: true });
     await writeFile(join(graphVault, "catalog", "sources.yaml"), `
 schemaVersion: ${SchemaVersion}
@@ -3676,7 +3704,7 @@ items:
     normalizationPolicyVersion: v1
     chunkIds: []
     metadata:
-      normalizedPath: input/missing.md
+      normalizedPath: books/book-123/input/missing.md
 `,
     );
     await writeFile(

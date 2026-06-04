@@ -45,12 +45,13 @@ async function writeLegacyDistributionFixture(input: {
   const bookRoot = join(input.stateRoot, "books", input.bookId);
   await mkdir(join(bookRoot, "input"), { recursive: true });
   await mkdir(join(bookRoot, "qmd"), { recursive: true });
-  await mkdir(join(bookRoot, "output"), { recursive: true });
-  await mkdir(join(bookRoot, "runs"), { recursive: true });
+  await mkdir(join(bookRoot, "graphrag", "output"), { recursive: true });
+  await mkdir(join(bookRoot, "graphrag", "runs"), { recursive: true });
+  await mkdir(join(bookRoot, "state"), { recursive: true });
   if (input.withSource !== false) {
-    await mkdir(join(input.stateRoot, "sources", input.bookId), { recursive: true });
+    await mkdir(join(input.stateRoot, "books", input.bookId, "source"), { recursive: true });
     await writeFile(
-      join(input.stateRoot, "sources", input.bookId, "source.epub"),
+      join(input.stateRoot, "books", input.bookId, "source", "source.epub"),
       sourceText,
       "utf8",
     );
@@ -68,7 +69,9 @@ async function writeLegacyDistributionFixture(input: {
     qmdIndexHash: "index-hash",
     configHash: "config-hash",
   });
-  await writeDurableJsonFixture(join(bookRoot, "output", "qmd_output_manifest.json"), {
+  await writeDurableJsonFixture(
+    join(bookRoot, "graphrag", "output", "qmd_output_manifest.json"),
+    {
     schemaVersion: "1.0.0",
     bookId: input.bookId,
     sourceHash,
@@ -76,23 +79,24 @@ async function writeLegacyDistributionFixture(input: {
     contentHash: sourceHash,
     stageFingerprints: { graph_extract: "fp-graph" },
     providerFingerprint: "provider-fp",
-    outputDir: `books/${input.bookId}/output`,
+    outputDir: `books/${input.bookId}/graphrag/output`,
     producerRunId: "run-query-ready",
     stageProducerRunIds: { graph_extract: "run-graph-extract" },
-  });
-  await writeDurableYamlFixture(join(bookRoot, "artifacts.yaml"), {
+    },
+  );
+  await writeDurableYamlFixture(join(bookRoot, "state", "artifacts.yaml"), {
     schemaVersion: "1.0.0",
     items: [{
       artifactId: `${input.bookId}:graph_extract:manifest`,
       bookId: input.bookId,
       stage: "graph_extract",
       kind: "graphrag_output_manifest",
-      path: `books/${input.bookId}/output/qmd_output_manifest.json`,
+      path: `books/${input.bookId}/graphrag/output/qmd_output_manifest.json`,
       contentHash: sha256Text(JSON.stringify({ bookId: input.bookId })),
       producerRunId: "run-graph-extract",
     }],
   });
-  await writeDurableYamlFixture(join(bookRoot, "checkpoints.yaml"), {
+  await writeDurableYamlFixture(join(bookRoot, "state", "checkpoints.yaml"), {
     schemaVersion: "1.0.0",
     items: [{
       bookId: input.bookId,
@@ -101,13 +105,16 @@ async function writeLegacyDistributionFixture(input: {
       runId: "run-graph-extract",
     }],
   });
-  await writeDurableYamlFixture(join(bookRoot, "runs", "run-graph-extract.yaml"), {
+  await writeDurableYamlFixture(
+    join(bookRoot, "graphrag", "runs", "run-graph-extract.yaml"),
+    {
     schemaVersion: "1.0.0",
     runId: "run-graph-extract",
     bookId: input.bookId,
     stage: "graph_extract",
     status: "succeeded",
-  });
+    },
+  );
   await writeDurableJsonFixture(join(bookRoot, "distribution_manifest.json"), {
     schemaVersion: "1.0.0",
     kind: "book_distribution_manifest",
@@ -116,10 +123,11 @@ async function writeLegacyDistributionFixture(input: {
     sourceRelativePath,
     portability: {
       closureRoot: `books/${input.bookId}`,
-      sourceRoot: `sources/${input.bookId}`,
+      sourceRoot: `books/${input.bookId}/source`,
       canonicalNormalizedPath: `books/${input.bookId}/input/book.md`,
       qmdBuildManifestPath: `books/${input.bookId}/qmd/qmd_build_manifest.json`,
-      graphOutputManifestPath: `books/${input.bookId}/output/qmd_output_manifest.json`,
+      graphOutputManifestPath:
+        `books/${input.bookId}/graphrag/output/qmd_output_manifest.json`,
     },
     producerEvidence: {
       outputProducerRunId: "run-query-ready",
@@ -151,14 +159,14 @@ describe("GraphRAG hotplug catalog projection", () => {
       });
       await mkdir(join(stateRoot, "books", bookId, "input"), { recursive: true });
       await mkdir(join(stateRoot, "books", bookId, "qmd"), { recursive: true });
-      await mkdir(join(stateRoot, "sources", bookId), { recursive: true });
+      await mkdir(join(stateRoot, "books", bookId, "source"), { recursive: true });
       await writeFile(
         join(stateRoot, "books", bookId, "input", "book.md"),
         inputText,
         "utf8",
       );
       await writeFile(
-        join(stateRoot, "sources", bookId, "source.epub"),
+        join(stateRoot, "books", bookId, "source", "source.epub"),
         sourceText,
         "utf8",
       );
@@ -171,7 +179,7 @@ describe("GraphRAG hotplug catalog projection", () => {
           runId: "run-hotplug-1",
           bookId,
           sourceName: "Book.epub",
-          sourceRelativePath: `sources/${bookId}/source.epub`,
+          sourceRelativePath: `books/${bookId}/source/source.epub`,
           sourceHash,
           canonicalBookNormalizedPath: `books/${bookId}/input/book.md`,
           normalizedContentHash: normalizedHash,
@@ -195,13 +203,20 @@ describe("GraphRAG hotplug catalog projection", () => {
           sourceHash,
           documentId: `doc-${sourceHash.slice(0, 12)}`,
           contentHash: normalizedHash,
-          normalizedPath: "input/book.md",
+          normalizedPath: `books/${bookId}/input/book.md`,
           graphDocumentId: `graph-doc-${bookId}`,
           graphTextUnitIds: [`tu-${bookId}`],
         },
       );
       await writeDurableYamlFixture(
-        join(stateRoot, "books", bookId, "runs", "run-query-ready.yaml"),
+        join(
+          stateRoot,
+          "books",
+          bookId,
+          "graphrag",
+          "runs",
+          "run-query-ready.yaml",
+        ),
         {
           schemaVersion: "1.0.0",
           runId: "run-query-ready",
@@ -221,7 +236,7 @@ describe("GraphRAG hotplug catalog projection", () => {
         stateRoot,
         bookId,
         sourceHash,
-        sourceRelativePath: `sources/${bookId}/source.epub`,
+        sourceRelativePath: `books/${bookId}/source/source.epub`,
         now: () => "2026-06-02T00:00:00.000Z",
         toolVersion: "test",
       });
@@ -273,7 +288,7 @@ describe("GraphRAG hotplug catalog projection", () => {
       expect(identityCatalog.items[0]?.normalizedPath)
         .toBe(`books/${bookId}/input/book.md`);
       expect(identityCatalog.items[0]?.metadata?.legacyGraphIdentityNormalizedPath)
-        .toBe("input/book.md");
+        .toBeUndefined();
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
@@ -356,6 +371,7 @@ describe("GraphRAG hotplug catalog projection", () => {
         await mkdir(
           join(
             stateRoot,
+            "catalog",
             ".staging",
             "book-hotplug-migrations",
             partialBookId,
@@ -515,14 +531,14 @@ describe("GraphRAG hotplug catalog projection", () => {
       });
       await mkdir(join(stateRoot, "books", bookId, "input"), { recursive: true });
       await mkdir(join(stateRoot, "books", bookId, "qmd"), { recursive: true });
-      await mkdir(join(stateRoot, "sources", bookId), { recursive: true });
+      await mkdir(join(stateRoot, "books", bookId, "source"), { recursive: true });
       await writeFile(
         join(stateRoot, "books", bookId, "input", "book.md"),
         inputText,
         "utf8",
       );
       await writeFile(
-        join(stateRoot, "sources", bookId, "source.epub"),
+        join(stateRoot, "books", bookId, "source", "source.epub"),
         sourceText,
         "utf8",
       );
@@ -535,7 +551,7 @@ describe("GraphRAG hotplug catalog projection", () => {
           runId: "run-hotplug-stale",
           bookId,
           sourceName: "Book.epub",
-          sourceRelativePath: `sources/${bookId}/source.epub`,
+          sourceRelativePath: `books/${bookId}/source/source.epub`,
           sourceHash,
           canonicalBookNormalizedPath: `books/${bookId}/input/book.md`,
           normalizedContentHash: normalizedHash,
@@ -568,7 +584,7 @@ describe("GraphRAG hotplug catalog projection", () => {
         stateRoot,
         bookId,
         sourceHash,
-        sourceRelativePath: `sources/${bookId}/source.epub`,
+        sourceRelativePath: `books/${bookId}/source/source.epub`,
         now: () => "2026-06-02T00:00:00.000Z",
         toolVersion: "test",
       });
@@ -636,14 +652,14 @@ describe("GraphRAG hotplug catalog projection", () => {
       });
       await mkdir(join(stateRoot, "books", bookId, "input"), { recursive: true });
       await mkdir(join(stateRoot, "books", bookId, "qmd"), { recursive: true });
-      await mkdir(join(stateRoot, "sources", bookId), { recursive: true });
+      await mkdir(join(stateRoot, "books", bookId, "source"), { recursive: true });
       await writeFile(
         join(stateRoot, "books", bookId, "input", "book.md"),
         inputText,
         "utf8",
       );
       await writeFile(
-        join(stateRoot, "sources", bookId, "source.epub"),
+        join(stateRoot, "books", bookId, "source", "source.epub"),
         sourceText,
         "utf8",
       );
@@ -656,7 +672,7 @@ describe("GraphRAG hotplug catalog projection", () => {
           runId: "run-invalid-sidecar",
           bookId,
           sourceName: "Book.epub",
-          sourceRelativePath: `sources/${bookId}/source.epub`,
+          sourceRelativePath: `books/${bookId}/source/source.epub`,
           sourceHash,
           canonicalBookNormalizedPath: `books/${bookId}/input/book.md`,
           normalizedContentHash: normalizedHash,
@@ -690,7 +706,7 @@ describe("GraphRAG hotplug catalog projection", () => {
         stateRoot,
         bookId,
         sourceHash,
-        sourceRelativePath: `sources/${bookId}/source.epub`,
+        sourceRelativePath: `books/${bookId}/source/source.epub`,
         now: () => "2026-06-02T00:00:00.000Z",
         toolVersion: "test",
       });
@@ -986,14 +1002,14 @@ describe("GraphRAG hotplug catalog projection", () => {
       });
       await mkdir(join(stateRoot, "books", bookId, "input"), { recursive: true });
       await mkdir(join(stateRoot, "books", bookId, "qmd"), { recursive: true });
-      await mkdir(join(stateRoot, "sources", bookId), { recursive: true });
+      await mkdir(join(stateRoot, "books", bookId, "source"), { recursive: true });
       await writeFile(
         join(stateRoot, "books", bookId, "input", "book.md"),
         inputText,
         "utf8",
       );
       await writeFile(
-        join(stateRoot, "sources", bookId, "source.epub"),
+        join(stateRoot, "books", bookId, "source", "source.epub"),
         sourceText,
         "utf8",
       );
@@ -1006,7 +1022,7 @@ describe("GraphRAG hotplug catalog projection", () => {
           runId: "run-missing-runs",
           bookId,
           sourceName: "Book.epub",
-          sourceRelativePath: `sources/${bookId}/source.epub`,
+          sourceRelativePath: `books/${bookId}/source/source.epub`,
           sourceHash,
           canonicalBookNormalizedPath: `books/${bookId}/input/book.md`,
           normalizedContentHash: normalizedHash,
@@ -1039,7 +1055,7 @@ describe("GraphRAG hotplug catalog projection", () => {
         stateRoot,
         bookId,
         sourceHash,
-        sourceRelativePath: `sources/${bookId}/source.epub`,
+        sourceRelativePath: `books/${bookId}/source/source.epub`,
         now: () => "2026-06-02T00:00:00.000Z",
         toolVersion: "test",
       });
@@ -1095,14 +1111,14 @@ describe("GraphRAG hotplug catalog projection", () => {
       });
       await mkdir(join(stateRoot, "books", bookId, "input"), { recursive: true });
       await mkdir(join(stateRoot, "books", bookId, "qmd"), { recursive: true });
-      await mkdir(join(stateRoot, "sources", bookId), { recursive: true });
+      await mkdir(join(stateRoot, "books", bookId, "source"), { recursive: true });
       await writeFile(
         join(stateRoot, "books", bookId, "input", "book.md"),
         inputText,
         "utf8",
       );
       await writeFile(
-        join(stateRoot, "sources", bookId, "source.epub"),
+        join(stateRoot, "books", bookId, "source", "source.epub"),
         sourceText,
         "utf8",
       );
@@ -1115,7 +1131,7 @@ describe("GraphRAG hotplug catalog projection", () => {
           runId: "run-missing-metadata-row",
           bookId,
           sourceName: "Book.epub",
-          sourceRelativePath: `sources/${bookId}/source.epub`,
+          sourceRelativePath: `books/${bookId}/source/source.epub`,
           sourceHash,
           canonicalBookNormalizedPath: `books/${bookId}/input/book.md`,
           normalizedContentHash: normalizedHash,
@@ -1148,7 +1164,7 @@ describe("GraphRAG hotplug catalog projection", () => {
         stateRoot,
         bookId,
         sourceHash,
-        sourceRelativePath: `sources/${bookId}/source.epub`,
+        sourceRelativePath: `books/${bookId}/source/source.epub`,
         now: () => "2026-06-02T00:00:00.000Z",
         toolVersion: "test",
       });
