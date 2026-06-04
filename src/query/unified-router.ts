@@ -28,6 +28,7 @@ import {
   type UnifiedAnswer,
   type UnifiedQueryRequest,
 } from "../contracts/unified-query.js";
+import type { QueryTimingRecorder } from "./query-timing.js";
 import { buildUnifiedAnswer } from "./unified-answer.js";
 
 export const DEFAULT_GRAPH_COVERAGE_THRESHOLD = 0.7;
@@ -288,7 +289,18 @@ export type RouteQueryServices = {
   resolveGraphScopeCapabilities?(
     request: UnifiedQueryRequest,
   ): Promise<GraphCapability[]>;
+  timing?: QueryTimingRecorder;
 };
+
+function measureRouteStage<T>(
+  services: RouteQueryServices,
+  name: string,
+  action: () => T | Promise<T>,
+): T | Promise<T> {
+  return services.timing == null
+    ? action()
+    : services.timing.measure(name, action);
+}
 
 function typedGraphProviderError(input: {
   request: UnifiedQueryRequest;
@@ -490,9 +502,10 @@ export async function routeQuery(
 ): Promise<UnifiedAnswer> {
   const startedAt = Date.now();
   const parsedRequest = UnifiedQueryRequestSchema.parse(request);
-  const graphScopeCapabilities = await resolveGraphScopeCapabilitiesForRoute(
-    parsedRequest,
+  const graphScopeCapabilities = await measureRouteStage(
     services,
+    "route.resolve_graph_scope_capabilities",
+    () => resolveGraphScopeCapabilitiesForRoute(parsedRequest, services),
   );
   const graphScopeCandidates = graphScopeCapabilities == null
     ? null
@@ -500,7 +513,11 @@ export async function routeQuery(
   let qmdResult: QmdSearchResult;
   if (graphScopeCandidates == null) {
     try {
-      qmdResult = QmdSearchResultSchema.parse(await services.searchQmd(parsedRequest));
+      qmdResult = QmdSearchResultSchema.parse(await measureRouteStage(
+        services,
+        "route.qmd_retrieval",
+        () => services.searchQmd(parsedRequest),
+      ));
     } catch (error) {
       if (error instanceof TypedQueryErrorException) throw error;
       if (error instanceof DspyQueryExpansionStrictRefusalError) {
@@ -523,16 +540,24 @@ export async function routeQuery(
         graphScopeCandidates,
         graphScopeCapabilities ?? [],
       )
-    : await resolveCandidateCapabilitiesForRoute(
-        parsedRequest,
+    : await measureRouteStage(
         services,
-        qmdResult.results,
+        "route.resolve_candidate_graph_capabilities",
+        () => resolveCandidateCapabilitiesForRoute(
+          parsedRequest,
+          services,
+          qmdResult.results,
+        ),
       );
-  const decision = decideRoute({
-    request: parsedRequest,
-    candidates: qmdResult.results,
-    capabilitiesByCandidateId,
-  });
+  const decision = await measureRouteStage(
+    services,
+    "route.decide",
+    () => decideRoute({
+      request: parsedRequest,
+      candidates: qmdResult.results,
+      capabilitiesByCandidateId,
+    }),
+  );
 
   if (
     parsedRequest.requestedRoute === "graphrag"
@@ -566,7 +591,11 @@ export async function routeQuery(
     let graphRagResponse: GraphRagQueryResponse;
     try {
       graphRagResponse = GraphRagQueryResponseSchema.parse(
-        await services.queryGraphRag(parsedRequest, decision),
+        await measureRouteStage(
+          services,
+          "route.query_graphrag_provider",
+          () => services.queryGraphRag!(parsedRequest, decision),
+        ),
       );
     } catch (error) {
       if (error instanceof TypedQueryErrorException) throw error;
@@ -586,19 +615,27 @@ export async function routeQuery(
         redactedMessage: "GraphRAG query provider failed before returning a response.",
       });
     }
-    return buildUnifiedAnswer({
+    return measureRouteStage(
+      services,
+      "route.build_answer",
+      () => buildUnifiedAnswer({
+        query: parsedRequest.query,
+        routeDecision: decision,
+        qmdResult,
+        graphRagResponse,
+        elapsedMs: Date.now() - startedAt,
+      }),
+    );
+  }
+
+  return measureRouteStage(
+    services,
+    "route.build_answer",
+    () => buildUnifiedAnswer({
       query: parsedRequest.query,
       routeDecision: decision,
       qmdResult,
-      graphRagResponse,
       elapsedMs: Date.now() - startedAt,
-    });
-  }
-
-  return buildUnifiedAnswer({
-    query: parsedRequest.query,
-    routeDecision: decision,
-    qmdResult,
-    elapsedMs: Date.now() - startedAt,
-  });
+    }),
+  );
 }

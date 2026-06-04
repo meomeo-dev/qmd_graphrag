@@ -70,6 +70,11 @@ _GRAPHRAG_TEXT_CONTEXT_COMPAT_PATCHED = False
 if str(REPO_ROOT / "python") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "python"))
 
+from qmd_graphrag.query_runtime_metrics import (  # noqa: E402
+    QueryRuntimeMetricsRecorder,
+    query_log_offset,
+)
+
 
 def _emit_error(message: str) -> int:
     print(message, file=sys.stderr)
@@ -441,6 +446,56 @@ def _scoped_storage_overrides(
             "db_uri": str(resolved_output / "lancedb"),
         }
     return overrides
+
+
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _safe_runtime_segment(value: str) -> str:
+    segment = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")
+    return segment[:120] or "unknown"
+
+
+def _default_query_report_dir(root_dir: Path, scoped_book_ids: list[str]) -> Path:
+    if len(scoped_book_ids) == 1:
+        return (
+            root_dir
+            / ".local"
+            / "book-runtime"
+            / _safe_runtime_segment(scoped_book_ids[0])
+            / "graphrag-query"
+            / "reports"
+        )
+    scope_digest = hashlib.sha256(
+        ",".join(sorted(scoped_book_ids)).encode("utf-8")
+    ).hexdigest()[:16]
+    return root_dir / ".local" / "query-runtime" / scope_digest / "reports"
+
+
+def _resolve_query_report_dir(
+    root_dir: Path,
+    report_dir: str | None,
+    scoped_book_ids: list[str],
+) -> Path:
+    requested = Path(report_dir) if report_dir else None
+    resolved = (
+        requested.resolve()
+        if requested is not None and requested.is_absolute()
+        else (root_dir / requested).resolve()
+        if requested is not None
+        else _default_query_report_dir(root_dir, scoped_book_ids).resolve()
+    )
+    if _path_is_relative_to(resolved, (root_dir / "books").resolve()):
+        raise ValueError(
+            "GraphRAG query reportDir must not be inside graph_vault/books"
+        )
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
 
 
 def _register_qmd_completion_providers() -> None:
@@ -2002,182 +2057,228 @@ def _filter_graphrag_frames_for_scope(
 
 
 async def _run_graphrag_query(request: dict[str, Any]) -> dict[str, Any]:
-    environment = request.get("environment") or {}
-    graphrag_repo = _resolve_repo_path(
-        environment.get("graphragRepoPath"),
-        DEFAULT_GRAPHRAG_REPO,
-    )
-    _add_monorepo_package_paths(graphrag_repo)
-    _register_qmd_completion_providers()
+    runtime_metrics = QueryRuntimeMetricsRecorder()
 
-    from graphrag.cli.query import (  # type: ignore
-        _resolve_output_files,
-    )
-    from graphrag.config.load_config import load_config  # type: ignore
-    import graphrag.api as api  # type: ignore
+    with runtime_metrics.measure("bridge.resolve_runtime_environment"):
+        environment = request.get("environment") or {}
+        graphrag_repo = _resolve_repo_path(
+            environment.get("graphragRepoPath"),
+            DEFAULT_GRAPHRAG_REPO,
+        )
+        _add_monorepo_package_paths(graphrag_repo)
+        _register_qmd_completion_providers()
 
-    root_dir = Path(request["rootDir"]).resolve()
-    data_dir = request.get("dataDir")
-    method = request["method"]
-    query = request["query"]
-    response_type = request["responseType"]
-    capability_scope = request.get("capabilityScope") or {}
-    selected_book_ids = capability_scope.get("selectedBookIds") or []
-    graph_capability_ids = capability_scope.get("graphCapabilityIds") or []
-    if not selected_book_ids or not graph_capability_ids:
-        raise ValueError("graphrag query requires a non-empty capabilityScope")
-    scoped_book_ids, scoped_capabilities = _resolve_capability_scoped_book_ids(
-        root_dir,
-        selected_book_ids,
-        graph_capability_ids,
-    )
-    _validate_capabilities_against_request_scope(
-        root_dir,
-        capability_scope,
-        scoped_capabilities,
-    )
-    community_level = request.get("communityLevel")
-    dynamic_community_selection = bool(
-        request.get("dynamicCommunitySelection", False)
-    )
-    verbose = bool(request.get("verbose", False))
+    with runtime_metrics.measure("bridge.import_graphrag_runtime"):
+        from graphrag.cli.query import (  # type: ignore
+            _resolve_output_files,
+        )
+        from graphrag.config.load_config import load_config  # type: ignore
+        import graphrag.api as api  # type: ignore
 
-    _ensure_graphrag_prompt_assets(root_dir)
+    with runtime_metrics.measure("bridge.parse_query_request"):
+        root_dir = Path(request["rootDir"]).resolve()
+        data_dir = request.get("dataDir")
+        report_dir = request.get("reportDir")
+        method = request["method"]
+        query = request["query"]
+        response_type = request["responseType"]
+        capability_scope = request.get("capabilityScope") or {}
+        selected_book_ids = capability_scope.get("selectedBookIds") or []
+        graph_capability_ids = capability_scope.get("graphCapabilityIds") or []
+        if not selected_book_ids or not graph_capability_ids:
+            raise ValueError("graphrag query requires a non-empty capabilityScope")
+        community_level = request.get("communityLevel")
+        dynamic_community_selection = bool(
+            request.get("dynamicCommunitySelection", False)
+        )
+        include_runtime_metrics = bool(request.get("includeRuntimeMetrics", False))
+        verbose = bool(request.get("verbose", False))
 
-    cli_overrides = _scoped_storage_overrides(output_dir=data_dir)
+    with runtime_metrics.measure("bridge.validate_capability_scope"):
+        scoped_book_ids, scoped_capabilities = _resolve_capability_scoped_book_ids(
+            root_dir,
+            selected_book_ids,
+            graph_capability_ids,
+        )
+        _validate_capabilities_against_request_scope(
+            root_dir,
+            capability_scope,
+            scoped_capabilities,
+        )
 
-    config = load_config(root_dir=root_dir, cli_overrides=cli_overrides)
+    with runtime_metrics.measure("bridge.prepare_query_runtime"):
+        _ensure_graphrag_prompt_assets(root_dir)
+        query_report_dir = _resolve_query_report_dir(
+            root_dir,
+            report_dir,
+            scoped_book_ids,
+        )
+        cli_overrides = _scoped_storage_overrides(
+            output_dir=data_dir,
+            report_dir=str(query_report_dir),
+        )
+        query_log_path = query_report_dir / "query.log"
+        query_log_start_offset = (
+            query_log_offset(query_log_path)
+            if include_runtime_metrics
+            else None
+        )
+
+    with runtime_metrics.measure("graphrag.load_config"):
+        config = load_config(root_dir=root_dir, cli_overrides=cli_overrides)
     evidence_scope: list[dict[str, Any]]
 
     if method == "global":
-        dfs = _resolve_output_files(
-            config=config,
-            output_list=[
-                "documents",
-                "entities",
-                "communities",
-                "community_reports",
-            ],
-            optional_list=[],
-        )
-        dfs, evidence_scope = _filter_graphrag_frames_for_scope(
-            root_dir,
-            dfs,
-            scoped_book_ids,
-            scoped_capabilities,
-        )
-        response, context_data = await api.global_search(
-            config=config,
-            entities=dfs["entities"],
-            communities=dfs["communities"],
-            community_reports=dfs["community_reports"],
-            community_level=community_level,
-            dynamic_community_selection=dynamic_community_selection,
-            response_type=response_type,
-            query=query,
-            verbose=verbose,
-        )
+        with runtime_metrics.measure("graphrag.resolve_output_files"):
+            dfs = _resolve_output_files(
+                config=config,
+                output_list=[
+                    "documents",
+                    "entities",
+                    "communities",
+                    "community_reports",
+                ],
+                optional_list=[],
+            )
+        with runtime_metrics.measure("graphrag.filter_capability_scope"):
+            dfs, evidence_scope = _filter_graphrag_frames_for_scope(
+                root_dir,
+                dfs,
+                scoped_book_ids,
+                scoped_capabilities,
+            )
+        with runtime_metrics.measure("graphrag.search"):
+            response, context_data = await api.global_search(
+                config=config,
+                entities=dfs["entities"],
+                communities=dfs["communities"],
+                community_reports=dfs["community_reports"],
+                community_level=community_level,
+                dynamic_community_selection=dynamic_community_selection,
+                response_type=response_type,
+                query=query,
+                verbose=verbose,
+            )
     elif method == "local":
-        dfs = _resolve_output_files(
-            config=config,
-            output_list=[
-                "documents",
-                "communities",
-                "community_reports",
-                "text_units",
-                "relationships",
-                "entities",
-            ],
-            optional_list=["covariates"],
-        )
-        dfs, evidence_scope = _filter_graphrag_frames_for_scope(
-            root_dir,
-            dfs,
-            scoped_book_ids,
-            scoped_capabilities,
-        )
-        response, context_data = await api.local_search(
-            config=config,
-            entities=dfs["entities"],
-            communities=dfs["communities"],
-            community_reports=dfs["community_reports"],
-            text_units=dfs["text_units"],
-            relationships=dfs["relationships"],
-            covariates=dfs["covariates"],
-            community_level=community_level or 2,
-            response_type=response_type,
-            query=query,
-            verbose=verbose,
-        )
+        with runtime_metrics.measure("graphrag.resolve_output_files"):
+            dfs = _resolve_output_files(
+                config=config,
+                output_list=[
+                    "documents",
+                    "communities",
+                    "community_reports",
+                    "text_units",
+                    "relationships",
+                    "entities",
+                ],
+                optional_list=["covariates"],
+            )
+        with runtime_metrics.measure("graphrag.filter_capability_scope"):
+            dfs, evidence_scope = _filter_graphrag_frames_for_scope(
+                root_dir,
+                dfs,
+                scoped_book_ids,
+                scoped_capabilities,
+            )
+        with runtime_metrics.measure("graphrag.search"):
+            response, context_data = await api.local_search(
+                config=config,
+                entities=dfs["entities"],
+                communities=dfs["communities"],
+                community_reports=dfs["community_reports"],
+                text_units=dfs["text_units"],
+                relationships=dfs["relationships"],
+                covariates=dfs["covariates"],
+                community_level=community_level or 2,
+                response_type=response_type,
+                query=query,
+                verbose=verbose,
+            )
     elif method == "drift":
-        dfs = _resolve_output_files(
-            config=config,
-            output_list=[
-                "documents",
-                "communities",
-                "community_reports",
-                "text_units",
-                "relationships",
-                "entities",
-            ],
-            optional_list=[],
-        )
-        dfs, evidence_scope = _filter_graphrag_frames_for_scope(
-            root_dir,
-            dfs,
-            scoped_book_ids,
-            scoped_capabilities,
-        )
-        response, context_data = await api.drift_search(
-            config=config,
-            entities=dfs["entities"],
-            communities=dfs["communities"],
-            community_reports=dfs["community_reports"],
-            text_units=dfs["text_units"],
-            relationships=dfs["relationships"],
-            community_level=community_level or 2,
-            response_type=response_type,
-            query=query,
-            verbose=verbose,
-        )
+        with runtime_metrics.measure("graphrag.resolve_output_files"):
+            dfs = _resolve_output_files(
+                config=config,
+                output_list=[
+                    "documents",
+                    "communities",
+                    "community_reports",
+                    "text_units",
+                    "relationships",
+                    "entities",
+                ],
+                optional_list=[],
+            )
+        with runtime_metrics.measure("graphrag.filter_capability_scope"):
+            dfs, evidence_scope = _filter_graphrag_frames_for_scope(
+                root_dir,
+                dfs,
+                scoped_book_ids,
+                scoped_capabilities,
+            )
+        with runtime_metrics.measure("graphrag.search"):
+            response, context_data = await api.drift_search(
+                config=config,
+                entities=dfs["entities"],
+                communities=dfs["communities"],
+                community_reports=dfs["community_reports"],
+                text_units=dfs["text_units"],
+                relationships=dfs["relationships"],
+                community_level=community_level or 2,
+                response_type=response_type,
+                query=query,
+                verbose=verbose,
+            )
     elif method == "basic":
-        dfs = _resolve_output_files(
-            config=config,
-            output_list=["documents", "text_units"],
-            optional_list=[],
-        )
-        dfs, evidence_scope = _filter_graphrag_frames_for_scope(
-            root_dir,
-            dfs,
-            scoped_book_ids,
-            scoped_capabilities,
-        )
-        response, context_data = await api.basic_search(
-            config=config,
-            text_units=dfs["text_units"],
-            response_type=response_type,
-            query=query,
-            verbose=verbose,
-        )
+        with runtime_metrics.measure("graphrag.resolve_output_files"):
+            dfs = _resolve_output_files(
+                config=config,
+                output_list=["documents", "text_units"],
+                optional_list=[],
+            )
+        with runtime_metrics.measure("graphrag.filter_capability_scope"):
+            dfs, evidence_scope = _filter_graphrag_frames_for_scope(
+                root_dir,
+                dfs,
+                scoped_book_ids,
+                scoped_capabilities,
+            )
+        with runtime_metrics.measure("graphrag.search"):
+            response, context_data = await api.basic_search(
+                config=config,
+                text_units=dfs["text_units"],
+                response_type=response_type,
+                query=query,
+                verbose=verbose,
+            )
     else:
         raise ValueError(f"unsupported graphrag query method: {method}")
 
-    return {
-        "schemaVersion": SCHEMA_VERSION,
-        "method": method,
-        "responseText": str(response),
-        "evidence": _build_graphrag_evidence(
+    with runtime_metrics.measure("graphrag.build_evidence"):
+        evidence = _build_graphrag_evidence(
             root_dir,
             method,
             context_data,
             dfs,
             evidence_scope,
             scoped_capabilities,
-        ),
-        "providerDetail": {
-            "provider": "graphrag",
-            "method": method,
-        },
+        )
+
+    provider_detail = {
+        "provider": "graphrag",
+        "method": method,
+    }
+    if include_runtime_metrics:
+        provider_detail["runtimeMetrics"] = runtime_metrics.report(
+            query_log_path=query_log_path,
+            query_log_start_offset=query_log_start_offset,
+        )
+
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "method": method,
+        "responseText": str(response),
+        "evidence": evidence,
+        "providerDetail": provider_detail,
     }
 
 

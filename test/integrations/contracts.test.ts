@@ -23,8 +23,10 @@ import {
 import {
   GraphRagEvidenceSchema,
   GraphRagIndexRequestSchema,
+  GraphRagProviderDetailSchema,
   GraphRagQueryResponseSchema,
   GraphRagQueryRequestSchema,
+  GraphRagQueryRuntimeMetricsSchema,
 } from "../../src/contracts/graphrag.js";
 import {
   JinaEmbeddingResponseSchema,
@@ -114,6 +116,15 @@ type TypeDdDocument = {
   route_contracts: Record<string, {
     schema: string;
     required_fields?: string[];
+    optional_fields?: string[];
+    timing_observability?: {
+      graphrag_provider_runtime_metrics?: {
+        hard_bounds?: {
+          provider_stage_count_max: number;
+          model_metric_count_max: number;
+        };
+      };
+    };
   }>;
 };
 
@@ -528,6 +539,30 @@ describe("GraphRAG contracts", () => {
     expect(parsed.communityLevel).toBe(2);
   });
 
+  test("accepts explicit runtime metrics request flag", () => {
+    const parsed = GraphRagQueryRequestSchema.parse({
+      rootDir: "/tmp/graphrag-root",
+      method: "local",
+      query: "What changed in the roadmap?",
+      responseType: "multiple paragraphs",
+      capabilityScope: {
+        selectedBookIds: ["book-1"],
+        graphCapabilityIds: ["book-1:graph_query"],
+        sourceIds: ["sha256:source"],
+        documentIds: ["doc-1"],
+        contentHashes: ["sha256:content"],
+        artifactIds: ["artifact-1"],
+      },
+      reportDir: "/tmp/qmd-runtime/book-1/graphrag-query/reports",
+      includeRuntimeMetrics: true,
+    });
+
+    expect(parsed.includeRuntimeMetrics).toBe(true);
+    expect(parsed.reportDir).toBe(
+      "/tmp/qmd-runtime/book-1/graphrag-query/reports",
+    );
+  });
+
   test("rejects graph query requests without capability scope", () => {
     expect(() =>
       GraphRagQueryRequestSchema.parse({
@@ -573,6 +608,120 @@ describe("GraphRAG contracts", () => {
         schemaVersion: SchemaVersion,
         method: "local",
         responseText: "Graph answer",
+      }),
+    ).toThrow();
+  });
+
+  test("accepts bounded provider runtime metrics on query responses", () => {
+    const parsed = GraphRagQueryResponseSchema.parse({
+      schemaVersion: SchemaVersion,
+      method: "local",
+      responseText: "Graph answer",
+      evidence: [{
+        evidenceId: "book-1:graph_query",
+        graphCapabilityId: "book-1:graph_query",
+        sourceId: "source-1",
+        documentId: "doc-1",
+        bookId: "book-1",
+        contentHash: "sha256:content",
+        graphTextUnitId: "tu-1",
+        artifactId: "artifact-1",
+      }],
+      providerDetail: {
+        provider: "graphrag",
+        method: "local",
+        runtimeMetrics: {
+          kind: "graphrag_query_runtime_metrics",
+          scope: "current_invocation",
+          totalDurationMs: 1234.56,
+          stages: [{
+            name: "graphrag.search",
+            durationMs: 1000.1,
+            status: "succeeded",
+          }],
+          modelMetrics: [{
+            model: "gpt-example",
+            attemptedRequestCount: 1,
+            successfulResponseCount: 1,
+            failedResponseCount: 0,
+            requestsWithRetries: 0,
+            retryCount: 0,
+            streamingResponseCount: 0,
+            loggedComputeDurationMs: 900.5,
+            promptTokens: 100,
+            completionTokens: 20,
+            totalTokens: 120,
+            cacheHitRate: 0,
+          }],
+          aggregate: {
+            modelCount: 1,
+            attemptedRequestCount: 1,
+            successfulResponseCount: 1,
+            failedResponseCount: 0,
+            requestsWithRetries: 0,
+            retryCount: 0,
+            streamingResponseCount: 0,
+            loggedComputeDurationMs: 900.5,
+            promptTokens: 100,
+            completionTokens: 20,
+            totalTokens: 120,
+            unattributedWallDurationMs: 334.06,
+          },
+        },
+      },
+    });
+
+    expect(parsed.providerDetail?.runtimeMetrics?.aggregate.totalTokens)
+      .toBe(120);
+    expect(GraphRagProviderDetailSchema.parse(parsed.providerDetail).provider)
+      .toBe("graphrag");
+  });
+
+  test("rejects unbounded provider runtime metric detail arrays", () => {
+    const stage = {
+      name: "graphrag.search",
+      durationMs: 1,
+      status: "succeeded",
+    };
+    const modelMetric = {
+      model: "gpt-example",
+      attemptedRequestCount: 1,
+      successfulResponseCount: 1,
+      failedResponseCount: 0,
+      requestsWithRetries: 0,
+      retryCount: 0,
+      streamingResponseCount: 0,
+      loggedComputeDurationMs: 1,
+      promptTokens: 1,
+      completionTokens: 1,
+      totalTokens: 2,
+      cacheHitRate: 0,
+    };
+
+    expect(() =>
+      GraphRagQueryRuntimeMetricsSchema.parse({
+        kind: "graphrag_query_runtime_metrics",
+        scope: "current_invocation",
+        totalDurationMs: 1,
+        stages: Array.from({ length: 17 }, () => stage),
+        modelMetrics: Array.from({ length: 33 }, (_, index) => ({
+          ...modelMetric,
+          model: `gpt-example-${index}`,
+        })),
+        aggregate: {
+          modelCount: 33,
+          attemptedRequestCount: 33,
+          successfulResponseCount: 33,
+          failedResponseCount: 0,
+          requestsWithRetries: 0,
+          retryCount: 0,
+          streamingResponseCount: 0,
+          loggedComputeDurationMs: 33,
+          promptTokens: 33,
+          completionTokens: 33,
+          totalTokens: 66,
+          unattributedWallDurationMs: 0,
+        },
       }),
     ).toThrow();
   });
@@ -2115,6 +2264,22 @@ describe("Data bus contracts", () => {
     expect(Object.keys(QmdSearchResultSchema.shape)).toEqual(
       expect.arrayContaining(contracts.qmd_search_result.required_fields),
     );
+    expect(contracts.graphrag_query_request.required_fields).toEqual([
+      "rootDir",
+      "method",
+      "query",
+      "responseType",
+      "capabilityScope",
+    ]);
+    expect(Object.keys(GraphRagQueryRequestSchema.shape)).toEqual(
+      expect.arrayContaining(contracts.graphrag_query_request.required_fields),
+    );
+    expect(contracts.graphrag_query_request.optional_fields).toContain(
+      "reportDir",
+    );
+    expect(Object.keys(GraphRagQueryRequestSchema.shape)).toEqual(
+      expect.arrayContaining(contracts.graphrag_query_request.optional_fields),
+    );
     expect(contracts.graphrag_query_response.required_fields).toEqual([
       "schemaVersion",
       "method",
@@ -2124,6 +2289,13 @@ describe("Data bus contracts", () => {
     expect(Object.keys(GraphRagQueryResponseSchema.shape)).toEqual(
       expect.arrayContaining(contracts.graphrag_query_response.required_fields),
     );
+    expect(
+      contracts.unified_answer.timing_observability
+        ?.graphrag_provider_runtime_metrics?.hard_bounds,
+    ).toEqual({
+      provider_stage_count_max: 16,
+      model_metric_count_max: 32,
+    });
     expect(contracts.unified_answer.required_fields).toEqual([
       "schemaVersion",
       "query",

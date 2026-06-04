@@ -749,6 +749,16 @@ describe("CLI GraphRAG unified route", () => {
     expect(bridgeRequest.dataDir).toBe(
       join(workspace.graphVault, "books", "book-cli", "graphrag", "output"),
     );
+    expect(bridgeRequest.reportDir).toBe(
+      join(
+        workspace.graphVault,
+        ".local",
+        "book-runtime",
+        "book-cli",
+        "graphrag-query",
+        "reports",
+      ),
+    );
     expect(JSON.stringify(answer)).not.toContain(workspace.graphVault);
   }, 30000);
 
@@ -935,6 +945,16 @@ describe("CLI GraphRAG unified route", () => {
     const bridgeRequest = await readLastBridgeRequest(workspace);
     expect(bridgeRequest.dataDir).toBe(
       join(workspace.graphVault, "books", "book-cli-second", "graphrag", "output"),
+    );
+    expect(bridgeRequest.reportDir).toBe(
+      join(
+        workspace.graphVault,
+        ".local",
+        "book-runtime",
+        "book-cli-second",
+        "graphrag-query",
+        "reports",
+      ),
     );
     expect(JSON.stringify(answer)).not.toContain(workspace.graphVault);
   }, 30000);

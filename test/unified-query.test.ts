@@ -8,6 +8,7 @@ import YAML from "yaml";
 import { SchemaVersion } from "../src/contracts/common.js";
 import { DspyQueryExpansionStrictRefusalError } from "../src/dspy/errors.js";
 import type { GraphCapability } from "../src/contracts/graph-enhancement.js";
+import type { GraphRagProviderDetail } from "../src/contracts/graphrag.js";
 import type { QmdRetrievalCandidate } from "../src/contracts/qmd-query.js";
 import type { UnifiedQueryRequest } from "../src/contracts/unified-query.js";
 import {
@@ -28,6 +29,10 @@ import {
   loadDocumentIdentitiesFromGraphVault,
   toQmdRetrievalCandidates,
 } from "../src/query/qmd-candidates.js";
+import {
+  QueryTimingRecorder,
+  formatGraphRagRuntimeMetrics,
+} from "../src/query/query-timing.js";
 
 const MinimalParquetFixture = Buffer.from(
   "UEFSMRUEFRIVFkwVAhUAEgAACSAFAAAAcm93LTEVABUSFRYsFQIVEBUGFQYcNgAoBXJvdy0xGAVyb3ctMRERAAAACSACAAAAAgEBAgAVBBksNQAYBnNjaGVtYRUCABUMJQIYAmlkJQBMHAAAABYCGRwZHCYAHBUMGTUABhAZGAJpZBUCFgIWigEWkgEmOiYIHDYAKAVyb3ctMRgFcm93LTEREQAZLBUEFQAVAgAVABUQFQIAPBYKGQYZJgACAAAAFooBFgImCBaSAQAZHBgMQVJST1c6c2NoZW1hGKABLy8vLy8zQUFBQUFRQUFBQUFBQUtBQXdBQmdBRkFBZ0FDZ0FBQUFBQkJBQU1BQUFBQ0FBSUFBQUFCQUFJQUFBQUJBQUFBQUVBQUFBVUFBQUFFQUFVQUFnQUJnQUhBQXdBQUFBUUFCQUFBQUFBQUFFRkVBQUFBQmdBQUFBRUFBQUFBQUFBQUFJQUFBQnBaQUFBQkFBRUFBUUFBQUFBQUFBQQAYIHBhcnF1ZXQtY3BwLWFycm93IHZlcnNpb24gMjIuMC4wGRwcAAAAWgEAAFBBUjE=",
@@ -683,6 +688,113 @@ describe("unified query routing", () => {
     expect(answer.answerText).toBe("Graph answer");
     expect(answer.evidence[0]?.artifactId).toBe("artifact-1");
     expect(answer.evidence[0]?.graphCapabilityId).toBe("cap-1");
+  });
+
+  test("records stable query timing stages when enabled", async () => {
+    const timing = new QueryTimingRecorder({ route: "auto" });
+
+    const answer = await routeQuery(request(), {
+      searchQmd: async (qmdRequest) => ({
+        schemaVersion: SchemaVersion,
+        query: qmdRequest.query,
+        results: [candidate()],
+      }),
+      resolveGraphCapabilities: async () => new Map([capability()]),
+      queryGraphRag: async () => ({
+        schemaVersion: SchemaVersion,
+        method: "local",
+        responseText: "Graph answer",
+        evidence: [graphEvidence()],
+      }),
+      timing,
+    });
+
+    const report = timing.report({
+      selectedRoute: answer.routeDecision.selectedRoute,
+    });
+    expect(report.kind).toBe("qmd_query_timing");
+    expect(report.totalDurationMs).toBeGreaterThanOrEqual(0);
+    expect(report.metadata).toMatchObject({
+      route: "auto",
+      selectedRoute: "graphrag",
+    });
+    expect(report.stages.map((stage) => stage.name)).toEqual([
+      "route.resolve_graph_scope_capabilities",
+      "route.qmd_retrieval",
+      "route.resolve_candidate_graph_capabilities",
+      "route.decide",
+      "route.query_graphrag_provider",
+      "route.build_answer",
+    ]);
+    for (const stage of report.stages) {
+      expect(stage.status).toBe("succeeded");
+      expect(stage.startedOffsetMs).toBeGreaterThanOrEqual(0);
+      expect(stage.durationMs).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  test("formats provider runtime metrics as bounded readable diagnostics", () => {
+    const detail: GraphRagProviderDetail = {
+      provider: "graphrag",
+      method: "local",
+      runtimeMetrics: {
+        kind: "graphrag_query_runtime_metrics",
+        scope: "current_invocation",
+        totalDurationMs: 1100,
+        stages: [
+          {
+            name: "bridge.import_graphrag_runtime",
+            durationMs: 100,
+            status: "succeeded",
+          },
+          {
+            name: "graphrag.search",
+            durationMs: 900,
+            status: "succeeded",
+          },
+        ],
+        modelMetrics: [{
+          model: "gpt-example",
+          attemptedRequestCount: 2,
+          successfulResponseCount: 2,
+          failedResponseCount: 0,
+          requestsWithRetries: 1,
+          retryCount: 1,
+          streamingResponseCount: 0,
+          loggedComputeDurationMs: 850,
+          promptTokens: 120,
+          completionTokens: 30,
+          totalTokens: 150,
+          cacheHitRate: 0,
+        }],
+        aggregate: {
+          modelCount: 1,
+          attemptedRequestCount: 2,
+          successfulResponseCount: 2,
+          failedResponseCount: 0,
+          requestsWithRetries: 1,
+          retryCount: 1,
+          streamingResponseCount: 0,
+          loggedComputeDurationMs: 850,
+          promptTokens: 120,
+          completionTokens: 30,
+          totalTokens: 150,
+          unattributedWallDurationMs: 250,
+        },
+      },
+    };
+
+    const report = formatGraphRagRuntimeMetrics(detail);
+
+    expect(report).toContain("GraphRAG runtime metrics:");
+    expect(report).toContain(
+      "bridge.import_graphrag_runtime: 100.00ms (ok)",
+    );
+    expect(report).toContain("graphrag.search: 900.00ms (ok)");
+    expect(report).toContain("requests: attempted=2, succeeded=2, failed=0");
+    expect(report).toContain("tokens=150");
+    expect(report).not.toContain("prompt text");
+    expect(report).not.toContain("response text");
   });
 
   test("sanitizes provider-owned GraphRAG evidence locators", async () => {

@@ -129,6 +129,10 @@ contract_artifacts:
       - GraphRagQueryResponseEnvelopeSchema
       - GraphRagEvidenceSchema
       - GraphRagEvidenceEnvelopeSchema
+      - GraphRagQueryRuntimeStageSchema
+      - GraphRagQueryModelMetricsSchema
+      - GraphRagQueryRuntimeAggregateSchema
+      - GraphRagQueryRuntimeMetricsSchema
       - GraphRagProviderDetailSchema
       - GraphRagProviderDetailEnvelopeSchema
       - GraphRagIndexRequestSchema
@@ -1531,6 +1535,34 @@ route_contracts:
     optional_fields:
       - elapsedMs
       - metadata
+  graphrag_query_request:
+    schema: src/contracts/graphrag.ts#GraphRagQueryRequestSchema
+    envelope: src/contracts/graphrag.ts#GraphRagQueryEnvelopeSchema
+    required_fields:
+      - rootDir
+      - method
+      - query
+      - responseType
+      - capabilityScope
+    optional_fields:
+      - dataDir
+      - reportDir
+      - communityLevel
+      - dynamicCommunitySelection
+      - includeRuntimeMetrics
+      - verbose
+      - environment
+    timing_observability:
+      flag_field: includeRuntimeMetrics
+      report_dir_policy: >-
+        Query runtime reports, including `query.log`, must be written to a
+        local runtime directory such as
+        `graph_vault/.local/book-runtime/{bookId}/graphrag-query/reports`.
+        They must not be written inside `graph_vault/books/**`.
+      rule: >-
+        GraphRAG provider runtime metrics are requested only when the CLI
+        receives `--timing`. Default query responses remain lightweight and do
+        not include provider-owned runtime metrics.
   graphrag_query_response:
     schema: src/contracts/graphrag.ts#GraphRagQueryResponseSchema
     envelope: src/contracts/graphrag.ts#GraphRagQueryResponseEnvelopeSchema
@@ -1554,6 +1586,73 @@ route_contracts:
       - providerDetail
       - elapsedMs
       - metadata
+    timing_observability:
+      cli_flag: --timing
+      metadata_key: metadata.queryTiming
+      report_kind: qmd_query_timing
+      stdout_policy: >-
+        For JSON output, query timing is embedded in
+        UnifiedAnswer.metadata.queryTiming. For non-JSON output, query timing
+        is written to stderr so stdout remains format-compatible.
+      required_fields:
+        - schemaVersion
+        - kind
+        - totalDurationMs
+        - stages
+      stage_required_fields:
+        - name
+        - startedOffsetMs
+        - durationMs
+        - status
+      stable_route_stage_names:
+        - route.resolve_graph_scope_capabilities
+        - route.qmd_retrieval
+        - route.resolve_candidate_graph_capabilities
+        - route.decide
+        - route.query_graphrag_provider
+        - route.build_answer
+      graphrag_cli_stage_names:
+        - cli.prepare_graphrag_query
+        - cli.resolve_book_graphrag_data_dir
+        - cli.invoke_graphrag_runtime
+      graphrag_provider_runtime_metrics:
+        location: providerDetail.runtimeMetrics
+        enabled_by_request_field: includeRuntimeMetrics
+        kind: graphrag_query_runtime_metrics
+        scope: current_invocation
+        stage_names:
+          - bridge.resolve_runtime_environment
+          - bridge.import_graphrag_runtime
+          - bridge.parse_query_request
+          - bridge.validate_capability_scope
+          - bridge.prepare_query_runtime
+          - graphrag.load_config
+          - graphrag.resolve_output_files
+          - graphrag.filter_capability_scope
+          - graphrag.search
+          - graphrag.build_evidence
+        aggregate_fields:
+          - attemptedRequestCount
+          - successfulResponseCount
+          - failedResponseCount
+          - requestsWithRetries
+          - retryCount
+          - loggedComputeDurationMs
+          - unattributedWallDurationMs
+          - promptTokens
+          - completionTokens
+          - totalTokens
+        data_volume_policy: >-
+          Runtime metrics are bounded numeric summaries derived from the
+          current invocation. They must not include raw query logs, prompt
+          text, response text, evidence quotes, vectors, or cache payloads.
+        hard_bounds:
+          provider_stage_count_max: 16
+          model_metric_count_max: 32
+      note: >-
+        Durations are inclusive boundary timings. GraphRAG provider runtime
+        metrics are an optional bounded summary and must not change default
+        stdout output.
   graph_capability_error:
     schema: src/contracts/unified-query.ts#GraphCapabilityErrorSchema
     envelope: src/contracts/unified-query.ts#GraphCapabilityErrorEnvelopeSchema

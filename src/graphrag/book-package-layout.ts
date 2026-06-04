@@ -65,6 +65,20 @@ export function resolveBookRunDir(
   return join(bookRoot, "graphrag", "runs");
 }
 
+export function resolveBookRuntimeGraphRagQueryReportDir(
+  graphVaultInput: string,
+  bookId: string,
+): string {
+  return join(
+    resolve(graphVaultInput),
+    ".local",
+    "book-runtime",
+    bookId,
+    "graphrag-query",
+    "reports",
+  );
+}
+
 export function bookScopedGraphOutputBases(bookId: string): string[] {
   return [`books/${bookId}/graphrag/output`];
 }

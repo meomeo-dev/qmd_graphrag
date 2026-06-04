@@ -132,7 +132,7 @@ import {
 } from "../collections.js";
 import { createQmdGraphRagRuntime } from "../runtime.js";
 import { GraphRagSearchMethodSchema } from "../contracts/graphrag.js";
-import { SchemaVersion } from "../contracts/common.js";
+import { SchemaVersion, type JsonValue } from "../contracts/common.js";
 import {
   buildDspyRuntimeFingerprints,
   dspyProviderEnvRefs,
@@ -162,6 +162,12 @@ import {
   routeQuery,
 } from "../query/unified-router.js";
 import {
+  QueryTimingRecorder,
+  formatGraphRagRuntimeMetrics,
+  formatQueryTimingReport,
+  type QueryTimingReport,
+} from "../query/query-timing.js";
+import {
   QmdSearchResultSchema,
   QmdVectorSearchRequestSchema,
   QmdVectorSearchResultSchema,
@@ -175,7 +181,10 @@ import {
   loadGraphQueryCapabilities,
   resolveCandidateGraphCapabilities,
 } from "../graphrag/capability-catalog.js";
-import { resolveBookGraphRagDataDir } from "../graphrag/book-package-layout.js";
+import {
+  resolveBookGraphRagDataDir,
+  resolveBookRuntimeGraphRagQueryReportDir,
+} from "../graphrag/book-package-layout.js";
 import {
   writeManagedGraphRagSettingsSync,
 } from "../graphrag/settings-projection.js";
@@ -2336,7 +2345,38 @@ type OutputOptions = {
   chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
   displayQuery?: string; // Presentation-only query string for snippets.
   showRouteSummary?: boolean;
+  timing?: boolean;
+  timingReport?: QueryTimingReport;
 };
+
+async function measureCliQueryTiming<T>(
+  timing: QueryTimingRecorder | undefined,
+  name: string,
+  action: () => T | Promise<T>,
+): Promise<T> {
+  return timing == null ? await action() : await timing.measure(name, action);
+}
+
+function createQueryTimingRecorder(
+  opts: OutputOptions,
+  metadata: Record<string, JsonValue>,
+): QueryTimingRecorder | undefined {
+  return opts.timing ? new QueryTimingRecorder(metadata) : undefined;
+}
+
+function answerWithQueryTiming(
+  answer: UnifiedAnswer,
+  report: QueryTimingReport | undefined,
+): UnifiedAnswer {
+  if (report == null) return answer;
+  return {
+    ...answer,
+    metadata: {
+      ...(answer.metadata ?? {}),
+      queryTiming: report as unknown as JsonValue,
+    },
+  };
+}
 
 // Highlight query terms in text (skip short words < 3 chars)
 function highlightTerms(text: string, query: string): string {
@@ -2846,7 +2886,11 @@ function outputUnifiedAnswerEvidence(answer: UnifiedAnswer, opts: OutputOptions)
 
 function outputUnifiedAnswer(answer: UnifiedAnswer, opts: OutputOptions): void {
   if (opts.format === "json") {
-    console.log(JSON.stringify(answer, null, 2));
+    console.log(JSON.stringify(
+      answerWithQueryTiming(answer, opts.timingReport),
+      null,
+      2,
+    ));
     return;
   }
 
@@ -2855,6 +2899,13 @@ function outputUnifiedAnswer(answer: UnifiedAnswer, opts: OutputOptions): void {
   }
 
   outputUnifiedAnswerEvidence(answer, opts);
+  if (opts.timingReport != null) {
+    process.stderr.write(`${formatQueryTimingReport(opts.timingReport)}\n`);
+    const runtimeMetrics = formatGraphRagRuntimeMetrics(answer.providerDetail);
+    if (runtimeMetrics != null) {
+      process.stderr.write(`${runtimeMetrics}\n`);
+    }
+  }
 }
 
 // Resolve -c collection filter: supports single string, array, or undefined.
@@ -3216,6 +3267,10 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 
 async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
   await withLLMSession(async () => {
+    const timing = createQueryTimingRecorder(opts, {
+      route: "qmd",
+      outputFormat: opts.format,
+    });
     const parsed = parseStructuredQuery(query);
     const intent = opts.intent || parsed?.intent;
     if (parsed) {
@@ -3252,6 +3307,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         );
         return searchResult.qmdResult;
       },
+      timing,
     });
 
     closeDb();
@@ -3262,7 +3318,10 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       ? (structuredQueries.find(s => s.type === 'lex')?.query || structuredQueries.find(s => s.type === 'vec')?.query || query)
       : query;
 
-    outputUnifiedAnswer(answer, { ...opts, displayQuery });
+    const timingReport = timing?.report({
+      selectedRoute: answer.routeDecision.selectedRoute,
+    });
+    outputUnifiedAnswer(answer, { ...opts, displayQuery, timingReport });
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
 }
 
@@ -3272,11 +3331,25 @@ async function autoQuerySearch(
   values: Record<string, unknown>,
 ): Promise<void> {
   await withLLMSession(async () => {
-    const config = ensureRuntimeConfigForCli();
-    const graphVault = resolveGraphVaultForCli(values, config);
-    ensureGraphRagSettingsProjectionForCli(config, graphVault);
-    const method = GraphRagSearchMethodSchema.parse(
-      config.graphrag?.default_method ?? "local",
+    const timing = createQueryTimingRecorder(opts, {
+      route: "auto",
+      outputFormat: opts.format,
+    });
+    const { config, graphVault, method } = await measureCliQueryTiming(
+      timing,
+      "cli.prepare_auto_query",
+      async () => {
+        const resolvedConfig = ensureRuntimeConfigForCli();
+        const resolvedGraphVault = resolveGraphVaultForCli(values, resolvedConfig);
+        ensureGraphRagSettingsProjectionForCli(resolvedConfig, resolvedGraphVault);
+        return {
+          config: resolvedConfig,
+          graphVault: resolvedGraphVault,
+          method: GraphRagSearchMethodSchema.parse(
+            resolvedConfig.graphrag?.default_method ?? "local",
+          ),
+        };
+      },
     );
     const graphBookId = values["graph-book-id"] == null
       ? null
@@ -3329,9 +3402,14 @@ async function autoQuerySearch(
           graphVault,
           decision.selectedBookIds[0]!,
         );
+        const reportDir = resolveBookRuntimeGraphRagQueryReportDir(
+          graphVault,
+          decision.selectedBookIds[0]!,
+        );
         return runtime.graphQuery({
           rootDir: graphVault,
           dataDir,
+          reportDir,
           method: GraphRagSearchMethodSchema.parse(request.method ?? method),
           query: request.query,
           responseType,
@@ -3343,17 +3421,24 @@ async function autoQuerySearch(
             contentHashes: decision.selectedContentHashes,
             artifactIds: decision.graphArtifactIds,
           },
+          includeRuntimeMetrics: opts.timing === true,
           verbose: false,
           environment: {
             workingDirectory: getPwd(),
           },
         });
       },
+      timing,
     });
 
     closeDb();
 
-    outputUnifiedAnswer(answer, { ...opts, showRouteSummary: true });
+    const timingReport = timing?.report({
+      selectedRoute: answer.routeDecision.selectedRoute,
+      graphBookId: graphBookId ?? null,
+      graphMethod: method,
+    });
+    outputUnifiedAnswer(answer, { ...opts, showRouteSummary: true, timingReport });
   }, { maxDuration: 10 * 60 * 1000, name: 'autoQuerySearch' });
 }
 
@@ -3362,11 +3447,29 @@ async function graphRagQuerySearch(
   opts: OutputOptions,
   values: Record<string, unknown>,
 ): Promise<void> {
-  const config = ensureRuntimeConfigForCli();
-  const graphVault = resolveGraphVaultForCli(values, config);
-  ensureGraphRagSettingsProjectionForCli(config, graphVault);
-  const method = GraphRagSearchMethodSchema.parse(
-    String(values["query-method"] || config.graphrag?.default_method || "local"),
+  const timing = createQueryTimingRecorder(opts, {
+    route: "graphrag",
+    outputFormat: opts.format,
+  });
+  const { config, graphVault, method } = await measureCliQueryTiming(
+    timing,
+    "cli.prepare_graphrag_query",
+    async () => {
+      const resolvedConfig = ensureRuntimeConfigForCli();
+      const resolvedGraphVault = resolveGraphVaultForCli(values, resolvedConfig);
+      ensureGraphRagSettingsProjectionForCli(resolvedConfig, resolvedGraphVault);
+      return {
+        config: resolvedConfig,
+        graphVault: resolvedGraphVault,
+        method: GraphRagSearchMethodSchema.parse(
+          String(
+            values["query-method"] ||
+              resolvedConfig.graphrag?.default_method ||
+              "local",
+          ),
+        ),
+      };
+    },
   );
   const responseType = String(
     values["response-type"] ||
@@ -3376,6 +3479,11 @@ async function graphRagQuerySearch(
   const graphBookId = values["graph-book-id"] == null
     ? null
     : String(values["graph-book-id"]);
+  timing?.addMetadata({
+    graphBookId: graphBookId ?? null,
+    graphMethod: method,
+    graphVault: basename(graphVault),
+  });
   const communityLevel = values["community-level"] == null
     ? undefined
     : parseInt(String(values["community-level"]), 10);
@@ -3435,39 +3543,59 @@ async function graphRagQuerySearch(
         }));
       }
       const runtime = createQmdGraphRagRuntime();
-      const dataDir = await resolveBookGraphRagDataDir(
+      const dataDir = await measureCliQueryTiming(
+        timing,
+        "cli.resolve_book_graphrag_data_dir",
+        () => resolveBookGraphRagDataDir(
+          graphVault,
+          decision.selectedBookIds[0]!,
+        ),
+      );
+      const reportDir = resolveBookRuntimeGraphRagQueryReportDir(
         graphVault,
         decision.selectedBookIds[0]!,
       );
-      return runtime.graphQuery({
-        rootDir: graphVault,
-        dataDir,
-        method: GraphRagSearchMethodSchema.parse(request.method ?? method),
-        query: request.query,
-        responseType,
-        capabilityScope: {
-          selectedBookIds: decision.selectedBookIds,
-          graphCapabilityIds: decision.graphCapabilityIds,
-          sourceIds: decision.selectedSourceIds,
-          documentIds: decision.selectedDocumentIds,
-          contentHashes: decision.selectedContentHashes,
-          artifactIds: decision.graphArtifactIds,
-        },
-        communityLevel,
-        verbose: false,
-        environment: {
-          pythonBin: values["python-bin"]
-            ? pathResolve(getPwd(), String(values["python-bin"]))
-            : config.graphrag?.python_bin
-              ? pathResolve(getPwd(), config.graphrag.python_bin)
-              : undefined,
-          workingDirectory: getPwd(),
-        },
-      });
+      return await measureCliQueryTiming(
+        timing,
+        "cli.invoke_graphrag_runtime",
+        () => runtime.graphQuery({
+          rootDir: graphVault,
+          dataDir,
+          reportDir,
+          method: GraphRagSearchMethodSchema.parse(request.method ?? method),
+          query: request.query,
+          responseType,
+          capabilityScope: {
+            selectedBookIds: decision.selectedBookIds,
+            graphCapabilityIds: decision.graphCapabilityIds,
+            sourceIds: decision.selectedSourceIds,
+            documentIds: decision.selectedDocumentIds,
+            contentHashes: decision.selectedContentHashes,
+            artifactIds: decision.graphArtifactIds,
+          },
+          communityLevel,
+          includeRuntimeMetrics: opts.timing === true,
+          verbose: false,
+          environment: {
+            pythonBin: values["python-bin"]
+              ? pathResolve(getPwd(), String(values["python-bin"]))
+              : config.graphrag?.python_bin
+                ? pathResolve(getPwd(), config.graphrag.python_bin)
+                : undefined,
+            workingDirectory: getPwd(),
+          },
+        }),
+      );
     },
+    timing,
   });
 
-  outputUnifiedAnswer(answer, opts);
+  const timingReport = timing?.report({
+    selectedRoute: answer.routeDecision.selectedRoute,
+    graphBookId: graphBookId ?? null,
+    graphMethod: method,
+  });
+  outputUnifiedAnswer(answer, { ...opts, timingReport });
 }
 
 function createDspyPolicyStore(values: Record<string, unknown>): DspyPolicyStore {
@@ -3915,6 +4043,7 @@ function parseCLI() {
       files: { type: "boolean" },
       json: { type: "boolean" },
       explain: { type: "boolean" },
+      timing: { type: "boolean" },
       collection: { type: "string", short: "c", multiple: true },  // Filter by collection(s)
       // Collection options
       name: { type: "string" },  // collection name
@@ -4023,6 +4152,7 @@ function parseCLI() {
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
     skipRerank: !!values["no-rerank"],
     explain: !!values.explain,
+    timing: !!values.timing,
     intent: values.intent as string | undefined,
     chunkStrategy: parseChunkStrategy(values["chunk-strategy"]),
   };
@@ -4544,6 +4674,7 @@ function showHelp(): void {
   console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
   console.log("  --line-numbers             - Include line numbers in output");
   console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
+  console.log("  --timing                   - Include query stage timing diagnostics");
   console.log("  --files | --json | --csv | --md | --xml  - Output format");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
   console.log("");
