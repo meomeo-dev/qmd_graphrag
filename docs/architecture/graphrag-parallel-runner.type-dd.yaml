@@ -214,6 +214,7 @@ resourceControls:
         - graph_vault/catalog/runs.yaml
         - graph_vault/catalog/document-identity-map.yaml
         - graph_vault/catalog/graph-capabilities.yaml
+        - graph_vault/catalog/qmd-projection.yaml
     qmdIndexWriterLane:
       capacity: 1
       protects:
@@ -373,7 +374,7 @@ resourceControls:
           lane: checkpointWriterLane
           owner: repository
           directoryDurableKind: directory
-        - scope: graph_vault/books/{bookId}/runs
+        - scope: graph_vault/books/{bookId}/graphrag/runs
           lane: checkpointWriterLane
           owner: repository
           directoryDurableKind: directory
@@ -381,7 +382,7 @@ resourceControls:
           lane: checkpointWriterLane
           owner: qmd
           directoryDurableKind: directory
-        - scope: graph_vault/books/{bookId}/output
+        - scope: graph_vault/books/{bookId}/graphrag/output
           lane: checkpointWriterLane
           owner: graphOutputProducer
           directoryDurableKind: directory
@@ -434,25 +435,31 @@ resourceControls:
         owner: capabilityCatalog
         laneTimeoutMs: 120000
         releaseOn: [commit, error, cancellation, lease_loss, timeout]
+      - target: graph_vault/catalog/qmd-projection.yaml
+        lane: catalogWriterLane
+        durableKind: yaml
+        owner: qmdProjectionCatalog
+        laneTimeoutMs: 120000
+        releaseOn: [commit, error, cancellation, lease_loss, timeout]
       - target: graph_vault/books/{bookId}/job.yaml
         lane: checkpointWriterLane
         durableKind: yaml
         owner: repository
         laneTimeoutMs: 120000
         releaseOn: [commit, error, cancellation, lease_loss, timeout]
-      - target: graph_vault/books/{bookId}/artifacts.yaml
+      - target: graph_vault/books/{bookId}/state/artifacts.yaml
         lane: checkpointWriterLane
         durableKind: yaml
         owner: repository
         laneTimeoutMs: 120000
         releaseOn: [commit, error, cancellation, lease_loss, timeout]
-      - target: graph_vault/books/{bookId}/checkpoints.yaml
+      - target: graph_vault/books/{bookId}/state/checkpoints.yaml
         lane: checkpointWriterLane
         durableKind: yaml
         owner: repository
         laneTimeoutMs: 120000
         releaseOn: [commit, error, cancellation, lease_loss, timeout]
-      - target: graph_vault/books/{bookId}/runs/{runId}.yaml
+      - target: graph_vault/books/{bookId}/graphrag/runs/{runId}.yaml
         lane: checkpointWriterLane
         durableKind: yaml
         owner: repository
@@ -565,13 +572,13 @@ resourceControls:
         owner: qmd
         laneTimeoutMs: 120000
         releaseOn: [commit, error, cancellation, lease_loss, timeout]
-      - target: graph_vault/books/{bookId}/output/qmd_output_manifest.json
+      - target: graph_vault/books/{bookId}/graphrag/output/qmd_output_manifest.json
         lane: checkpointWriterLane
         durableKind: json
         owner: graphOutputProducer
         laneTimeoutMs: 120000
         releaseOn: [commit, error, cancellation, lease_loss, timeout]
-      - target: graph_vault/books/{bookId}/output/qmd_graph_text_unit_identity.json
+      - target: graph_vault/books/{bookId}/graphrag/output/qmd_graph_text_unit_identity.json
         lane: checkpointWriterLane
         durableKind: json
         owner: graphOutputProducer
@@ -583,13 +590,13 @@ resourceControls:
         owner: bookDistributionProducer
         laneTimeoutMs: 120000
         releaseOn: [commit, error, cancellation, lease_loss, timeout]
-      - target: graph_vault/books/{bookId}/output/context.json
+      - target: graph_vault/books/{bookId}/graphrag/output/context.json
         lane: checkpointWriterLane
         durableKind: json
         owner: graphOutputProducer
         laneTimeoutMs: 120000
         releaseOn: [commit, error, cancellation, lease_loss, timeout]
-      - target: graph_vault/books/{bookId}/output/stats.json
+      - target: graph_vault/books/{bookId}/graphrag/output/stats.json
         lane: checkpointWriterLane
         durableKind: json
         owner: graphOutputProducer
@@ -617,7 +624,7 @@ resourceControls:
           earlier over-strict checksum repair attempt. Normal runner_start must
           not apply this writable repair outside the explicit migrate-only
           boundary.
-      - target: graph_vault/books/{bookId}/output/lancedb/*.lance/qmd_row_count.json
+      - target: graph_vault/books/{bookId}/graphrag/output/lancedb/*.lance/qmd_row_count.json
         lane: checkpointWriterLane
         durableKind: json
         owner: artifactValidation
@@ -1418,9 +1425,10 @@ stateModel:
           stdout/stderr 的采集、脱敏、日志写入与 fsync 必须有 maxBuffer、
           timeout 和 release-on-error 证据。
         multiGetScopeRule: >
-          qmd-multi-get-json 必须限定到当前书的 qmd://books/{fileName}
-          或等价单文件目标，并设置 --max-bytes；不得使用 books/*.md
-          扫描全库作为每本书完成门控。
+          qmd-multi-get-json 必须限定到当前书的
+          qmd://books/{bookId}/input/{fileName} 或等价单文件目标，
+          并设置 --max-bytes；不得使用 books/*.md 扫描全库作为每本书
+          完成门控。
     graph_extract:
       requiredEvidence:
         - GraphRAG workflow succeeded
@@ -1623,15 +1631,16 @@ failureRecovery:
         targets，不得只扫描固定目录一层。
       - preflight 结果必须写入 event 或 recovery summary，不能只写 stdout。
       - normal resume 的主路径不得为了构建 resume plan 全量读取
-        graph_vault/books/{bookId}/runs/*.yaml。它只能读取当前 checkpoint 明确
-        引用的 runId，或读取 catalog 中按 bookId、stage、status 精确过滤后的
-        有界当前候选。历史 run record 的全量 repair、checksum backfill、
-        checksum meta backfill、quarantine 或 corrupt rename 只能发生在
-        explicit repair 或 migrate-only 边界内。
+        graph_vault/books/{bookId}/graphrag/runs/*.yaml。它只能读取当前
+        checkpoint 明确引用的 runId，或读取 catalog 中按 bookId、stage、
+        status 精确过滤后的有界当前候选。历史 root runs/*.yaml 的全量
+        repair、checksum backfill、checksum meta backfill、quarantine 或
+        corrupt rename 只能发生在 explicit repair 或 migrate-only 边界内。
       - normal registerBookSource 的 legacy bookId migration 不得全量扫描或
-        重写 graph_vault/books/{bookId}/runs/*.yaml。run record remap 只能处理
-        old/new checkpoints 明确引用的 runId；历史 run record repair/backfill
-        只能进入 explicit repair 或 migrate-only 边界。
+        重写 graph_vault/books/{bookId}/graphrag/runs/*.yaml。run record
+        remap 只能处理 old/new checkpoints 明确引用的 runId；历史 root
+        runs/*.yaml 仅作为 legacy read compatibility，repair/backfill 只能
+        进入 explicit repair 或 migrate-only 边界。
       - normal resume 对 superseded running run 的 abandon 清理只能基于
         catalog 中 status=running 的有界条目写入 abandoned 记录；不得为清理
         历史 running 候选而先读取或 reconcile 旧 run record primary target。
@@ -1689,12 +1698,12 @@ failureRecovery:
     bookScopedDurableState:
       authority: production_state
       storage:
-        - graph_vault/books/{bookId}/job.yaml
-        - graph_vault/books/{bookId}/artifacts.yaml
-        - graph_vault/books/{bookId}/checkpoints.yaml
-        - graph_vault/books/{bookId}/runs/*.yaml
-        - graph_vault/books/{bookId}/output/*.json
-        - graph_vault/books/{bookId}/output/lancedb/*.lance/qmd_row_count.json
+        - graph_vault/books/{bookId}/state/job.yaml
+        - graph_vault/books/{bookId}/state/artifacts.yaml
+        - graph_vault/books/{bookId}/state/checkpoints.yaml
+        - graph_vault/books/{bookId}/graphrag/runs/*.yaml
+        - graph_vault/books/{bookId}/graphrag/output/*.json
+        - graph_vault/books/{bookId}/graphrag/output/lancedb/*.lance/qmd_row_count.json
       normalRunnerStartRecovery: read_only_blocking_diagnostic
       explicitRepairRecovery: bounded_repair_or_quarantine
       rules:
@@ -2283,9 +2292,11 @@ validationRequirements:
     - 每个 completed item 必须写入
       graph_vault/books/{bookId}/distribution_manifest.json，作为单书分发
       闭包（single-book distribution closure）的唯一枚举入口。
-    - distribution_manifest.json 必须至少包含 sources/{bookId}/source.epub、
-      books/{bookId}/job.yaml、artifacts.yaml、checkpoints.yaml、qmd/、
-      input/、output/、runs/{producerRunId}.yaml 及其 checksum sidecars。
+    - distribution_manifest.json 必须至少包含
+      books/{bookId}/source/source.epub、books/{bookId}/state/job.yaml、
+      state/artifacts.yaml、state/checkpoints.yaml、qmd/、input/、
+      graphrag/output/、graphrag/runs/{producerRunId}.yaml 及其 checksum
+      sidecars。
     - distribution_manifest.json 必须声明 canonicalNormalizedPath 指向
       books/{bookId}/input/{file}.md；若历史 qmd_build_manifest 仍引用根级
       input/{file}.md，则必须同时记录 legacyNormalizedPath 并复制 canonical
@@ -2478,7 +2489,7 @@ validationRequirements:
           primary quarantine authority for historical provider request targets
         - graph_vault/catalog/batch-runs/{runId}/book-leases/*.json maps both
           target write and parent directory fsync to checkpointWriterLane
-        - graph_vault/books/{bookId}/output/lancedb/*.lance/qmd_row_count.json
+        - graph_vault/books/{bookId}/graphrag/output/lancedb/*.lance/qmd_row_count.json
           parent directory fsync is covered by recursive book output scope
         - graph_vault/output/lancedb/*.lance/qmd_row_count.json parent directory
           fsync maps to checkpointWriterLane and artifactValidation

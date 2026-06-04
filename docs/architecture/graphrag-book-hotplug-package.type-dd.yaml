@@ -452,7 +452,9 @@ targetDirectoryLayout:
       description: qmd 建库产物、书级索引、qmd build manifest 与校验 sidecars。
     - path: graphrag/output/
       role: graphrag_artifacts
-      description: GraphRAG 查询所需 parquet、LanceDB、reports、stats 与上下文文件。
+      description: >
+        GraphRAG 查询所需 parquet、LanceDB、community_reports.parquet、
+        stats 与上下文文件。运行期 reports 目录不属于该闭包。
     - path: graphrag/runs/
       role: producer_evidence
       description: graph_extract、community_report、embed、query_ready 等 producer run 证据。
@@ -596,6 +598,8 @@ bookManifestSchema:
         - "**/.env"
         - "provider-requests/**"
         - "provider-responses/**"
+        - "graphrag/output/reports/**"
+        - "output/reports/**"
         - "**/*.corrupt-*"
         - "**/.durable-recovery.jsonl"
         - "**/logs/**"
@@ -1553,8 +1557,8 @@ artifactSchemaConversionMatrix:
         - embeddingModel
         - embeddingDimension
         - vectorCount
-    - name: reports_and_stats
-      pathPattern: graphrag/output/{reports,stats,context}.json
+    - name: community_reports_and_stats
+      pathPattern: graphrag/output/{community_reports.parquet,stats.json,context.json}
       action: preserve_if_bound_to_output_manifest_else_rebuild_reports_required
       requiredMetadata:
         - reportSchema
@@ -1853,6 +1857,14 @@ sensitiveMaterialTaxonomy:
     path pattern. Export, import, scan, migration, and query diagnostics must
     refuse unclassified sensitive classes.
   forbiddenClasses:
+    runtimeReports:
+      patterns:
+        - "graphrag/output/reports/**"
+        - "output/reports/**"
+      rule: >
+        Raw GraphRAG runtime reports and query logs must be migrated to the
+        runner log root before package publication. They are never declared in
+        BOOK_MANIFEST.files and fail closed if present in the package root.
     providerPayloads:
       patterns:
         - "**/provider-requests/**"

@@ -663,6 +663,18 @@ manifestSensitivitySchema:
       or secrets.
 
       '
+  packagePathPolicy:
+    forbiddenPatterns:
+    - pattern: graphrag/output/reports/**
+      reason: runtime_graph_report_log_not_distribution_artifact
+    - pattern: output/reports/**
+      reason: legacy_runtime_graph_report_log_not_distribution_artifact
+    rule: >
+      GraphRAG runtime report directories and query logs are not part of the
+      portable package closure. A publisher must migrate them to the runner
+      log root before generating BOOK_MANIFEST.json, and validation fails closed
+      with forbidden_sensitive_material if they remain in the package root or
+      are declared in BOOK_MANIFEST.files.
   manifestValidationTests:
     requiredCases:
     - manifest rejects unknown top-level section
@@ -674,6 +686,7 @@ manifestSensitivitySchema:
     - diagnostics exceptionStackTrace is forbidden
     - restricted packageRelativePath rejects absolute paths
     - forbidden provider payload fields fail closed
+    - forbidden runtime report paths fail closed
     - redacted fields contain digest or summary only
 importerPrePublishValidationContract:
   principle: 'Staged import must validate compatibility before publication. Mount-scan validation

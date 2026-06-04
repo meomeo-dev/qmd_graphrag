@@ -43,6 +43,8 @@ baseline，未新增、删除、重排、重命名维度，也未改变任何 `p
 1. 不得把全局 catalog 当作单本书包权威状态。
 2. 不得将 provider payload、密钥、日志 payload、`.env` 或私人路径写入
    可分发书包。
+   GraphRAG 运行期报告目录 `graphrag/output/reports/**` 与旧
+   `output/reports/**` 属于运行日志，不属于可复制包文件闭包。
 3. 实现必须覆盖 final contracts 中的 manifest schema、importer
    pre-publish validation、qmd availability、GraphRAG manifest-first resolver
    和 migration rerun/cleanup contracts。
@@ -66,7 +68,7 @@ GraphRAG/qmd 产物，但在 `--only-missing` 跳过前必须通过
 `queryReady` 状态时，必须显式使用 `--refresh-existing`，刷新后仍需
 通过 live package validation 才会保留 `PUBLISH_READY.json`。
 
-真实 vault 检查点：
+历史 backfill 检查点：
 
 - backfill run: `hotplug-backfill-20260603104306017`
 - discovered: `38`
@@ -75,6 +77,29 @@ GraphRAG/qmd 产物，但在 `--only-missing` 跳过前必须通过
 - catalog projection: `bookCount=38`, `identityCount=38`,
   `capabilityCount=38`
 
-`graph_vault/books` 下当前保留 38 个 hotplug package live root。
-每个 live root 均有 `BOOK_MANIFEST.json`、`PUBLISH_READY.json`、质量门
-和 runtime gate，并满足 copy distribution 与 query-ready 投影要求。
+该检查点覆盖当时已发现的 38 个 live root。当前全库状态以本节后续
+“全库 hotplug 质量收尾检查点”为准。
+
+旧样本根部 legacy 清理检查点：
+
+- rerun: `legacy-hotplug-two-books-20260603163015`
+- books:
+  - `book-ee74cde0b3c8-1167290c`
+  - `book-a86adccdc7a8-64158fde`
+- status: `completed`
+- package validation: `ok`
+- runtime query gate: `ok`
+- archived legacy root residue:
+  `graph_vault/archive/legacy-book-root-residue/20260603164442/`
+
+全库 hotplug 质量收尾检查点：
+
+- repair runs:
+  - `hotplug-quality-repair-20260603185512`
+  - `hotplug-quality-repair-a3-20260603185639`
+- graph_vault/books total: `41`
+- package validation failures: `0`
+- runtime query gate failures: `0`
+- quality gate summary: `passed|true|query_ready = 41`
+- root legacy residue count: `0`
+- runtime report residue count: `0`
