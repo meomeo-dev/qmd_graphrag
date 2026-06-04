@@ -15,10 +15,19 @@ export function qmdIndexLockedCommandNamesFor(requiredCommandCheckNames) {
   return new Set(qmdIndexWriterCommandCheckNames.filter((name) => required.has(name)));
 }
 
+export function qmdBooksUriForNormalizedPath(normalizedPath) {
+  const normalized = String(normalizedPath).replaceAll("\\", "/");
+  const match = /(?:^|\/)books\/([^/]+)\/input\/([^/]+)$/u.exec(normalized);
+  if (match != null) {
+    return `qmd://books/${match[1]}/input/${match[2]}`;
+  }
+  return `qmd://books/${basename(normalizedPath)}`;
+}
+
 export function qmdMultiGetJsonArgsForNormalizedPath(normalizedPath) {
   return [
     "multi-get",
-    `qmd://books/${basename(normalizedPath)}`,
+    qmdBooksUriForNormalizedPath(normalizedPath),
     "-l",
     "1",
     "--max-bytes",

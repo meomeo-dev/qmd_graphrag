@@ -7,6 +7,14 @@ import { existsSync } from "node:fs";
 import { parseArgs } from "node:util";
 
 import YAML from "yaml";
+import {
+  cleanHotplugStageOutputFiles,
+  hotplugStageClosureRebuildStage,
+  missingHotplugStageOutputFiles,
+} from "./hotplug-stage-closure.mjs";
+import {
+  convergeHotplugOrphanRunningStages,
+} from "./hotplug-orphan-stage-convergence.mjs";
 
 function required(value, name) {
   if (!value) {
@@ -322,8 +330,13 @@ async function queryReadyProducerArtifacts(runtimeApi, repo, sync) {
     expectedProviderFingerprint: sync.job.providerFingerprint,
     expectedCorpusContentHash,
   });
+  const lineageArtifactIds = [...new Set([
+    ...artifacts.map((artifact) => artifact.artifactId),
+    ...artifactIds,
+  ])];
   return {
     artifactIds,
+    lineageArtifactIds,
     producerRunIds: {
       graph_extract: graphExtract.runId,
       community_report: communityReport.runId,
@@ -393,7 +406,7 @@ function producerRunIdsFromManifest(manifest) {
 }
 
 function graphRagBookOutputLocator(bookId) {
-  return `books/${bookId}/output`;
+  return `books/${bookId}/graphrag/output`;
 }
 
 function outputProducerManifestMatchesSync(manifest, sync) {
@@ -542,6 +555,33 @@ async function graphQueryScopeFromSync(sync, loadGraphQueryCapabilities) {
   };
 }
 
+async function graphQueryScopeFromReadyBook(runtimeApi, repo, sync) {
+  const queryReady = (await repo.listStageCheckpoints(sync.job.bookId))
+    .find((item) =>
+      item.stage === "query_ready" &&
+      item.status === "succeeded" &&
+      Array.isArray(item.artifactIds) &&
+      item.artifactIds.length > 0
+    );
+  if (queryReady == null) {
+    return graphQueryScopeFromSync(sync, runtimeApi.loadGraphQueryCapabilities);
+  }
+  const producerArtifacts = await queryReadyProducerArtifacts(
+    runtimeApi,
+    repo,
+    sync,
+  );
+  await repo.publishQueryReadyGraphCapabilities(sync.job.bookId);
+  return {
+    selectedBookIds: [sync.job.bookId],
+    graphCapabilityIds: [`${sync.job.bookId}:graph_query`],
+    sourceIds: [`sha256:${sync.job.sourceHash}`],
+    documentIds: [sync.job.documentId],
+    contentHashes: [sync.job.normalizedContentHash ?? sync.job.sourceHash],
+    artifactIds: producerArtifacts.lineageArtifactIds,
+  };
+}
+
 async function loadSingleBookDefaults() {
   const catalogPath = resolve(stateRoot, "catalog", "books.yaml");
   const raw = await readFile(catalogPath, "utf8");
@@ -603,6 +643,9 @@ async function resolveWorkspaceInputs() {
 async function materializeScopedGraphInput(inputDir, normalizedPath) {
   await mkdir(inputDir, { recursive: true });
   const target = resolve(inputDir, basename(normalizedPath));
+  if (resolve(normalizedPath) === target) {
+    return target;
+  }
   await copyFile(normalizedPath, target);
   return target;
 }
@@ -621,7 +664,13 @@ async function syncCurrentBook(
     normalizedPath,
     settingsPath: resolve(stateRoot, "settings.yaml"),
     promptsDir: resolve(stateRoot, "prompts"),
-    outputDir: resolve(stateRoot, "output"),
+    outputDir: runtimeApi.graphRagBookOutputDir({
+      stateRootDir: stateRoot,
+      bookId: runtimeApi.buildBookIdFromSourceHash(
+        sourceIdentityPath,
+        await runtimeApi.hashFile(sourcePath),
+      ),
+    }),
     qmdIndexPath,
     projectConfig,
     metadata: {
@@ -928,7 +977,8 @@ async function runRepairLocalArtifactGateOnly(runtimeApi, repo) {
           requiresRealRebuild: false,
           repairReason: "graph_query_capability_projection_missing",
           repairedProjection: "graph_capability",
-          repairEvidenceLocator: `graph_vault/books/${bookId}/checkpoints.yaml#query_ready`,
+          repairEvidenceLocator:
+            `graph_vault/books/${bookId}/state/checkpoints.yaml#query_ready`,
           reusedProducerRunIds: producerRunIds,
           repairedCheckpointStages:
             repairedProjection.repairedCheckpointStages,
@@ -1041,14 +1091,15 @@ async function runRepairLocalArtifactGateOnly(runtimeApi, repo) {
   checkpoints = await repo.listStageCheckpoints(bookId);
   checkpoint = localArtifactGateProjectionFailureCheckpoint(checkpoints) ?? checkpoint;
   let repairReason = "graph_query_capability_projection_missing";
-  let repairEvidenceLocator = `graph_vault/books/${bookId}/output/qmd_output_manifest.json`;
+  let repairEvidenceLocator =
+    `graph_vault/books/${bookId}/graphrag/output/qmd_output_manifest.json`;
   let repairedProjection = "graph_capability";
   try {
     await graphQueryScopeFromSync(sync, runtimeApi.loadGraphQueryCapabilities);
     repairReason = "graph_identity_projection_missing";
     repairedProjection = "document_identity_map";
     repairEvidenceLocator =
-      `graph_vault/books/${bookId}/output/qmd_graph_text_unit_identity.json`;
+      `graph_vault/books/${bookId}/graphrag/output/qmd_graph_text_unit_identity.json`;
   } catch {
     if (sync.resumePlan.nextStage === "query_ready") {
       const queryReadyArtifacts = await queryReadyProducerArtifacts(
@@ -1091,7 +1142,7 @@ async function runRepairLocalArtifactGateOnly(runtimeApi, repo) {
       repairReason = "graph_query_capability_projection_missing";
       repairedProjection = "graph_capability";
       repairEvidenceLocator =
-        `graph_vault/books/${bookId}/checkpoints.yaml#query_ready`;
+        `graph_vault/books/${bookId}/state/checkpoints.yaml#query_ready`;
       await graphQueryScopeFromSync(sync, runtimeApi.loadGraphQueryCapabilities);
     } else {
       printJson({
@@ -1165,6 +1216,25 @@ async function run() {
     sourceIdentityPath,
     normalizedPath,
   );
+  const resyncCurrent = () => syncCurrentBook(
+    runtimeApi,
+    projectConfig,
+    sourcePath,
+    sourceIdentityPath,
+    normalizedPath,
+  );
+  let orphanStageConvergence = [];
+  const convergence = await convergeHotplugOrphanRunningStages({
+    runtimeApi,
+    repo,
+    sync,
+    scopedOutputDir,
+    resync: resyncCurrent,
+  });
+  if (convergence.converged.length > 0) {
+    orphanStageConvergence = convergence.converged;
+    ({ sync, scopedInputDir, scopedOutputDir } = await resyncCurrent());
+  }
 
   let repairedLocalArtifactGate = false;
   for (let repairPass = 0; repairPass < 3; repairPass += 1) {
@@ -1185,7 +1255,20 @@ async function run() {
     ));
   }
 
-  const nextStage = sync.resumePlan.nextStage;
+  const hotplugClosureRebuildStage = hotplugStageClosureRebuildStage(
+    scopedOutputDir,
+    sync.resumePlan,
+  );
+  const hotplugClosureRepair = hotplugClosureRebuildStage == null
+    ? undefined
+    : {
+        stage: hotplugClosureRebuildStage,
+        missingFiles: missingHotplugStageOutputFiles(
+          scopedOutputDir,
+          hotplugClosureRebuildStage,
+        ),
+      };
+  const nextStage = hotplugClosureRebuildStage ?? sync.resumePlan.nextStage;
   if (values["repair-local-artifact-gate-only"]) {
     printJson({
       status: repairedLocalArtifactGate
@@ -1198,6 +1281,8 @@ async function run() {
       queryResult: null,
       repairOnly: true,
       repairedLocalArtifactGate,
+      orphanStageConvergence,
+      hotplugClosureRepair,
       settingsProjectionRepair: settingsProjectionRepairForOutput(sync),
       reason: repairedLocalArtifactGate || nextStage == null
         ? undefined
@@ -1212,6 +1297,53 @@ async function run() {
       sync,
       scopedOutputDir,
     );
+    let readyProjectionRepair = null;
+    let queryCapabilityScope = null;
+    if (values.query) {
+      try {
+        queryCapabilityScope = await graphQueryScopeFromReadyBook(
+          runtimeApi,
+          repo,
+          sync,
+        );
+      } catch {
+        const producerRunIds = await restoreProducerManifestFromEvidence({
+          runtimeApi,
+          repo,
+          sync,
+          scopedOutputDir,
+        });
+        const repaired = await repairQueryReadyProjectionIfPossible({
+          runtimeApi,
+          repo,
+          projectConfig,
+          sourcePath,
+          sourceIdentityPath,
+          normalizedPath,
+          sync,
+          scopedOutputDir,
+          producerRunIds,
+        });
+        if (repaired != null) {
+          sync = repaired.sync;
+          scopedOutputDir = repaired.scopedOutputDir ?? scopedOutputDir;
+          readyProjectionRepair = {
+            repairReason: "graph_query_capability_projection_missing",
+            repairedProjection: "graph_capability",
+            repairedCheckpointStages: repaired.repairedCheckpointStages,
+          };
+          queryCapabilityScope = await graphQueryScopeFromReadyBook(
+            runtimeApi,
+            repo,
+            sync,
+          );
+        } else {
+          throw new Error(
+            `no graph_query capability is ready for book ${sync.job.bookId}`,
+          );
+        }
+      }
+    }
     let queryResult = null;
     if (values.query) {
       queryResult = await runtime.graphQuery({
@@ -1220,10 +1352,7 @@ async function run() {
         method: values["query-method"],
         query: values.query,
         responseType: "multiple paragraphs",
-        capabilityScope: await graphQueryScopeFromSync(
-          sync,
-          runtimeApi.loadGraphQueryCapabilities,
-        ),
+        capabilityScope: queryCapabilityScope,
         verbose: values.verbose,
         environment: {
           pythonBin,
@@ -1238,7 +1367,10 @@ async function run() {
       nextStage: null,
       completedStages: sync.resumePlan.completedStages,
       queryResult,
+      orphanStageConvergence,
+      readyProjectionRepair,
       settingsProjectionRepair: settingsProjectionRepairForOutput(sync),
+      hotplugClosureRepair,
     });
     return;
   }
@@ -1334,7 +1466,9 @@ async function run() {
       nextStage: refreshed.resumePlan.nextStage,
       completedStages: refreshed.resumePlan.completedStages,
       queryResult: null,
+      orphanStageConvergence,
       settingsProjectionRepair: settingsProjectionRepairForOutput(refreshed),
+      hotplugClosureRepair,
     });
     return;
   }
@@ -1347,7 +1481,9 @@ async function run() {
       nextStage,
       completedStages: sync.resumePlan.completedStages,
       queryResult: null,
+      orphanStageConvergence,
       settingsProjectionRepair: settingsProjectionRepairForOutput(sync),
+      hotplugClosureRepair,
       reason: `${nextStage} is a qmd_graphrag workspace materialization stage; rerun with valid --source-path and --normalized-path before GraphRAG workflows`,
     });
     return;
@@ -1367,11 +1503,13 @@ async function run() {
     sync.job.bookId,
     nextStage,
   );
-  const residualCleanup = await runtimeApi.cleanFailedGraphRagStageOutputs({
-    outputDir: scopedOutputDir,
-    stage: nextStage,
-    previousCheckpoint: previousStageCheckpoint,
-  });
+  const residualCleanup = hotplugClosureRebuildStage === nextStage
+    ? await cleanHotplugStageOutputFiles(scopedOutputDir, nextStage)
+    : await runtimeApi.cleanFailedGraphRagStageOutputs({
+        outputDir: scopedOutputDir,
+        stage: nextStage,
+        previousCheckpoint: previousStageCheckpoint,
+      });
 
   await repo.startStage({
     bookId: sync.job.bookId,
@@ -1381,6 +1519,7 @@ async function run() {
     metadata: {
       workflows,
       resumedFrom: nextStage,
+      ...(hotplugClosureRepair == null ? {} : { hotplugClosureRepair }),
       residualCleanup,
     },
   });
@@ -1469,6 +1608,7 @@ async function run() {
         workflows,
         resumedFrom: nextStage,
         graphWorkspace: "book_scoped",
+        ...(hotplugClosureRepair == null ? {} : { hotplugClosureRepair }),
         residualCleanup,
         stageReportHealth,
         durableOutputRefresh,
@@ -1491,9 +1631,10 @@ async function run() {
         method: values["query-method"],
         query: values.query,
         responseType: "multiple paragraphs",
-        capabilityScope: await graphQueryScopeFromSync(
+        capabilityScope: await graphQueryScopeFromReadyBook(
+          runtimeApi,
+          repo,
           refreshed,
-          runtimeApi.loadGraphQueryCapabilities,
         ),
         verbose: values.verbose,
         environment: {
@@ -1512,6 +1653,7 @@ async function run() {
       completedStages: refreshed.resumePlan.completedStages,
       outputs: indexResult.outputs,
       queryResult,
+      orphanStageConvergence,
       settingsProjectionRepair: settingsProjectionRepairForOutput(refreshed),
     });
   } catch (error) {

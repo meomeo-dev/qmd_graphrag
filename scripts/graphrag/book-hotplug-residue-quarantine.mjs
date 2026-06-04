@@ -19,6 +19,7 @@ const ForbiddenPackagePathPatterns = [
   /(?:^|\/)\.env$/u,
   /(?:^|\/)provider-requests(?:\/|$)/u,
   /(?:^|\/)provider-responses(?:\/|$)/u,
+  /^(?:graphrag\/output|output)\/reports(?:\/|$)/u,
   /(?:^|\/)logs(?:\/|$)/u,
   /(?:^|\/)debug(?:\/|$)/u,
   /(?:^|\/)trace(?:\/|$)/u,

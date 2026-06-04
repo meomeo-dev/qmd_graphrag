@@ -27,6 +27,7 @@ import {
   validateRuntimeCompatibility,
   writeRuntimeCompatibility,
 } from "./book-hotplug-runtime-compatibility.mjs";
+import { writeHotplugTextAtomic } from "./book-hotplug-durable-writer.mjs";
 
 const SchemaVersion = "1.0.0";
 const LayoutVersion = "book-hotplug-v1";
@@ -186,10 +187,35 @@ function rewriteLegacyArtifactStatePaths(stateArtifactsPath, bookId) {
     return { ...item, path: nextPath };
   });
   if (!changed) return false;
-  writeFileSync(
-    stateArtifactsPath,
-    YAML.stringify({ ...parsed, items }),
-    "utf8",
+  const text = YAML.stringify({ ...parsed, items });
+  writeHotplugTextAtomic(stateArtifactsPath, text, {
+    operationId: `rewrite-legacy-artifact-paths-${bookId}`,
+    runnerSessionId: "book-hotplug-package",
+    targetLocator: `books/${bookId}/state/artifacts.yaml`,
+  });
+  const checksum = sha256Text(text);
+  writeHotplugTextAtomic(`${stateArtifactsPath}.sha256`, `${checksum}\n`, {
+    operationId: `rewrite-legacy-artifact-paths-${bookId}-checksum`,
+    runnerSessionId: "book-hotplug-package",
+    targetLocator: `books/${bookId}/state/artifacts.yaml.sha256`,
+  });
+  writeHotplugTextAtomic(
+    `${stateArtifactsPath}.sha256.meta.json`,
+    `${JSON.stringify({
+      checksum,
+      targetLocator: `books/${bookId}/state/artifacts.yaml`,
+      checksumPath: `books/${bookId}/state/artifacts.yaml.sha256`,
+      checksumRecoveryDecision: "committed",
+      commitState: "committed",
+      operationId: `rewrite-legacy-artifact-paths-${bookId}`,
+      runnerSessionId: "book-hotplug-package",
+      committedAt: new Date().toISOString(),
+    }, null, 2)}\n`,
+    {
+      operationId: `rewrite-legacy-artifact-paths-${bookId}-meta`,
+      runnerSessionId: "book-hotplug-package",
+      targetLocator: `books/${bookId}/state/artifacts.yaml.sha256.meta.json`,
+    },
   );
   return true;
 }
@@ -198,6 +224,9 @@ function ensureLegacySourceClosure(input) {
   const sourceRoot = join(input.stateRoot, "sources", input.bookId);
   const packageSourceRoot = join(input.bookRoot, "source");
   const copied = [];
+  if (listFilesRecursive(packageSourceRoot, { bookRoot: input.bookRoot }).length > 0) {
+    return copied;
+  }
   for (const sourcePath of listFilesRecursive(sourceRoot, { bookRoot: sourceRoot })) {
     const relativePath = relative(sourceRoot, sourcePath);
     const targetPath = join(packageSourceRoot, relativePath);
@@ -655,6 +684,8 @@ export function buildBookHotplugManifest(input) {
         "**/.env",
         "provider-requests/**",
         "provider-responses/**",
+        "graphrag/output/reports/**",
+        "output/reports/**",
         "**/*.corrupt-*",
         "**/.durable-recovery.jsonl",
         "**/logs/**",

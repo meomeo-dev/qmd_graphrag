@@ -42,6 +42,10 @@ import {
 } from "./batch-failure-classifier.mjs";
 import { hydrateBatchCheckpoint } from "./batch-checkpoint-hydration.mjs";
 import {
+  filterItemsByBookId,
+  parseBookIdFilter,
+} from "./batch-item-filter.mjs";
+import {
   buildBookDistributionManifest,
 } from "./book-distribution-manifest.mjs";
 import {
@@ -108,10 +112,16 @@ import {
   selectProviderRuntimeEnv,
 } from "./provider-env-policy.mjs";
 import {
+  qmdBooksUriForNormalizedPath,
   qmdIndexLockedCommandNamesFor,
   qmdMultiGetJsonArgsForNormalizedPath,
   qmdValidationOutputMaxBufferBytes,
 } from "./qmd-validation-policy.mjs";
+import {
+  bookScopedRawReportResiduals,
+  migrateBookScopedRawReports,
+  migrateGraphVaultRawReports as migrateGraphVaultRawReportsForItems,
+} from "./raw-report-migration.mjs";
 import {
   isResumeTerminalReady,
   resumePassEventStatus,
@@ -174,6 +184,7 @@ const { values } = parseArgs({
     "max-provider-recovery-waits": { type: "string", default: "3" },
     "command-timeout-seconds": { type: "string", default: "21600" },
     "completed-manifest": { type: "string" },
+    "include-book-id": { type: "string" },
     "heartbeat-interval-seconds": { type: "string", default: "30" },
     "book-concurrency": { type: "string", default: "2" },
     "openai-provider-concurrency": { type: "string", default: "1" },
@@ -202,6 +213,7 @@ const query = String(values.query);
 const completedManifestPath = values["completed-manifest"]
   ? resolve(String(values["completed-manifest"]))
   : null;
+const includeBookIds = parseBookIdFilter(values["include-book-id"]);
 const maxCommandAttempts = Math.max(
   1,
   Number.parseInt(String(values["max-command-attempts"]), 10) || 3,
@@ -412,18 +424,25 @@ const durableTargetMappingTable = [
     preflightScopes: [{ path: "graph_vault/catalog" }],
   },
   {
+    pattern: /^graph_vault\/catalog\/qmd-projection\.yaml$/,
+    lane: "catalogWriterLane",
+    durableKind: "yaml",
+    targetMappingOwner: "qmdProjectionCatalog",
+    preflightScopes: [{ path: "graph_vault/catalog" }],
+  },
+  {
     pattern: /^graph_vault\/books\/[^/]+\/(?:job|artifacts|checkpoints)\.yaml$/,
     lane: "checkpointWriterLane",
     durableKind: "yaml",
     targetMappingOwner: "repository",
-    preflightScopes: [{ path: "graph_vault/books/{bookId}" }],
+    preflightScopes: [],
   },
   {
     pattern:
       /^graph_vault\/books\/[^/]+\/state\/(?:job|artifacts|checkpoints)\.yaml$/,
     lane: "checkpointWriterLane",
     durableKind: "yaml",
-    targetMappingOwner: "bookHotplugPackage",
+    targetMappingOwner: "repository",
     preflightScopes: [{ path: "graph_vault/books/{bookId}/state" }],
   },
   {
@@ -431,7 +450,14 @@ const durableTargetMappingTable = [
     lane: "checkpointWriterLane",
     durableKind: "yaml",
     targetMappingOwner: "repository",
-    preflightScopes: [{ path: "graph_vault/books/{bookId}/runs" }],
+    preflightScopes: [],
+  },
+  {
+    pattern: /^graph_vault\/books\/[^/]+\/graphrag\/runs\/[^/]+\.yaml$/,
+    lane: "checkpointWriterLane",
+    durableKind: "yaml",
+    targetMappingOwner: "repository",
+    preflightScopes: [{ path: "graph_vault/books/{bookId}/graphrag/runs" }],
   },
   {
     pattern: /^graph_vault\/settings\.yaml$/,
@@ -553,21 +579,21 @@ const durableTargetMappingTable = [
     lane: "checkpointWriterLane",
     durableKind: "json",
     targetMappingOwner: "bookDistribution",
-    preflightScopes: [{ path: "graph_vault/books/{bookId}" }],
+    preflightScopes: [],
   },
   {
     pattern: /^graph_vault\/books\/[^/]+\/BOOK_MANIFEST\.json$/,
     lane: "checkpointWriterLane",
     durableKind: "json",
     targetMappingOwner: "bookHotplugPackage",
-    preflightScopes: [{ path: "graph_vault/books/{bookId}" }],
+    preflightScopes: [],
   },
   {
     pattern: /^graph_vault\/books\/[^/]+\/PUBLISH_READY\.json$/,
     lane: "checkpointWriterLane",
     durableKind: "json",
     targetMappingOwner: "bookHotplugPackage",
-    preflightScopes: [{ path: "graph_vault/books/{bookId}" }],
+    preflightScopes: [],
   },
   {
     pattern: /^graph_vault\/books\/[^/]+\/state\/hotplug-quality-gate\.json$/,
@@ -5815,12 +5841,15 @@ function checksumMetaIsInvalid(path, checksum, meta) {
 function graphOutputArtifactForDurableTarget(path) {
   if (!migrateOnly) return null;
   const stateRelativeLocator = relative(stateRoot, path).split(sep).join("/");
-  const match = /^books\/([^/]+)\/output\/([^/]+\.json)$/u
+  const match = /^books\/([^/]+)\/(?:graphrag\/)?output\/([^/]+\.json)$/u
     .exec(stateRelativeLocator);
   if (match == null) return null;
   const [, bookId] = match;
   const artifactCatalog = readYamlSchemaIfExists(
-    join(stateRoot, "books", bookId, "artifacts.yaml"),
+    firstExistingPath([
+      join(stateRoot, "books", bookId, "state", "artifacts.yaml"),
+      join(stateRoot, "books", bookId, "artifacts.yaml"),
+    ]) ?? join(stateRoot, "books", bookId, "state", "artifacts.yaml"),
     BookArtifactManifestListSchema,
   );
   const artifacts = artifactCatalog?.items ?? [];
@@ -5847,12 +5876,15 @@ function graphOutputArtifactForDurableTarget(path) {
 function graphOutputArtifactsForDurableTarget(path) {
   if (!migrateOnly) return [];
   const stateRelativeLocator = relative(stateRoot, path).split(sep).join("/");
-  const match = /^books\/([^/]+)\/output\/([^/]+\.json)$/u
+  const match = /^books\/([^/]+)\/(?:graphrag\/)?output\/([^/]+\.json)$/u
     .exec(stateRelativeLocator);
   if (match == null) return [];
   const [, bookId] = match;
   const artifactCatalog = readYamlSchemaIfExists(
-    join(stateRoot, "books", bookId, "artifacts.yaml"),
+    firstExistingPath([
+      join(stateRoot, "books", bookId, "state", "artifacts.yaml"),
+      join(stateRoot, "books", bookId, "artifacts.yaml"),
+    ]) ?? join(stateRoot, "books", bookId, "state", "artifacts.yaml"),
     BookArtifactManifestListSchema,
   );
   const artifacts = artifactCatalog?.items ?? [];
@@ -5988,18 +6020,30 @@ function repairKnownMutableGraphOutputStatsQuarantines(items, scanStats) {
   let repaired = 0;
   const seen = new Set();
   for (const item of items) {
-    const statsPath = join(stateRoot, "books", item.bookId, "output", "stats.json");
-    if (seen.has(statsPath)) continue;
-    seen.add(statsPath);
-    if (existsSync(statsPath)) continue;
-    if (
-      Number.isInteger(migrateRepair.maxMutationCount) &&
-      scanStats.mutationCount >= migrateRepair.maxMutationCount
-    ) {
-      break;
+    for (const statsPath of [
+      join(
+        stateRoot,
+        "books",
+        item.bookId,
+        "graphrag",
+        "output",
+        "stats.json",
+      ),
+      join(stateRoot, "books", item.bookId, "output", "stats.json"),
+    ]) {
+      if (seen.has(statsPath)) continue;
+      seen.add(statsPath);
+      if (existsSync(statsPath)) continue;
+      if (!existsSync(dirname(statsPath))) continue;
+      if (
+        Number.isInteger(migrateRepair.maxMutationCount) &&
+        scanStats.mutationCount >= migrateRepair.maxMutationCount
+      ) {
+        return repaired;
+      }
+      noteStartupPrimaryTarget(scanStats, relative(root, statsPath));
+      if (repairMutableGraphOutputStatsFromQuarantine(statsPath)) repaired += 1;
     }
-    noteStartupPrimaryTarget(scanStats, relative(root, statsPath));
-    if (repairMutableGraphOutputStatsFromQuarantine(statsPath)) repaired += 1;
   }
   return repaired;
 }
@@ -8431,13 +8475,25 @@ function catalogKey(sourceHash, sourceIdentityPath) {
   return `${sourceHash}:${String(sourceIdentityPath).normalize("NFKC").toLowerCase()}`;
 }
 
-function normalizedPathFor(sourcePath, sourceHash, sourceIdentityPath, catalogByHash) {
+function normalizedPathFor(
+  sourcePath,
+  sourceHash,
+  sourceIdentityPath,
+  catalogByHash,
+  bookId,
+) {
   const catalogItem = catalogByHash.get(catalogKey(sourceHash, sourceIdentityPath));
   if (typeof catalogItem?.normalizedPath === "string") {
     return join(stateRoot, catalogItem.normalizedPath);
   }
   const stem = basename(sourcePath, ".epub");
-  return join(stateRoot, "input", `${slugify(stem)}-${sourceHash.slice(0, 10)}.md`);
+  return join(
+    stateRoot,
+    "books",
+    bookId,
+    "input",
+    `${slugify(stem)}-${sourceHash.slice(0, 10)}.md`,
+  );
 }
 
 function loadCompletedSeed() {
@@ -8464,7 +8520,7 @@ function defaultBookIdFor(sourceHash, sourceRelativePath = "") {
 
 function discoverItems() {
   const catalogByHash = loadCatalogBySourceHash();
-  return readdirSync(sourceDir)
+  const items = readdirSync(sourceDir)
     .filter((name) => name.toLowerCase().endsWith(".epub"))
     .sort((a, b) => a.localeCompare(b))
     .map((name) => {
@@ -8472,11 +8528,15 @@ function discoverItems() {
       const sourceHash = sha256File(sourcePath);
       const sourceRelativePath = relative(root, sourcePath);
       const catalogItem = catalogByHash.get(catalogKey(sourceHash, sourceRelativePath));
+      const bookId = typeof catalogItem?.bookId === "string"
+        ? catalogItem.bookId
+        : defaultBookIdFor(sourceHash, sourceRelativePath);
       const normalizedPath = normalizedPathFor(
         sourcePath,
         sourceHash,
         sourceRelativePath,
         catalogByHash,
+        bookId,
       );
       return {
         itemId: itemIdFor(sourceHash, sourceRelativePath),
@@ -8487,11 +8547,10 @@ function discoverItems() {
         normalizedRel: relative(root, normalizedPath),
         sourceRelativePath,
         sourceIdentityPath: sourceRelativePath,
-        bookId: typeof catalogItem?.bookId === "string"
-          ? catalogItem.bookId
-          : defaultBookIdFor(sourceHash, sourceRelativePath),
+        bookId,
       };
     });
+  return filterItemsByBookId(items, includeBookIds);
 }
 
 function discoverItemsWithDurableFailureEvent() {
@@ -9096,6 +9155,13 @@ function saveCheckpoint(item, checkpoint, options = {}) {
   });
 }
 
+function readCheckpointWithExistingSnapshot(item) {
+  const raw = BatchItemCheckpointInputSchema.parse(readJson(itemPath(item)));
+  return BatchItemCheckpointSchema.parse(
+    withExistingBuildStatusSnapshot(evidenceItemForCheckpoint(item, raw), raw),
+  );
+}
+
 function appendCommandCheckCheckpoint(item, checkpoint, check) {
   if (statusJson) return checkpoint;
   const nextChecks = [
@@ -9123,7 +9189,7 @@ function startCommandHeartbeatMonitor(item, command, commandStartedAt) {
     try {
       return withJsonFileLock(itemPath(item), () => {
         if (stopped || failure != null || !existsSync(itemPath(item))) return false;
-        const checkpoint = BatchItemCheckpointSchema.parse(readJson(itemPath(item)));
+        const checkpoint = readCheckpointWithExistingSnapshot(item);
         if (
           checkpoint.status !== "running" ||
           checkpoint.runnerSessionId !== runnerSessionId ||
@@ -9132,13 +9198,15 @@ function startCommandHeartbeatMonitor(item, command, commandStartedAt) {
         ) {
           return false;
         }
-        const updated = BatchItemCheckpointSchema.parse({
-          ...checkpoint,
-          runnerHeartbeatAt: now(),
-          currentCommand: command,
-          activeCommand: command,
-          currentCommandStartedAt: commandStartedAt,
-        });
+        const updated = BatchItemCheckpointSchema.parse(
+          withBuildStatusSnapshot(item, {
+            ...checkpoint,
+            runnerHeartbeatAt: now(),
+            currentCommand: command,
+            activeCommand: command,
+            currentCommandStartedAt: commandStartedAt,
+          }),
+        );
         writeJsonAtomicWithValue(itemPath(item), updated);
         return true;
       });
@@ -9170,7 +9238,7 @@ function clearCommandHeartbeat(item, command) {
   if (statusJson || !existsSync(itemPath(item))) return;
   try {
     withJsonFileLock(itemPath(item), () => {
-      const checkpoint = BatchItemCheckpointSchema.parse(readJson(itemPath(item)));
+      const checkpoint = readCheckpointWithExistingSnapshot(item);
       if (
         checkpoint.status !== "running" ||
         checkpoint.runnerSessionId !== runnerSessionId ||
@@ -9676,6 +9744,15 @@ function validateArtifactContent(artifact, bookId) {
 }
 
 function readGraphJob(item) {
+  const bookScopedJob = readYamlSchemaIfExists(
+    firstExistingPath([
+      join(stateRoot, "books", item.bookId, "state", "job.yaml"),
+      join(stateRoot, "books", item.bookId, "job.yaml"),
+    ]),
+    BookJobSchema,
+  );
+  if (bookScopedJob?.sourceHash === item.sourceHash) return bookScopedJob;
+
   const catalog = readYamlSchemaIfExists(
     join(stateRoot, "catalog", "books.yaml"),
     BookJobCatalogSchema,
@@ -10177,7 +10254,7 @@ function ensureBookSourceClosure(item) {
   if (sha256File(sourcePath) !== item.sourceHash) {
     throw new Error(`book source closure hash mismatch: ${item.sourceRelativePath}`);
   }
-  const targetPath = join(stateRoot, "sources", item.bookId, "source.epub");
+  const targetPath = join(stateRoot, "books", item.bookId, "source", "source.epub");
   mkdirSync(dirname(targetPath), { recursive: true });
   if (!existsSync(targetPath) || sha256File(targetPath) !== item.sourceHash) {
     copyFileSync(sourcePath, targetPath);
@@ -10194,6 +10271,66 @@ function ensureBookCreationHotplugQualityInputs(item) {
     runnerSessionId,
     allowTestFallback: process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS === "1",
   });
+}
+
+function revokeStaleHotplugPublishMarkerForRun(item) {
+  const bookRoot = join(stateRoot, "books", item.bookId);
+  const packagePaths = [
+    bookManifestPath(item),
+    `${bookManifestPath(item)}.sha256`,
+    `${bookManifestPath(item)}.sha256.meta.json`,
+    publishReadyPath(item),
+    `${publishReadyPath(item)}.sha256`,
+    `${publishReadyPath(item)}.sha256.meta.json`,
+  ];
+  if (!packagePaths.some((path) => existsSync(path))) return;
+  removeHotplugPublishMarkerForBookRoot(bookRoot);
+  for (const path of packagePaths.slice(0, 3)) {
+    rmSync(path, { force: true });
+  }
+  event({
+    itemId: item.itemId,
+    event: "stale_hotplug_package_surface_revoked",
+    status: "pending",
+    metadata: {
+      bookId: item.bookId,
+      manifestLocator: relative(root, bookManifestPath(item)),
+      publishReadyLocator: relative(root, publishReadyPath(item)),
+      recoveryDecision: "rebuild_package_before_publish",
+    },
+  });
+}
+
+function quarantineHotplugStateRepairResidues(item) {
+  const stateDir = join(stateRoot, "books", item.bookId, "state");
+  if (!existsSync(stateDir)) return;
+  for (const entry of readdirSync(stateDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !/\.corrupt-\d+$/u.test(entry.name)) continue;
+    const sourcePath = join(stateDir, entry.name);
+    const targetPath = join(
+      stateRoot,
+      "catalog",
+      "book-package-migrations",
+      "quarantine",
+      runId,
+      item.bookId,
+      "state",
+      entry.name,
+    );
+    mkdirSync(dirname(targetPath), { recursive: true });
+    renameSync(sourcePath, targetPath);
+    event({
+      itemId: item.itemId,
+      event: "hotplug_state_repair_residue_quarantined",
+      status: "pending",
+      metadata: {
+        bookId: item.bookId,
+        sourceLocator: relative(root, sourcePath),
+        quarantineLocator: relative(root, targetPath),
+        recoveryDecision: "exclude_repair_residue_from_package",
+      },
+    });
+  }
 }
 
 function writeBookDistributionManifest(item, options = {}) {
@@ -10232,6 +10369,13 @@ function writeBookDistributionManifest(item, options = {}) {
 
 function writeBookHotplugPackage(item, options = {}) {
   if (statusJson) return null;
+  migrateBookScopedRawReports({
+    stateRoot,
+    logRoot,
+    bookId: item.bookId,
+    redactLog,
+    emitEvent: event,
+  });
   const preGate = prePublishHotplugQualityGate({
     stateRoot,
     bookId: item.bookId,
@@ -11542,70 +11686,26 @@ function migrateEventLog(checkpoints) {
 }
 
 function migrateGraphVaultRawLogs() {
-  const targetDir = join(logRoot, "graph_vault_reports");
-  const migratedAt = Date.now();
-  const migrateEntry = (source, target, sourceLocator) => {
-    const stat = statSync(source);
-    if (stat.isDirectory()) {
-      for (const child of readdirSync(source)) {
-        migrateEntry(
-          join(source, child),
-          join(target, child),
-          `${sourceLocator}/${child}`,
-        );
-      }
-      rmSync(source, { recursive: true, force: true });
-      return;
-    }
-    if (!stat.isFile()) return;
-    mkdirSync(dirname(target), { recursive: true });
-    const rawLog = readFileSync(source, "utf8");
-    writeFileSync(target, redactLog(rawLog), "utf8");
-    unlinkSync(source);
-    event({
-      event: "raw_log_migrated",
-      metadata: {
-        sourceLocator,
-        targetLogRootName: basename(logRoot),
-        targetFileName: relative(targetDir, target),
-      },
-    });
-  };
-  const migrateDir = (reportsDir, sourceLocatorPrefix) => {
-    if (!existsSync(reportsDir)) return;
-    mkdirSync(targetDir, { recursive: true });
-    for (const name of readdirSync(reportsDir)) {
-      const source = join(reportsDir, name);
-      const target = join(targetDir, `${migratedAt}-${name}`);
-      migrateEntry(source, target, `${sourceLocatorPrefix}/${name}`);
-    }
-  };
-  migrateDir(join(stateRoot, "reports"), "graph_vault/reports");
-  for (const item of discoverItems()) {
-    migrateDir(
-      join(stateRoot, "books", item.bookId, "output", "reports"),
-      `graph_vault/books/${item.bookId}/output/reports`,
-    );
-  }
+  migrateGraphVaultRawReportsForItems({
+    stateRoot,
+    logRoot,
+    items: discoverItems(),
+    redactLog,
+    emitEvent: event,
+  });
 }
 
 function assertNoBookScopedRawReports() {
-  const residuals = [];
-  for (const item of discoverItems()) {
-    const reportsDir = join(stateRoot, "books", item.bookId, "output", "reports");
-    if (!existsSync(reportsDir)) continue;
-    const residualNames = readdirSync(reportsDir);
-    if (residualNames.length === 0) continue;
-    residuals.push({
-      bookId: item.bookId,
-      sourceName: item.sourceName,
-      residualCount: residualNames.length,
-    });
+  const residuals = bookScopedRawReportResiduals({
+    stateRoot,
+    items: discoverItems(),
+  });
+  for (const residual of residuals) {
     event({
       event: "raw_log_residual_detected",
       metadata: {
-        sourceLocator: `graph_vault/books/${item.bookId}/output/reports`,
-        logCount: residualNames.length,
+        sourceLocator: residual.sourceLocator,
+        logCount: residual.residualCount,
       },
     });
   }
@@ -12403,7 +12503,7 @@ async function repairLocalArtifactGate(item, checkpoint, options = {}) {
           reason,
         },
       });
-      return {
+      return withBuildStatusSnapshot(item, {
         ...checkpoint,
         status: "pending",
         bookId: repairResult.bookId ?? checkpoint.bookId,
@@ -12427,7 +12527,7 @@ async function repairLocalArtifactGate(item, checkpoint, options = {}) {
           localArtifactGateRepairBlockedReason: reason,
           waitingForProviderRecovery: false,
         },
-      };
+      });
     }
   }
   if (repairResult?.status === "blocked") {
@@ -12461,7 +12561,7 @@ async function repairLocalArtifactGate(item, checkpoint, options = {}) {
         ...(repairMetadata ?? {}),
       },
     });
-    return {
+    return withBuildStatusSnapshot(item, {
       ...checkpoint,
       status: "pending",
       bookId: repairResult.bookId ?? checkpoint.bookId,
@@ -12488,7 +12588,7 @@ async function repairLocalArtifactGate(item, checkpoint, options = {}) {
         localArtifactGateRepairRebuildStage: rebuildStage,
         waitingForProviderRecovery: false,
       },
-    };
+    });
   }
   event({
     itemId: item.itemId,
@@ -12506,7 +12606,7 @@ async function repairLocalArtifactGate(item, checkpoint, options = {}) {
       ...repairMetadata,
     },
   });
-  return {
+  return withBuildStatusSnapshot(item, {
     ...checkpoint,
     status: "pending",
     bookId: repairResult?.bookId ?? checkpoint.bookId,
@@ -12531,7 +12631,7 @@ async function repairLocalArtifactGate(item, checkpoint, options = {}) {
       localArtifactGateRepairCompleted: true,
       waitingForProviderRecovery: false,
     },
-  };
+  });
 }
 
 function parseBookIdFromResume(item) {
@@ -12623,7 +12723,7 @@ async function runCliChecks(item, checkpoint, options = {}) {
   await recordQmd("qmd-query-json", ["query", "--json", query], maxCommandAttempts);
   await recordQmd(
     "qmd-get-book",
-    ["get", `qmd://books/${basename(item.normalizedPath)}`, "-l", "5"],
+    ["get", qmdBooksUriForNormalizedPath(item.normalizedPath), "-l", "5"],
   );
   await recordQmd(
     "qmd-multi-get-json",
@@ -12658,6 +12758,8 @@ async function runCliChecks(item, checkpoint, options = {}) {
 }
 
 async function runItem(item, checkpoint, options = {}) {
+  revokeStaleHotplugPublishMarkerForRun(item);
+  quarantineHotplugStateRepairResidues(item);
   await normalizeEpubToMarkdown(item, { workerId: options.workerId });
   const resumeResult = await runGraphResume(item, checkpoint, {
     workerId: options.workerId,
