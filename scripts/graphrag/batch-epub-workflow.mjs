@@ -53,6 +53,10 @@ import {
   validateBookHotplugPackage,
 } from "./book-hotplug-package.mjs";
 import {
+  bookScopedQmdIndexPath,
+  ensureBookScopedQmdIndex,
+} from "./book-hotplug-qmd-index.mjs";
+import {
   ensureBookCreationGraphTextUnitIdentity,
 } from "./book-hotplug-creation-identity.mjs";
 import {
@@ -1187,6 +1191,9 @@ const QmdBuildManifestSchema = z.object({
   normalizedContentHash: z.string().min(1),
   qmdIndexLocator: BatchProjectRelativeLocatorSchema,
   qmdIndexHash: z.string().min(1),
+  qmdIndexBytes: z.number().int().nonnegative().optional(),
+  qmdIndexVectorRows: z.number().int().nonnegative().optional(),
+  qmdIndexVectorCompleteness: z.string().min(1).optional(),
   configLocator: BatchProjectRelativeLocatorSchema,
   configHash: z.string().min(1),
   commandCheckNames: z.array(z.string().min(1)).refine(
@@ -9283,6 +9290,14 @@ function qmdBuildManifestPath(item) {
   return join(stateRoot, qmdBuildManifestLocator(item));
 }
 
+function qmdBookIndexPath(item) {
+  return bookScopedQmdIndexPath(join(stateRoot, "books", item.bookId));
+}
+
+function bookPackageRootPath(item) {
+  return join(stateRoot, "books", item.bookId);
+}
+
 function bookDistributionManifestPath(item) {
   return join(stateRoot, "books", item.bookId, "distribution_manifest.json");
 }
@@ -10381,7 +10396,7 @@ function writeBookHotplugPackage(item, options = {}) {
   return parsedManifest;
 }
 
-function writeQmdBuildManifest(item, commandChecks) {
+async function writeQmdBuildManifest(item, commandChecks) {
   const commandCheckStatus = qmdCommandCheckEvidence({ commandChecks });
   if (commandCheckStatus.status !== "succeeded") {
     throw Object.assign(
@@ -10417,7 +10432,16 @@ function writeQmdBuildManifest(item, commandChecks) {
       },
     );
   }
-  if (!existsSync(qmdIndexPath)) {
+  const qmdIndex = await ensureBookScopedQmdIndex({
+    stateRoot,
+    bookId: item.bookId,
+    normalizedPath: item.normalizedPath,
+    sourceQmdIndexPath: qmdIndexPath,
+    rootPath: root,
+    now,
+    toolVersion: "batch-epub-workflow-v1",
+  });
+  if (!existsSync(qmdIndex.indexPath)) {
     throw Object.assign(new Error("qmd build index missing"), {
       commandCheck: {
         name: "qmd-build",
@@ -10445,11 +10469,14 @@ function writeQmdBuildManifest(item, commandChecks) {
     sourceName: item.sourceName,
     sourceRelativePath: item.sourceRelativePath,
     sourceHash: item.sourceHash,
-    normalizedPath: relative(root, item.normalizedPath),
-    canonicalBookNormalizedPath: relative(root, bookScopedNormalizedPath(item)),
+    normalizedPath: relative(bookPackageRootPath(item), bookScopedNormalizedPath(item)),
+    canonicalBookNormalizedPath: relative(bookPackageRootPath(item), bookScopedNormalizedPath(item)),
     normalizedContentHash: sha256File(item.normalizedPath),
-    qmdIndexLocator: relative(root, qmdIndexPath),
-    qmdIndexHash: sha256File(qmdIndexPath),
+    qmdIndexLocator: relative(bookPackageRootPath(item), qmdIndex.indexPath),
+    qmdIndexHash: qmdIndex.indexSha256,
+    qmdIndexBytes: qmdIndex.indexBytes,
+    qmdIndexVectorRows: qmdIndex.vectorRowsCopied,
+    qmdIndexVectorCompleteness: qmdIndex.vectorCompleteness,
     configLocator: relative(root, configPath),
     configHash: sha256File(configPath),
     commandCheckNames: qmdNativeCommandCheckNames,
@@ -10481,11 +10508,15 @@ function qmdBuildEvidence(item) {
   const normalizedPath = isAbsolute(item.normalizedPath)
     ? item.normalizedPath
     : join(root, item.normalizedPath);
-  const expectedNormalizedLocator = relative(root, normalizedPath);
-  const expectedQmdIndexLocator = relative(root, qmdIndexPath);
+  const expectedNormalizedLocator = relative(
+    bookPackageRootPath(item),
+    bookScopedNormalizedPath(item),
+  );
+  const expectedCanonicalBookNormalizedLocator = expectedNormalizedLocator;
+  const expectedQmdIndexLocator = relative(bookPackageRootPath(item), qmdBookIndexPath(item));
   const expectedConfigLocator = relative(root, configPath);
   const normalizedExists = existsSync(normalizedPath);
-  const indexExists = existsSync(qmdIndexPath);
+  const indexExists = existsSync(qmdBookIndexPath(item));
   const configExists = existsSync(configPath);
   const commandNames = Array.isArray(manifest.commandCheckNames)
     ? manifest.commandCheckNames
@@ -10525,6 +10556,9 @@ function qmdBuildEvidence(item) {
     manifest.normalizedPath === expectedNormalizedLocator
       ? null
       : "normalized_path_mismatch",
+    manifest.canonicalBookNormalizedPath === expectedCanonicalBookNormalizedLocator
+      ? null
+      : "canonical_book_normalized_path_mismatch",
     normalizedExists ? null : "normalized_file_missing",
     normalizedExists && manifest.normalizedContentHash === sha256File(normalizedPath)
       ? null
@@ -12598,7 +12632,7 @@ async function runCliChecks(item, checkpoint, options = {}) {
   await recordQmd("qmd-skill-show", ["skill", "show"]);
   await recordQmd("qmd-dspy-status-json", ["dspy", "status", "--json"]);
   await recordQmd("qmd-cleanup", ["cleanup"]);
-  writeQmdBuildManifest(item, checks);
+  await writeQmdBuildManifest(item, checks);
   activeCheckpoint = saveCheckpoint(item, {
     ...activeCheckpoint,
     commandChecks: checks,

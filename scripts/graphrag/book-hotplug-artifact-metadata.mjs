@@ -68,6 +68,15 @@ function producerStepForKind(kind) {
   return "graph_extract";
 }
 
+function producerRunIdForStep(graphManifest, producerStep) {
+  const stageRunId = graphManifest?.stageProducerRunIds?.[producerStep];
+  if (typeof stageRunId === "string" && stageRunId.length > 0) return stageRunId;
+  const outputRunId = graphManifest?.producerRunId;
+  return typeof outputRunId === "string" && outputRunId.length > 0
+    ? outputRunId
+    : undefined;
+}
+
 function upstreamHashesForRow(graphManifest, fileEntry, producerStep) {
   return [
     graphManifest?.contentHash,
@@ -101,7 +110,7 @@ function derivedRowsFromRequiredArtifacts(input, existingRows) {
       fileSha256: fileEntry.sha256,
       bytes: fileEntry.bytes,
       required: fileEntry.required !== false,
-      producerRunId: graphManifest?.producerRunId,
+      producerRunId: producerRunIdForStep(graphManifest, producerStep),
       producerStep,
       producerToolVersion: input.toolVersion ?? "unknown",
       producerSchemaVersion: SchemaVersion,

@@ -344,6 +344,13 @@ function sourceHashFromExistingBookManifest(manifest) {
   return { sourceHash: sourceHashes[0], diagnostics: [] };
 }
 
+function sourcePathFromExistingBookManifest(manifest) {
+  const sourcePath = manifest?.source?.sourcePath;
+  return typeof sourcePath === "string" && sourcePath.length > 0
+    ? sourcePath
+    : null;
+}
+
 function classifyBookDirectory(input) {
   const distributionPath = join(input.bookRoot, "distribution_manifest.json");
   const manifestPath = join(input.bookRoot, "BOOK_MANIFEST.json");
@@ -366,10 +373,12 @@ function classifyBookDirectory(input) {
   const diagnostics = [];
   const hasHotplugManifest = existsSync(manifestPath) && existsSync(publishReadyPath);
   const hasPartialManifest = existsSync(manifestPath) !== existsSync(publishReadyPath);
+  const hasAuthoritativeBookManifest = existingBookManifest != null;
   const hasStagingRoot = existsSync(stagingRoot);
   const distSidecar = validateSidecar(distributionPath);
-  if (distribution == null) diagnostics.push("migration_distribution_manifest_missing");
-  else if (!distSidecar.ok) {
+  if (distribution == null && !hasAuthoritativeBookManifest) {
+    diagnostics.push("migration_distribution_manifest_missing");
+  } else if (distribution != null && !distSidecar.ok) {
     diagnostics.push(
       ...distSidecar.diagnostics.map((code) =>
         code === "missing_sha256_sidecar" ||
@@ -398,6 +407,23 @@ function classifyBookDirectory(input) {
   const artifactChecksums = artifactChecksumEvidence(input);
   if (!artifactChecksums.ok) diagnostics.push("migration_artifact_checksum_missing");
 
+  const distributionSourceHash = typeof distribution?.sourceHash === "string"
+    ? distribution.sourceHash
+    : null;
+  const sourceHash = distributionSourceHash ??
+    existingManifestSourceHash.sourceHash ??
+    null;
+  if (
+    distributionSourceHash != null &&
+    existingManifestSourceHash.sourceHash != null &&
+    existingManifestSourceHash.sourceHash !== distributionSourceHash
+  ) {
+    diagnostics.push("migration_book_id_source_hash_conflict");
+  }
+  const sourceRelativePath = typeof distribution?.sourceRelativePath === "string"
+    ? distribution.sourceRelativePath
+    : sourcePathFromExistingBookManifest(existingBookManifest);
+
   const criticalDiagnostics = diagnostics.filter((code) =>
     [
       "migration_distribution_manifest_missing",
@@ -409,20 +435,7 @@ function classifyBookDirectory(input) {
       "migration_manifest_identity_mismatch",
     ].includes(code)
   );
-  const sourceHash = typeof distribution?.sourceHash === "string"
-    ? distribution.sourceHash
-    : null;
-  if (
-    sourceHash != null &&
-    existingManifestSourceHash.sourceHash != null &&
-    existingManifestSourceHash.sourceHash !== sourceHash
-  ) {
-    diagnostics.push("migration_book_id_source_hash_conflict");
-  }
-  const sourceRelativePath = typeof distribution?.sourceRelativePath === "string"
-    ? distribution.sourceRelativePath
-    : null;
-  const eligible = distribution != null &&
+  const eligible =
     sourceHash != null &&
     sourceRelativePath != null &&
     criticalDiagnostics.length === 0 &&

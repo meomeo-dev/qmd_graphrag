@@ -35,6 +35,9 @@ type HotplugManifest = {
   };
   qmd?: {
     qmdIndexSchema?: unknown;
+    indexPolicy?: unknown;
+    qmdReadyState?: unknown;
+    requiredArtifacts?: unknown;
   };
   graphrag?: {
     queryReady?: unknown;
@@ -85,6 +88,14 @@ const ForbiddenPackagePathPatterns = [
   /\.lock$/u,
   /\.corrupt-[^/]+$/u,
   /(?:^|\/)\.DS_Store$/u,
+];
+
+const RequiredQmdArtifacts = [
+  "qmd/qmd_build_manifest.json",
+  "qmd/index/qmd_book_index.sqlite",
+  "qmd/index/qmd_book_index.sqlite.sha256",
+  "qmd/index/qmd_book_index.sqlite.sha256.meta.json",
+  "qmd/index/qmd_book_index.meta.json",
 ];
 
 function toPosixPath(path: string): string {
@@ -396,6 +407,22 @@ function validateManifestClosure(input: {
     }
     if (entry.sha256 !== sha256Path(absolutePath)) {
       input.diagnostics.push(`file_sha256_mismatch:${path}`);
+    }
+  }
+
+  if (input.manifest.qmd?.indexPolicy !== "included_index") {
+    input.diagnostics.push("qmd_index_policy_not_included");
+  }
+  if (input.manifest.qmd?.qmdReadyState !== "included_index_valid") {
+    input.diagnostics.push("qmd_ready_state_not_included_index_valid");
+  }
+  const requiredQmdArtifacts = Array.isArray(input.manifest.qmd?.requiredArtifacts)
+    ? input.manifest.qmd.requiredArtifacts
+    : RequiredQmdArtifacts;
+  for (const artifact of requiredQmdArtifacts) {
+    const path = normalizeRelativePath(artifact);
+    if (path == null || !filesByPath.has(path) || !existsSync(join(input.bookRoot, path))) {
+      input.diagnostics.push(`missing_required_file:${String(artifact)}`);
     }
   }
 

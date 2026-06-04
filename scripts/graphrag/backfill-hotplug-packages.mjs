@@ -13,6 +13,9 @@ import {
   validateBookHotplugPackage,
 } from "./book-hotplug-package.mjs";
 import {
+  ensureBookScopedQmdIndex,
+} from "./book-hotplug-qmd-index.mjs";
+import {
   validateHotplugPackagePublishCandidate,
 } from "./book-hotplug-publish-gate.mjs";
 import {
@@ -21,6 +24,11 @@ import {
 import {
   quarantineForbiddenHotplugPackageResidues,
 } from "./book-hotplug-residue-quarantine.mjs";
+import {
+  hotplugNormalizedPathForBook,
+  hotplugSourceHashForBook,
+  hotplugSourceRelativePathForBook,
+} from "./book-hotplug-package-source.mjs";
 import {
   removeHotplugPublishMarkerForBookRoot,
 } from "./book-hotplug-publish-marker.mjs";
@@ -88,30 +96,6 @@ function summarizeCatalogRebuild(result) {
   };
 }
 
-function sourceHashForBook(bookRoot) {
-  const manifest = JSON.parse(
-    readFileSync(join(bookRoot, "distribution_manifest.json"), "utf8"),
-  );
-  const sourceHash = manifest?.sourceHash;
-  if (typeof sourceHash !== "string" || sourceHash.length === 0) {
-    throw new Error(`legacy distribution_manifest missing sourceHash: ${bookRoot}`);
-  }
-  return sourceHash;
-}
-
-function sourceRelativePathForBook(bookRoot) {
-  const manifest = JSON.parse(
-    readFileSync(join(bookRoot, "distribution_manifest.json"), "utf8"),
-  );
-  const sourceRelativePath = manifest?.sourceRelativePath;
-  if (typeof sourceRelativePath !== "string" || sourceRelativePath.length === 0) {
-    throw new Error(
-      `legacy distribution_manifest missing sourceRelativePath: ${bookRoot}`,
-    );
-  }
-  return sourceRelativePath;
-}
-
 function existingPackageGeneration(bookRoot) {
   const manifestPath = join(bookRoot, "BOOK_MANIFEST.json");
   if (!existsSync(manifestPath)) return undefined;
@@ -166,9 +150,17 @@ function hasHardIdentityConflict(records) {
   return records.some((record) => isHardIdentityConflict(record));
 }
 
-function backfillBookPackage(input) {
+async function backfillBookPackage(input) {
   const manifestPath = join(input.bookRoot, "BOOK_MANIFEST.json");
   const publishReadyPath = join(input.bookRoot, "PUBLISH_READY.json");
+  await ensureBookScopedQmdIndex({
+    stateRoot: input.stateRoot,
+    bookId: input.bookId,
+    normalizedPath: hotplugNormalizedPathForBook(input.bookRoot, input.bookId),
+    rootPath: root,
+    now,
+    toolVersion: "book-hotplug-backfill-v1",
+  });
   const { manifest, publishReady } = buildBookHotplugPackage({
     stateRoot: input.stateRoot,
     bookId: input.bookId,
@@ -480,12 +472,12 @@ async function main() {
       const reusableExistingValidation = !refreshExisting && existingValidation?.ok
         ? existingValidation
         : null;
-      const validation = reusableExistingValidation ?? backfillBookPackage({
+      const validation = reusableExistingValidation ?? await backfillBookPackage({
         stateRoot,
         bookId: book.bookId,
         bookRoot: book.path,
-        sourceHash: sourceHashForBook(book.path),
-        sourceRelativePath: sourceRelativePathForBook(book.path),
+        sourceHash: hotplugSourceHashForBook(book.path),
+        sourceRelativePath: hotplugSourceRelativePathForBook(book.path),
         forceGraphRagNotQueryReady:
           graphRagNotQueryReadyFromGate(book.classification),
       });

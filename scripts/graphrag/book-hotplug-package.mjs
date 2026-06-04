@@ -50,6 +50,14 @@ const RequiredGraphRagArtifacts = [
   "graphrag/output/lancedb",
 ];
 
+const RequiredQmdArtifacts = [
+  "qmd/qmd_build_manifest.json",
+  "qmd/index/qmd_book_index.sqlite",
+  "qmd/index/qmd_book_index.sqlite.sha256",
+  "qmd/index/qmd_book_index.sqlite.sha256.meta.json",
+  "qmd/index/qmd_book_index.meta.json",
+];
+
 function toPosixPath(path) {
   return String(path).split(sep).join("/");
 }
@@ -489,6 +497,10 @@ export function buildBookHotplugManifest(input) {
   });
   files = buildFileEntries({ ...input, stateRoot, bookRoot }, producerRunIds);
   const qmdReadyState = qmdState({ ...input, bookRoot });
+  const qmdRequiredArtifacts = [
+    ...RequiredQmdArtifacts,
+    normalizedPath,
+  ].filter(Boolean);
   const graphRagReadyState = graphRagState({ ...input, bookRoot });
 
   const manifest = {
@@ -512,9 +524,7 @@ export function buildBookHotplugManifest(input) {
       packageGeneration,
       mountMode: "readonly",
       catalogProjectionPolicy: "mount_scan_rebuildable_projection",
-      qmdIndexPolicy: qmdReadyState === "included_index_valid"
-        ? "use_included_index"
-        : "reindex_on_mount",
+      qmdIndexPolicy: "use_included_index",
     },
     metadata: {
       title,
@@ -538,10 +548,10 @@ export function buildBookHotplugManifest(input) {
     },
     qmd: {
       buildManifestPath: "qmd/qmd_build_manifest.json",
-      indexPolicy: qmdReadyState === "included_index_valid"
-        ? "included_index"
-        : "reindex_on_mount",
-      requiredArtifacts: ["qmd/qmd_build_manifest.json", normalizedPath].filter(Boolean),
+      indexPath: "qmd/index/qmd_book_index.sqlite",
+      indexMetadataPath: "qmd/index/qmd_book_index.meta.json",
+      indexPolicy: "included_index",
+      requiredArtifacts: qmdRequiredArtifacts,
       qmdIndexSchema: "qmd-book-index-v1",
       freshnessDigest: sha256Text(JSON.stringify({
         bookId: input.bookId,
@@ -713,6 +723,7 @@ export function validateBookHotplugPackage(input) {
 
   const fileEntries = Array.isArray(manifest.files) ? manifest.files : [];
   if (fileEntries.length === 0) diagnostics.push("manifest_files_empty");
+  const filesByPath = new Map(fileEntries.map((entry) => [entry.path, entry]));
 
   const sourcePath = normalizeRelativePath(manifest.source?.sourcePath);
   if (sourcePath == null) {
@@ -780,6 +791,22 @@ export function validateBookHotplugPackage(input) {
       if (entry.sha256 !== sha256Directory(absolutePath)) {
         diagnostics.push(`directory_sha256_mismatch:${path}`);
       }
+    }
+  }
+
+  if (manifest.mount?.qmdIndexPolicy !== "use_included_index") {
+    diagnostics.push("qmd_index_policy_not_included");
+  }
+  if (manifest.qmd?.indexPolicy !== "included_index") {
+    diagnostics.push("qmd_index_policy_not_included");
+  }
+  if (manifest.qmd?.qmdReadyState !== "included_index_valid") {
+    diagnostics.push("qmd_ready_state_not_included_index_valid");
+  }
+  for (const artifact of manifest.qmd?.requiredArtifacts ?? RequiredQmdArtifacts) {
+    const path = normalizeRelativePath(artifact);
+    if (path == null || !filesByPath.has(path) || !existsSync(join(bookRoot, path))) {
+      diagnostics.push(`missing_required_file:${artifact}`);
     }
   }
 

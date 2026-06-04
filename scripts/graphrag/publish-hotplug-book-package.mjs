@@ -10,6 +10,9 @@ import {
   validateBookHotplugPackage,
 } from "./book-hotplug-package.mjs";
 import {
+  ensureBookScopedQmdIndex,
+} from "./book-hotplug-qmd-index.mjs";
+import {
   validateHotplugPackagePublishCandidate,
 } from "./book-hotplug-publish-gate.mjs";
 import {
@@ -18,6 +21,11 @@ import {
 import {
   removeHotplugPublishMarkerForBookRoot,
 } from "./book-hotplug-publish-marker.mjs";
+import {
+  hotplugNormalizedPathForBook,
+  hotplugSourceHashForBook,
+  hotplugSourceRelativePathForBook,
+} from "./book-hotplug-package-source.mjs";
 import {
   buildPostPublishQualityGate,
   buildPrePublishQualityGateFailure,
@@ -54,24 +62,6 @@ function existingPackageGeneration(bookRoot) {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-function sourceRelativePathForBook(bookRoot) {
-  const qmdManifestPath = join(bookRoot, "qmd", "qmd_build_manifest.json");
-  if (existsSync(qmdManifestPath)) {
-    const value = readJson(qmdManifestPath)?.sourceRelativePath;
-    if (typeof value === "string" && value.length > 0) return value;
-  }
-  throw new Error(`source relative path not found for ${bookRoot}`);
-}
-
-function sourceHashForBook(bookRoot) {
-  const qmdManifestPath = join(bookRoot, "qmd", "qmd_build_manifest.json");
-  if (existsSync(qmdManifestPath)) {
-    const value = readJson(qmdManifestPath)?.sourceHash;
-    if (typeof value === "string" && value.length > 0) return value;
-  }
-  throw new Error(`source hash not found for ${bookRoot}`);
-}
-
 function writeJsonWithSidecars(path, value) {
   return writeHotplugJsonWithSidecars(path, value, {
     rootPath: root,
@@ -90,7 +80,7 @@ function withoutUndefined(value) {
   );
 }
 
-function publishBookPackage(input) {
+async function publishBookPackage(input) {
   const bookRoot = join(input.stateRoot, "books", input.bookId);
   const gate = prePublishHotplugQualityGate({
     stateRoot: input.stateRoot,
@@ -108,11 +98,20 @@ function publishBookPackage(input) {
     throw new Error(qualityGateFailureMessage(input.bookId, gate.diagnostics));
   }
 
+  await ensureBookScopedQmdIndex({
+    stateRoot: input.stateRoot,
+    bookId: input.bookId,
+    normalizedPath: hotplugNormalizedPathForBook(bookRoot, input.bookId),
+    rootPath: root,
+    now,
+    toolVersion: "publish-hotplug-book-package-v1",
+  });
+
   const { manifest, publishReady } = buildBookHotplugPackage({
     stateRoot: input.stateRoot,
     bookId: input.bookId,
-    sourceHash: sourceHashForBook(bookRoot),
-    sourceRelativePath: sourceRelativePathForBook(bookRoot),
+    sourceHash: hotplugSourceHashForBook(bookRoot),
+    sourceRelativePath: hotplugSourceRelativePathForBook(bookRoot),
     forceGraphRagNotQueryReady: graphRagNotQueryReadyFromGate(gate),
     packageGeneration: existingPackageGeneration(bookRoot),
     now,
@@ -199,7 +198,7 @@ const { values } = parseArgs({
   },
 });
 
-const result = publishBookPackage({
+const result = await publishBookPackage({
   stateRoot: resolve(String(values["state-root"])),
   bookId: required(values["book-id"], "book-id"),
 });
