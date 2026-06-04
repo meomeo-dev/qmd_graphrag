@@ -761,9 +761,13 @@ describe("syncGraphRagBookWorkspace", () => {
         (item) => item.kind === "source_epub",
       );
 
-      expect(state.job.sourcePath).toMatch(/^sources\/.+\/source\.epub$/);
+      expect(state.job.sourcePath).toBe(
+        `books/${state.job.bookId}/source/source.epub`,
+      );
       expect(state.job.sourcePath).not.toContain(root);
-      expect(state.job.metadata?.normalizedPath).toBe("input/book.md");
+      expect(state.job.metadata?.normalizedPath).toBe(
+        `books/${state.job.bookId}/input/book.md`,
+      );
       expect(sourceArtifacts).toHaveLength(1);
       expect(sourceArtifacts[0]?.path).toBe(state.job.sourcePath);
       expect(checkpoints.map((item) => item.stage)).toEqual([
@@ -2465,13 +2469,8 @@ describe("syncGraphRagBookWorkspace", () => {
         join(graphVault, "books", stableBookId),
         join(graphVault, "books", legacyBookId),
       );
-      await mkdir(join(graphVault, "sources"), { recursive: true });
-      await rename(
-        join(graphVault, "sources", stableBookId),
-        join(graphVault, "sources", legacyBookId),
-      );
       for (const filePath of [
-        join(graphVault, "books", legacyBookId, "job.yaml"),
+        join(graphVault, "books", legacyBookId, "state", "job.yaml"),
         join(graphVault, "catalog", "books.yaml"),
         join(graphVault, "catalog", "sources.yaml"),
         join(graphVault, "catalog", "document-identity-map.yaml"),
@@ -2479,7 +2478,7 @@ describe("syncGraphRagBookWorkspace", () => {
         const raw = (await readFile(filePath, "utf8"))
           .split(stableBookId)
           .join(legacyBookId);
-        await writeFile(filePath, raw, "utf8");
+        await writeYamlFileDurable(filePath, YAML.parse(raw));
       }
 
       const state = await syncGraphRagBookWorkspace({
@@ -2507,9 +2506,11 @@ describe("syncGraphRagBookWorkspace", () => {
       )) as { items: Array<{ canonicalBookId?: string; metadata?: { bookId?: string } }> };
 
       expect(state.job.bookId).toBe(stableBookId);
-      expect(state.job.sourcePath).toBe(`sources/${stableBookId}/source.epub`);
+      expect(state.job.sourcePath).toBe(`books/${stableBookId}/source/source.epub`);
       expect(books.items.map((item) => item.bookId)).toEqual([stableBookId]);
-      expect(books.items[0]?.sourcePath).toBe(`sources/${stableBookId}/source.epub`);
+      expect(books.items[0]?.sourcePath).toBe(
+        `books/${stableBookId}/source/source.epub`,
+      );
       expect(sources.items[0]?.metadata?.bookId).toBe(stableBookId);
       expect(identities.items[0]?.canonicalBookId).toBe(stableBookId);
       expect(identities.items[0]?.metadata?.bookId).toBe(stableBookId);
@@ -2567,19 +2568,13 @@ describe("syncGraphRagBookWorkspace", () => {
           graphTextUnitCount: 1,
         },
       });
-      await writeFile(
+      await writeYamlFileDurable(
         catalogPath,
-        YAML.stringify({ schemaVersion: SchemaVersion, items: catalog.items }),
-        "utf8",
+        { schemaVersion: SchemaVersion, items: catalog.items },
       );
       await rename(
         join(graphVault, "books", stableBookId),
         join(graphVault, "books", legacyBookId),
-      );
-      await mkdir(join(graphVault, "sources"), { recursive: true });
-      await rename(
-        join(graphVault, "sources", stableBookId),
-        join(graphVault, "sources", legacyBookId),
       );
 
       await syncGraphRagBookWorkspace({

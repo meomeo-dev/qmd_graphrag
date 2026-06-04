@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import {
+  qmdBooksUriForNormalizedPath,
   qmdIndexLockedCommandNamesFor,
   qmdIndexWriterCommandCheckNames,
   qmdMultiGetJsonArgsForNormalizedPath,
@@ -24,12 +25,12 @@ describe("GraphRAG runner qmd validation policy", () => {
 
   test("multi-get validation is scoped to current book and output bounded", () => {
     const args = qmdMultiGetJsonArgsForNormalizedPath(
-      "/tmp/qmd/graph_vault/input/Clean Architecture.md",
+      "/tmp/qmd/graph_vault/books/book-abc/input/Clean Architecture.md",
     );
 
     expect(args).toEqual([
       "multi-get",
-      "qmd://books/Clean Architecture.md",
+      "qmd://books/book-abc/input/Clean Architecture.md",
       "-l",
       "1",
       "--max-bytes",
@@ -38,5 +39,11 @@ describe("GraphRAG runner qmd validation policy", () => {
     ]);
     expect(args).not.toContain("books/*.md");
     expect(qmdValidationOutputMaxBufferBytes).toBeLessThanOrEqual(1024 * 1024);
+  });
+
+  test("book URI falls back for legacy normalized input paths", () => {
+    expect(qmdBooksUriForNormalizedPath(
+      "/tmp/qmd/graph_vault/input/Clean Architecture.md",
+    )).toBe("qmd://books/Clean Architecture.md");
   });
 });

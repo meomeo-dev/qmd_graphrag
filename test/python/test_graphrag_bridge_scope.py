@@ -754,7 +754,7 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                 patch.object(
                     bridge_module,
                     "_register_qmd_completion_providers",
-                    wraps=bridge_module._register_qmd_completion_providers,
+                    return_value=None,
                 ) as register_providers,
             ):
                 response = asyncio.run(
@@ -762,7 +762,9 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                         {
                             "rootDir": str(root),
                             "inputDir": str(root / "books" / "book-1" / "input"),
-                            "dataDir": str(root / "books" / "book-1" / "output"),
+                            "dataDir": str(
+                                root / "books" / "book-1" / "graphrag" / "output"
+                            ),
                             "reportDir": str(root / "logs" / "book-1" / "graph_extract"),
                             "method": "standard",
                             "skipValidation": True,
@@ -785,7 +787,9 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                 },
                 "output_storage": {
                     "type": "file",
-                    "base_dir": str((root / "books" / "book-1" / "output").resolve()),
+                    "base_dir": str(
+                        (root / "books" / "book-1" / "graphrag" / "output").resolve()
+                    ),
                 },
                 "reporting": {
                     "type": "file",
@@ -796,14 +800,28 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                     "storage": {
                         "type": "file",
                         "base_dir": str(
-                            (root / "books" / "book-1" / "output" / "cache").resolve()
+                            (
+                                root
+                                / "books"
+                                / "book-1"
+                                / "graphrag"
+                                / "output"
+                                / "cache"
+                            ).resolve()
                         ),
                     },
                 },
                 "vector_store": {
                     "type": "lancedb",
                     "db_uri": str(
-                        (root / "books" / "book-1" / "output" / "lancedb").resolve()
+                        (
+                            root
+                            / "books"
+                            / "book-1"
+                            / "graphrag"
+                            / "output"
+                            / "lancedb"
+                        ).resolve()
                     ),
                 },
                 "workflows": ["load_input_documents"],

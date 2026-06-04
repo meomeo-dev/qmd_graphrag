@@ -338,7 +338,7 @@ export async function writeProviderAuthReopenGraphFixture(input: {
     schemaVersion: SchemaVersion,
     bookId: input.bookId,
     documentId,
-    sourcePath: `sources/${input.bookId}/source.epub`,
+    sourcePath: `books/${input.bookId}/source/source.epub`,
     sourceHash: input.sourceHash,
     normalizedContentHash: contentHash,
     normalizedPath: `books/${input.bookId}/input/book.md`,
@@ -362,6 +362,10 @@ export async function writeProviderAuthReopenGraphFixture(input: {
         nextBook,
       ],
     },
+  );
+  await writeDurableYamlFixture(
+    join(input.stateRoot, "books", input.bookId, "state", "job.yaml"),
+    nextBook,
   );
   await writeDurableYamlFixture(
     join(input.stateRoot, "books", input.bookId, "state", "artifacts.yaml"),
@@ -755,7 +759,7 @@ export async function writeCompletedGraphBatchFixture(input: {
   const itemId = `item-${sourceHash.slice(0, 12)}-${
     stableTextHash(sourceRelativePath).slice(0, 8)
   }`;
-  const outputRel = join("books", bookId, "output");
+  const outputRel = join("books", bookId, "graphrag", "output");
   const outputDir = join(input.stateRoot, outputRel);
   const documentId = `doc-${sourceHash.slice(0, 12)}`;
   const contentHash = sourceHash;
@@ -827,7 +831,7 @@ export async function writeCompletedGraphBatchFixture(input: {
       contentHash,
       stageFingerprints,
       providerFingerprint,
-      outputDir: `books/${bookId}/output`,
+      outputDir: outputRel,
       producerRunId: "run-query-ready",
       stageProducerRunIds: {
         graph_extract: "run-graph-extract",
@@ -846,7 +850,7 @@ export async function writeCompletedGraphBatchFixture(input: {
         schemaVersion: SchemaVersion,
         bookId,
         documentId,
-        sourcePath: `sources/${bookId}/source.epub`,
+        sourcePath: `books/${bookId}/source/source.epub`,
         sourceHash,
         normalizedContentHash: contentHash,
         normalizedPath: `books/${bookId}/input/book.md`,
@@ -861,12 +865,33 @@ export async function writeCompletedGraphBatchFixture(input: {
       }],
     },
   );
+  const bookJob = {
+    schemaVersion: SchemaVersion,
+    bookId,
+    documentId,
+    sourcePath: `books/${bookId}/source/source.epub`,
+    sourceHash,
+    normalizedContentHash: contentHash,
+    normalizedPath: `books/${bookId}/input/book.md`,
+    configFingerprint: "config-fp",
+    promptFingerprint: "prompt-fp",
+    modelFingerprint: "model-fp",
+    stageFingerprints,
+    providerFingerprint,
+    overallStatus: "succeeded",
+    createdAt: "2026-05-23T00:00:00.000Z",
+    updatedAt: "2026-05-23T00:00:01.000Z",
+  };
   await writeDurableYamlFixture(
-    join(input.stateRoot, "books", bookId, "artifacts.yaml"),
+    join(input.stateRoot, "books", bookId, "state", "job.yaml"),
+    bookJob,
+  );
+  await writeDurableYamlFixture(
+    join(input.stateRoot, "books", bookId, "state", "artifacts.yaml"),
     { schemaVersion: SchemaVersion, items: graphArtifacts },
   );
   await writeDurableYamlFixture(
-    join(input.stateRoot, "books", bookId, "checkpoints.yaml"),
+    join(input.stateRoot, "books", bookId, "state", "checkpoints.yaml"),
     {
       schemaVersion: SchemaVersion,
       items: [

@@ -43,6 +43,23 @@ describe("GraphRAG hotplug creation quality gate", () => {
 
         expectPackageFileWithSidecars(bookRoot, "BOOK_MANIFEST.json");
         expectPackageFileWithSidecars(bookRoot, "PUBLISH_READY.json");
+        for (const legacyPath of [
+          "output",
+          "runs",
+          "job.yaml",
+          "artifacts.yaml",
+          "checkpoints.yaml",
+        ]) {
+          expect(existsSync(join(bookRoot, legacyPath))).toBe(false);
+        }
+        expect(existsSync(join(bookRoot, "source", "source.epub"))).toBe(true);
+        for (const statePath of [
+          "job.yaml",
+          "artifacts.yaml",
+          "checkpoints.yaml",
+        ]) {
+          expectPackageFileWithSidecars(bookRoot, join("state", statePath));
+        }
         expectPackageFileWithSidecars(
           bookRoot,
           join("graphrag", "output", "qmd_graph_text_unit_identity.json"),

@@ -795,6 +795,103 @@ describe("GraphRAG runner durable preflight", () => {
     },
     30000);
 
+  test("migrate-only repairs changed hotplug graph output checksum",
+    async () => {
+      const tmpRoot = await mkProjectTmpDir("qmd-runner-hotplug-output-mismatch-");
+      const sourceDir = join(tmpRoot, "source");
+      const stateRoot = join(tmpRoot, "graph_vault");
+      const logRoot = join(tmpRoot, "logs");
+      const configDir = join(tmpRoot, "config");
+      const runId = "hotplug-output-checksum-mismatch-fixture";
+      try {
+        const fixture = await writeMinimalBatchFixture({
+          tmpRoot,
+          sourceDir,
+          stateRoot,
+          configDir,
+          runId,
+          sourceName: "Hotplug-Output-Mismatch.epub",
+        });
+        const sourceHash = createHash("sha256")
+          .update(readFileSync(fixture.sourcePath))
+          .digest("hex");
+        const sourceRelativePath = relative(projectRoot, fixture.sourcePath);
+        const bookId = batchBookId(sourceHash, sourceRelativePath);
+        const statsPath = join(
+          stateRoot,
+          "books",
+          bookId,
+          "graphrag",
+          "output",
+          "stats.json",
+        );
+        const oldStats = "{ \"old\": true }\n";
+        const newStats = "{ \"new\": true }\n";
+        await writeDurableTextFixture(statsPath, oldStats);
+        await writeFile(statsPath, newStats, "utf8");
+        await writeDurableTextFixture(
+          join(stateRoot, "books", bookId, "state", "artifacts.yaml"),
+          [
+            "schemaVersion: 1.0.0",
+            "items:",
+            "  - schemaVersion: 1.0.0",
+            "    artifactId: stats-artifact",
+            `    bookId: ${bookId}`,
+            "    stage: graph_extract",
+            "    kind: graphrag_stats_json",
+            "    path: " + `books/${bookId}/graphrag/output/stats.json`,
+            `    contentHash: ${sha256Text(newStats)}`,
+            "    stageFingerprint: graph-stage",
+            "    providerFingerprint: provider-fingerprint",
+            "    producerRunId: graph-run",
+            "    createdAt: 2026-05-23T00:00:00.000Z",
+            "    metadata:",
+            "      corpusContentHash: corpus-hash",
+            "",
+          ].join("\n"),
+        );
+
+        const first = await runBatch({
+          tmpRoot,
+          sourceDir,
+          stateRoot,
+          logRoot,
+          configDir,
+          runId,
+        });
+        const repair = await runBatch({
+          tmpRoot,
+          sourceDir,
+          stateRoot,
+          logRoot,
+          configDir,
+          runId,
+          extraArgs: [
+            "--migrate-only",
+            "--migrate-repair-max-mutations",
+            "3",
+          ],
+        });
+        const eventRaw = readFileSync(join(fixture.runRoot, "events.jsonl"), "utf8");
+
+        expect(first.exitCode).not.toBe(0);
+        expect(first.stdout).toContain("durable_preflight_blocked");
+        expect(repair.exitCode).toBe(0);
+        expect(readFileSync(`${statsPath}.sha256`, "utf8").trim())
+          .toBe(sha256Text(newStats));
+        expect(JSON.parse(readFileSync(`${statsPath}.sha256.meta.json`, "utf8")))
+          .toMatchObject({
+            checksum: sha256Text(newStats),
+            checksumRecoveryDecision: "artifact_evidence_checksum_refreshed",
+          });
+        expect(eventRaw).toContain("graph_output_json_checksum_refreshed");
+        expect(existsSync(join(stateRoot, "books", bookId, "output"))).toBe(false);
+      } finally {
+        await rm(tmpRoot, { recursive: true, force: true });
+      }
+    },
+    30000);
+
   test("migrate-only restores mutable stats quarantine after later stage rewrite",
     async () => {
       const tmpRoot = await mkProjectTmpDir("qmd-runner-stats-quarantine-");

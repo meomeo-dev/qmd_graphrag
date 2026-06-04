@@ -813,6 +813,111 @@ describe("GraphRAG hotplug catalog projection", () => {
     }
   });
 
+  test("keeps GraphRAG runtime reports outside package file closure", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-hotplug-runtime-reports-");
+    try {
+      const stateRoot = join(tmpRoot, "graph_vault");
+      const bookId = "book-runtime-reports";
+      const sourceText = "epub";
+      const sourceHash = await writeLegacyDistributionFixture({
+        stateRoot,
+        bookId,
+        sourceText,
+      });
+      await mkdir(
+        join(stateRoot, "books", bookId, "graphrag", "output", "reports"),
+        { recursive: true },
+      );
+      await writeFile(
+        join(
+          stateRoot,
+          "books",
+          bookId,
+          "graphrag",
+          "output",
+          "reports",
+          "query.log",
+        ),
+        "Bearer raw-token sk-test-secret /tmp/query.log\n",
+        "utf8",
+      );
+
+      const { manifest } = buildBookHotplugPackage({
+        stateRoot,
+        bookId,
+        sourceHash,
+        sourceRelativePath: `inbox/${bookId}.epub`,
+        forceGraphRagNotQueryReady: true,
+        now: () => "2026-06-02T00:00:00.000Z",
+        toolVersion: "test",
+      });
+
+      expect(
+        manifest.files.some((entry) =>
+          String(entry.path).startsWith("graphrag/output/reports/")
+        ),
+      ).toBe(false);
+      expect(manifest.exclusions.patterns).toContain(
+        "graphrag/output/reports/**",
+      );
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects copied book package with declared runtime report payload", async () => {
+    const tmpRoot = await mkProjectTmpDir("qmd-hotplug-declared-report-");
+    try {
+      const stateRoot = join(tmpRoot, "graph_vault");
+      const bookId = "book-declared-report";
+      const sourceText = "epub";
+      const sourceHash = await writeLegacyDistributionFixture({
+        stateRoot,
+        bookId,
+        sourceText,
+      });
+      const { manifest, publishReady } = buildBookHotplugPackage({
+        stateRoot,
+        bookId,
+        sourceHash,
+        sourceRelativePath: `inbox/${bookId}.epub`,
+        forceGraphRagNotQueryReady: true,
+        now: () => "2026-06-02T00:00:00.000Z",
+        toolVersion: "test",
+      });
+      await writeDurableJsonFixture(
+        join(stateRoot, "books", bookId, "BOOK_MANIFEST.json"),
+        {
+          ...manifest,
+          files: [
+            ...manifest.files,
+            {
+              path: "graphrag/output/reports/query.log",
+              role: "graphrag_output",
+              bytes: 0,
+              sha256: sha256Text(""),
+              required: true,
+              sensitivity: "restricted",
+            },
+          ],
+        },
+      );
+      await writeDurableJsonFixture(
+        join(stateRoot, "books", bookId, "PUBLISH_READY.json"),
+        publishReady,
+      );
+
+      const validation = validateBookHotplugPackage({
+        bookRoot: join(stateRoot, "books", bookId),
+      });
+
+      expect(validation.ok).toBe(false);
+      expect(validation.diagnostics).toContain("forbidden_sensitive_material");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
   test("rejects copied book package with undeclared provider payload", async () => {
     const tmpRoot = await mkProjectTmpDir("qmd-hotplug-provider-payload-");
     try {

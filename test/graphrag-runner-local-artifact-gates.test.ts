@@ -662,7 +662,9 @@ describe("GraphRAG EPUB batch runner - Local Artifact Gates", () => {
         "  repairedLocalArtifactGate: true,",
         "  repairReason: 'graph_identity_projection_missing',",
         "  repairedProjection: 'document_identity_map',",
-        `  repairEvidenceLocator: 'graph_vault/books/${batchBookId(repairedHash, repairedRelativePath)}/output/qmd_graph_text_unit_identity.json',`,
+        `  repairEvidenceLocator: 'graph_vault/books/${
+          batchBookId(repairedHash, repairedRelativePath)
+        }/graphrag/output/qmd_graph_text_unit_identity.json',`,
         "  reusedProducerRunIds: {",
         "    graph_extract: 'run-graph-extract',",
         "    community_report: 'run-community-report',",
@@ -1032,7 +1034,7 @@ describe("GraphRAG EPUB batch runner - Local Artifact Gates", () => {
         "GraphRAG document identity is missing for query_ready: doc-fd8875181a17",
       repairReason: "graph_identity_projection_missing",
       repairedProjection: "document_identity_map",
-      evidenceSuffix: "output/qmd_graph_text_unit_identity.json",
+      evidenceSuffix: "graphrag/output/qmd_graph_text_unit_identity.json",
     },
     {
       name: "graph capability",
@@ -1041,7 +1043,7 @@ describe("GraphRAG EPUB batch runner - Local Artifact Gates", () => {
         "book-356ff4920cdf-0bbd8bdb:graph_query",
       repairReason: "graph_query_capability_projection_missing",
       repairedProjection: "graph_capability",
-      evidenceSuffix: "checkpoints.yaml#query_ready",
+      evidenceSuffix: "state/checkpoints.yaml#query_ready",
     },
     {
       name: "document identity sidecar mismatch",
@@ -1049,7 +1051,7 @@ describe("GraphRAG EPUB batch runner - Local Artifact Gates", () => {
         "GraphRAG document identity sidecar does not match query_ready",
       repairReason: "graph_identity_projection_missing",
       repairedProjection: "document_identity_map",
-      evidenceSuffix: "output/qmd_graph_text_unit_identity.json",
+      evidenceSuffix: "graphrag/output/qmd_graph_text_unit_identity.json",
     },
     {
       name: "document identity sidecar invalid evidence",
@@ -1057,7 +1059,7 @@ describe("GraphRAG EPUB batch runner - Local Artifact Gates", () => {
         "GraphRAG document identity sidecar evidence is invalid for query_ready",
       repairReason: "graph_identity_projection_missing",
       repairedProjection: "document_identity_map",
-      evidenceSuffix: "output/qmd_graph_text_unit_identity.json",
+      evidenceSuffix: "graphrag/output/qmd_graph_text_unit_identity.json",
     },
     {
       name: "managed settings projection",
@@ -1065,7 +1067,7 @@ describe("GraphRAG EPUB batch runner - Local Artifact Gates", () => {
         "graph_vault/settings.yaml is not the managed projection of .qmd/index.yml",
       repairReason: "graph_query_capability_projection_missing",
       repairedProjection: "graph_capability",
-      evidenceSuffix: "checkpoints.yaml#query_ready",
+      evidenceSuffix: "state/checkpoints.yaml#query_ready",
     },
   ])("reopens query-ready $name projection gate failures with fixed repair metadata", async ({
     failureText,

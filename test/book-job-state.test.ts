@@ -4655,27 +4655,27 @@ describe("FileBookJobStateRepository", () => {
         join(root, "graph_vault", "books", legacyBookId),
       );
       const legacyArtifacts = (await readFile(
-        join(root, "graph_vault", "books", legacyBookId, "artifacts.yaml"),
+        join(root, "graph_vault", "books", legacyBookId, "state", "artifacts.yaml"),
         "utf8",
       )).split(stableJob.bookId).join(legacyBookId);
       await writeYamlFileDurable(
-        join(root, "graph_vault", "books", legacyBookId, "artifacts.yaml"),
+        join(root, "graph_vault", "books", legacyBookId, "state", "artifacts.yaml"),
         YAML.parse(legacyArtifacts),
       );
       const legacyCheckpoints = (await readFile(
-        join(root, "graph_vault", "books", legacyBookId, "checkpoints.yaml"),
+        join(root, "graph_vault", "books", legacyBookId, "state", "checkpoints.yaml"),
         "utf8",
       )).split(stableJob.bookId).join(legacyBookId);
       await writeYamlFileDurable(
-        join(root, "graph_vault", "books", legacyBookId, "checkpoints.yaml"),
+        join(root, "graph_vault", "books", legacyBookId, "state", "checkpoints.yaml"),
         YAML.parse(legacyCheckpoints),
       );
       const legacyJob = (await readFile(
-        join(root, "graph_vault", "books", legacyBookId, "job.yaml"),
+        join(root, "graph_vault", "books", legacyBookId, "state", "job.yaml"),
         "utf8",
       )).split(stableJob.bookId).join(legacyBookId);
       await writeYamlFileDurable(
-        join(root, "graph_vault", "books", legacyBookId, "job.yaml"),
+        join(root, "graph_vault", "books", legacyBookId, "state", "job.yaml"),
         YAML.parse(legacyJob),
       );
 
@@ -4831,7 +4831,14 @@ describe("FileBookJobStateRepository", () => {
         "utf8",
       )) as { items: Array<{ bookId: string }> };
       const legacyRun = YAML.parse(await readFile(
-        join(graphVault, "books", stableJob.bookId, "runs", "run-legacy.yaml"),
+        join(
+          graphVault,
+          "books",
+          stableJob.bookId,
+          "graphrag",
+          "runs",
+          "run-legacy.yaml",
+        ),
         "utf8",
       )) as { bookId: string; artifactIds: string[] };
 

@@ -85,6 +85,8 @@ describe("GraphRAG EPUB batch runner - Durable State", () => {
     expect(script).toContain("\"jina-provider-concurrency\"");
     expect(script).toContain("\"local-cpu-concurrency\"");
     expect(script).toContain("coordinator-lock.json");
+    expect(script).toContain("qmd-projection\\.yaml");
+    expect(script).toContain("qmdProjectionCatalog");
     expect(script).toContain("CoordinatorLockSchema");
     expect(script).toContain("BookLeaseSchema");
     expect(script).toContain("ProviderSlotLeaseSchema");
@@ -181,12 +183,19 @@ describe("GraphRAG EPUB batch runner - Durable State", () => {
     const logRoot = join(tmpRoot, "logs");
     const configDir = join(tmpRoot, "config");
     const runId = "command-heartbeat-fixture";
-    const sourceBytes = "heartbeat fixture";
-    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
     const sourcePath = join(sourceDir, "Book.epub");
     const sourceRelativePath = relative(projectRoot, sourcePath);
+    await mkdir(sourceDir, { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await writeMinimalEpubFixture(sourcePath, "Book");
+    const sourceHash = createHash("sha256")
+      .update(readFileSync(sourcePath))
+      .digest("hex");
+    const bookId = batchBookId(sourceHash, sourceRelativePath);
     const normalizedPath = join(
       stateRoot,
+      "books",
+      bookId,
       "input",
       `book-${sourceHash.slice(0, 10)}.md`,
     );
@@ -202,10 +211,7 @@ describe("GraphRAG EPUB batch runner - Durable State", () => {
       `${itemId}.json`,
     );
 
-    await mkdir(sourceDir, { recursive: true });
     await mkdir(dirname(normalizedPath), { recursive: true });
-    await mkdir(configDir, { recursive: true });
-    await writeFile(sourcePath, sourceBytes);
     await writeFile(normalizedPath, "# Book\n\nHeartbeat fixture.\n");
     await writeFile(join(configDir, "index.yml"), "collections: {}\n");
     const resumeScript = join(tmpRoot, "fake-slow-resume.mjs");
