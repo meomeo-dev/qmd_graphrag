@@ -26,6 +26,7 @@ import {
   writeDurableJsonFixture,
   writeDurableYamlFixture,
   writeProviderAuthReopenGraphFixture,
+  writeBookScopedQmdIndexFixture,
   mkProjectTmpDir,
 } from "./helpers/graphrag-runner-harness.js";
 
@@ -137,7 +138,25 @@ async function writeLegacyDistributionFixture(input: {
     },
     files: [],
   });
+  await writePackageQmdIndex({
+    stateRoot: input.stateRoot,
+    bookId: input.bookId,
+    normalizedContentHash: sha256Text("# Book\n"),
+  });
   return sourceHash;
+}
+
+async function writePackageQmdIndex(input: {
+  stateRoot: string;
+  bookId: string;
+  normalizedContentHash?: string;
+}): Promise<void> {
+  await writeBookScopedQmdIndexFixture({
+    stateRoot: input.stateRoot,
+    bookId: input.bookId,
+    normalizedPath: join(input.stateRoot, "books", input.bookId, "input", "book.md"),
+    normalizedContentHash: input.normalizedContentHash,
+  });
 }
 
 describe("GraphRAG hotplug catalog projection", () => {
@@ -231,6 +250,7 @@ describe("GraphRAG hotplug catalog projection", () => {
           metadata: {},
         },
       );
+      await writePackageQmdIndex({ stateRoot, bookId, normalizedContentHash: normalizedHash });
 
       const { manifest, publishReady } = buildBookHotplugPackage({
         stateRoot,
@@ -580,6 +600,7 @@ describe("GraphRAG hotplug catalog projection", () => {
           graphTextUnitIds: [`tu-${bookId}`],
         },
       );
+      await writePackageQmdIndex({ stateRoot, bookId, normalizedContentHash: normalizedHash });
       const { manifest, publishReady } = buildBookHotplugPackage({
         stateRoot,
         bookId,
@@ -701,6 +722,7 @@ describe("GraphRAG hotplug catalog projection", () => {
           graphTextUnitIds: [`tu-${bookId}`],
         },
       );
+      await writePackageQmdIndex({ stateRoot, bookId, normalizedContentHash: normalizedHash });
 
       const { manifest, publishReady } = buildBookHotplugPackage({
         stateRoot,
@@ -1051,6 +1073,7 @@ describe("GraphRAG hotplug catalog projection", () => {
           graphTextUnitIds: [`tu-${bookId}`],
         },
       );
+      await writePackageQmdIndex({ stateRoot, bookId, normalizedContentHash: normalizedHash });
       const { manifest, publishReady } = buildBookHotplugPackage({
         stateRoot,
         bookId,
@@ -1160,6 +1183,7 @@ describe("GraphRAG hotplug catalog projection", () => {
           graphTextUnitIds: [`tu-${bookId}`],
         },
       );
+      await writePackageQmdIndex({ stateRoot, bookId, normalizedContentHash: normalizedHash });
       const { manifest, publishReady } = buildBookHotplugPackage({
         stateRoot,
         bookId,

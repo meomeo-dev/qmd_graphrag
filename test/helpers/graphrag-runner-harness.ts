@@ -13,6 +13,9 @@ import {
 } from "../../src/job-state/artifact-validation.ts";
 import { hashFile } from "../../src/job-state/fingerprint.ts";
 import { sanitizeVaultText } from "../../src/vault/metadata.ts";
+import {
+  ensureBookScopedQmdIndex,
+} from "../../scripts/graphrag/book-hotplug-qmd-index.mjs";
 import { projectRoot } from "./cli-harness.ts";
 
 export { classifyFailure, projectRoot, sanitizeVaultText };
@@ -200,6 +203,23 @@ export async function writeQmdBuildFixture(input: {
       createdAt: "2026-05-23T00:00:00.000Z",
     },
   );
+}
+
+export async function writeBookScopedQmdIndexFixture(input: {
+  stateRoot: string;
+  bookId: string;
+  normalizedPath: string;
+  normalizedContentHash?: string;
+}): Promise<void> {
+  await ensureBookScopedQmdIndex({
+    stateRoot: input.stateRoot,
+    bookId: input.bookId,
+    normalizedPath: input.normalizedPath,
+    normalizedContentHash: input.normalizedContentHash,
+    rootPath: projectRoot,
+    now: () => "2026-05-23T00:00:00.000Z",
+    toolVersion: "test-fixture",
+  });
 }
 
 export async function writeMinimalParquetFixture(path: string): Promise<void> {

@@ -11,6 +11,7 @@ import {
 } from "../scripts/graphrag/book-hotplug-package.mjs";
 import {
   mkProjectTmpDir,
+  writeBookScopedQmdIndexFixture,
   writeDurableJsonFixture,
   writeProviderAuthReopenGraphFixture,
 } from "./helpers/graphrag-runner-harness.js";
@@ -135,6 +136,12 @@ async function writeRefreshExistingFixture(input: {
       missingRunRecordIds: [],
     },
     files: [],
+  });
+  await writeBookScopedQmdIndexFixture({
+    stateRoot: input.stateRoot,
+    bookId: input.bookId,
+    normalizedPath: join(bookRoot, "input", "book.md"),
+    normalizedContentHash: normalizedHash,
   });
 
   const { manifest, publishReady } = buildBookHotplugPackage({

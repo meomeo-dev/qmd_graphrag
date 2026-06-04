@@ -15,6 +15,7 @@ import {
 import { loadGraphQueryCapabilities } from "../src/index.js";
 import {
   mkProjectTmpDir,
+  writeBookScopedQmdIndexFixture,
   writeDurableJsonFixture,
   writeDurableYamlFixture,
   writeProviderAuthReopenGraphFixture,
@@ -184,6 +185,18 @@ async function writeQueryReadyHotplugPackageFixture(input: {
       graphTextUnitIds: [`tu-${input.bookId}`],
     },
   );
+  await writeBookScopedQmdIndexFixture({
+    stateRoot: input.stateRoot,
+    bookId: input.bookId,
+    normalizedPath: join(
+      input.stateRoot,
+      "books",
+      input.bookId,
+      "input",
+      "book.md",
+    ),
+    normalizedContentHash: normalizedHash,
+  });
 
   const { manifest, publishReady } = buildBookHotplugPackage({
     stateRoot: input.stateRoot,

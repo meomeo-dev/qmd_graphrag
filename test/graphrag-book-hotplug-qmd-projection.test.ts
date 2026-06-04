@@ -14,6 +14,7 @@ import {
 } from "../src/graphrag/book-hotplug-catalog.js";
 import {
   mkProjectTmpDir,
+  writeBookScopedQmdIndexFixture,
   writeDurableJsonFixture,
   writeProviderAuthReopenGraphFixture,
 } from "./helpers/graphrag-runner-harness.js";
@@ -74,6 +75,12 @@ async function writeHotplugProjectionFixture(input: {
       graphTextUnitIds: [`tu-${input.bookId}`],
     },
   );
+  await writeBookScopedQmdIndexFixture({
+    stateRoot: input.stateRoot,
+    bookId: input.bookId,
+    normalizedPath: join(bookRoot, "input", "book.md"),
+    normalizedContentHash: normalizedHash,
+  });
 
   const { manifest, publishReady } = buildBookHotplugPackage({
     stateRoot: input.stateRoot,
