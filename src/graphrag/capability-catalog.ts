@@ -50,7 +50,6 @@ import {
   loadBookJobFromState,
   loadCatalogBookJobs,
   loadScopedBookJobsFromState,
-  hasPublishedScopedBookPackage,
   projectDocumentIdentityFromBookState,
 } from "./book-state-reader.js";
 import {
@@ -786,18 +785,18 @@ async function deriveCapabilitiesFromBookState(
   );
   const catalogBooks = hotplugBooks.length > 0
     ? []
-    : await loadCatalogBookJobs(graphVault);
+    : scope.bookIds.size > 0
+      ? (
+        await Promise.all([...scope.bookIds].map((bookId) =>
+          loadBookJobFromCatalog(graphVault, bookId)
+        ))
+      ).filter((book): book is BookJob => book != null)
+      : await loadCatalogBookJobs(graphVault);
   const books = dedupeBookJobs([
     ...hotplugBooks,
     ...scopedStateBooks,
     ...catalogBooks,
   ]);
-  const identityRaw = await readYaml(
-    join(graphVault, "catalog", "document-identity-map.yaml"),
-  );
-  const catalogIdentities = identityRaw == null
-    ? []
-    : DocumentIdentityCatalogSchema.parse(identityRaw).items;
   const hotplugIdentities = new Map(
     (await Promise.all(books.map((book) =>
       projectHotplugDocumentIdentity(graphVault, book.bookId)
@@ -812,6 +811,15 @@ async function deriveCapabilitiesFromBookState(
       .filter((identity): identity is DocumentIdentityMap => identity != null)
       .map((identity) => [identity.canonicalBookId, identity]),
   );
+  const needsCatalogIdentities = books.some((book) =>
+    !hotplugIdentities.has(book.bookId) && !stateIdentities.has(book.bookId)
+  );
+  const identityRaw = needsCatalogIdentities
+    ? await readYaml(join(graphVault, "catalog", "document-identity-map.yaml"))
+    : null;
+  const catalogIdentities = identityRaw == null
+    ? []
+    : DocumentIdentityCatalogSchema.parse(identityRaw).items;
   const capabilities: GraphCapability[] = [];
 
   for (const book of books) {
@@ -931,12 +939,15 @@ export async function loadGraphCapabilities(
   const documentIds = normalizeIdentitySet(input.documentIds);
   const sourceIds = normalizeIdentitySet(input.sourceIds);
   const scope = { bookIds, documentIds, sourceIds };
-  if (
-    bookIds.size === 0 ||
-    hasPublishedScopedBookPackage(graphVault, bookIds)
-  ) {
-    await ensureCatalogProjectionFromBookHotplugPackages(graphVault);
+  if (bookIds.size > 0) {
+    const lineageCache: QueryReadyLineageCache = new Map();
+    return filterCapabilitiesByScope(
+      await deriveCapabilitiesFromBookState(graphVault, scope, lineageCache),
+      scope,
+    );
   }
+
+  await ensureCatalogProjectionFromBookHotplugPackages(graphVault);
   const capabilities = await loadGraphCapabilitiesFromProjection(graphVault, scope);
   if (capabilities.length > 0 || !(await hasQueryReadyHotplugPackage(graphVault))) {
     return capabilities;

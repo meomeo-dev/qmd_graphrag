@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,9 +13,18 @@ import {
   loadGraphQueryCapabilities,
 } from "../src/index.js";
 import {
+  buildBookHotplugPackage,
+} from "../scripts/graphrag/book-hotplug-package.mjs";
+import {
+  writeBookScopedQmdIndexFixture,
+  writeDurableJsonFixture,
   writeDurableYamlFixture,
   writeProviderAuthReopenGraphFixture,
 } from "./helpers/graphrag-runner-harness.js";
+
+function sha256Text(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
 
 async function createGraphReadyBook(input: {
   graphVault: string;
@@ -88,6 +99,69 @@ async function appendBadRunCatalogEntry(input: {
   );
 }
 
+async function createPublishedHotplugBook(input: {
+  graphVault: string;
+  bookId: string;
+  sourceText: string;
+  inputText: string;
+}) {
+  const sourceHash = sha256Text(input.sourceText);
+  const normalizedHash = sha256Text(input.inputText);
+  const bookRoot = join(input.graphVault, "books", input.bookId);
+  await writeProviderAuthReopenGraphFixture({
+    stateRoot: input.graphVault,
+    bookId: input.bookId,
+    sourceHash,
+    contentHash: normalizedHash,
+  });
+  await mkdir(join(bookRoot, "source"), { recursive: true });
+  await mkdir(join(bookRoot, "input"), { recursive: true });
+  await mkdir(join(bookRoot, "qmd"), { recursive: true });
+  await writeFile(join(bookRoot, "source", "source.epub"), input.sourceText, "utf8");
+  await writeFile(join(bookRoot, "input", "book.md"), input.inputText, "utf8");
+  await writeDurableJsonFixture(join(bookRoot, "qmd", "qmd_build_manifest.json"), {
+    schemaVersion: SchemaVersion,
+    kind: "qmd_build_manifest",
+    bookId: input.bookId,
+    sourceRelativePath: `books/${input.bookId}/source/source.epub`,
+    sourceHash,
+    canonicalBookNormalizedPath: `books/${input.bookId}/input/book.md`,
+    normalizedContentHash: normalizedHash,
+    configHash: "config-hash",
+    normalizationPolicyVersion: "graphrag-normalized-markdown-v1",
+  });
+  await writeDurableJsonFixture(
+    join(bookRoot, "graphrag", "output", "qmd_graph_text_unit_identity.json"),
+    {
+      schemaVersion: SchemaVersion,
+      bookId: input.bookId,
+      sourceId: `sha256:${sourceHash}`,
+      sourceHash,
+      documentId: `doc-${sourceHash.slice(0, 12)}`,
+      contentHash: normalizedHash,
+      normalizedPath: `books/${input.bookId}/input/book.md`,
+      graphDocumentId: `graph-doc-${input.bookId}`,
+      graphTextUnitIds: [`tu-${input.bookId}`],
+    },
+  );
+  await writeBookScopedQmdIndexFixture({
+    stateRoot: input.graphVault,
+    bookId: input.bookId,
+    normalizedPath: join(bookRoot, "input", "book.md"),
+    normalizedContentHash: normalizedHash,
+  });
+  const { manifest, publishReady } = buildBookHotplugPackage({
+    stateRoot: input.graphVault,
+    bookId: input.bookId,
+    sourceHash,
+    sourceRelativePath: `books/${input.bookId}/source/source.epub`,
+    now: () => "2026-06-04T00:00:00.000Z",
+    toolVersion: "test",
+  });
+  await writeDurableJsonFixture(join(bookRoot, "BOOK_MANIFEST.json"), manifest);
+  await writeDurableJsonFixture(join(bookRoot, "PUBLISH_READY.json"), publishReady);
+}
+
 describe("GraphRAG capability scope", () => {
   test("scoped query skips unrelated damaged run records", async () => {
     const root = await mkdtemp(join(tmpdir(), "qmd-graphrag-cap-scope-"));
@@ -149,6 +223,43 @@ describe("GraphRAG capability scope", () => {
 
       expect(capabilities).toHaveLength(1);
       expect(capabilities[0]?.bookId).toBe(wanted.bookId);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("book-scoped hotplug query does not rebuild global projection", async () => {
+    const root = await mkdtemp(join(tmpdir(), "qmd-graphrag-book-live-scope-"));
+    try {
+      const graphVault = join(root, "graph_vault");
+      const bookId = "book-live-hotplug";
+      await createPublishedHotplugBook({
+        graphVault,
+        bookId,
+        sourceText: "epub",
+        inputText: "# Book\n\nTest driven development.\n",
+      });
+      for (const path of [
+        "books.yaml",
+        "sources.yaml",
+        "document-identity-map.yaml",
+        "graph-capabilities.yaml",
+        "qmd-projection.yaml",
+      ]) {
+        await rm(join(graphVault, "catalog", path), { force: true });
+      }
+
+      const capabilities = await loadGraphQueryCapabilities({
+        graphVault,
+        bookIds: [bookId],
+      });
+
+      expect(capabilities).toHaveLength(1);
+      expect(capabilities[0]?.bookId).toBe(bookId);
+      expect(capabilities[0]?.metadata?.projectionSource)
+        .toBe("book_hotplug_manifest");
+      expect(existsSync(join(graphVault, "catalog", "graph-capabilities.yaml")))
+        .toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

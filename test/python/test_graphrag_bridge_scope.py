@@ -412,22 +412,30 @@ def _write_complete_lancedb_fixture(root: Path) -> None:
 
 
 def _artifact_manifest(root: Path, book_id: str) -> dict:
-    path = root / "books" / book_id / "artifacts.yaml"
+    path = root / "books" / book_id / "state" / "artifacts.yaml"
+    if not path.exists():
+        path = root / "books" / book_id / "artifacts.yaml"
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
 def _write_artifact_manifest(root: Path, book_id: str, manifest: dict) -> None:
-    path = root / "books" / book_id / "artifacts.yaml"
+    path = root / "books" / book_id / "state" / "artifacts.yaml"
+    if not path.exists():
+        path = root / "books" / book_id / "artifacts.yaml"
     path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
 
 
 def _checkpoint_manifest(root: Path, book_id: str) -> dict:
-    path = root / "books" / book_id / "checkpoints.yaml"
+    path = root / "books" / book_id / "state" / "checkpoints.yaml"
+    if not path.exists():
+        path = root / "books" / book_id / "checkpoints.yaml"
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
 def _write_checkpoint_manifest(root: Path, book_id: str, manifest: dict) -> None:
-    path = root / "books" / book_id / "checkpoints.yaml"
+    path = root / "books" / book_id / "state" / "checkpoints.yaml"
+    if not path.exists():
+        path = root / "books" / book_id / "checkpoints.yaml"
     path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
 
 

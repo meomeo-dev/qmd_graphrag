@@ -727,9 +727,22 @@ readinessGates:
     queryEntrypoint:
       commandContract: >
         A query command may target bookId. It resolves bookId through the
-        committed mount projection, locates graphrag/output through the current
-        packageGeneration, validates query_ready state, and refuses stale or
-        cross-book artifacts.
+        current package root before consulting global catalog projection,
+        locates graphrag/output through the current packageGeneration,
+        validates query_ready state, and refuses stale or cross-book artifacts.
+        Explicit bookId queries must not block on full-vault projection rebuild.
+      scopedBookIdResolver:
+        authorityOrder:
+          - graph_vault/books/{bookId}/BOOK_MANIFEST.json
+          - graph_vault/books/{bookId}/state/checkpoints.yaml
+          - graph_vault/books/{bookId}/state/artifacts.yaml
+          - graph_vault/books/{bookId}/graphrag/runs/*.yaml
+          - graph_vault/books/{bookId}/graphrag/output/qmd_graph_text_unit_identity.json
+          - graph_vault/catalog projection as optional cache only
+        prohibitedBeforeScopedResolution:
+          - full graph_vault/books scan
+          - graph_vault/catalog projection rebuild
+          - stale graph-capabilities cache as required authority
       failureMode: >
         Gate failures return stable diagnostics and do not trigger provider
         calls unless an explicit rebuild command is requested.

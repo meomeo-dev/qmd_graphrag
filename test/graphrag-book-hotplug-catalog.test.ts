@@ -280,7 +280,6 @@ describe("GraphRAG hotplug catalog projection", () => {
 
       const capabilities = await loadGraphQueryCapabilities({
         graphVault: stateRoot,
-        bookIds: [bookId],
       });
 
       expect(capabilities).toHaveLength(1);
@@ -641,7 +640,6 @@ describe("GraphRAG hotplug catalog projection", () => {
 
       const capabilities = await loadGraphQueryCapabilities({
         graphVault: stateRoot,
-        bookIds: [bookId],
       });
       expect(capabilities).toHaveLength(1);
 
@@ -750,7 +748,6 @@ describe("GraphRAG hotplug catalog projection", () => {
       });
       const capabilities = await loadGraphQueryCapabilities({
         graphVault: stateRoot,
-        bookIds: [bookId],
       });
       const booksCatalog = YAML.parse(
         await readFile(join(stateRoot, "catalog", "books.yaml"), "utf8"),

@@ -1064,6 +1064,26 @@ manifestFirstDirectQueryResolver:
     and embedding dimension against BOOK_MANIFEST and qmd_output_manifest.json
   - compute query_ready or visible_not_query_ready
   - use catalog projection only as a cache if it agrees with manifest digest
+  scopedBookIdResolution:
+    rule: >
+      A query command with an explicit bookId resolves GraphRAG capability from
+      graph_vault/books/{bookId} and its book-scoped state before reading or
+      rebuilding any global catalog projection.
+    forbiddenBlockingWork:
+      - full graph_vault/books scan before scoped capability resolution
+      - graph_vault/catalog projection rebuild before scoped capability resolution
+      - stale graph_vault/catalog/graph-capabilities.yaml as a required authority
+      - stale graph_vault/catalog/document-identity-map.yaml as a required
+        authority when package identity exists
+    requiredLocalChecks:
+      - validatePublishedBookHotplugPackage
+      - validateHotplugRuntimeQueryGate
+      - producer lineage and artifact set validation
+      - qmd_graph_text_unit_identity package identity validation
+    noCapabilityOutcome: >
+      If the scoped package fails local checks, the resolver returns no
+      query-ready capability for that book and must not repair or rebuild the
+      full vault unless an explicit rebuild or mount-scan command is requested.
   readonlyPackageRule: >
     Manifest-first query validation reads BOOK_MANIFEST.json, GraphRAG artifact
     metadata, runtime compatibility, and producer run summaries as immutable
@@ -1115,6 +1135,8 @@ manifestFirstDirectQueryResolver:
   tests:
     requiredCases:
     - direct query gate succeeds with catalog projection deleted
+    - explicit bookId capability resolution succeeds without catalog projection
+      rebuild
     - stale graph-capabilities cache cannot mark failed manifest as ready
     - missing artifact metadata row returns visible_not_query_ready
     - provider roots absent does not fail manifest-first query gate
