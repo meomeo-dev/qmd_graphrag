@@ -362,7 +362,7 @@ qmdAvailabilityAndReexportPolicy:
     qmdState: reindex_required
     qmdQueryAllowed: false
     rebuildAllowed: true
-    exportBehavior: export_without_local_projection_by_default
+    exportBehavior: repair_required_not_publishable
   - packageState: mounted
     qmdState: reindexing
     qmdQueryAllowed: false
@@ -853,22 +853,22 @@ qmdAvailabilityReasonMatrix:
     qmdRetrievalAllowed: true
     rebuildAction: none
     diagnosticCode: qmd_ready_included_index_valid
-  - id: missing_index_reindex_declared
-    condition: qmd/index missing and manifest qmd.indexPolicy is reindex_on_mount
-    packageMounted: true
-    bookVisible: true
-    graphRagOnlyQueryAllowed: true
+  - id: missing_index_repair_required
+    condition: qmd/index missing
+    packageMounted: false
+    bookVisible: false
+    graphRagOnlyQueryAllowed: false
     qmdRetrievalAllowed: false
-    rebuildAction: enqueue_local_projection_rebuild
-    diagnosticCode: qmd_index_missing_reindex_declared
-  - id: missing_index_reindex_not_declared
-    condition: qmd/index missing and manifest lacks reindex_on_mount
-    packageMounted: true
-    bookVisible: true
-    graphRagOnlyQueryAllowed: true
+    rebuildAction: rebuild_package_qmd_index_before_publish
+    diagnosticCode: qmd_index_missing_not_publishable
+  - id: missing_index_policy_absent
+    condition: qmd/index missing or manifest lacks included_index
+    packageMounted: false
+    bookVisible: false
+    graphRagOnlyQueryAllowed: false
     qmdRetrievalAllowed: false
-    rebuildAction: none_until_repair_or_repack
-    diagnosticCode: qmd_index_missing_policy_absent
+    rebuildAction: rebuild_package_qmd_index_before_publish
+    diagnosticCode: qmd_index_missing_not_publishable
   - id: stale_bundled_index
     condition: bundled qmd index exists but freshness digest differs
     packageMounted: true
@@ -1251,7 +1251,7 @@ migrationSourceTruthFailClosedTable:
     requiredForAuthoritativeManifest: true
     missingOutcome: visible_not_qmd_ready_only_if_inputs_complete
     mayGenerateBookManifest: true
-    manifestRestriction: qmd.indexPolicy must be reindex_on_mount
+    manifestRestriction: qmd.indexPolicy must be included_index after repair
     diagnosticCode: migration_qmd_build_manifest_missing
   - evidence: graphrag/output/qmd_output_manifest.json
     requiredForAuthoritativeManifest: true
@@ -1492,8 +1492,8 @@ fixedBaselineTestContracts:
   qmdIndex:
     requiredCases:
     - bundled qmd index valid
-    - missing index with reindex_on_mount
-    - missing index without reindex_on_mount
+    - missing index is not publishable
+    - manifest policy not included_index is not publishable
     - stale bundled index
     - qmd schema incompatible
     - local projection valid

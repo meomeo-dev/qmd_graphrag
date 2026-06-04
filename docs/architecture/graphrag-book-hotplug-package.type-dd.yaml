@@ -195,6 +195,10 @@ currentStateSnapshot:
       - source/
       - input/
       - qmd/
+      - qmd/index/qmd_book_index.sqlite
+      - qmd/index/qmd_book_index.sqlite.sha256
+      - qmd/index/qmd_book_index.sqlite.sha256.meta.json
+      - qmd/index/qmd_book_index.meta.json
       - graphrag/
       - state/
 
@@ -208,7 +212,8 @@ targetContract:
       - Deleting graph_vault/books/{bookId} from a vault uninstalls the book.
       - graph_vault/catalog files are derived by mount scan and can be rebuilt.
       - Global qmd and retrieval indexes are caches or projections, not package
-        authority.
+        authority. A publishable copied package carries a book-scoped qmd
+        SQLite index under qmd/index.
   packageRoot:
     path: graph_vault/books/{bookId}
     completenessRule: >
@@ -447,6 +452,20 @@ targetDirectoryLayout:
     - path: qmd/
       role: qmd_artifacts
       description: qmd 建库产物、书级索引、qmd build manifest 与校验 sidecars。
+    - path: qmd/index/qmd_book_index.sqlite
+      role: book_scoped_qmd_index
+      description: >
+        单本书 qmd SQLite 索引。发布态包必须包含该文件和 sidecars；
+        缺失时包进入 repair_required，不能标记为 copyDistributionAllowed。
+    - path: qmd/index/qmd_book_index.sqlite.sha256
+      role: book_scoped_qmd_index_checksum
+      description: qmd_book_index.sqlite 的内容校验。
+    - path: qmd/index/qmd_book_index.sqlite.sha256.meta.json
+      role: book_scoped_qmd_index_checksum_metadata
+      description: qmd_book_index.sqlite 校验元数据。
+    - path: qmd/index/qmd_book_index.meta.json
+      role: book_scoped_qmd_index_metadata
+      description: 单书 qmd 索引的 schema、freshness 与向量完整性证据。
     - path: graphrag/output/
       role: graphrag_artifacts
       description: >
@@ -471,9 +490,6 @@ targetDirectoryLayout:
         单本书挂载和查询状态转换证据。该文件可随验证刷新，但不参与
         BOOK_MANIFEST.files 文件闭包。
   optional:
-    - path: qmd/index/qmd_book_index.sqlite
-      role: book_scoped_qmd_index
-      description: 单本书 qmd 索引。若缺失，mount scanner 可触发本地重建。
     - path: metadata/
       role: human_metadata
       description: 标题、作者、标签、摘要、封面引用与人工备注。
@@ -555,9 +571,9 @@ bookManifestSchema:
         - indexPolicy
         - requiredArtifacts
       contract: >
-        A package may include a book-scoped qmd index. If it does not, the
-        manifest must declare reindex_on_mount and list the normalized input
-        files required to rebuild the projection.
+        A publishable package must include a book-scoped qmd index and declare
+        included_index. Mount-time reindex is a local repair path for damaged
+        or legacy candidates, not a successful distribution state.
     graphrag:
       requiredFields:
         - outputManifestPath
@@ -631,7 +647,6 @@ readinessGates:
   qmdReadyGate:
     states:
       - included_index_valid
-      - reindex_required
       - reindex_pending
       - reindexing
       - projection_ready
@@ -658,9 +673,9 @@ readinessGates:
         Concurrent reindex requests with the same idempotencyKey must coalesce
         into one rebuild. A newer packageGeneration cancels stale rebuilds.
     qmdReadyRule: >
-      qmd-only queries require projection_ready or included_index_valid. A book
-      can remain GraphRAG-ready while qmd projection is rebuilding only if the
-      query path does not require qmd index lookup.
+      Publish-ready copied packages require included_index_valid. qmd-only
+      queries also accept projection_ready for local repair projections, but a
+      package without an included index is not copyDistributionAllowed.
   graphragReadyGate:
     states:
       - artifact_missing
@@ -1524,7 +1539,7 @@ artifactSchemaConversionMatrix:
         - chunkingConfigHash
     - name: qmd_book_index
       pathPattern: qmd/index/qmd_book_index.sqlite
-      action: preserve_if_fresh_else_rebuild_outside_package
+      action: preserve_if_fresh_else_rebuild_before_publish
       requiredMetadata:
         - sqliteSchemaDigest
         - qmdIndexSchema
@@ -1640,9 +1655,10 @@ lockLeaseAndStagingCleanup:
 
 qmdRebuildTransaction:
   principle: >
-    qmd rebuild is a per-book transaction that writes outside readonly packages,
-    atomically publishes rebuilt projections, and never exposes partial SQLite
-    or stale qmd-ready state.
+    qmd rebuild is a per-book transaction. Publish-time rebuild writes the
+    book-scoped SQLite under qmd/index before BOOK_MANIFEST.json is regenerated.
+    Mount-time repair writes outside readonly packages and never exposes partial
+    SQLite or stale qmd-ready state.
   freshnessDigest:
     fields:
       - bookId
@@ -1670,6 +1686,8 @@ qmdRebuildTransaction:
       - qmdConfigSha256
       - metadataSchemaDigest
   transactionPaths:
+    publishIndex: graph_vault/books/{bookId}/qmd/index/qmd_book_index.sqlite
+    publishIndexMetadata: graph_vault/books/{bookId}/qmd/index/qmd_book_index.meta.json
     stagingRoot: graph_vault/catalog/qmd-book-projections/.staging/{bookId}-{rebuildId}
     liveRoot: graph_vault/catalog/qmd-book-projections/{bookId}
     files:
@@ -1683,7 +1701,7 @@ qmdRebuildTransaction:
     - write SQLite and projection manifest into stagingRoot.
     - fsync SQLite, sidecars, staging root, and parent directory.
     - atomically rename stagingRoot to liveRoot generation.
-    - update qmdReadyState in catalog projection generation.
+    - update qmdReadyState in package manifest and catalog projection generation.
     - release lease after commit record is durable.
   retryPolicy:
     sameIdempotencyKey: coalesce
@@ -2072,8 +2090,8 @@ implementationPlan:
     - Export uses allowlist first and fails closed on secret scan, path escape,
       symlink escape, or unclassified producer evidence.
     - Same bookId with different sourceHash fails closed.
-    - A package without a book-scoped qmd index can be reindexed on mount when
-      its manifest declares reindex_on_mount.
+    - A publishable package without a book-scoped qmd index fails validation and
+      cannot expose PUBLISH_READY.json.
     - qmd index freshness changes invalidate qmd-ready in the same projection
       generation.
     - GraphRAG query-ready requires minimum artifact closure and
@@ -2116,16 +2134,13 @@ implementationPlan:
       titleSlug.
     - Schema upgrade fixtures cover supported current, legacy, partial, missing
       lineage, duplicate residue, and unsupported legacy package shapes.
-    - qmd default export excludes local projections unless an explicit repack
-      creates a new packageGeneration.
+    - qmd default export includes the package-local qmd/index SQLite; local
+      repair projections remain excluded unless an explicit repack creates a new
+      packageGeneration.
     - Legacy bridge locators are forbidden in current hotplug-v1 packages and
       must fail validation rather than be exported or repacked.
 
 openQuestions:
-  - id: qmd_book_index_format
-    question: >
-      Whether qmd_book_index.sqlite should become the default package artifact
-      or remain an optional mount-time projection.
   - id: source_license_policy
     question: >
       Whether source EPUB files may be exported by default, or whether packages
