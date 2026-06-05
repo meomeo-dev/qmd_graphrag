@@ -335,6 +335,34 @@ describe("GraphRAG EPUB batch runner - Recovery Classification", () => {
       failureKind: "transient",
       retryable: true,
     });
+    expect(classifyFailure(JSON.stringify({
+      schemaVersion: "1.0.0",
+      route: "qmd",
+      stage: "route",
+      provider: null,
+      capability: null,
+      code: "cli_error",
+      retryable: false,
+      redactedMessage:
+        "The socket connection was closed unexpectedly. For more " +
+        "information, pass `verbose: true` in the second argument to fetch()",
+    }, null, 2))).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+    });
+    expect(classifyFailure(
+      "qmd query failed: unknown certificate verification error",
+    )).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+    });
+    expect(classifyFailure(
+      "httpx.ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate " +
+      "verify failed: unable to get local issuer certificate",
+    )).toMatchObject({
+      failureKind: "transient",
+      retryable: true,
+    });
     expect(classifyFailure("httpx.ConnectError: [Errno 8] nodename nor servname"))
       .toMatchObject({
         failureKind: "transient",
