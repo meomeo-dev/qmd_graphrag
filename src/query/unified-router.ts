@@ -258,8 +258,13 @@ export function createTypedQueryError(input: {
   provider?: string | null;
   capability?: string | null;
   code: string;
+  exitCode?: number;
+  scopeKind?: TypedQueryError["scopeKind"];
+  scopeId?: string;
   retryable: boolean;
   redactedMessage: string;
+  remediationCommand?: string;
+  timingAvailable?: boolean;
   graphCapabilityError?: GraphCapabilityError;
   metadata?: TypedQueryError["metadata"];
 }): TypedQueryError {
@@ -270,8 +275,13 @@ export function createTypedQueryError(input: {
     provider: input.provider ?? null,
     capability: input.capability ?? null,
     code: input.code,
+    exitCode: input.exitCode,
+    scopeKind: input.scopeKind,
+    scopeId: input.scopeId,
     retryable: input.retryable,
     redactedMessage: input.redactedMessage,
+    remediationCommand: input.remediationCommand,
+    timingAvailable: input.timingAvailable,
     graphCapabilityError: input.graphCapabilityError,
     metadata: input.metadata,
   });

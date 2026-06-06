@@ -15,7 +15,10 @@ import { describe, expect, test } from "vitest";
 
 import { SchemaVersion } from "../../src/contracts/common.js";
 import { GraphRagIndexResponseSchema } from "../../src/contracts/graphrag.js";
-import { callPythonBridge } from "../../src/integrations/python-bridge.js";
+import {
+  PythonBridgeTimeoutError,
+  callPythonBridge,
+} from "../../src/integrations/python-bridge.js";
 
 async function createWorkspace(): Promise<string> {
   return mkdtemp(join(tmpdir(), "qmd-python-bridge-early-stop-"));
@@ -39,6 +42,23 @@ async function writeFakeBridge(
   );
   await chmod(scriptPath, 0o755);
   return scriptPath;
+}
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForPidExit(pid: number, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return;
+    }
+    await delayMs(50);
+  }
+  throw new Error(`Process ${pid} did not exit within ${timeoutMs}ms`);
 }
 
 describe("Python bridge GraphRAG stage early stop", () => {
@@ -357,6 +377,35 @@ describe("Python bridge GraphRAG stage early stop", () => {
     await expect(call).rejects.toThrow(
       "graphrag-reports/book/community_report/indexing-engine.log",
     );
+  });
+
+  test("times out and terminates a stuck python bridge child", async () => {
+    const workspace = await createWorkspace();
+    try {
+      const pidPath = join(workspace, "bridge.pid");
+      const fakeBridge = await writeFakeBridge(
+        workspace,
+        [
+          "const { writeFileSync } = await import('node:fs');",
+          `writeFileSync(${JSON.stringify(pidPath)}, String(process.pid), 'utf8');`,
+          "setInterval(() => {}, 1000);",
+        ].join("\n"),
+      );
+
+      await expect(callPythonBridge({
+        command: "graphrag_index",
+        pythonBin: fakeBridge,
+        workingDirectory: workspace,
+        request: {},
+        responseSchema: GraphRagIndexResponseSchema,
+        timeoutMs: 200,
+      })).rejects.toBeInstanceOf(PythonBridgeTimeoutError);
+
+      const pid = Number(await readFile(pidPath, "utf8"));
+      await waitForPidExit(pid);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
   });
 
   test("redacts unsafe locators and evidence from early-stop errors", async () => {

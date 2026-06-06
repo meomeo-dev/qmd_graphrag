@@ -6,7 +6,10 @@ import { join } from "node:path";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
 import { SchemaVersion } from "../../src/contracts/common.js";
-import { callPythonBridge } from "../../src/integrations/python-bridge.js";
+import {
+  PythonBridgeTimeoutError,
+  callPythonBridge,
+} from "../../src/integrations/python-bridge.js";
 import {
   runGraphRagIndex,
   runGraphRagQuery,
@@ -18,9 +21,26 @@ import {
 import { hashLanceDbDirectoryContents } from "../../src/job-state/artifact-validation.js";
 import { hashFile } from "../../src/job-state/fingerprint.js";
 
-vi.mock("../../src/integrations/python-bridge.js", () => ({
-  callPythonBridge: vi.fn(),
-}));
+vi.mock("../../src/integrations/python-bridge.js", () => {
+  class MockPythonBridgeTimeoutError extends Error {
+    readonly command: string;
+    readonly timeoutMs: number;
+
+    constructor(input: { command: string; timeoutMs: number }) {
+      super(
+        `python_bridge_timeout: command ${input.command} timed out after ` +
+          `${input.timeoutMs}ms`,
+      );
+      this.name = "PythonBridgeTimeoutError";
+      this.command = input.command;
+      this.timeoutMs = input.timeoutMs;
+    }
+  }
+  return {
+    PythonBridgeTimeoutError: MockPythonBridgeTimeoutError,
+    callPythonBridge: vi.fn(),
+  };
+});
 
 const mockedBridge = callPythonBridge as ReturnType<typeof vi.fn>;
 
@@ -269,6 +289,42 @@ describe("GraphRAG provider cost accounting", () => {
     expect(mockedBridge).toHaveBeenCalledTimes(2);
     expect(records).toHaveLength(1);
     expect(records[0]?.requestCount).toBe(1);
+  });
+
+  test("does not retry GraphRAG query bridge timeouts", async () => {
+    const graphVault = await mkdtemp(join(tmpdir(), "qmd-graphrag-query-timeout-"));
+    const previousTimeout = process.env.QMD_GRAPHRAG_QUERY_TIMEOUT_MS;
+    try {
+      process.env.QMD_GRAPHRAG_QUERY_TIMEOUT_MS = "17";
+      mockedBridge.mockRejectedValueOnce(new PythonBridgeTimeoutError({
+        command: "graphrag_query",
+        timeoutMs: 17,
+      }));
+
+      await expect(runGraphRagQuery({
+        rootDir: graphVault,
+        method: "local",
+        query: "How do concepts relate?",
+        responseType: "multiple paragraphs",
+        capabilityScope: {
+          selectedBookIds: ["book-1"],
+          graphCapabilityIds: ["cap-1"],
+          sourceIds: ["source-1"],
+          documentIds: ["doc-1"],
+          contentHashes: ["content-1"],
+          artifactIds: ["artifact-from-evidence"],
+        },
+      })).rejects.toThrow("python_bridge_timeout");
+
+      expect(mockedBridge).toHaveBeenCalledTimes(1);
+      expect(mockedBridge).toHaveBeenCalledWith(expect.objectContaining({
+        command: "graphrag_query",
+        timeoutMs: 17,
+      }));
+    } finally {
+      if (previousTimeout == null) delete process.env.QMD_GRAPHRAG_QUERY_TIMEOUT_MS;
+      else process.env.QMD_GRAPHRAG_QUERY_TIMEOUT_MS = previousTimeout;
+    }
   });
 
   test("keeps multi-book query cost lineage grouped by evidence identity", async () => {

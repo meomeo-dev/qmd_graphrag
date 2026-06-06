@@ -7,14 +7,6 @@
 
 - `/Users/jin/projects/qmd_graphrag/docs/architecture/graphrag-hierarchical-library-index.type-dd.yaml`
 
-固定设计审计基准是：
-
-- `/Users/jin/projects/qmd_graphrag/docs/architecture/graphrag-hierarchical-library-index-audits/base/evaluation-dimensions.yaml`
-
-历史上拆出的 pipeline I/O 与 grounding review 已合并进唯一 Type DD。后续不得再把
-`graphrag-hierarchical-library-pipeline-io.type-dd.yaml` 或
-`graphrag-hierarchical-library-grounding-review.type-dd.yaml` 当作规范入口。
-
 ## 目标
 
 在既有单书 hotplug package、包内 qmd index、包内 GraphRAG output、catalog

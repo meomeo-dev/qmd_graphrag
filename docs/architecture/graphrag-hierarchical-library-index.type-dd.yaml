@@ -56,16 +56,21 @@ implementationGrounding:
       capability 投影。
     - qmd query --graphrag --graph-book-id 的单书 GraphRAG 查询、runtime bridge、timing 和
       provider metrics。
-  newCapabilities:
+  implementedCapabilities:
     - bookshelf_members.json、membership_decisions.jsonl 和书架成员决策引擎。
     - BOOKSHELF_MANIFEST、书架 semantic_units、semantic_edges、
       community_reports、evidence_map 和书架质量门。
     - LIBRARY_MANIFEST、library_members、library semantic artifacts、 library 质量门和分区策略。
-    - --bookshelf-id、--library-id、qmd library list/build/status/rebuild 命令和
-      upper_index_* typed errors 的 CLI 实现。
+    - --bookshelf-id、--library-id 和 upper_index_* typed errors 的 CLI 实现。
+  remainingCapabilities:
+    - qmd library list/build/status/rebuild 管理命令。
+    - LLM synthesis over selected upper semantic units。
+    - bounded deepening into selected single-book GraphRAG。
   implementationRule: >
-    本设计不得被解释为当前代码已经支持书架或 library 查询。实现必须以 现有单书包和 catalog projection 为输入边界，新增独立
-    upper-index 模块， 不得把 runner ledger 当作语义输入，也不得把书架/library 索引写回单书包。
+    已实现的书架/library 查询仅覆盖固定预算 community_reports report
+    search、证据回链、typed error 和 timing。后续实现必须继续以现有单书包和
+    catalog projection 为输入边界，新增独立 upper-index 模块，不得把 runner
+    ledger 当作语义输入，也不得把书架/library 索引写回单书包。
 terms:
   book:
     meaning: >
@@ -573,47 +578,62 @@ queryContract:
       - code: missing_scope
         exitCode: 64
         retryable: false
-        remediationCommand: qmd library list --graph-vault <path>
+        remediationCommand: >
+          qmd query --graph-book-id <id>, --bookshelf-id <id>, or --library-id <id>
         meaning: >
           No explicit book, bookshelf, library, or configured default library was
           available for an upper-level GraphRAG query.
       - code: ambiguous_scope
         exitCode: 64
         retryable: false
-        remediationCommand: qmd library list --graph-vault <path>
+        remediationCommand: >
+          qmd query --graph-book-id <id>, --bookshelf-id <id>, or --library-id <id>
         meaning: >
           Multiple scopes matched and no default scope could be selected within the
           fixed query budget.
       - code: upper_index_missing
         exitCode: 66
         retryable: false
-        remediationCommand: qmd library build --scope <scopeId>
+        remediationCommand: >
+          node scripts/graphrag/build-bookshelf-graph.mjs --graph-vault <path>
+          --bookshelf-id <scopeId>, or node scripts/graphrag/build-library-graph.mjs
+          --graph-vault <path> --library-id <scopeId>
         meaning: >
           The requested bookshelf or library manifest, vector index, semantic units,
           semantic edges, evidence map, or quality gate is missing.
       - code: upper_index_stale
         exitCode: 65
         retryable: false
-        remediationCommand: qmd library rebuild --scope <scopeId>
+        remediationCommand: >
+          node scripts/graphrag/build-bookshelf-graph.mjs --graph-vault <path>
+          --bookshelf-id <scopeId>, or node scripts/graphrag/build-library-graph.mjs
+          --graph-vault <path> --library-id <scopeId>
         meaning: >
           The requested upper index generation does not match current member manifests
           and stale reads were not explicitly allowed.
       - code: upper_quality_gate_failed
         exitCode: 65
         retryable: false
-        remediationCommand: qmd library status --scope <scopeId> --json
+        remediationCommand: >
+          node scripts/graphrag/build-bookshelf-graph.mjs --graph-vault <path>
+          --bookshelf-id <scopeId>, or node scripts/graphrag/build-library-graph.mjs
+          --graph-vault <path> --library-id <scopeId>
         meaning: |
           The bookshelf or library quality gate is failed or not query-ready.
       - code: budget_exceeded_narrow_scope_required
         exitCode: 64
         retryable: false
-        remediationCommand: qmd query --bookshelf-id <id> or --graph-book-id <id>
+        remediationCommand: >
+          qmd query --library-id <id>, --bookshelf-id <id>, or --graph-book-id <id>
         meaning: |
           Candidate evidence cannot fit the active fixed query budget.
       - code: upper_index_runtime_error
         exitCode: 70
         retryable: true
-        remediationCommand: qmd library status --scope <scopeId> --json
+        remediationCommand: >
+          node scripts/graphrag/build-bookshelf-graph.mjs --graph-vault <path>
+          --bookshelf-id <scopeId>, or node scripts/graphrag/build-library-graph.mjs
+          --graph-vault <path> --library-id <scopeId>
         meaning: >
           Query failed after selecting a valid upper index because of runtime
           interruption, provider timeout, or local I/O failure.
@@ -696,6 +716,20 @@ queryContract:
 qualityGates:
   bookshelfGate:
     path: graph_vault/catalog/bookshelves/{bookshelfId}/state/bookshelf-quality-gate.json
+    checkIds:
+      - member_manifest_sha256_matches
+      - member_package_gates_passed
+      - membership_decisions_schema_valid
+      - semantic_units_schema_valid
+      - semantic_edges_schema_valid
+      - semantic_edges_relation_types_allowed
+      - communities_schema_valid
+      - community_reports_schema_valid
+      - evidence_map_lineage_valid
+      - embedding_fingerprint_matches_manifest
+      - fixed_query_budget_simulation_passed
+      - sensitive_payload_scan_passed
+      - stale_marker_absent
     requiredChecks:
       - manifest schema and checksum sidecars valid
       - every member manifest sha256 matches recorded generation
@@ -709,6 +743,8 @@ qualityGates:
       - virtual parent shelves do not own semantic_units or community_reports
       - semantic_units.parquet schema valid
       - semantic_edges.parquet schema valid
+      - semantic_edges_relation_types_allowed
+      - semantic_edges.parquet relationType values are in allowedRelationTypes
       - community_reports.parquet schema valid
       - evidence_map.parquet links every upper unit to member evidence
       - embedding fingerprint and vector index metadata match manifest
@@ -717,6 +753,20 @@ qualityGates:
       - stale marker absent
   libraryGate:
     path: graph_vault/catalog/library/{libraryId}/state/library-quality-gate.json
+    checkIds:
+      - member_bookshelf_manifest_sha256_matches
+      - member_bookshelf_gates_passed
+      - library_membership_gate_passed
+      - semantic_units_schema_valid
+      - semantic_edges_schema_valid
+      - semantic_edges_relation_types_allowed
+      - communities_schema_valid
+      - community_reports_schema_valid
+      - evidence_map_links_shelf_and_book_evidence
+      - embedding_fingerprint_matches_manifest
+      - fixed_query_budget_simulation_passed
+      - sensitive_payload_scan_passed
+      - stale_marker_absent
     requiredChecks:
       - manifest schema and checksum sidecars valid
       - every member bookshelf manifest sha256 matches recorded generation
@@ -726,6 +776,8 @@ qualityGates:
       - library shelf count stays within configured limit or partitions exist
       - semantic_units.parquet schema valid
       - semantic_edges.parquet schema valid
+      - semantic_edges_relation_types_allowed
+      - semantic_edges.parquet relationType values are in allowedRelationTypes
       - community_reports.parquet schema valid
       - evidence_map.parquet links every unit to shelf and book evidence
       - embedding fingerprint and vector index metadata match manifest
@@ -824,6 +876,11 @@ stateAndRecovery:
 manifestSchemas:
   bookshelfManifest:
     path: BOOKSHELF_MANIFEST.json
+    authority: graph_build_query_ready_manifest
+    rule: >
+      BOOKSHELF_MANIFEST.json 只能由 materialized_bookshelf_graph_build 在
+      上层 GraphRAG 派生索引和 bookshelf 质量门通过后发布。membership
+      阶段不得用它表示可查询书架。
     requiredSections:
       - schemaVersion
       - bookshelfIdentity
@@ -836,8 +893,30 @@ manifestSchemas:
       - qualityGate
       - files
       - sensitivityPolicy
+  bookshelfMembershipManifest:
+    path: BOOKSHELF_MEMBERSHIP_MANIFEST.json
+    authority: membership_only_handoff_manifest
+    rule: >
+      membership 阶段可以发布 BOOKSHELF_MEMBERSHIP_MANIFEST.json，证明
+      bookshelf_members.json、membership_decisions.jsonl、split plan 和
+      membership-quality-gate 已形成闭环。该 manifest 的 queryReady 必须为
+      false，只能作为 materialized_bookshelf_graph_build 的输入，不能授权
+      --bookshelf-id 查询。
+    requiredSections:
+      - schemaVersion
+      - bookshelfIdentity
+      - membership
+      - nextStage
+      - qualityGate
+      - files
+      - sensitivityPolicy
   libraryManifest:
     path: LIBRARY_MANIFEST.json
+    authority: graph_build_query_ready_manifest
+    rule: >
+      LIBRARY_MANIFEST.json 只能由 library_graph_build 在 library 级
+      GraphRAG 派生索引和 library 质量门通过后发布。library membership
+      阶段不得用它表示可查询 library。
     requiredSections:
       - schemaVersion
       - libraryIdentity
@@ -847,6 +926,24 @@ manifestSchemas:
       - graphArtifactSchemas
       - evidenceMap
       - fixedQueryBudget
+      - qualityGate
+      - files
+      - sensitivityPolicy
+  libraryMembershipManifest:
+    path: LIBRARY_MEMBERSHIP_MANIFEST.json
+    authority: library_membership_only_handoff_manifest
+    rule: >
+      library_membership_resolution 可以发布 LIBRARY_MEMBERSHIP_MANIFEST.json，
+      证明 library_members.json、library_partition_plan.json、
+      library-membership-gate 和 diagnostics 已形成闭环。该 manifest 的
+      queryReady 必须为 false，只能作为 library_graph_build 的输入，不能
+      授权 --library-id 查询。
+    requiredSections:
+      - schemaVersion
+      - libraryIdentity
+      - membership
+      - partitionPlan
+      - nextStage
       - qualityGate
       - files
       - sensitivityPolicy
@@ -976,16 +1073,23 @@ pipelineIoContract:
       - book_package_publish
       - book_mount_projection
       - single-book scoped_query_execution through --graph-book-id
-    directExtensions:
+    implementedStageTargets:
       - bookshelf_membership_resolution
-    newCapabilities:
       - materialized_bookshelf_graph_build
+      - bookshelf scoped_query_execution fixed-budget report search
       - library_membership_resolution
       - library_graph_build
-      - bookshelf/library scoped_query_execution
+      - library scoped_query_execution fixed-budget report search
+    remainingNewCapabilities:
+      - bounded deepening into single-book GraphRAG
+      - LLM synthesis over selected upper semantic units
     rule: >
-      alreadySupported 表示当前代码已有对应单书或 catalog 基础；directExtensions 表示输入基础已存在但需要新增
-      resolver；newCapabilities 表示设计已定义 合同但尚无实现。实现和测试不得把 newCapabilities 当成当前功能。
+      alreadySupported 表示当前代码已有对应单书或 catalog 基础；
+      implementedStageTargets 表示已有真实运行目标和测试覆盖的阶段能力；
+      remainingNewCapabilities 表示设计已定义合同但尚无实现。实现和测试不得把
+      remainingNewCapabilities 当成当前功能。bookshelf/library scoped_query_execution
+      当前只覆盖固定预算 community_reports 检索、证据回链和 timing 观测，
+      不包含 LLM synthesis 或跨 scope 下钻。
   stageFieldContract:
     requiredFields:
       - stageId
@@ -1115,9 +1219,14 @@ pipelineIoContract:
         - raw LLM prompt or completion
         - runner ledger events as classification evidence
       emittedOutputs:
+        - BOOKSHELF_MEMBERSHIP_MANIFEST.json
+        - BOOKSHELF_MEMBERSHIP_MANIFEST.json.sha256
         - membership_decisions.jsonl
+        - membership_decisions.jsonl.sha256
         - bookshelf_members.json
+        - bookshelf_members.json.sha256
         - bookshelf_split_plan.json
+        - bookshelf_split_plan.json.sha256
         - optional VIRTUAL_BOOKSHELF_MANIFEST.json
         - membership diagnostics
       qualityGate:
@@ -1131,15 +1240,23 @@ pipelineIoContract:
           - oversized categories split before materialized indexing
           - virtual parents do not own semantic units
       stateWrites:
+        - BOOKSHELF_MEMBERSHIP_MANIFEST.json
+        - BOOKSHELF_MEMBERSHIP_MANIFEST.json.sha256
         - state/membership-quality-gate.json
+        - state/membership-quality-gate.json.sha256
         - state/diagnostics.json
         - runs/{runId}/events.jsonl
+        - runs/{runId}/status.json
         - runs/{runId}/checkpoints/{decisionId}.json
+        - runs/{runId}/recovery-summary.json
       failureOutputs:
         - upper_quality_gate_failed with membership check id
         - no BOOKSHELF_MANIFEST publish for the affected materialized shelf
         - optional suggestion-only shelves remain not query-ready
       nextStageInputs:
+        - BOOKSHELF_MEMBERSHIP_MANIFEST.json with queryReady false
+        - BOOKSHELF_MEMBERSHIP_MANIFEST.json.sha256
+        - state/membership-quality-gate.json with status passed
         - bookshelf_members.json for materialized shelf build
         - virtual parent to child materialized shelf mapping
         - accepted membership_decisions generation digest
@@ -1148,6 +1265,9 @@ pipelineIoContract:
         从成员单书包的已验证 qmd/GraphRAG 产物派生书架级 GraphRAG 索引。 只有物化书架执行该阶段。
       authorityRoot: graph_vault/catalog/bookshelves/{bookshelfId}
       requiredInputs:
+        - BOOKSHELF_MEMBERSHIP_MANIFEST.json with queryReady false
+        - BOOKSHELF_MEMBERSHIP_MANIFEST.json.sha256
+        - state/membership-quality-gate.json with membership_resolved passed
         - bookshelf_members.json with manifestSha256 and packageGeneration
         - member BOOK_MANIFEST.json files
         - member qmd/index metadata for source labeling
@@ -1178,6 +1298,7 @@ pipelineIoContract:
           - every member manifest sha256 matches bookshelf_members.json
           - member package gates passed at build time
           - semantic unit, edge, community report and evidence schemas valid
+          - semantic edge relationType values are in allowedRelationTypes
           - every upper semantic unit has evidence lineage to book artifacts
           - embedding fingerprint and vector index metadata match manifest
           - fixed query budget simulation passes
@@ -1215,6 +1336,8 @@ pipelineIoContract:
         - direct book set beyond directBookLimit
         - stale or failed bookshelf gates
       emittedOutputs:
+        - LIBRARY_MEMBERSHIP_MANIFEST.json
+        - LIBRARY_MEMBERSHIP_MANIFEST.json.sha256
         - library_members.json
         - library_partition_plan.json
         - library diagnostics
@@ -1230,11 +1353,17 @@ pipelineIoContract:
         - state/library-membership-gate.json
         - state/diagnostics.json
         - runs/{runId}/events.jsonl
+        - runs/{runId}/status.json
+        - runs/{runId}/recovery-summary.json
+        - runs/{runId}/checkpoints/{memberId}.json
       failureOutputs:
         - library not query-ready
         - upper_quality_gate_failed with membership_library_partition_valid or
           membership_direct_book_limit_valid
       nextStageInputs:
+        - LIBRARY_MEMBERSHIP_MANIFEST.json
+        - LIBRARY_MEMBERSHIP_MANIFEST.json.sha256
+        - state/library-membership-gate.json
         - library_members.json
         - ordered materialized bookshelf manifest list
         - expanded virtual parent to materialized child mapping
@@ -1273,6 +1402,7 @@ pipelineIoContract:
           - every member bookshelf manifest sha256 matches library_members.json
           - member bookshelf gates passed at build time
           - library semantic schemas valid
+          - semantic edge relationType values are in allowedRelationTypes
           - evidence_map links every unit to shelf and book evidence
           - fixed query budget simulation passes at representative library sizes
           - sensitive payload scan passes
@@ -1356,10 +1486,19 @@ pipelineIoContract:
     - fromStage: bookshelf_membership_resolution
       toStage: materialized_bookshelf_graph_build
       handoffArtifacts:
+        - BOOKSHELF_MEMBERSHIP_MANIFEST.json
+        - BOOKSHELF_MEMBERSHIP_MANIFEST.json.sha256
+        - state/membership-quality-gate.json
         - bookshelf_members.json
         - membership_decisions.jsonl
         - split plan for oversized categories
       rejectIf:
+        - BOOKSHELF_MEMBERSHIP_MANIFEST.json missing or checksum mismatch
+        - BOOKSHELF_MEMBERSHIP_MANIFEST queryReady is not false
+        - membership manifest membersDigest differs from bookshelf_members.json
+        - membership manifest decisionsDigest differs from membership_decisions.jsonl
+        - membership split plan digest missing or mismatched
+        - membership quality gate missing or not passed
         - LLM suggestion was not accepted
         - member count exceeds hardLimit without split
         - user lock conflict unresolved
@@ -1460,13 +1599,15 @@ implementationGroundingReview:
   summary:
     conclusion: >
       当前层级设计以已实现的单书 hotplug package、包内 qmd index、包内 GraphRAG output、catalog
-      projection、GraphRAG 单书查询和 runner ledger 为基础，没有脱离既有领域模型。书架和 library 的
-      manifest、builder、 上层 semantic artifacts、CLI scope 和 typed error 处理仍是新能力，
-      必须作为后续实现阶段交付，不能被视为已存在功能。
+      projection、GraphRAG 单书查询和 runner ledger 为基础，没有脱离既有领域模型。书架和
+      library 的 membership、builder、上层 semantic artifacts、CLI scope 和 typed
+      error fixed-budget report search 已作为独立 upper-index 能力交付；LLM
+      synthesis、受控下钻和 library 管理命令仍是后续能力。
     highestRisk: >
-      设计最容易脱节的位置不是单书包输入，而是 upper-level builder 与 CLI 查询 scope。现有代码只有单书 `--graph-book-id`
-      GraphRAG 查询和 book capability catalog；没有 `--bookshelf-id`、`--library-id`、upper
-      semantic unit index、BOOKSHELF_MANIFEST 或 LIBRARY_MANIFEST 的实现。
+      设计最容易脱节的位置不是单书包输入，而是 upper-level builder 与 CLI 查询 scope 的状态判定。当前代码已支持
+      `--bookshelf-id`、`--library-id`、upper semantic unit index、
+      BOOKSHELF_MANIFEST 和 LIBRARY_MANIFEST 的固定预算 report search；不得把这些
+      能力误读为已包含 LLM synthesis、跨 scope 下钻或完整 library 管理命令。
     requiredImplementationPosture: >
       实现必须优先新增独立模块，复用现有 hotplug validator、catalog projection、 qmd index 和 GraphRAG query
       contracts；不得把 bookshelf/library 逻辑塞入 已经较长的 CLI 主文件，也不得把 runner ledger 当作语义输入。
@@ -1518,22 +1659,35 @@ implementationGroundingReview:
         单书 GraphRAG 查询、capability route、runtime bridge retry、runtime metrics 和 query
         timing 已存在。层级查询设计应复用这些 contracts，但不能假设 已有跨书 scope。
     - designStage: bookshelf_membership_resolution
-      groundingStatus: direct_extension
+      groundingStatus: implemented_stage_target
       existingBasis:
         - catalog projected book inventory
         - manifestSha256 and packageGeneration in BOOK_MANIFEST
         - qmd projection metadata
         - hotplug quality and runtime gate states
-      missingImplementation:
-        - BOOKSHELF_MANIFEST schema
-        - bookshelf_members.json writer
-        - membership_decisions.jsonl writer
-        - user lock and taxonomy/LLM suggestion resolver
-        - oversized shelf split planner
+      implementedCode:
+        - src/graphrag/upper-index/bookshelf-membership.ts
+        - scripts/graphrag/build-bookshelf-membership.mjs
+        - test/graphrag-bookshelf-membership.test.ts
+      implementedArtifacts:
+        - graph_vault/catalog/bookshelves/{bookshelfId}/current/membership/BOOKSHELF_MEMBERSHIP_MANIFEST.json
+        - graph_vault/catalog/bookshelves/{bookshelfId}/current/membership/bookshelf_members.json
+        - graph_vault/catalog/bookshelves/{bookshelfId}/current/membership/membership_decisions.jsonl
+        - graph_vault/catalog/bookshelves/{bookshelfId}/current/membership/bookshelf_split_plan.json
+        - graph_vault/catalog/bookshelves/{bookshelfId}/current/state/membership-quality-gate.json
+      remainingImplementation:
+        - BOOKSHELF_MEMBERSHIP_MANIFEST schema
+          extension for taxonomy and LLM proposal provenance
+        - interactive user lock editing commands
+        - accepted LLM suggestion promotion workflow
       assessment: |
-        该阶段依赖的输入都能从现有 catalog 和单书包得到，但成员决策引擎本身 尚未实现。设计是合理扩展，不是现有功能。
+        该阶段已作为第一阶段真实目标实现：从已通过单书质量门的 mounted
+        book inventory 生成 membership manifest、members、decisions、split
+        plan 和 membership quality gate。BOOKSHELF_MEMBERSHIP_MANIFEST 仍只
+        证明成员闭环，不授予 bookshelf query_ready；BOOKSHELF_MANIFEST 仍由
+        materialized_bookshelf_graph_build 发布。
     - designStage: materialized_bookshelf_graph_build
-      groundingStatus: new_capability
+      groundingStatus: implemented_stage_target
       existingBasis:
         - member community_reports.parquet
         - member entities.parquet
@@ -1541,47 +1695,99 @@ implementationGroundingReview:
         - member text_units.parquet
         - GraphRAG index/query schemas and provider bridge
         - durable state and artifact validation patterns
-      missingImplementation:
-        - upper semantic_units.parquet builder
-        - semantic_edges.parquet builder
-        - bookshelf community clustering
-        - bookshelf community_reports generation
-        - evidence_map.parquet builder
-        - bookshelf quality gate
-        - atomic upper index publish protocol
+      implementedCode:
+        - src/graphrag/upper-index/bookshelf-graph-contracts.ts
+        - src/graphrag/upper-index/bookshelf-graph-parquet.ts
+        - src/graphrag/upper-index/bookshelf-graph-validator.ts
+        - src/graphrag/upper-index/bookshelf-graph.ts
+        - scripts/graphrag/build-bookshelf-graph.mjs
+        - scripts/graphrag/bookshelf-graph-parquet-bridge.py
+        - scripts/graphrag/bookshelf_graph_bridge_build.py
+        - scripts/graphrag/bookshelf_graph_bridge_contracts.py
+        - scripts/graphrag/bookshelf_graph_bridge_inspect.py
+        - scripts/graphrag/bookshelf_graph_bridge_io.py
+        - scripts/graphrag/bookshelf_graph_bridge_query.py
+        - test/graphrag-bookshelf-graph.test.ts
+      implementedArtifacts:
+        - graph_vault/catalog/bookshelves/{bookshelfId}/current/BOOKSHELF_MANIFEST.json
+        - graph_vault/catalog/bookshelves/{bookshelfId}/current/semantic_units.parquet
+        - graph_vault/catalog/bookshelves/{bookshelfId}/current/semantic_edges.parquet
+        - graph_vault/catalog/bookshelves/{bookshelfId}/current/communities.parquet
+        - graph_vault/catalog/bookshelves/{bookshelfId}/current/community_reports.parquet
+        - graph_vault/catalog/bookshelves/{bookshelfId}/current/evidence_map.parquet
+        - graph_vault/catalog/bookshelves/{bookshelfId}/current/semantic_unit_embeddings.lance/
+        - graph_vault/catalog/bookshelves/{bookshelfId}/current/state/bookshelf-quality-gate.json
+      remainingImplementation:
+        - richer bookshelf community clustering and summarization
+        - LLM-authored bookshelf community report synthesis
+        - incremental rebuild planner beyond conservative generation rebuild
       assessment: >
-        输入来源贴近现有 GraphRAG 单书产物，但上层图构建算法和产物格式尚未 编码。实现时应新增独立 upper-index builder 模块，不应改写单书
-        GraphRAG vendor output 或把全部 text_units 当交互查询输入。
+        该阶段已作为第二阶段真实目标实现，产物位于 catalog/bookshelves
+        下，不写回单书包。第一版 builder 生成上层 semantic_units、
+        semantic_edges、communities、community_reports、evidence_map 和
+        bookshelf quality gate，并执行固定预算模拟。当前版本偏向可验证的
+        派生 report search 结构，后续可在相同合同内增强社区聚类和 LLM
+        synthesis。
     - designStage: library_membership_resolution
-      groundingStatus: new_capability
+      groundingStatus: implemented_stage_target
       existingBasis:
-        - proposed BOOKSHELF_MANIFEST outputs
-        - proposed virtual parent and partition rules
+        - published BOOKSHELF_MANIFEST outputs
         - current catalog root convention
-      missingImplementation:
-        - LIBRARY_MANIFEST schema
-        - library_members.json writer
-        - virtual parent expansion
+        - graph_vault/catalog/library/{libraryId}/current/membership/
+        - graph_vault/catalog/library/{libraryId}/current/state/library-membership-gate.json
+      implementedCode:
+        - src/graphrag/upper-index/library-membership.ts
+        - scripts/graphrag/build-library-membership.mjs
+        - test/graphrag-library-membership.test.ts
+      implementedArtifacts:
+        - LIBRARY_MEMBERSHIP_MANIFEST.json
+        - library_members.json
+        - library_partition_plan.json
+        - library_membership_quality_gate
+      implementedBehavior:
         - directBookLimit enforcement
-        - library partition planner
+        - conservative library partition planning
+        - membership-only queryReady false handoff
+        - membership archive fallback after library graph publish
+      remainingImplementation:
+        - richer virtual parent expansion policies
+        - incremental membership refresh beyond conservative generation publish
       assessment: |
-        library membership 是书架能力之后的派生层。它符合 catalog 派生物设计， 但当前代码没有对应命令、schema 或 builder。
+        library membership 已作为真实目标实现。该阶段发布 queryReady=false 的
+        membership-only 产物，只能作为 library_graph_build 输入，不能授权
+        `--library-id` 查询。实现支持 membership-only current 和 graph current
+        archive 的读取与校验，防止 library graph 发布后复验 membership 失败。
     - designStage: library_graph_build
-      groundingStatus: new_capability
+      groundingStatus: implemented_stage_target
       existingBasis:
-        - proposed bookshelf semantic_units and community_reports
+        - published bookshelf semantic_units and community_reports
         - existing GraphRAG community report concepts
         - query timing and provider metrics pattern
-      missingImplementation:
-        - library semantic_units.parquet builder
-        - library semantic_edges.parquet builder
-        - library community_reports generator
-        - library evidence_map.parquet
-        - library quality gate
-        - incremental refresh by shelf manifest sha256
+      implementedCode:
+        - src/graphrag/upper-index/library-graph.ts
+        - src/graphrag/upper-index/library-graph-contracts.ts
+        - src/graphrag/upper-index/library-graph-validator.ts
+        - scripts/graphrag/build-library-graph.mjs
+        - scripts/graphrag/library_graph_bridge_build.py
+        - test/graphrag-library-graph.test.ts
+      implementedArtifacts:
+        - graph_vault/catalog/library/{libraryId}/current/LIBRARY_MANIFEST.json
+        - graph_vault/catalog/library/{libraryId}/current/semantic_units.parquet
+        - graph_vault/catalog/library/{libraryId}/current/semantic_edges.parquet
+        - graph_vault/catalog/library/{libraryId}/current/community_reports.parquet
+        - graph_vault/catalog/library/{libraryId}/current/evidence_map.parquet
+        - graph_vault/catalog/library/{libraryId}/current/state/library-quality-gate.json
+      remainingImplementation:
+        - LLM-authored library community report synthesis
+        - richer cross-shelf clustering
+        - incremental refresh planner beyond conservative generation rebuild
       assessment: >
-        该阶段是全新上层索引能力，必须在书架 builder 稳定后实现。设计中固定 查询预算与预计算 semantic units 的方向合理，但需要实现前的
-        fixture 和 contract tests。
+        library graph build 已作为真实目标实现。第一版 builder 以已发布
+        bookshelf current 为输入，生成 library 级 semantic_units、
+        semantic_edges、community_reports、evidence_map 和 quality gate，并以
+        staging -> quality gate -> current generation 发布。当前版本偏向可验证的
+        固定预算 report search，后续可在相同合同内增强跨书架聚类与 LLM
+        synthesis。
     - designStage: scoped_query_execution
       groundingStatus: partial_support
       existingCode:
@@ -1591,21 +1797,43 @@ implementationGroundingReview:
         - src/query/query-timing.ts
       existingCli:
         - --graph-book-id
+        - --bookshelf-id
+        - --library-id
         - --graph-vault
         - --query-method
         - --timing
       missingImplementation:
-        - --bookshelf-id
-        - --library-id
         - qmd library list/build/status/rebuild commands
-        - upper_index_missing typed error mapping in code
-        - upper_index_stale typed error mapping in code
-        - upper_quality_gate_failed typed error mapping in code
-        - fixed-budget upper semantic unit retrieval
+        - bounded deepening into selected single-book GraphRAG
+        - LLM synthesis over selected upper semantic units
+      implementedCode:
+        - src/graphrag/upper-index/bookshelf-query.ts
+        - src/graphrag/upper-index/library-query.ts
+        - src/cli/qmd.ts
+        - test/graphrag-bookshelf-graph.test.ts
+        - test/graphrag-library-graph.test.ts
+      implementedQueryBehavior:
+        - fixed-budget bookshelf community_reports retrieval
+        - fixed-budget library community_reports retrieval
+        - upper_index_missing typed error
+        - upper_index_stale typed error
+        - upper_quality_gate_failed typed error
+        - budget_exceeded_narrow_scope_required typed error
+        - evidence lineage through evidence_map
+        - bounded timing stage cli.query_bookshelf_upper_index
+        - bounded timing stage cli.query_library_upper_index
       assessment: >
-        现有 query route 和 timing 可复用，但 scoped upper query 需要扩展 CLI options、typed
-        errors、capability scope 和 retrieval provider。当前代码 的 TypedQueryErrorSchema 允许
-        string code，但没有层级设计列出的稳定 error code 分支。
+        scoped_query_execution 目前是部分实现：单书 `--graph-book-id` 保持既有
+        GraphRAG 查询，`--bookshelf-id` 与 `--library-id` 已支持只读取已发布
+        upper index current 的固定预算 report search，并返回 typed error、
+        timing 和 evidence lineage。LLM synthesis 和受控下钻仍未实现。
+      firstRunnableTarget: >
+        第一版 --bookshelf-id 与 --library-id 查询以已发布 upper index current
+        为唯一输入，执行固定预算的 upper-level community_reports 检索，并通过
+        evidence_map 把证据回链到 bookshelfId、bookId、sourceId、documentId、
+        contentHash、community report 或 text_unit。该目标不在交互路径构建索引，
+        不扫描全部单书 community_reports，不调用未受限 LLM synthesis；默认
+        synthesisLlMCallCap 为 0，输出标准 UnifiedAnswer 与 bounded timing。
   riskAssessment:
     - id: risk_upper_scope_assumed_existing
       severity: high

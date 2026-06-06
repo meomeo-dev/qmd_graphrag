@@ -959,6 +959,152 @@ describe("CLI GraphRAG unified route", () => {
     expect(JSON.stringify(answer)).not.toContain(workspace.graphVault);
   }, 30000);
 
+  test("qmd query --bookshelf-id returns upper typed error for missing index",
+    async () => {
+      const workspace = await createWorkspace();
+      const result = await runQmd(workspace, [
+        "query",
+        "--bookshelf-id",
+        "missing-bookshelf",
+        "--json",
+        "--timing",
+        "--no-rerank",
+        "How does test driven development work?",
+      ]);
+
+      expect(result.exitCode).toBe(66);
+      const error = JSON.parse(result.stderr);
+      expect(error).toMatchObject({
+        route: "graphrag",
+        stage: "graph_capability",
+        provider: "graphrag",
+        capability: "graph_query",
+        code: "upper_index_missing",
+        exitCode: 66,
+        scopeKind: "bookshelf",
+        scopeId: "missing-bookshelf",
+        retryable: false,
+        remediationCommand:
+          "node scripts/graphrag/build-bookshelf-graph.mjs --graph-vault <path> --bookshelf-id missing-bookshelf",
+        timingAvailable: true,
+      });
+      expect(error.metadata.diagnostics).toContain(
+        "missing_bookshelf_manifest_or_gate",
+      );
+      expect(result.stdout).toBe("");
+    },
+    30000,
+  );
+
+  test("qmd query --library-id returns upper typed error for missing index",
+    async () => {
+      const workspace = await createWorkspace();
+      const result = await runQmd(workspace, [
+        "query",
+        "--library-id",
+        "missing-library",
+        "--json",
+        "--timing",
+        "--no-rerank",
+        "How do architecture and delivery practices relate?",
+      ]);
+
+      expect(result.exitCode).toBe(66);
+      const error = JSON.parse(result.stderr);
+      expect(error).toMatchObject({
+        route: "graphrag",
+        stage: "graph_capability",
+        provider: "graphrag",
+        capability: "graph_query",
+        code: "upper_index_missing",
+        exitCode: 66,
+        scopeKind: "library",
+        scopeId: "missing-library",
+        retryable: false,
+        remediationCommand:
+          "node scripts/graphrag/build-library-graph.mjs --graph-vault <path> --library-id missing-library",
+        timingAvailable: true,
+      });
+      expect(error.metadata.diagnostics).toContain(
+        "missing_library_manifest_or_gate",
+      );
+      expect(result.stdout).toBe("");
+    },
+    30000,
+  );
+
+  test("qmd query rejects book and bookshelf scope ambiguity with upper fields",
+    async () => {
+      const workspace = await createWorkspace();
+      const result = await runQmd(workspace, [
+        "query",
+        "--graph-book-id",
+        "book-cli",
+        "--bookshelf-id",
+        "software-architecture-core",
+        "--json",
+        "--timing",
+        "--no-rerank",
+        "How does test driven development work?",
+      ]);
+
+      expect(result.exitCode).toBe(64);
+      const error = JSON.parse(result.stderr);
+      expect(error).toMatchObject({
+        route: "graphrag",
+        stage: "route",
+        provider: "graphrag",
+        capability: "graph_query",
+        code: "ambiguous_scope",
+        exitCode: 64,
+        scopeKind: "bookshelf",
+        scopeId: "software-architecture-core",
+        retryable: false,
+        remediationCommand:
+          "qmd query --graph-book-id <id>, --bookshelf-id <id>, or --library-id <id>",
+        timingAvailable: true,
+      });
+      expect(result.stdout).toBe("");
+    },
+    30000,
+  );
+
+  test("qmd query rejects book and library scope ambiguity with upper fields",
+    async () => {
+      const workspace = await createWorkspace();
+      const result = await runQmd(workspace, [
+        "query",
+        "--graph-book-id",
+        "book-cli",
+        "--library-id",
+        "software-engineering-library",
+        "--json",
+        "--timing",
+        "--no-rerank",
+        "How do architecture and delivery practices relate?",
+      ]);
+
+      expect(result.exitCode).toBe(64);
+      const error = JSON.parse(result.stderr);
+      expect(error).toMatchObject({
+        route: "graphrag",
+        stage: "route",
+        provider: "graphrag",
+        capability: "graph_query",
+        code: "ambiguous_scope",
+        exitCode: 64,
+        scopeKind: "library",
+        scopeId: "software-engineering-library",
+        retryable: false,
+        remediationCommand:
+          "qmd query --graph-book-id <id>, --bookshelf-id <id>, or --library-id <id>",
+        timingAvailable: true,
+      });
+      expect(result.stdout).toBe("");
+    },
+    30000,
+  );
+
   test("qmd query --graphrag recreates managed settings projection for a fresh vault",
     async () => {
       const workspace = await createWorkspace();

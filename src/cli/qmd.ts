@@ -188,6 +188,20 @@ import {
 import {
   writeManagedGraphRagSettingsSync,
 } from "../graphrag/settings-projection.js";
+import {
+  BookshelfQueryScopeError,
+  loadBookshelfGraphQueryCapabilities,
+  queryBookshelfGraph,
+} from "../graphrag/upper-index/bookshelf-query.js";
+import {
+  LibraryQueryScopeError,
+  loadLibraryGraphQueryCapabilities,
+  queryLibraryGraph,
+} from "../graphrag/upper-index/library-query.js";
+import {
+  resolveGraphRagQueryMethod,
+  resolveUpperTypedQueryErrorDetails,
+} from "./graphrag-query-scope.js";
 import { createRunId } from "../job-state/fingerprint.js";
 
 // NOTE: enableProductionMode() is intentionally NOT called at module scope here.
@@ -3458,16 +3472,21 @@ async function graphRagQuerySearch(
       const resolvedConfig = ensureRuntimeConfigForCli();
       const resolvedGraphVault = resolveGraphVaultForCli(values, resolvedConfig);
       ensureGraphRagSettingsProjectionForCli(resolvedConfig, resolvedGraphVault);
+      const bookshelfId = values["bookshelf-id"] == null
+        ? null
+        : String(values["bookshelf-id"]);
+      const libraryId = values["library-id"] == null
+        ? null
+        : String(values["library-id"]);
       return {
         config: resolvedConfig,
         graphVault: resolvedGraphVault,
-        method: GraphRagSearchMethodSchema.parse(
-          String(
-            values["query-method"] ||
-              resolvedConfig.graphrag?.default_method ||
-              "local",
-          ),
-        ),
+        method: resolveGraphRagQueryMethod({
+          requestedMethod: values["query-method"],
+          bookshelfId,
+          libraryId,
+          defaultMethod: resolvedConfig.graphrag?.default_method ?? null,
+        }),
       };
     },
   );
@@ -3479,8 +3498,47 @@ async function graphRagQuerySearch(
   const graphBookId = values["graph-book-id"] == null
     ? null
     : String(values["graph-book-id"]);
+  const bookshelfId = values["bookshelf-id"] == null
+    ? null
+    : String(values["bookshelf-id"]);
+  const libraryId = values["library-id"] == null
+    ? null
+    : String(values["library-id"]);
+  const explicitScopes = [
+    graphBookId == null ? null : "book",
+    bookshelfId == null ? null : "bookshelf",
+    libraryId == null ? null : "library",
+  ].filter(Boolean);
+  if (explicitScopes.length > 1) {
+    const upperScopeKind = libraryId != null ? "library" : "bookshelf";
+    const upperScopeId = libraryId ?? bookshelfId;
+    const upperError = resolveUpperTypedQueryErrorDetails({
+      code: "ambiguous_scope",
+      scopeKind: upperScopeKind,
+      scopeId: upperScopeId,
+      timingAvailable: opts.timing === true,
+    });
+    throw new TypedQueryErrorException(createTypedQueryError({
+      route: "graphrag",
+      stage: "route",
+      provider: "graphrag",
+      capability: "graph_query",
+      code: "ambiguous_scope",
+      ...upperError,
+      redactedMessage:
+        "--graph-book-id, --bookshelf-id and --library-id are mutually exclusive.",
+      metadata: { graphBookId, bookshelfId, libraryId },
+    }));
+  }
+  const pythonBin = values["python-bin"]
+    ? pathResolve(getPwd(), String(values["python-bin"]))
+    : config.graphrag?.python_bin
+      ? pathResolve(getPwd(), config.graphrag.python_bin)
+      : undefined;
   timing?.addMetadata({
     graphBookId: graphBookId ?? null,
+    bookshelfId: bookshelfId ?? null,
+    libraryId: libraryId ?? null,
     graphMethod: method,
     graphVault: basename(graphVault),
   });
@@ -3511,6 +3569,72 @@ async function graphRagQuerySearch(
       },
     )).qmdResult,
     resolveGraphScopeCapabilities: async () => {
+      if (bookshelfId != null) {
+        try {
+          return await loadBookshelfGraphQueryCapabilities({
+            graphVault,
+            bookshelfId,
+            method,
+            pythonBin,
+          });
+        } catch (error) {
+          if (error instanceof BookshelfQueryScopeError) {
+            const upperError = resolveUpperTypedQueryErrorDetails({
+              code: error.code,
+              scopeKind: "bookshelf",
+              scopeId: bookshelfId,
+              timingAvailable: opts.timing === true,
+            });
+            throw new TypedQueryErrorException(createTypedQueryError({
+              route: "graphrag",
+              stage: "graph_capability",
+              provider: "graphrag",
+              capability: "graph_query",
+              code: error.code,
+              ...upperError,
+              redactedMessage: error.message,
+              metadata: {
+                bookshelfId,
+                diagnostics: error.diagnostics,
+              },
+            }));
+          }
+          throw error;
+        }
+      }
+      if (libraryId != null) {
+        try {
+          return await loadLibraryGraphQueryCapabilities({
+            graphVault,
+            libraryId,
+            method,
+            pythonBin,
+          });
+        } catch (error) {
+          if (error instanceof LibraryQueryScopeError) {
+            const upperError = resolveUpperTypedQueryErrorDetails({
+              code: error.code,
+              scopeKind: "library",
+              scopeId: libraryId,
+              timingAvailable: opts.timing === true,
+            });
+            throw new TypedQueryErrorException(createTypedQueryError({
+              route: "graphrag",
+              stage: "graph_capability",
+              provider: "graphrag",
+              capability: "graph_query",
+              code: error.code,
+              ...upperError,
+              redactedMessage: error.message,
+              metadata: {
+                libraryId,
+                diagnostics: error.diagnostics,
+              },
+            }));
+          }
+          throw error;
+        }
+      }
       const capabilities = await loadGraphQueryCapabilities({
         graphVault,
         ...(graphBookId == null ? {} : { bookIds: [graphBookId] }),
@@ -3526,6 +3650,88 @@ async function graphRagQuerySearch(
         candidates,
       }),
     queryGraphRag: async (request, decision) => {
+      if (bookshelfId != null) {
+        try {
+          return await measureCliQueryTiming(
+            timing,
+            "cli.query_bookshelf_upper_index",
+            () => queryBookshelfGraph({
+              graphVault,
+              bookshelfId,
+              query: request.query,
+              method: GraphRagSearchMethodSchema.parse(request.method ?? method),
+              pythonBin,
+            }),
+          );
+        } catch (error) {
+          if (error instanceof BookshelfQueryScopeError) {
+            const upperError = resolveUpperTypedQueryErrorDetails({
+              code: error.code,
+              scopeKind: "bookshelf",
+              scopeId: bookshelfId,
+              timingAvailable: opts.timing === true,
+            });
+            throw new TypedQueryErrorException(createTypedQueryError({
+              route: request.requestedRoute,
+              stage: error.code === "budget_exceeded_narrow_scope_required" ||
+                error.code === "upper_index_runtime_error"
+                ? "graphrag_query"
+                : "graph_capability",
+              provider: "graphrag",
+              capability: "graph_query",
+              code: error.code,
+              ...upperError,
+              redactedMessage: error.message,
+              metadata: {
+                bookshelfId,
+                diagnostics: error.diagnostics,
+              },
+            }));
+          }
+          throw error;
+        }
+      }
+      if (libraryId != null) {
+        try {
+          return await measureCliQueryTiming(
+            timing,
+            "cli.query_library_upper_index",
+            () => queryLibraryGraph({
+              graphVault,
+              libraryId,
+              query: request.query,
+              method: GraphRagSearchMethodSchema.parse(request.method ?? method),
+              pythonBin,
+            }),
+          );
+        } catch (error) {
+          if (error instanceof LibraryQueryScopeError) {
+            const upperError = resolveUpperTypedQueryErrorDetails({
+              code: error.code,
+              scopeKind: "library",
+              scopeId: libraryId,
+              timingAvailable: opts.timing === true,
+            });
+            throw new TypedQueryErrorException(createTypedQueryError({
+              route: request.requestedRoute,
+              stage: error.code === "budget_exceeded_narrow_scope_required" ||
+                error.code === "upper_index_runtime_error"
+                ? "graphrag_query"
+                : "graph_capability",
+              provider: "graphrag",
+              capability: "graph_query",
+              code: error.code,
+              ...upperError,
+              redactedMessage: error.message,
+              metadata: {
+                libraryId,
+                diagnostics: error.diagnostics,
+              },
+            }));
+          }
+          throw error;
+        }
+      }
       if (decision.selectedBookIds.length !== 1) {
         throw new TypedQueryErrorException(createTypedQueryError({
           route: request.requestedRoute,
@@ -3577,11 +3783,7 @@ async function graphRagQuerySearch(
           includeRuntimeMetrics: opts.timing === true,
           verbose: false,
           environment: {
-            pythonBin: values["python-bin"]
-              ? pathResolve(getPwd(), String(values["python-bin"]))
-              : config.graphrag?.python_bin
-                ? pathResolve(getPwd(), config.graphrag.python_bin)
-                : undefined,
+            pythonBin,
             workingDirectory: getPwd(),
           },
         }),
@@ -3593,6 +3795,8 @@ async function graphRagQuerySearch(
   const timingReport = timing?.report({
     selectedRoute: answer.routeDecision.selectedRoute,
     graphBookId: graphBookId ?? null,
+    bookshelfId: bookshelfId ?? null,
+    libraryId: libraryId ?? null,
     graphMethod: method,
   });
   outputUnifiedAnswer(answer, { ...opts, timingReport });
@@ -4067,6 +4271,8 @@ function parseCLI() {
       graphrag: { type: "boolean", default: false },
       "graph-vault": { type: "string" },
       "graph-book-id": { type: "string" },
+      "bookshelf-id": { type: "string" },
+      "library-id": { type: "string" },
       mode: { type: "string" },
       "query-method": { type: "string" },
       "response-type": { type: "string" },
@@ -4684,6 +4890,8 @@ function showHelp(): void {
   console.log("  --graphrag                    - Use qmd graph-enhanced query over graph_vault");
   console.log("  --graph-vault <path>          - GraphRAG vault root (default ./graph_vault)");
   console.log("  --graph-book-id <bookId>      - Restrict GraphRAG query to one graph-ready book");
+  console.log("  --bookshelf-id <id>           - Query a published bookshelf upper index");
+  console.log("  --library-id <id>             - Query a published library upper index");
   console.log("  --query-method <method>       - GraphRAG method: local, global, drift, or basic");
   console.log("  --response-type <text>        - GraphRAG response type (default multiple paragraphs)");
   console.log("  --community-level <n>         - GraphRAG community level override");
@@ -5343,7 +5551,7 @@ function exitWithError(
 ): never {
   if (error instanceof TypedQueryErrorException) {
     console.error(JSON.stringify(error.payload, null, 2));
-    process.exit(code);
+    process.exit(error.payload.exitCode ?? code);
   } else {
     const message = error instanceof Error ? error.message : String(error);
     const redactedMessage =
@@ -5815,7 +6023,11 @@ if (isMain) {
             redactedMessage: "--mode must be qmd or auto.",
           }));
         }
-        if (cli.values.graphrag) {
+        if (
+          cli.values.graphrag ||
+          cli.values["bookshelf-id"] != null ||
+          cli.values["library-id"] != null
+        ) {
           await graphRagQuerySearch(cli.query, cli.opts, cli.values);
         } else {
           const config = ensureRuntimeConfigForCli();

@@ -149,8 +149,13 @@ export const TypedQueryErrorSchema = z.object({
   provider: z.string().min(1).nullable(),
   capability: z.string().min(1).nullable(),
   code: z.string().min(1),
+  exitCode: z.number().int().positive().optional(),
+  scopeKind: z.enum(["book", "bookshelf", "library"]).optional(),
+  scopeId: z.string().min(1).optional(),
   retryable: z.boolean(),
   redactedMessage: z.string().min(1),
+  remediationCommand: z.string().min(1).optional(),
+  timingAvailable: z.boolean().optional(),
   graphCapabilityError: GraphCapabilityErrorSchema.optional(),
   metadata: z.record(z.string(), JsonValueSchema).optional(),
 });

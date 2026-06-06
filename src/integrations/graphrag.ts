@@ -27,12 +27,16 @@ import {
   toIsoTimestamp,
 } from "../job-state/fingerprint.js";
 import { writeJsonFileDurable } from "../job-state/durable-json.js";
-import { callPythonBridge } from "./python-bridge.js";
+import {
+  PythonBridgeTimeoutError,
+  callPythonBridge,
+} from "./python-bridge.js";
 import type { BookStage } from "../contracts/book-job.js";
 import type { PythonBridgeEarlyStop } from "./python-bridge.js";
 
 const GRAPHRAG_QUERY_MAX_RETRIES = 3;
 const GRAPHRAG_QUERY_RETRY_BASE_MS = 1000;
+const DEFAULT_GRAPHRAG_QUERY_TIMEOUT_MS = 120_000;
 
 export type GraphRagIndexRuntimeOptions = {
   earlyStop?: {
@@ -46,7 +50,17 @@ function delayMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function graphRagQueryTimeoutMs(): number {
+  const raw = process.env.QMD_GRAPHRAG_QUERY_TIMEOUT_MS;
+  if (raw == null || raw.trim() === "") return DEFAULT_GRAPHRAG_QUERY_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isInteger(parsed) && parsed > 0
+    ? parsed
+    : DEFAULT_GRAPHRAG_QUERY_TIMEOUT_MS;
+}
+
 function isRetryableGraphRagQueryError(error: unknown): boolean {
+  if (error instanceof PythonBridgeTimeoutError) return false;
   if (!(error instanceof Error)) return false;
   const message = error.message.toLowerCase();
   const statusMatch = /(?:http|status(?: code)?|error code|code)[^\d]*([5]\d\d)/iu
@@ -112,6 +126,7 @@ async function callGraphRagQueryBridgeWithRetry(
         workingDirectory: parsed.environment?.workingDirectory,
         request: parsed,
         responseSchema: GraphRagQueryResponseSchema,
+        timeoutMs: graphRagQueryTimeoutMs(),
       });
     } catch (error) {
       if (

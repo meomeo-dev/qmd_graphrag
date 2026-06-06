@@ -29,6 +29,7 @@ type PythonBridgeCallOptions<TRequest, TResponse> = {
   responseSchema: ZodType<TResponse>;
   workingDirectory?: string;
   earlyStop?: PythonBridgeEarlyStop;
+  timeoutMs?: number;
 };
 
 const GRAPH_RAG_COMMUNITY_PARTIAL_LOG_PATTERN =
@@ -75,6 +76,28 @@ type BridgeSubprocessRecord = {
   completedAt?: string;
 };
 
+type ActivePythonBridgeChild = {
+  child: ReturnType<typeof spawn>;
+  processGroup: boolean;
+};
+
+const activePythonBridgeChildren = new Set<ActivePythonBridgeChild>();
+
+export class PythonBridgeTimeoutError extends Error {
+  readonly command: string;
+  readonly timeoutMs: number;
+
+  constructor(input: { command: string; timeoutMs: number }) {
+    super(
+      `python_bridge_timeout: command ${input.command} timed out after ` +
+        `${input.timeoutMs}ms`,
+    );
+    this.name = "PythonBridgeTimeoutError";
+    this.command = input.command;
+    this.timeoutMs = input.timeoutMs;
+  }
+}
+
 function pythonBridgeUsesProcessGroup(): boolean {
   return (
     process.platform !== "win32" &&
@@ -90,6 +113,12 @@ function parsePositiveInteger(value: string | undefined): number | undefined {
 
 function optionalString(value: string | undefined): string | undefined {
   return value == null || value === "" ? undefined : value;
+}
+
+function optionalPositiveMs(value: number | undefined): number | undefined {
+  return Number.isFinite(value) && value != null && value > 0
+    ? Math.floor(value)
+    : undefined;
 }
 
 function optionalProvider(
@@ -184,6 +213,33 @@ function terminatePythonBridgeChild(
     // Process may have already exited.
   }
 }
+
+function terminateActivePythonBridgeChildren(signal: NodeJS.Signals): void {
+  for (const item of activePythonBridgeChildren) {
+    terminatePythonBridgeChild(item.child, signal, item.processGroup);
+  }
+}
+
+function installPythonBridgeParentExitCleanup(): void {
+  const signalHandler = (signal: NodeJS.Signals) => {
+    terminateActivePythonBridgeChildren("SIGTERM");
+    terminateActivePythonBridgeChildren("SIGKILL");
+    if (process.listenerCount(signal) <= 1) {
+      process.removeListener("SIGTERM", sigtermHandler);
+      process.removeListener("SIGINT", sigintHandler);
+      process.kill(process.pid, signal);
+    }
+  };
+  const sigtermHandler = () => signalHandler("SIGTERM");
+  const sigintHandler = () => signalHandler("SIGINT");
+  process.on("SIGTERM", sigtermHandler);
+  process.on("SIGINT", sigintHandler);
+  process.on("exit", () => {
+    terminateActivePythonBridgeChildren("SIGKILL");
+  });
+}
+
+installPythonBridgeParentExitCleanup();
 
 function isActionableGraphRagPartialOutputLine(line: string): boolean {
   return GRAPH_RAG_ACTIONABLE_LOG_LEVEL_PATTERN.test(line) &&
@@ -353,6 +409,8 @@ export async function callPythonBridge<TRequest, TResponse>(
       stdio: ["pipe", "pipe", "pipe"],
       detached: processGroup,
     });
+    const activeChild = { child, processGroup };
+    activePythonBridgeChildren.add(activeChild);
     try {
       writeBridgeSubprocessRecord(buildBridgeSubprocessRecord({
         subprocessId,
@@ -363,6 +421,7 @@ export async function callPythonBridge<TRequest, TResponse>(
         processGroup,
       }));
     } catch (error) {
+      activePythonBridgeChildren.delete(activeChild);
       terminatePythonBridgeChild(child, "SIGTERM", processGroup);
       setTimeout(() => {
         terminatePythonBridgeChild(child, "SIGKILL", processGroup);
@@ -374,16 +433,22 @@ export async function callPythonBridge<TRequest, TResponse>(
     let stdout = "";
     let stderr = "";
     let finished = false;
-    let earlyStopError: Error | null = null;
+    let terminalError: Error | null = null;
     let watcher: EarlyStopWatcher | null = null;
     let killTimer: NodeJS.Timeout | null = null;
+    let timeoutTimer: NodeJS.Timeout | null = null;
 
     const cleanup = () => {
+      activePythonBridgeChildren.delete(activeChild);
       watcher?.stop();
       watcher = null;
       if (killTimer != null) {
         clearTimeout(killTimer);
         killTimer = null;
+      }
+      if (timeoutTimer != null) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
       }
     };
 
@@ -413,12 +478,23 @@ export async function callPythonBridge<TRequest, TResponse>(
     };
 
     const requestEarlyStop = (error: Error) => {
-      if (earlyStopError != null || finished) return;
-      earlyStopError = error;
+      if (terminalError != null || finished) return;
+      terminalError = error;
       watcher?.stop();
       watcher = null;
       terminateCurrentChild();
     };
+
+    const timeoutMs = optionalPositiveMs(options.timeoutMs);
+    if (timeoutMs != null) {
+      timeoutTimer = setTimeout(() => {
+        requestEarlyStop(new PythonBridgeTimeoutError({
+          command: options.command,
+          timeoutMs,
+        }));
+      }, timeoutMs);
+      timeoutTimer.unref?.();
+    }
 
     child.stdout.on("data", (chunk: Buffer | string) => {
       stdout += chunk.toString();
@@ -429,7 +505,7 @@ export async function callPythonBridge<TRequest, TResponse>(
     });
 
     child.on("error", (error) => {
-      if (earlyStopError != null) return;
+      if (terminalError != null) return;
       writeBridgeSubprocessRecord(buildBridgeSubprocessRecord({
         subprocessId,
         command: `python-bridge:${options.command}`,
@@ -456,8 +532,8 @@ export async function callPythonBridge<TRequest, TResponse>(
         processGroup,
       }));
       if (finished) return;
-      if (earlyStopError != null) {
-        rejectOnce(earlyStopError);
+      if (terminalError != null) {
+        rejectOnce(terminalError);
         return;
       }
       if (code !== 0) {
@@ -481,7 +557,7 @@ export async function callPythonBridge<TRequest, TResponse>(
     });
 
     child.stdin.on("error", (error) => {
-      if (earlyStopError != null) return;
+      if (terminalError != null) return;
       rejectOnce(error);
     });
     child.stdin.end(JSON.stringify(options.request), () => {
