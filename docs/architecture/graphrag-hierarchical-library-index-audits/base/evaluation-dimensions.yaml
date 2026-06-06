@@ -1,0 +1,103 @@
+schemaVersion: "1.0.0"
+title: GraphRAG 层级 Library 索引设计固定审计基准
+status: fixed_baseline
+owner: qmd_graphrag
+createdAt: "2026-06-05"
+appliesTo:
+  designDocument: >
+    docs/architecture/graphrag-hierarchical-library-index.type-dd.yaml
+baselinePolicy: >
+  本文件定义 10 个固定设计审计维度。所有 design-turn_* 审计必须逐项使用
+  相同 id、title、riskQuestion 与 passCriteria，不得改写基准后再判定通过。
+
+dimensions:
+  - id: D01_authority_boundaries
+    title: 权威边界与热插包隔离
+    riskQuestion: >
+      设计是否保持单书包 BOOK_MANIFEST.json 作为唯一包权威，并把书架与
+      library 索引限定为可重建派生物。
+    passCriteria:
+      - 单书包 query_ready 不依赖书架或 library 索引。
+      - 书架/library 不写入单书包文件闭包。
+      - catalog 派生索引损坏不会改变单书包挂载状态。
+  - id: D02_fixed_query_budget
+    title: 固定查询预算
+    riskQuestion: >
+      设计是否保证交互查询的 LLM 调用数、token 输入、候选语义单元数和
+      下钻书本数不随书籍数量线性增长。
+    passCriteria:
+      - 查询阶段使用固定 top-K 或明确预算参数。
+      - 禁止查询时全量扫描所有单书 community_reports。
+      - 超预算时有 fail-closed 或收窄 scope 机制。
+  - id: D03_graphrag_semantic_alignment
+    title: GraphRAG 语义对齐
+    riskQuestion: >
+      设计是否贴近 GraphRAG 的 community report、entity、relationship 和
+      map-reduce 查询原理，而不是退化为普通摘要检索。
+    passCriteria:
+      - 上层索引输入包含 community reports。
+      - 设计保留 entity/relationship 或等价语义关系。
+      - 上层综合回答基于预计算社区报告或语义单元。
+  - id: D04_evidence_traceability
+    title: 证据可追溯
+    riskQuestion: >
+      设计是否能把书架/library 回答追溯到 bookId、sourceId、documentId、
+      contentHash、community report 或 text_unit。
+    passCriteria:
+      - 定义 evidence_map 或等价结构。
+      - 每个上层语义单元有下层证据引用。
+      - 回答输出能暴露或摘要 evidence lineage。
+  - id: D05_state_recovery
+    title: 状态闭环与恢复
+    riskQuestion: >
+      设计是否覆盖构建阶段中断、失败、恢复、stale 检测和 partial publish
+      防护。
+    passCriteria:
+      - 有 durable checkpoints/events/status。
+      - partial build 不会发布 query-ready 上层索引。
+      - 成员变更会标记 stale 或生成新 generation。
+  - id: D06_quality_gates
+    title: 质量门
+    riskQuestion: >
+      设计是否为书架和 library 定义独立质量门，并覆盖 schema、checksum、
+      成员一致性、敏感信息和固定预算模拟。
+    passCriteria:
+      - 书架质量门存在且有 requiredChecks。
+      - library 质量门存在且有 requiredChecks。
+      - 质量门失败时查询不可用且诊断可见。
+  - id: D07_incremental_scaling
+    title: 增量扩展
+    riskQuestion: >
+      设计是否允许构建成本随规模增长，同时支持增量刷新，避免每次变更都
+      必须重建全库。
+    passCriteria:
+      - 记录成员 manifest sha256 和 generation。
+      - 定义增量刷新或保守全量重建条件。
+      - 大库通过书架分层限制重建影响范围。
+  - id: D08_security_privacy
+    title: 安全与隐私
+    riskQuestion: >
+      设计是否禁止 provider payload、密钥、原始 prompt/completion、绝对
+      路径和 query.log 进入可发布上层 manifest 或索引。
+    passCriteria:
+      - 定义 forbiddenInputs 或 sensitivityPolicy。
+      - 质量门包含敏感信息扫描。
+      - 诊断和 manifest 使用脱敏摘要或 digest。
+  - id: D09_cli_operability
+    title: CLI 可操作性与降级
+    riskQuestion: >
+      设计是否说明无 scope、有 scope、stale、缺索引、超预算等场景的 CLI
+      行为，避免长时间无输出。
+    passCriteria:
+      - 定义 scope resolution order。
+      - stale 或 ambiguity 有快速 typed error。
+      - 查询 timing/cost 观测可分解到层级阶段。
+  - id: D10_testability
+    title: 可测试性
+    riskQuestion: >
+      设计是否提供足够测试合同，覆盖正确性、成本边界、恢复、证据、
+      安全和热插兼容。
+    passCriteria:
+      - 至少定义 8 个必测案例。
+      - 测试包含不同规模库的固定预算验证。
+      - 测试包含单书 hotplug 非回归。
