@@ -40,7 +40,7 @@ export const LibraryQualityGateSchema = z.object({
     selectedSemanticUnits: z.number().int().nonnegative(),
     maxInputTokens: z.number().int().positive(),
     estimatedInputTokens: z.number().int().nonnegative(),
-    maxBookshelvesForDeepening: z.number().int().nonnegative(),
+    maxBookshelves: z.number().int().nonnegative(),
     selectedBookshelvesForDeepening: z.number().int().nonnegative(),
   }),
 });
@@ -114,7 +114,7 @@ export const LibraryGraphManifestSchema = z.object({
   }),
   fixedQueryBudget: z.object({
     maxSemanticUnits: z.number().int().positive(),
-    maxBookshelvesForDeepening: z.number().int().nonnegative(),
+    maxBookshelves: z.number().int().nonnegative(),
     maxShelfCommunityRefs: z.number().int().positive(),
     maxInputTokens: z.number().int().positive(),
     simulationStatus: z.literal("passed"),

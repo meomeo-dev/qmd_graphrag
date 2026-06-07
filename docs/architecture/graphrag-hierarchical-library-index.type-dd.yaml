@@ -2,36 +2,37 @@ schemaVersion: 1.0.0
 title: GraphRAG 书-书架-Library 层级索引统一设计
 status: design_audit_passed
 owner: qmd_graphrag
-lastReviewed: 2026-06-06
+lastReviewed: 2026-06-07
 purpose: >
   定义在现有单书热插拔包之上构建书架 (bookshelf) 与 library 层级 GraphRAG
   索引的设计，使跨书查询在书籍数量增长时保持固定查询预算，同时把
   全库语义整合、聚类与摘要成本前移到构建阶段。design-turn_011 后，
   bookshelf 与 library 被定义为 graph_vault/bookshelves/** 和
   graph_vault/library/** 下可复制传播的上层包，catalog 只承担 projection
-  与路由索引职责。design-turn_014 已按固定 D01-D10 基准复审通过。
+  与路由索引职责。design-turn_016 已按固定 D01-D10 基准复审通过。
 designAudit:
   auditDirectory: docs/architecture/graphrag-hierarchical-library-index-audits
   baselineDirectory: |
     docs/architecture/graphrag-hierarchical-library-index-audits/base
   currentRunDirectory: |
-    docs/architecture/graphrag-hierarchical-library-index-audits/design-turn_014
+    docs/architecture/graphrag-hierarchical-library-index-audits/design-turn_016
   finalReport: >
     docs/architecture/graphrag-hierarchical-library-index-audits/reports/final-summary.md
   baselinePolicy: |
     所有设计审计轮次必须复用 base 目录中的固定 10 个评估维度。 后续轮次不得新增、删除、重命名、重排或改写基准维度，除非开启新的 设计任务。
   status: design_audit_passed
   finalAuditSummary:
-    run: design-turn_014
+    run: design-turn_016
     baseline: |
       docs/architecture/graphrag-hierarchical-library-index-audits/base/evaluation-dimensions.yaml
-    result: 3_agents_all_d01_to_d10_passed_catalog_projection_update
+    result: 3_agents_all_d01_to_d10_passed_controlled_deepening_update
     conclusion: >
-      第十四轮设计审计中 3 个 agent 均按固定 D01-D10 基准判定通过。
-      本文档继续保持上层包目录权威修订：bookshelf 与 library 包根分别为
-      graph_vault/bookshelves/{bookshelfId} 与 graph_vault/library/{libraryId}。
-      最新复审确认 query-ready 上层包发布后生成的 catalog projection 仍是
-      非权威派生视图，不拥有上层包闭包，也不能证明 query-ready。
+      第十五轮设计审计中 2 个 agent 判定 PASS、1 个 agent 判定 FAIL。
+      FAIL required fixes 指出 `maxBookshelvesForDeepening` 预算字段未闭合，
+      且 design-turn_015 / implementation-turn_016 状态被提前写成已通过。
+      本轮修复后，第十六轮设计审计中 3 个 agent 均按固定 D01-D10 基准
+      判定通过。当前文档将 library 受控下钻预算统一为已定义的
+      `maxBookshelves`，并保持 implementation-turn_016 为待实施审计闭环状态。
 documentAuthority:
   canonicalDocument: docs/architecture/graphrag-hierarchical-library-index.type-dd.yaml
   rule: 本文档是书-书架-library 层级 GraphRAG 索引设计的唯一规范性 Type DD。pipeline I/O、实现接地性、书架组织策略、library
@@ -83,13 +84,18 @@ implementationGrounding:
     - package-root qmd bookshelf/library status/list/build/rebuild 管理命令；
       status/list 仅读取上层包权威状态，build/rebuild 仅从 package-root
       membership 调用现有上层 builder/validator 并发布 query-ready 包。
+    - explicit --upper-deepening controlled deepening from selected upper
+      evidence into bounded member single-book GraphRAG calls, with
+      --max-deepening-targets only allowed to narrow the package budget。
   remainingCapabilities:
     - LLM synthesis over selected upper semantic units。
-    - bounded deepening into selected single-book GraphRAG。
   implementationRule: >
     已实现的书架/library 查询仅覆盖固定预算 community_reports report
-    search、证据回链、typed error 和 timing，权威读取已迁移到
-    graph_vault/bookshelves/** 与 graph_vault/library/** 上层包闭包。
+    search、显式受控单书下钻、证据回链、typed error 和 timing，权威读取已迁移到
+    graph_vault/bookshelves/** 与 graph_vault/library/** 上层包闭包。受控下钻默认关闭；
+    只有显式 `--upper-deepening` 才能从上层已选 evidence 中按
+    maxBooksForDeepening 或 maxBookshelves 选择固定数量目标，并且
+    `--max-deepening-targets` 只能收窄不能放宽 package-local 固定预算。
     catalog projection 只能作为派生发现和路由视图；显式上层查询必须先校验
     package-local CURRENT、manifest、PUBLISH_READY、quality gate 和 checksum
     sidecar。后续实现必须继续以现有单书包和上层包 manifest 为权威边界，
@@ -1211,14 +1217,15 @@ pipelineIoContract:
       - bookshelf_membership_resolution
       - materialized_bookshelf_graph_build
       - bookshelf scoped_query_execution fixed-budget report search
+      - bookshelf scoped_query_execution explicit controlled deepening
       - library_membership_resolution
       - library_graph_build
       - library scoped_query_execution fixed-budget report search
+      - library scoped_query_execution explicit controlled deepening
       - catalog projection generated from query-ready bookshelf/library packages
       - qmd bookshelf/library status/list/build/rebuild management commands
         over package roots
     remainingNewCapabilities:
-      - bounded deepening into single-book GraphRAG
       - LLM synthesis over selected upper semantic units
     rule: >
       alreadySupported 表示当前代码已有对应单书或 catalog 基础；
@@ -1227,14 +1234,17 @@ pipelineIoContract:
       作为上层包权威根。remainingNewCapabilities 表示设计已定义合同但
       尚未完成实现。bookshelf/library scoped_query_execution 当前覆盖
       package-root 固定预算 community_reports 检索、证据回链、timing 观测、
-      legacy catalog-only migration typed error，以及无 catalog projection 的显式
+      显式 `--upper-deepening` 受控单书下钻、legacy catalog-only migration
+      typed error，以及无 catalog projection 的显式
       上层包查询。catalog projection 生成已限定为从 query-ready 上层包派生的
       非权威 projection。bookshelf/library status/list 管理命令只读取
       package-root `CURRENT.json`、manifest、PUBLISH_READY、quality gate 和
       catalog projection 存在性，不触发构建，也不把 catalog projection 当作
       query-ready 权威。bookshelf/library build/rebuild 管理命令只消费既有
       package-root membership，调用已实现的上层 builder/validator 并重新发布
-      query-ready 包；仍不包含 LLM synthesis、跨 scope 下钻、membership 创建、
+      query-ready 包；显式上层下钻只使用上层 query 已选 evidence 和固定数量
+      member book GraphRAG 调用，默认关闭，不扫描全库。当前仍不包含
+      LLM synthesis、membership 创建、
       自动 repair 或增量 refresh 管理生命周期。
   stageFieldContract:
     requiredFields:
@@ -1926,6 +1936,74 @@ implementationGroundingReview:
           management lifecycle remains future
         - real external provider single-book --graph-book-id success not executed
         - LLM synthesis and controlled deepening remain future
+    postImplementationTurn016LocalAdditions:
+      status: explicit_controlled_deepening_minimum_reaudited_with_risk
+      completed:
+        - src/graphrag/upper-index/upper-query-capability.ts models upper scope
+          query as a scope-level graph_query capability shared by route
+          decisions and evidence lineage
+        - src/graphrag/upper-index/controlled-deepening.ts adds fixed-budget
+          optional deepening from selected upper evidence into member book
+          GraphRAG calls
+        - src/graphrag/upper-index/bookshelf-query.ts and library-query.ts
+          wire controlled deepening after package-root upper report search
+        - src/cli/qmd.ts adds --upper-deepening and --max-deepening-targets,
+          with max-deepening-targets only allowed to narrow the package budget
+        - controlled deepening validates selected member book graph_query
+          capabilities before invoking single-book GraphRAG and fails closed
+          with upper_index_stale when a selected book is no longer query-ready
+        - queryBookshelfGraph and queryLibraryGraph reject attempts to widen
+          package-local maxReports or maxInputTokens beyond the manifest budget
+        - bookshelf/library scale tests publish package-local synthetic packages
+          and validate CURRENT, PUBLISH_READY, manifest, quality gate and
+          formal query APIs at 10/100/1000 represented book scale
+      validation:
+        - TypeScript build check passed
+        - test/graphrag-controlled-deepening.test.ts passed with fixed-budget,
+          library target de-duplication, budget-exceeded and missing-capability
+          fail-closed coverage
+        - test/graphrag-bookshelf-graph.test.ts and
+          test/graphrag-library-graph.test.ts passed after default report-only
+          query regression
+        - test/cli-graphrag-route.test.ts, test/cli-graphrag-query-scope.test.ts
+          and test/cli-graphrag-upper-index-failclosed.test.ts passed after
+          CLI controlled-deepening option wiring
+        - test/graphrag-bookshelf-membership.test.ts,
+          test/graphrag-library-membership.test.ts and
+          test/cli-graphrag-upper-management.test.ts passed after
+          implementation-turn_019 review
+        - single-book hotplug creation/runtime/catalog/qmd projection,
+          capability scope, CLI vsearch and store vectorSearchQuery focused
+          regressions passed after implementation-turn_019 review
+      reAudit:
+        implementationTurn016:
+          result: mixed_with_required_fixes
+          finding: >
+            agent-2 required fixes for upper graph_query capability consistency,
+            query-time row budget validation, CLI controlled deepening coverage
+            and bookshelf scale coverage.
+        implementationTurn017:
+          result: mixed_with_required_fixes
+          finding: >
+            agent-2 and agent-3 required fixes for exported query API budget
+            widening, scale tests bypassing package-local closure and missing
+            library CLI upper-deepening success coverage.
+        implementationTurn018:
+          result: mixed_with_required_fixes
+          finding: >
+            agent-3 required fix for library 10/100/1000 package-local scale
+            test timeout.
+        implementationTurn019:
+          result: 3_agents_pass_with_risk
+          report: >
+            docs/architecture/graphrag-hierarchical-library-index-audits/reports/implementation-turn-019-summary.md
+      retainedRisks:
+        - real external provider single-book --graph-book-id success not executed
+        - --upper-deepening uses fixture-tested and injectable provider paths in
+          this turn; real external provider success remains separately blocked
+        - LLM synthesis remains future
+        - membership creation, automatic repair and incremental refresh
+          management lifecycle remains future
   groundingMatrix:
     - designStage: book_package_publish
       groundingStatus: already_supported
@@ -2149,13 +2227,14 @@ implementationGroundingReview:
         - --query-method
         - --timing
       missingImplementation:
-        - qmd library list/build/status/rebuild commands
-        - bounded deepening into selected single-book GraphRAG
         - LLM synthesis over selected upper semantic units
       implementedCode:
         - src/graphrag/upper-index/bookshelf-query.ts
         - src/graphrag/upper-index/library-query.ts
+        - src/graphrag/upper-index/upper-query-capability.ts
+        - src/graphrag/upper-index/controlled-deepening.ts
         - src/cli/qmd.ts
+        - test/graphrag-controlled-deepening.test.ts
         - test/graphrag-bookshelf-graph.test.ts
         - test/graphrag-library-graph.test.ts
       implementedQueryBehavior:
@@ -2166,23 +2245,32 @@ implementationGroundingReview:
         - upper_quality_gate_failed typed error
         - budget_exceeded_narrow_scope_required typed error
         - evidence lineage through evidence_map
+        - explicit --upper-deepening routes selected upper evidence into
+          bounded member book GraphRAG calls
+        - --max-deepening-targets rejects attempts to exceed package fixed budget
+        - controlled deepening fails closed when a selected member book
+          graph_query capability is missing
         - bounded timing stage cli.query_bookshelf_upper_index
         - bounded timing stage cli.query_library_upper_index
       assessment: >
         scoped_query_execution 目前是部分实现：单书 `--graph-book-id` 保持既有
         GraphRAG 查询，package-root `--bookshelf-id` 与 `--library-id` 已支持
-        只读取已发布 upper package current 的固定预算 report search，并返回
-        typed error、timing 和 evidence lineage。显式查询不依赖 catalog
+        只读取已发布 upper package current 的固定预算 report search，并可通过
+        显式 `--upper-deepening` 对已选 evidence 中的固定数量 member books
+        调用单书 GraphRAG；查询返回 typed error、timing 和 evidence lineage。
+        显式查询不依赖 catalog
         projection；query-ready 上层包发布后会重建非权威 catalog projection。
-        LLM synthesis 和受控下钻仍未实现。
+        LLM synthesis 仍未实现。
       firstRunnableTarget: >
         新一版 --bookshelf-id 与 --library-id 查询必须以已发布 package-root
         upper index current 为唯一输入，执行固定预算的 upper-level
         community_reports 检索，并通过
         evidence_map 把证据回链到 bookshelfId、bookId、sourceId、documentId、
         contentHash、community report 或 text_unit。该目标不在交互路径构建索引，
-        不扫描全部单书 community_reports，不调用未受限 LLM synthesis；默认
-        synthesisLlMCallCap 为 0，输出标准 UnifiedAnswer 与 bounded timing。
+        不扫描全部单书 community_reports。显式 `--upper-deepening` 只在该
+        upper query 已选 evidence 上按 fixed budget 调用单书 GraphRAG；
+        默认 synthesisLlMCallCap 为 0，不调用未受限 LLM synthesis，输出标准
+        UnifiedAnswer 与 bounded timing。
   riskAssessment:
     - id: risk_upper_scope_assumed_existing
       severity: high
@@ -2248,9 +2336,10 @@ implementationGroundingReview:
         - bookshelf quality gate and fixed-budget simulation
         - catalog projection generated from query-ready bookshelf package
         - no LLM suggestion promotion without user acceptance record
+        - explicit --upper-deepening controlled deepening into selected
+          member books under maxBooksForDeepening
       remaining:
         - LLM synthesis over selected bookshelf semantic units
-        - controlled deepening into selected member books
     phase3_libraryBuild:
       status: package_root_minimum_implemented
       includes:
@@ -2261,6 +2350,8 @@ implementationGroundingReview:
         - catalog projection generated from query-ready library package
         - bookshelf/library status/list/build/rebuild management commands over
           package roots
+        - explicit --upper-deepening controlled deepening from selected
+          library evidence into member books under maxBookshelves
       remaining:
         - LLM synthesis over selected library semantic units
         - membership creation, automatic repair and incremental refresh

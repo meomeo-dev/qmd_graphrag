@@ -2162,6 +2162,9 @@ function parseEmbedBatchOption(name: string, value: unknown): number | undefined
 
 function parsePositiveIntegerOption(name: string, value: unknown): number | undefined {
   if (value === undefined) return undefined;
+  if (typeof value === "boolean") {
+    throw new Error(`${name} must be a positive integer`);
+  }
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 1) {
     throw new Error(`${name} must be a positive integer`);
@@ -3554,6 +3557,14 @@ async function graphRagQuerySearch(
   ) {
     throw new Error("--community-level must be a positive integer");
   }
+  const upperDeepening = values["upper-deepening"] === true;
+  const maxDeepeningTargets = parsePositiveIntegerOption(
+    "--max-deepening-targets",
+    values["max-deepening-targets"],
+  );
+  if (maxDeepeningTargets != null && !upperDeepening) {
+    throw new Error("--max-deepening-targets requires --upper-deepening");
+  }
 
   const answer = await routeQuery({
     schemaVersion: SchemaVersion,
@@ -3664,6 +3675,46 @@ async function graphRagQuerySearch(
               query: request.query,
               method: GraphRagSearchMethodSchema.parse(request.method ?? method),
               pythonBin,
+              responseType,
+              communityLevel,
+              controlledDeepening: {
+                enabled: upperDeepening,
+                maxTargets: maxDeepeningTargets,
+                runBookQuery: upperDeepening
+                  ? async (deepening) => {
+                    const runtime = createQmdGraphRagRuntime();
+                    const dataDir = await measureCliQueryTiming(
+                      timing,
+                      "cli.resolve_deepening_book_graphrag_data_dir",
+                      () => resolveBookGraphRagDataDir(graphVault, deepening.bookId),
+                    );
+                    const reportDir = resolveBookRuntimeGraphRagQueryReportDir(
+                      graphVault,
+                      deepening.bookId,
+                    );
+                    return await measureCliQueryTiming(
+                      timing,
+                      "cli.invoke_deepening_graphrag_runtime",
+                      () => runtime.graphQuery({
+                        rootDir: graphVault,
+                        dataDir,
+                        reportDir,
+                        method: deepening.method,
+                        query: deepening.query,
+                        responseType: deepening.responseType,
+                        capabilityScope: deepening.capabilityScope,
+                        communityLevel: deepening.communityLevel,
+                        includeRuntimeMetrics: opts.timing === true,
+                        verbose: false,
+                        environment: {
+                          pythonBin,
+                          workingDirectory: getPwd(),
+                        },
+                      }),
+                    );
+                  }
+                  : undefined,
+              },
             }),
           );
         } catch (error) {
@@ -3705,6 +3756,46 @@ async function graphRagQuerySearch(
               query: request.query,
               method: GraphRagSearchMethodSchema.parse(request.method ?? method),
               pythonBin,
+              responseType,
+              communityLevel,
+              controlledDeepening: {
+                enabled: upperDeepening,
+                maxTargets: maxDeepeningTargets,
+                runBookQuery: upperDeepening
+                  ? async (deepening) => {
+                    const runtime = createQmdGraphRagRuntime();
+                    const dataDir = await measureCliQueryTiming(
+                      timing,
+                      "cli.resolve_deepening_book_graphrag_data_dir",
+                      () => resolveBookGraphRagDataDir(graphVault, deepening.bookId),
+                    );
+                    const reportDir = resolveBookRuntimeGraphRagQueryReportDir(
+                      graphVault,
+                      deepening.bookId,
+                    );
+                    return await measureCliQueryTiming(
+                      timing,
+                      "cli.invoke_deepening_graphrag_runtime",
+                      () => runtime.graphQuery({
+                        rootDir: graphVault,
+                        dataDir,
+                        reportDir,
+                        method: deepening.method,
+                        query: deepening.query,
+                        responseType: deepening.responseType,
+                        capabilityScope: deepening.capabilityScope,
+                        communityLevel: deepening.communityLevel,
+                        includeRuntimeMetrics: opts.timing === true,
+                        verbose: false,
+                        environment: {
+                          pythonBin,
+                          workingDirectory: getPwd(),
+                        },
+                      }),
+                    );
+                  }
+                  : undefined,
+              },
             }),
           );
         } catch (error) {
@@ -4281,6 +4372,8 @@ function parseCLI() {
       "response-type": { type: "string" },
       "community-level": { type: "string" },
       "python-bin": { type: "string" },
+      "upper-deepening": { type: "boolean", default: false },
+      "max-deepening-targets": { type: "string" },
       "max-semantic-units": { type: "string" },
       "max-edges": { type: "string" },
       "max-reports-per-book": { type: "string" },
@@ -4905,6 +4998,8 @@ function showHelp(): void {
   console.log("  --response-type <text>        - GraphRAG response type (default multiple paragraphs)");
   console.log("  --community-level <n>         - GraphRAG community level override");
   console.log("  --python-bin <path>           - Python executable for GraphRAG bridge");
+  console.log("  --upper-deepening             - Deepen selected upper-index evidence into member books");
+  console.log("  --max-deepening-targets <n>   - Narrow upper deepening below package budget");
   console.log("");
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");

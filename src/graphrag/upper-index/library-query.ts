@@ -8,11 +8,6 @@ import {
   type GraphRagSearchMethod,
 } from "../../contracts/graphrag.js";
 import { readHotplugPackageUnknown } from "../book-hotplug-package-readonly.js";
-import { resolveBookManifestPath } from "../book-package-layout.js";
-import {
-  BookManifestSchema,
-  BookshelfGraphManifestSchema,
-} from "./bookshelf-graph-contracts.js";
 import {
   defaultBookshelfGraphBridgePath,
   runBookshelfGraphQueryBridge,
@@ -27,6 +22,15 @@ import {
   packageLocator,
   readQueryReadyPackage,
 } from "./upper-package-paths.js";
+import {
+  upperGraphQueryCapability,
+  upperGraphQueryCapabilityId,
+} from "./upper-query-capability.js";
+import {
+  ControlledDeepeningError,
+  applyControlledDeepening,
+  type ControlledDeepeningBookQuery,
+} from "./controlled-deepening.js";
 
 export type LibraryQueryScopeErrorCode =
   | "upper_index_missing"
@@ -57,6 +61,7 @@ export type LibraryQueryScope = {
   libraryId: string;
   root: string;
   manifest: LibraryGraphManifest;
+  manifestSha256: string;
   maxInputTokens: number;
   maxReports: number;
 };
@@ -70,7 +75,72 @@ export type QueryLibraryGraphInput = {
   bridgePath?: string;
   maxReports?: number;
   maxInputTokens?: number;
+  responseType?: string;
+  communityLevel?: number;
+  controlledDeepening?: {
+    enabled?: boolean;
+    maxTargets?: number;
+    loadBookCapabilities?: (
+      bookIds: readonly string[],
+    ) => Promise<GraphCapability[]>;
+    runBookQuery?: ControlledDeepeningBookQuery;
+  };
 };
+
+function hasBudgetDiagnostic(diagnostics: readonly string[]): boolean {
+  return diagnostics.some((item) =>
+    item === "budget_exceeded_narrow_scope_required" ||
+    item.startsWith("budget_exceeded_narrow_scope_required:")
+  );
+}
+
+function resolveRequestedBudget(input: {
+  requestedMaxReports?: number;
+  requestedMaxInputTokens?: number;
+  scope: LibraryQueryScope;
+}): { maxReports: number; maxInputTokens: number } {
+  const diagnostics: string[] = [];
+  if (input.requestedMaxReports != null) {
+    if (
+      !Number.isInteger(input.requestedMaxReports) ||
+      input.requestedMaxReports < 1
+    ) {
+      diagnostics.push(`invalid_max_reports:${input.requestedMaxReports}`);
+    } else if (input.requestedMaxReports > input.scope.maxReports) {
+      diagnostics.push(
+        `requested_max_reports_exceeds_package_budget:` +
+          `${input.requestedMaxReports}:max:${input.scope.maxReports}`,
+      );
+    }
+  }
+  if (input.requestedMaxInputTokens != null) {
+    if (
+      !Number.isInteger(input.requestedMaxInputTokens) ||
+      input.requestedMaxInputTokens < 1
+    ) {
+      diagnostics.push(
+        `invalid_max_input_tokens:${input.requestedMaxInputTokens}`,
+      );
+    } else if (input.requestedMaxInputTokens > input.scope.maxInputTokens) {
+      diagnostics.push(
+        `requested_max_input_tokens_exceeds_package_budget:` +
+          `${input.requestedMaxInputTokens}:max:${input.scope.maxInputTokens}`,
+      );
+    }
+  }
+  if (diagnostics.length > 0) {
+    throw new LibraryQueryScopeError(
+      "budget_exceeded_narrow_scope_required",
+      "Library query budget cannot exceed the package-local fixed budget.",
+      diagnostics,
+    );
+  }
+  return {
+    maxReports: input.requestedMaxReports ?? input.scope.maxReports,
+    maxInputTokens:
+      input.requestedMaxInputTokens ?? input.scope.maxInputTokens,
+  };
+}
 
 async function readPublishedScope(input: {
   graphVault: string;
@@ -142,12 +212,15 @@ async function readPublishedScope(input: {
     );
   }
   if (!validation.ok) {
+    const budgetExceeded = hasBudgetDiagnostic(validation.diagnostics);
     const stale = validation.diagnostics.some((item) =>
       item.includes("stale") ||
       item.includes("sha_changed")
     );
     throw new LibraryQueryScopeError(
-      stale ? "upper_index_stale" : "upper_quality_gate_failed",
+      budgetExceeded
+        ? "budget_exceeded_narrow_scope_required"
+        : stale ? "upper_index_stale" : "upper_quality_gate_failed",
       "Library upper index failed query readiness validation.",
       validation.diagnostics,
     );
@@ -170,43 +243,9 @@ async function readPublishedScope(input: {
     libraryId: input.libraryId,
     root,
     manifest,
+    manifestSha256: packageReady.current.manifestSha256,
     maxInputTokens: manifest.fixedQueryBudget.maxInputTokens,
     maxReports: manifest.fixedQueryBudget.maxSemanticUnits,
-  };
-}
-
-async function representativeBookForShelf(input: {
-  graphVault: string;
-  bookshelfId: string;
-}): Promise<{ bookId: string; contentHash: string }> {
-  const ready = await readQueryReadyPackage({
-    graphVault: input.graphVault,
-    scopeKind: "bookshelf",
-    scopeId: input.bookshelfId,
-  }).catch(() => {
-    throw new LibraryQueryScopeError(
-      "upper_quality_gate_failed",
-      "Library member bookshelf package is not query-ready.",
-      [`member_bookshelf_package_missing:${input.bookshelfId}`],
-    );
-  });
-  const manifest = BookshelfGraphManifestSchema.parse(
-    await readHotplugPackageUnknown(ready.manifestPath),
-  );
-  const bookId = Object.keys(manifest.membership.memberManifestSha256).sort()[0];
-  if (bookId == null) {
-    throw new LibraryQueryScopeError(
-      "upper_quality_gate_failed",
-      "Library member bookshelf has no representative book.",
-      [`empty_bookshelf_member:${input.bookshelfId}`],
-    );
-  }
-  const bookManifest = BookManifestSchema.parse(
-    await readHotplugPackageUnknown(resolveBookManifestPath(input.graphVault, bookId)),
-  );
-  return {
-    bookId,
-    contentHash: bookManifest.identity.sourceHash,
   };
 }
 
@@ -223,50 +262,14 @@ export async function loadLibraryGraphQueryCapabilities(input: {
     pythonBin: input.pythonBin ?? "python3",
     bridgePath: input.bridgePath ?? defaultBookshelfGraphBridgePath(),
   });
-  const selectedShelves =
-    scope.manifest.membership.expandedMaterializedBookshelfIds.slice(
-      0,
-      Math.max(1, scope.manifest.fixedQueryBudget.maxBookshelvesForDeepening),
-    );
-  const capabilities: GraphCapability[] = [];
-  for (const bookshelfId of selectedShelves) {
-    const representative = await representativeBookForShelf({
-      graphVault: scope.graphVault,
-      bookshelfId,
-    });
-    capabilities.push({
-      schemaVersion: SchemaVersion,
-      capabilityId: [
-        "library",
-        scope.libraryId,
-        scope.manifest.libraryIdentity.generation,
-        bookshelfId,
-        representative.bookId,
-        input.method ?? "global",
-      ].join(":"),
-      kind: "global_search",
-      bookId: representative.bookId,
-      sourceId: `library:${scope.libraryId}`,
-      documentId: `library:${scope.libraryId}:${bookshelfId}`,
-      contentHash: representative.contentHash,
-      method: input.method ?? "global",
-      ready: true,
-      readinessSource: "validated_checkpoint_plus_validated_manifest",
-      artifactIds: [
-        `library:${scope.libraryId}:community_reports.parquet`,
-        `library:${scope.libraryId}:evidence_map.parquet`,
-      ],
-      createdAt: scope.manifest.libraryIdentity.createdAt,
-      metadata: {
-        projectionSource: "library_manifest",
-        libraryId: scope.libraryId,
-        libraryGeneration: scope.manifest.libraryIdentity.generation,
-        bookshelfId,
-        sourceName: scope.libraryId,
-      },
-    });
-  }
-  return capabilities;
+  return [upperGraphQueryCapability({
+    scopeKind: "library",
+    scopeId: scope.libraryId,
+    generation: scope.manifest.libraryIdentity.generation,
+    createdAt: scope.manifest.libraryIdentity.createdAt,
+    manifestSha256: scope.manifestSha256,
+    method: input.method,
+  })];
 }
 
 export async function queryLibraryGraph(
@@ -280,7 +283,11 @@ export async function queryLibraryGraph(
     pythonBin,
     bridgePath,
   });
-  const maxInputTokens = input.maxInputTokens ?? scope.maxInputTokens;
+  const budget = resolveRequestedBudget({
+    requestedMaxReports: input.maxReports,
+    requestedMaxInputTokens: input.maxInputTokens,
+    scope,
+  });
   const bridgeStartedAt = Date.now();
   const bridge = await runBookshelfGraphQueryBridge({
     pythonBin,
@@ -292,8 +299,8 @@ export async function queryLibraryGraph(
       generation: scope.manifest.libraryIdentity.generation,
       outputRoot: scope.root,
       query: input.query,
-      maxReports: input.maxReports ?? scope.maxReports,
-      maxInputTokens,
+      maxReports: budget.maxReports,
+      maxInputTokens: budget.maxInputTokens,
     },
   }).catch((error: unknown) => {
     if (error instanceof Error) {
@@ -331,13 +338,19 @@ export async function queryLibraryGraph(
       bridge.diagnostics,
     );
   }
-  return GraphRagQueryResponseSchema.parse({
+  const graphCapabilityId = upperGraphQueryCapabilityId({
+    scopeKind: "library",
+    scopeId: scope.libraryId,
+    generation: scope.manifest.libraryIdentity.generation,
+    method: input.method ?? "global",
+  });
+  const upperResponse = GraphRagQueryResponseSchema.parse({
     schemaVersion: SchemaVersion,
     method: input.method ?? "global",
     responseText: bridge.answerText,
     evidence: bridge.evidence.map((item) => ({
       evidenceId: item.evidenceMapId,
-      graphCapabilityId: `library:${scope.libraryId}:graph_query`,
+      graphCapabilityId,
       sourceId: item.targetSourceId,
       documentId: item.targetDocumentId,
       bookId: item.targetBookId,
@@ -402,4 +415,31 @@ export async function queryLibraryGraph(
       },
     },
   });
+  try {
+    return await applyControlledDeepening({
+      enabled: input.controlledDeepening?.enabled,
+      graphVault: scope.graphVault,
+      scopeKind: "library",
+      scopeId: scope.libraryId,
+      generation: scope.manifest.libraryIdentity.generation,
+      query: input.query,
+      method: input.method ?? "global",
+      responseType: input.responseType ?? "multiple paragraphs",
+      communityLevel: input.communityLevel,
+      upperResponse,
+      maxDeepeningTargets: scope.manifest.fixedQueryBudget.maxBookshelves,
+      requestedMaxDeepeningTargets: input.controlledDeepening?.maxTargets,
+      loadBookCapabilities: input.controlledDeepening?.loadBookCapabilities,
+      runBookQuery: input.controlledDeepening?.runBookQuery,
+    });
+  } catch (error) {
+    if (error instanceof ControlledDeepeningError) {
+      throw new LibraryQueryScopeError(
+        error.code,
+        error.message,
+        error.diagnostics,
+      );
+    }
+    throw error;
+  }
 }

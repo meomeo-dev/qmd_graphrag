@@ -59,7 +59,7 @@ export type BuildLibraryGraphInput = {
   maxSemanticUnits?: number;
   maxEdges?: number;
   maxInputTokens?: number;
-  maxBookshelvesForDeepening?: number;
+  maxBookshelves?: number;
   maxShelfCommunityRefs?: number;
   now?: () => string;
 };
@@ -292,7 +292,7 @@ function graphGeneration(input: {
   maxSemanticUnits: number;
   maxEdges: number;
   maxInputTokens: number;
-  maxBookshelvesForDeepening: number;
+  maxBookshelves: number;
   maxShelfCommunityRefs: number;
 }): string {
   return `library-${sha256Text(stableJson({
@@ -305,7 +305,7 @@ function budgetSimulation(input: {
   artifactRows: Record<string, number>;
   maxSemanticUnits: number;
   maxInputTokens: number;
-  maxBookshelvesForDeepening: number;
+  maxBookshelves: number;
   bookshelfCount: number;
 }): LibraryQualityGate["fixedQueryBudgetSimulation"] {
   const selectedSemanticUnits = Math.min(
@@ -319,10 +319,10 @@ function budgetSimulation(input: {
     selectedSemanticUnits,
     maxInputTokens: input.maxInputTokens,
     estimatedInputTokens,
-    maxBookshelvesForDeepening: input.maxBookshelvesForDeepening,
+    maxBookshelves: input.maxBookshelves,
     selectedBookshelvesForDeepening: Math.min(
       input.bookshelfCount,
-      input.maxBookshelvesForDeepening,
+      input.maxBookshelves,
     ),
   };
 }
@@ -371,7 +371,7 @@ export async function buildLibraryGraph(
   const maxSemanticUnits = input.maxSemanticUnits ?? 32;
   const maxEdges = input.maxEdges ?? 96;
   const maxInputTokens = input.maxInputTokens ?? 64000;
-  const maxBookshelvesForDeepening = input.maxBookshelvesForDeepening ?? 3;
+  const maxBookshelves = input.maxBookshelves ?? 4;
   const maxShelfCommunityRefs = input.maxShelfCommunityRefs ?? 24;
   const memberManifestSha256 = Object.fromEntries(
     membership.membersFile.members.bookshelves.map((member) => [
@@ -387,7 +387,7 @@ export async function buildLibraryGraph(
     maxSemanticUnits,
     maxEdges,
     maxInputTokens,
-    maxBookshelvesForDeepening,
+    maxBookshelves,
     maxShelfCommunityRefs,
   });
   const createdAt = input.now?.() ?? new Date().toISOString();
@@ -462,7 +462,7 @@ export async function buildLibraryGraph(
     artifactRows,
     maxSemanticUnits,
     maxInputTokens,
-    maxBookshelvesForDeepening,
+    maxBookshelves,
     bookshelfCount: membership.membersFile.bookshelfCount,
   });
   ensureBudgetPasses(simulation);
@@ -678,7 +678,7 @@ export async function buildLibraryGraph(
     },
     fixedQueryBudget: {
       maxSemanticUnits,
-      maxBookshelvesForDeepening,
+      maxBookshelves,
       maxShelfCommunityRefs,
       maxInputTokens,
       simulationStatus: "passed",

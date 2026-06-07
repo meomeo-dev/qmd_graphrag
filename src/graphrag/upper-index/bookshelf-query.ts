@@ -8,9 +8,7 @@ import {
   type GraphRagSearchMethod,
 } from "../../contracts/graphrag.js";
 import { readHotplugPackageUnknown } from "../book-hotplug-package-readonly.js";
-import { resolveBookManifestPath } from "../book-package-layout.js";
 import {
-  BookManifestSchema,
   BookshelfGraphManifestSchema,
   BookshelfQualityGateSchema,
   type BookshelfGraphManifest,
@@ -24,6 +22,15 @@ import {
   packageLocator,
   readQueryReadyPackage,
 } from "./upper-package-paths.js";
+import {
+  upperGraphQueryCapability,
+  upperGraphQueryCapabilityId,
+} from "./upper-query-capability.js";
+import {
+  ControlledDeepeningError,
+  applyControlledDeepening,
+  type ControlledDeepeningBookQuery,
+} from "./controlled-deepening.js";
 
 export type BookshelfQueryScopeErrorCode =
   | "upper_index_missing"
@@ -54,6 +61,7 @@ export type BookshelfQueryScope = {
   bookshelfId: string;
   root: string;
   manifest: BookshelfGraphManifest;
+  manifestSha256: string;
   maxInputTokens: number;
   maxReports: number;
 };
@@ -67,7 +75,72 @@ export type QueryBookshelfGraphInput = {
   bridgePath?: string;
   maxReports?: number;
   maxInputTokens?: number;
+  responseType?: string;
+  communityLevel?: number;
+  controlledDeepening?: {
+    enabled?: boolean;
+    maxTargets?: number;
+    loadBookCapabilities?: (
+      bookIds: readonly string[],
+    ) => Promise<GraphCapability[]>;
+    runBookQuery?: ControlledDeepeningBookQuery;
+  };
 };
+
+function hasBudgetDiagnostic(diagnostics: readonly string[]): boolean {
+  return diagnostics.some((item) =>
+    item === "budget_exceeded_narrow_scope_required" ||
+    item.startsWith("budget_exceeded_narrow_scope_required:")
+  );
+}
+
+function resolveRequestedBudget(input: {
+  requestedMaxReports?: number;
+  requestedMaxInputTokens?: number;
+  scope: BookshelfQueryScope;
+}): { maxReports: number; maxInputTokens: number } {
+  const diagnostics: string[] = [];
+  if (input.requestedMaxReports != null) {
+    if (
+      !Number.isInteger(input.requestedMaxReports) ||
+      input.requestedMaxReports < 1
+    ) {
+      diagnostics.push(`invalid_max_reports:${input.requestedMaxReports}`);
+    } else if (input.requestedMaxReports > input.scope.maxReports) {
+      diagnostics.push(
+        `requested_max_reports_exceeds_package_budget:` +
+          `${input.requestedMaxReports}:max:${input.scope.maxReports}`,
+      );
+    }
+  }
+  if (input.requestedMaxInputTokens != null) {
+    if (
+      !Number.isInteger(input.requestedMaxInputTokens) ||
+      input.requestedMaxInputTokens < 1
+    ) {
+      diagnostics.push(
+        `invalid_max_input_tokens:${input.requestedMaxInputTokens}`,
+      );
+    } else if (input.requestedMaxInputTokens > input.scope.maxInputTokens) {
+      diagnostics.push(
+        `requested_max_input_tokens_exceeds_package_budget:` +
+          `${input.requestedMaxInputTokens}:max:${input.scope.maxInputTokens}`,
+      );
+    }
+  }
+  if (diagnostics.length > 0) {
+    throw new BookshelfQueryScopeError(
+      "budget_exceeded_narrow_scope_required",
+      "Bookshelf query budget cannot exceed the package-local fixed budget.",
+      diagnostics,
+    );
+  }
+  return {
+    maxReports: input.requestedMaxReports ?? input.scope.maxReports,
+    maxInputTokens:
+      input.requestedMaxInputTokens ?? input.scope.maxInputTokens,
+  };
+}
 
 async function readPublishedScope(input: {
   graphVault: string;
@@ -139,12 +212,15 @@ async function readPublishedScope(input: {
     );
   }
   if (!validation.ok) {
+    const budgetExceeded = hasBudgetDiagnostic(validation.diagnostics);
     const stale = validation.diagnostics.some((item) =>
       item.startsWith("member_manifest_stale:") ||
       item.includes("stale")
     );
     throw new BookshelfQueryScopeError(
-      stale ? "upper_index_stale" : "upper_quality_gate_failed",
+      budgetExceeded
+        ? "budget_exceeded_narrow_scope_required"
+        : stale ? "upper_index_stale" : "upper_quality_gate_failed",
       "Bookshelf upper index failed query readiness validation.",
       validation.diagnostics,
     );
@@ -171,6 +247,7 @@ async function readPublishedScope(input: {
     bookshelfId: input.bookshelfId,
     root,
     manifest,
+    manifestSha256: packageReady.current.manifestSha256,
     maxInputTokens: manifest.fixedQueryBudget.maxInputTokens,
     maxReports: manifest.fixedQueryBudget.maxSemanticUnits,
   };
@@ -189,44 +266,14 @@ export async function loadBookshelfGraphQueryCapabilities(input: {
     pythonBin: input.pythonBin ?? "python3",
     bridgePath: input.bridgePath ?? defaultBookshelfGraphBridgePath(),
   });
-  const entries = Object.entries(scope.manifest.membership.memberManifestSha256)
-    .slice(0, Math.max(1, scope.manifest.fixedQueryBudget.maxBooksForDeepening));
-  const capabilities: GraphCapability[] = [];
-  for (const [bookId] of entries) {
-    const bookManifest = BookManifestSchema.parse(
-      await readHotplugPackageUnknown(resolveBookManifestPath(scope.graphVault, bookId)),
-    );
-    capabilities.push({
-      schemaVersion: SchemaVersion,
-      capabilityId: [
-        "bookshelf",
-        scope.bookshelfId,
-        scope.manifest.bookshelfIdentity.generation,
-        bookId,
-        input.method ?? "global",
-      ].join(":"),
-      kind: "global_search",
-      bookId,
-      sourceId: `bookshelf:${scope.bookshelfId}`,
-      documentId: `bookshelf:${scope.bookshelfId}:${bookId}`,
-      contentHash: bookManifest.identity.sourceHash,
-      method: input.method ?? "global",
-      ready: true,
-      readinessSource: "validated_checkpoint_plus_validated_manifest",
-      artifactIds: [
-        `bookshelf:${scope.bookshelfId}:community_reports.parquet`,
-        `bookshelf:${scope.bookshelfId}:evidence_map.parquet`,
-      ],
-      createdAt: scope.manifest.bookshelfIdentity.createdAt,
-      metadata: {
-        projectionSource: "bookshelf_manifest",
-        bookshelfId: scope.bookshelfId,
-        bookshelfGeneration: scope.manifest.bookshelfIdentity.generation,
-        sourceName: scope.bookshelfId,
-      },
-    });
-  }
-  return capabilities;
+  return [upperGraphQueryCapability({
+    scopeKind: "bookshelf",
+    scopeId: scope.bookshelfId,
+    generation: scope.manifest.bookshelfIdentity.generation,
+    createdAt: scope.manifest.bookshelfIdentity.createdAt,
+    manifestSha256: scope.manifestSha256,
+    method: input.method,
+  })];
 }
 
 export async function queryBookshelfGraph(
@@ -240,7 +287,11 @@ export async function queryBookshelfGraph(
     pythonBin,
     bridgePath,
   });
-  const maxInputTokens = input.maxInputTokens ?? scope.maxInputTokens;
+  const budget = resolveRequestedBudget({
+    requestedMaxReports: input.maxReports,
+    requestedMaxInputTokens: input.maxInputTokens,
+    scope,
+  });
   const bridgeStartedAt = Date.now();
   const bridge = await runBookshelfGraphQueryBridge({
     pythonBin,
@@ -252,8 +303,8 @@ export async function queryBookshelfGraph(
       generation: scope.manifest.bookshelfIdentity.generation,
       outputRoot: scope.root,
       query: input.query,
-      maxReports: input.maxReports ?? scope.maxReports,
-      maxInputTokens,
+      maxReports: budget.maxReports,
+      maxInputTokens: budget.maxInputTokens,
     },
   }).catch((error: unknown) => {
     if (error instanceof Error) {
@@ -291,13 +342,19 @@ export async function queryBookshelfGraph(
       bridge.diagnostics,
     );
   }
-  return GraphRagQueryResponseSchema.parse({
+  const graphCapabilityId = upperGraphQueryCapabilityId({
+    scopeKind: "bookshelf",
+    scopeId: scope.bookshelfId,
+    generation: scope.manifest.bookshelfIdentity.generation,
+    method: input.method ?? "global",
+  });
+  const upperResponse = GraphRagQueryResponseSchema.parse({
     schemaVersion: SchemaVersion,
     method: input.method ?? "global",
     responseText: bridge.answerText,
     evidence: bridge.evidence.map((item) => ({
       evidenceId: item.evidenceMapId,
-      graphCapabilityId: `bookshelf:${scope.bookshelfId}:graph_query`,
+      graphCapabilityId,
       sourceId: item.targetSourceId,
       documentId: item.targetDocumentId,
       bookId: item.targetBookId,
@@ -361,4 +418,31 @@ export async function queryBookshelfGraph(
       },
     },
   });
+  try {
+    return await applyControlledDeepening({
+      enabled: input.controlledDeepening?.enabled,
+      graphVault: scope.graphVault,
+      scopeKind: "bookshelf",
+      scopeId: scope.bookshelfId,
+      generation: scope.manifest.bookshelfIdentity.generation,
+      query: input.query,
+      method: input.method ?? "global",
+      responseType: input.responseType ?? "multiple paragraphs",
+      communityLevel: input.communityLevel,
+      upperResponse,
+      maxDeepeningTargets: scope.manifest.fixedQueryBudget.maxBooksForDeepening,
+      requestedMaxDeepeningTargets: input.controlledDeepening?.maxTargets,
+      loadBookCapabilities: input.controlledDeepening?.loadBookCapabilities,
+      runBookQuery: input.controlledDeepening?.runBookQuery,
+    });
+  } catch (error) {
+    if (error instanceof ControlledDeepeningError) {
+      throw new BookshelfQueryScopeError(
+        error.code,
+        error.message,
+        error.diagnostics,
+      );
+    }
+    throw error;
+  }
 }

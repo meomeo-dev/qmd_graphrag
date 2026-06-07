@@ -45,6 +45,28 @@ function validateQualityGateChecks(input: {
   }
 }
 
+function validateArtifactRowBudget(input: {
+  artifactRows: Record<string, { rowCount: number } | undefined>;
+  recordedRows: Record<string, number>;
+  maxSemanticUnits: number;
+  diagnostics: string[];
+}): void {
+  for (const artifact of ["semantic_units.parquet", "community_reports.parquet"]) {
+    const actual = input.artifactRows[artifact]?.rowCount;
+    if (actual == null) continue;
+    const recorded = input.recordedRows[artifact];
+    if (recorded != null && actual !== recorded) {
+      input.diagnostics.push(`artifact_row_count_mismatch:${artifact}`);
+    }
+    if (actual > input.maxSemanticUnits) {
+      input.diagnostics.push(
+        `budget_exceeded_narrow_scope_required:${artifact}:` +
+          `rows:${actual}:maxSemanticUnits:${input.maxSemanticUnits}`,
+      );
+    }
+  }
+}
+
 function normalizeScopeRelativePath(path: string): string | null {
   if (
     path === "" ||
@@ -209,6 +231,12 @@ export async function validateLibraryGraphAtRoot(input: {
     },
   });
   if (!inspection.ok) diagnostics.push(...inspection.diagnostics);
+  validateArtifactRowBudget({
+    artifactRows: inspection.artifacts,
+    recordedRows: gate.data.artifactRowCounts,
+    maxSemanticUnits: manifest.data.fixedQueryBudget.maxSemanticUnits,
+    diagnostics,
+  });
   if (
     inspection.artifacts["evidence_map.parquet"]?.rowCount !==
       manifest.data.evidenceMap.rowCount

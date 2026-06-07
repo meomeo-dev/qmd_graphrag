@@ -10,12 +10,22 @@ import {
   buildBookshelfGraph,
 } from "../src/graphrag/upper-index/bookshelf-graph.js";
 import {
+  BookshelfGraphBuilderVersion,
+  BookshelfGraphChecks,
+  BookshelfGraphSchemaVersion,
+} from "../src/graphrag/upper-index/bookshelf-graph-contracts.js";
+import {
   resolveBookshelfMembership,
 } from "../src/graphrag/upper-index/bookshelf-membership.js";
 import {
   buildLibraryGraph,
   validateLibraryGraph,
 } from "../src/graphrag/upper-index/library-graph.js";
+import {
+  LibraryGraphBuilderVersion,
+  LibraryGraphChecks,
+  LibraryGraphSchemaVersion,
+} from "../src/graphrag/upper-index/library-graph-contracts.js";
 import {
   resolveLibraryMembership,
 } from "../src/graphrag/upper-index/library-membership.js";
@@ -26,7 +36,6 @@ import {
 import {
   defaultBookshelfGraphBridgePath,
   runBookshelfGraphParquetBridge,
-  runBookshelfGraphQueryBridge,
 } from "../src/graphrag/upper-index/bookshelf-graph-parquet.js";
 import {
   loadUpperCatalogProjection,
@@ -59,6 +68,17 @@ async function writeJsonWithSidecar(path: string, value: unknown): Promise<void>
   const text = stableJson(value);
   await writeFile(path, text, "utf8");
   await writeFile(`${path}.sha256`, `${sha256Text(text)}\n`, "utf8");
+}
+
+async function packageFileRecord(
+  root: string,
+  relativePath: string,
+): Promise<{ path: string; sha256: string; bytes: number }> {
+  const path = join(root, relativePath);
+  const bytes = await readFile(path);
+  const sha256 = sha256Buffer(bytes);
+  await writeFile(`${path}.sha256`, `${sha256}\n`, "utf8");
+  return { path: relativePath, sha256, bytes: bytes.byteLength };
 }
 
 async function readParquetColumn(path: string, column: string): Promise<string[]> {
@@ -106,6 +126,32 @@ async function overwriteParquetColumn(input: {
       input.column,
       input.value,
     ]);
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(stderr || `python3 exited ${code ?? 1}`));
+    });
+  });
+}
+
+async function duplicateParquetRows(input: {
+  path: string;
+  minRows: number;
+}): Promise<void> {
+  const script = [
+    "import sys",
+    "import pandas as pd",
+    "path, min_rows = sys.argv[1], int(sys.argv[2])",
+    "df = pd.read_parquet(path)",
+    "frames = [df]",
+    "while sum(len(frame) for frame in frames) < min_rows:",
+    "    frames.append(df)",
+    "pd.concat(frames, ignore_index=True).to_parquet(path, index=False)",
+  ].join("\n");
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn("python3", ["-c", script, input.path, String(input.minRows)]);
     let stderr = "";
     child.stderr.on("data", (chunk) => { stderr += String(chunk); });
     child.on("error", reject);
@@ -304,6 +350,489 @@ async function writeSyntheticShelfArtifacts(root: string): Promise<{
   };
 }
 
+async function publishSyntheticBookshelfMemberPackage(input: {
+  stateRoot: string;
+  bookshelfId: string;
+  generation: string;
+  memberCount: number;
+  maxSemanticUnits: number;
+  evidenceMapRowCount: number;
+}): Promise<{ manifestSha256: string }> {
+  const packageRoot = join(input.stateRoot, "bookshelves", input.bookshelfId);
+  const generationRoot = join(packageRoot, "generations", input.generation);
+  await mkdir(join(generationRoot, "state"), { recursive: true });
+  await mkdir(join(packageRoot, "state"), { recursive: true });
+  const gate = {
+    schemaVersion: BookshelfGraphSchemaVersion,
+    scopeKind: "bookshelf",
+    scopeId: input.bookshelfId,
+    generation: input.generation,
+    stageId: "materialized_bookshelf_graph_build",
+    readyState: "bookshelf_query_ready",
+    queryReady: true,
+    status: "passed",
+    checkedAt: "2026-06-06T00:00:01.000Z",
+    checks: BookshelfGraphChecks.map((checkId) => ({ checkId, status: "passed" })),
+    diagnostics: [],
+    artifactRowCounts: {
+      "semantic_units.parquet": input.maxSemanticUnits,
+      "community_reports.parquet": input.maxSemanticUnits,
+      "evidence_map.parquet": input.evidenceMapRowCount,
+    },
+    fixedQueryBudgetSimulation: {
+      status: "passed",
+      maxSemanticUnits: input.maxSemanticUnits,
+      selectedSemanticUnits: input.maxSemanticUnits,
+      maxInputTokens: 1000,
+      estimatedInputTokens: input.maxSemanticUnits * 64,
+      maxBooksForDeepening: 3,
+      selectedBooksForDeepening: Math.min(input.memberCount, 3),
+    },
+  };
+  await writeJsonWithSidecar(
+    join(generationRoot, "state", "bookshelf-quality-gate.json"),
+    gate,
+  );
+  await writeJsonWithSidecar(
+    join(packageRoot, "state", "bookshelf-quality-gate.json"),
+    gate,
+  );
+  const manifest = {
+    schemaVersion: BookshelfGraphSchemaVersion,
+    kind: "qmd_graphrag_bookshelf_manifest",
+    bookshelfIdentity: {
+      bookshelfId: input.bookshelfId,
+      generation: input.generation,
+      membershipGeneration: `membership-${input.generation}`,
+      createdAt: "2026-06-06T00:00:01.000Z",
+      materializationStatus: "bookshelf_query_ready",
+      queryReady: true,
+    },
+    membership: {
+      memberCount: input.memberCount,
+      membersPath: "bookshelf_members.json",
+      membershipManifestPath: "membership/BOOKSHELF_MEMBERSHIP_MANIFEST.json",
+      membershipManifestSha256: `membership-sha-${input.bookshelfId}`,
+      membersDigest: `members-digest-${input.bookshelfId}`,
+      decisionsDigest: `decisions-digest-${input.bookshelfId}`,
+      splitPlanDigest: `split-plan-digest-${input.bookshelfId}`,
+      memberManifestSha256: {},
+    },
+    buildConfig: {
+      builderVersion: BookshelfGraphBuilderVersion,
+      maxReportsPerBook: 2,
+      maxSemanticUnits: input.maxSemanticUnits,
+      maxEdges: 16,
+      embeddingFingerprint: "synthetic-embedding-fingerprint",
+      summaryFingerprint: sha256Text(BookshelfGraphBuilderVersion),
+      evidenceSchema: "upper-evidence-map-v1",
+    },
+    graphArtifacts: {
+      semanticUnits: "semantic_units.parquet",
+      semanticEdges: "semantic_edges.parquet",
+      communities: "communities.parquet",
+      communityReports: "community_reports.parquet",
+      semanticUnitEmbeddings: "semantic_unit_embeddings.lance",
+    },
+    graphArtifactSchemas: {
+      semanticUnits: { requiredColumns: [] },
+      semanticEdges: { requiredColumns: [] },
+      communities: { requiredColumns: [] },
+      communityReports: { requiredColumns: [] },
+    },
+    evidenceMap: {
+      path: "evidence_map.parquet",
+      requiredColumns: [],
+      rowCount: input.evidenceMapRowCount,
+    },
+    fixedQueryBudget: {
+      maxSemanticUnits: input.maxSemanticUnits,
+      maxBooksForDeepening: 3,
+      maxMemberCommunityRefs: 24,
+      maxInputTokens: 1000,
+      simulationStatus: "passed",
+    },
+    qualityGate: {
+      path: "state/bookshelf-quality-gate.json",
+      status: "passed",
+    },
+    files: [],
+    sensitivityPolicy: {
+      forbiddenFields: [
+        "providerRequestPayload",
+        "providerResponsePayload",
+        "rawPrompt",
+        "rawCompletion",
+        "apiKey",
+        "credential",
+        "absoluteLocalPath",
+        "queryLogContent",
+      ],
+      locatorRule: "only graph_vault-relative and scope-relative locators allowed",
+    },
+  };
+  await writeJsonWithSidecar(
+    join(generationRoot, "BOOKSHELF_MANIFEST.json"),
+    manifest,
+  );
+  await writeJsonWithSidecar(join(packageRoot, "BOOKSHELF_MANIFEST.json"), manifest);
+  const manifestSha256 = sha256Text(stableJson(manifest));
+  await writeJsonWithSidecar(join(packageRoot, "CURRENT.json"), {
+    schemaVersion: BookshelfGraphSchemaVersion,
+    scopeKind: "bookshelf",
+    bookshelfId: input.bookshelfId,
+    generation: input.generation,
+    current: `generations/${input.generation}`,
+    manifestPath: `generations/${input.generation}/BOOKSHELF_MANIFEST.json`,
+    manifestSha256,
+    readyState: "bookshelf_query_ready",
+    queryReady: true,
+    publishedAt: "2026-06-06T00:00:01.000Z",
+  });
+  await writeJsonWithSidecar(join(packageRoot, "PUBLISH_READY.json"), {
+    schemaVersion: BookshelfGraphSchemaVersion,
+    kind: "qmd_graphrag_upper_package_publish_ready",
+    scopeKind: "bookshelf",
+    scopeId: input.bookshelfId,
+    generation: input.generation,
+    readyState: "bookshelf_query_ready",
+    queryReady: true,
+    manifestPath: "BOOKSHELF_MANIFEST.json",
+    manifestSha256,
+    qualityGatePath: "state/bookshelf-quality-gate.json",
+    currentPath: "CURRENT.json",
+    publishedAt: "2026-06-06T00:00:01.000Z",
+  });
+  return { manifestSha256 };
+}
+
+async function publishSyntheticLibraryPackage(input: {
+  stateRoot: string;
+  libraryId: string;
+  generation: string;
+  members: Array<{
+    bookshelfId: string;
+    generation: string;
+    manifestSha256: string;
+    memberCount: number;
+  }>;
+  maxSemanticUnits: number;
+  maxInputTokens: number;
+  maxBookshelves: number;
+  maxShelfCommunityRefs: number;
+  artifactRows: Record<string, number>;
+}): Promise<void> {
+  const packageRoot = join(input.stateRoot, "library", input.libraryId);
+  const generationRoot = join(packageRoot, "generations", input.generation);
+  await mkdir(join(generationRoot, "state"), { recursive: true });
+  await mkdir(join(generationRoot, "membership"), { recursive: true });
+  await mkdir(join(packageRoot, "state"), { recursive: true });
+  const memberManifestSha256 = Object.fromEntries(
+    input.members.map((member) => [member.bookshelfId, member.manifestSha256]),
+  );
+  const libraryMembers = {
+    schemaVersion: LibraryGraphSchemaVersion,
+    kind: "qmd_graphrag_library_members",
+    libraryId: input.libraryId,
+    generation: `membership-${input.generation}`,
+    directBookLimit: 0,
+    bookshelfCount: input.members.length,
+    directBookCount: 0,
+    members: {
+      bookshelves: input.members.map((member) => ({
+        bookshelfId: member.bookshelfId,
+        manifestSha256: member.manifestSha256,
+        generation: member.generation,
+        membershipGeneration: `membership-${member.generation}`,
+        queryReady: true,
+        readyState: "bookshelf_query_ready",
+        memberCount: member.memberCount,
+        semanticUnitBudget: input.maxSemanticUnits,
+        evidenceMapRowCount: input.artifactRows["evidence_map.parquet"] ?? 1,
+        membershipSourceKind: "user_explicit",
+        userLocked: true,
+        manifestPath:
+          `bookshelves/${member.bookshelfId}/generations/` +
+          `${member.generation}/BOOKSHELF_MANIFEST.json`,
+        qualityGatePath:
+          `bookshelves/${member.bookshelfId}/generations/` +
+          `${member.generation}/state/bookshelf-quality-gate.json`,
+        semanticArtifacts: {
+          semanticUnits:
+            `bookshelves/${member.bookshelfId}/generations/` +
+            `${member.generation}/semantic_units.parquet`,
+          semanticEdges:
+            `bookshelves/${member.bookshelfId}/generations/` +
+            `${member.generation}/semantic_edges.parquet`,
+          communityReports:
+            `bookshelves/${member.bookshelfId}/generations/` +
+            `${member.generation}/community_reports.parquet`,
+          evidenceMap:
+            `bookshelves/${member.bookshelfId}/generations/` +
+            `${member.generation}/evidence_map.parquet`,
+        },
+      })),
+      directBooks: [],
+    },
+    expandedMaterializedBookshelfIds: input.members.map(
+      (member) => member.bookshelfId,
+    ),
+  };
+  const partitionPlan = {
+    schemaVersion: LibraryGraphSchemaVersion,
+    kind: "qmd_graphrag_library_partition_plan",
+    libraryId: input.libraryId,
+    generation: `membership-${input.generation}`,
+    status: "not_required",
+    shelfCount: input.members.length,
+    shelfLimit: input.members.length,
+    directBookLimit: 0,
+    virtualParentBookshelfIds: [],
+    partitions: [],
+  };
+  const membershipManifest = {
+    schemaVersion: LibraryGraphSchemaVersion,
+    kind: "qmd_graphrag_library_membership_manifest",
+    libraryIdentity: {
+      libraryId: input.libraryId,
+      generation: `membership-${input.generation}`,
+      createdAt: "2026-06-06T00:00:00.000Z",
+      materializationStatus: "library_membership_resolved",
+      queryReady: false,
+    },
+    membership: {
+      bookshelfCount: input.members.length,
+      directBookCount: 0,
+      membersPath: "library_members.json",
+      policyKind: "user_explicit",
+      policyDigest: "synthetic-policy",
+      membersDigest: sha256Text(stableJson(libraryMembers)),
+      memberManifestSha256,
+      expandedMaterializedBookshelfIds:
+        input.members.map((member) => member.bookshelfId),
+    },
+    partitionPlan: {
+      partitionPlanPath: "library_partition_plan.json",
+      partitionPlanDigest: sha256Text(stableJson(partitionPlan)),
+      shelfLimit: input.members.length,
+      directBookLimit: 0,
+      status: "not_required",
+    },
+    nextStage: {
+      stageId: "library_graph_build",
+      requiredManifest: "LIBRARY_MANIFEST.json",
+      rule: "synthetic scale fixture",
+    },
+    qualityGate: {
+      path: "state/library-membership-gate.json",
+      status: "passed",
+    },
+    sensitivityPolicy: {
+      forbiddenFields: [],
+      locatorRule: "only graph_vault-relative locators allowed",
+    },
+    files: [],
+  };
+  const membershipGate = {
+    schemaVersion: LibraryGraphSchemaVersion,
+    scopeKind: "library",
+    scopeId: input.libraryId,
+    generation: `membership-${input.generation}`,
+    stageId: "library_membership_resolution",
+    readyState: "library_membership_resolved",
+    queryReady: false,
+    status: "passed",
+    checkedAt: "2026-06-06T00:00:00.000Z",
+    checks: [],
+    diagnostics: [],
+  };
+  await writeJsonWithSidecar(join(generationRoot, "library_members.json"), libraryMembers);
+  await writeJsonWithSidecar(
+    join(generationRoot, "library_partition_plan.json"),
+    partitionPlan,
+  );
+  await writeJsonWithSidecar(
+    join(generationRoot, "membership", "LIBRARY_MEMBERSHIP_MANIFEST.json"),
+    membershipManifest,
+  );
+  await writeJsonWithSidecar(
+    join(generationRoot, "state", "library-membership-gate.json"),
+    membershipGate,
+  );
+
+  const gate = {
+    schemaVersion: LibraryGraphSchemaVersion,
+    scopeKind: "library",
+    scopeId: input.libraryId,
+    generation: input.generation,
+    stageId: "library_graph_build",
+    readyState: "library_query_ready",
+    queryReady: true,
+    status: "passed",
+    checkedAt: "2026-06-06T00:00:01.000Z",
+    checks: LibraryGraphChecks.map((checkId) => ({ checkId, status: "passed" })),
+    diagnostics: [],
+    artifactRowCounts: input.artifactRows,
+    fixedQueryBudgetSimulation: {
+      status: "passed",
+      maxSemanticUnits: input.maxSemanticUnits,
+      selectedSemanticUnits: input.artifactRows["semantic_units.parquet"] ?? 0,
+      maxInputTokens: input.maxInputTokens,
+      estimatedInputTokens:
+        (input.artifactRows["semantic_units.parquet"] ?? 0) * 64,
+      maxBookshelves: input.maxBookshelves,
+      selectedBookshelvesForDeepening: Math.min(
+        input.members.length,
+        input.maxBookshelves,
+      ),
+    },
+  };
+  await writeJsonWithSidecar(
+    join(generationRoot, "state", "library-quality-gate.json"),
+    gate,
+  );
+
+  const files = [
+    await packageFileRecord(generationRoot, "library_members.json"),
+    await packageFileRecord(generationRoot, "library_partition_plan.json"),
+    await packageFileRecord(
+      generationRoot,
+      "membership/LIBRARY_MEMBERSHIP_MANIFEST.json",
+    ),
+    await packageFileRecord(
+      generationRoot,
+      "state/library-membership-gate.json",
+    ),
+    await packageFileRecord(generationRoot, "semantic_units.parquet"),
+    await packageFileRecord(generationRoot, "semantic_edges.parquet"),
+    await packageFileRecord(generationRoot, "communities.parquet"),
+    await packageFileRecord(generationRoot, "community_reports.parquet"),
+    await packageFileRecord(generationRoot, "evidence_map.parquet"),
+    await packageFileRecord(
+      generationRoot,
+      "semantic_unit_embeddings.lance/INDEX_MANIFEST.json",
+    ),
+    await packageFileRecord(
+      generationRoot,
+      "semantic_unit_embeddings.lance/qmd_row_count.json",
+    ),
+    await packageFileRecord(
+      generationRoot,
+      "semantic_unit_embeddings.lance/vectors.parquet",
+    ),
+    await packageFileRecord(generationRoot, "state/library-quality-gate.json"),
+  ];
+  const manifest = {
+    schemaVersion: LibraryGraphSchemaVersion,
+    kind: "qmd_graphrag_library_manifest",
+    libraryIdentity: {
+      libraryId: input.libraryId,
+      generation: input.generation,
+      membershipGeneration: `membership-${input.generation}`,
+      createdAt: "2026-06-06T00:00:01.000Z",
+      materializationStatus: "library_query_ready",
+      queryReady: true,
+    },
+    membership: {
+      bookshelfCount: input.members.length,
+      directBookCount: 0,
+      membersPath: "library_members.json",
+      membershipManifestPath: "membership/LIBRARY_MEMBERSHIP_MANIFEST.json",
+      membershipManifestSha256: sha256Text(stableJson(membershipManifest)),
+      membersDigest: sha256Text(stableJson(libraryMembers)),
+      partitionPlanDigest: sha256Text(stableJson(partitionPlan)),
+      memberBookshelfManifestSha256: memberManifestSha256,
+      expandedMaterializedBookshelfIds:
+        input.members.map((member) => member.bookshelfId),
+    },
+    buildConfig: {
+      builderVersion: LibraryGraphBuilderVersion,
+      maxReportsPerShelf: 2,
+      maxSemanticUnits: input.maxSemanticUnits,
+      maxEdges: 16,
+      embeddingFingerprint: "synthetic-embedding-fingerprint",
+      summaryFingerprint: sha256Text(LibraryGraphBuilderVersion),
+      evidenceSchema: "upper-evidence-map-v1",
+    },
+    graphArtifacts: {
+      semanticUnits: "semantic_units.parquet",
+      semanticEdges: "semantic_edges.parquet",
+      communities: "communities.parquet",
+      communityReports: "community_reports.parquet",
+      semanticUnitEmbeddings: "semantic_unit_embeddings.lance",
+    },
+    graphArtifactSchemas: {
+      semanticUnits: { requiredColumns: [] },
+      semanticEdges: { requiredColumns: [] },
+      communities: { requiredColumns: [] },
+      communityReports: { requiredColumns: [] },
+    },
+    evidenceMap: {
+      path: "evidence_map.parquet",
+      requiredColumns: [],
+      rowCount: input.artifactRows["evidence_map.parquet"] ?? 0,
+    },
+    fixedQueryBudget: {
+      maxSemanticUnits: input.maxSemanticUnits,
+      maxBookshelves: input.maxBookshelves,
+      maxShelfCommunityRefs: input.maxShelfCommunityRefs,
+      maxInputTokens: input.maxInputTokens,
+      simulationStatus: "passed",
+    },
+    qualityGate: {
+      path: "state/library-quality-gate.json",
+      status: "passed",
+    },
+    files,
+    sensitivityPolicy: {
+      forbiddenFields: [
+        "providerRequestPayload",
+        "providerResponsePayload",
+        "rawPrompt",
+        "rawCompletion",
+        "apiKey",
+        "credential",
+        "absoluteLocalPath",
+        "queryLogContent",
+      ],
+      locatorRule: "only graph_vault-relative and scope-relative locators allowed",
+    },
+  };
+  await writeJsonWithSidecar(join(generationRoot, "LIBRARY_MANIFEST.json"), manifest);
+  await writeJsonWithSidecar(join(packageRoot, "LIBRARY_MANIFEST.json"), manifest);
+  await writeJsonWithSidecar(
+    join(packageRoot, "state", "library-quality-gate.json"),
+    gate,
+  );
+  const manifestSha256 = sha256Text(stableJson(manifest));
+  await writeJsonWithSidecar(join(packageRoot, "CURRENT.json"), {
+    schemaVersion: LibraryGraphSchemaVersion,
+    scopeKind: "library",
+    libraryId: input.libraryId,
+    generation: input.generation,
+    current: `generations/${input.generation}`,
+    manifestPath: `generations/${input.generation}/LIBRARY_MANIFEST.json`,
+    manifestSha256,
+    readyState: "library_query_ready",
+    queryReady: true,
+    publishedAt: "2026-06-06T00:00:01.000Z",
+  });
+  await writeJsonWithSidecar(join(packageRoot, "PUBLISH_READY.json"), {
+    schemaVersion: LibraryGraphSchemaVersion,
+    kind: "qmd_graphrag_upper_package_publish_ready",
+    scopeKind: "library",
+    scopeId: input.libraryId,
+    generation: input.generation,
+    readyState: "library_query_ready",
+    queryReady: true,
+    manifestPath: "LIBRARY_MANIFEST.json",
+    manifestSha256,
+    qualityGatePath: "state/library-quality-gate.json",
+    currentPath: "CURRENT.json",
+    publishedAt: "2026-06-06T00:00:01.000Z",
+  });
+}
+
 async function writeReadyBookshelf(input: {
   stateRoot: string;
   bookshelfId: string;
@@ -484,8 +1013,9 @@ describe("GraphRAG library graph build", () => {
           method: "global",
         });
 
-        expect(capabilities).toHaveLength(2);
+        expect(capabilities).toHaveLength(1);
         expect(capabilities.every((capability) => capability.ready)).toBe(true);
+        expect(capabilities[0]?.kind).toBe("graph_query");
         expect(query.method).toBe("global");
         expect(query.providerDetail?.runtimeMetrics?.aggregate
           .attemptedRequestCount).toBe(0);
@@ -493,6 +1023,8 @@ describe("GraphRAG library graph build", () => {
           "Library software-engineering-library fixed-budget",
         );
         expect(query.evidence.length).toBeGreaterThan(0);
+        expect(query.evidence[0]?.graphCapabilityId)
+          .toBe(capabilities[0]?.capabilityId);
         expect(query.evidence[0]?.bookId).toMatch(/^book-lg-/u);
         expect(query.evidence[0]?.metadata?.scopeKind).toBe("library");
         expect(query.evidence[0]?.metadata?.targetBookshelfId).toMatch(/core$/u);
@@ -517,6 +1049,35 @@ describe("GraphRAG library graph build", () => {
           method: "global",
         });
         expect(queryAfterProjectionDelete.evidence.length).toBeGreaterThan(0);
+
+        await expect(queryLibraryGraph({
+          graphVault: stateRoot,
+          libraryId: "software-engineering-library",
+          query: "How do architecture and delivery practices relate?",
+          method: "global",
+          maxReports: manifest.fixedQueryBudget.maxSemanticUnits + 1,
+        })).rejects.toMatchObject({
+          code: "budget_exceeded_narrow_scope_required",
+          diagnostics: expect.arrayContaining([
+            expect.stringContaining(
+              "requested_max_reports_exceeds_package_budget",
+            ),
+          ]),
+        });
+        await expect(queryLibraryGraph({
+          graphVault: stateRoot,
+          libraryId: "software-engineering-library",
+          query: "How do architecture and delivery practices relate?",
+          method: "global",
+          maxInputTokens: manifest.fixedQueryBudget.maxInputTokens + 1,
+        })).rejects.toMatchObject({
+          code: "budget_exceeded_narrow_scope_required",
+          diagnostics: expect.arrayContaining([
+            expect.stringContaining(
+              "requested_max_input_tokens_exceeds_package_budget",
+            ),
+          ]),
+        });
 
         await expect(queryLibraryGraph({
           graphVault: stateRoot,
@@ -647,21 +1208,45 @@ describe("GraphRAG library graph build", () => {
     async () => {
       const tmpRoot = await mkProjectTmpDir("qmd-library-budget-scale-");
       try {
+        const stateRoot = join(tmpRoot, "graph_vault");
         const bridgePath = defaultBookshelfGraphBridgePath();
         const shelfArtifacts = await writeSyntheticShelfArtifacts(
           join(tmpRoot, "synthetic-shelf"),
         );
         const results = [];
         for (const scale of [10, 100, 1000]) {
-          const outputRoot = join(tmpRoot, `library-scale-${scale}`);
           const libraryId = `library-scale-${scale}`;
           const generation = `library-scale-generation-${scale}`;
-          const members = Array.from({ length: scale }, (_, index) => {
+          const generationRoot = join(
+            stateRoot,
+            "library",
+            libraryId,
+            "generations",
+            generation,
+          );
+          const shelfCount = 4;
+          const baseBookCount = Math.floor(scale / shelfCount);
+          const remainder = scale % shelfCount;
+          const members = [];
+          for (let index = 0; index < shelfCount; index += 1) {
             const padded = String(index + 1).padStart(4, "0");
-            return {
-              bookshelfId: `shelf-${padded}`,
-              generation: "bookshelf-synthetic-generation",
-              manifestSha256: `sha256-shelf-${padded}`,
+            const bookshelfId = `shelf-${scale}-${padded}`;
+            const memberGeneration =
+              `bookshelf-synthetic-generation-${scale}-${padded}`;
+            const memberCount = baseBookCount + (index < remainder ? 1 : 0);
+            const memberPackage = await publishSyntheticBookshelfMemberPackage({
+              stateRoot,
+              bookshelfId,
+              generation: memberGeneration,
+              memberCount,
+              maxSemanticUnits: 8,
+              evidenceMapRowCount: 2,
+            });
+            members.push({
+              bookshelfId,
+              generation: memberGeneration,
+              manifestSha256: memberPackage.manifestSha256,
+              memberCount,
               communityReportsPath: shelfArtifacts.communityReportsPath,
               evidenceMapPath: shelfArtifacts.evidenceMapPath,
               artifactDigests: {
@@ -670,8 +1255,8 @@ describe("GraphRAG library graph build", () => {
                 communityReports: "sha256:synthetic-community-reports",
                 evidenceMap: "sha256:synthetic-evidence-map",
               },
-            };
-          });
+            });
+          }
           const inspection = await runBookshelfGraphParquetBridge({
             mode: "build-library",
             pythonBin: "python3",
@@ -679,7 +1264,7 @@ describe("GraphRAG library graph build", () => {
             payload: {
               libraryId,
               generation,
-              outputRoot,
+              outputRoot: generationRoot,
               maxReportsPerShelf: 2,
               maxSemanticUnits: 8,
               maxEdges: 16,
@@ -687,52 +1272,82 @@ describe("GraphRAG library graph build", () => {
               members,
             },
           });
-          const query = await runBookshelfGraphQueryBridge({
-            pythonBin: "python3",
-            bridgePath,
-            payload: {
-              scopeKind: "library",
-              scopeId: libraryId,
-              libraryId,
-              generation,
-              outputRoot,
-              query: "architecture delivery practices",
-              maxReports: 3,
-              maxInputTokens: 1000,
-            },
+          const artifactRows = Object.fromEntries(
+            Object.entries(inspection.artifacts).map(([name, artifact]) => [
+              name,
+              artifact.rowCount,
+            ]),
+          );
+          await publishSyntheticLibraryPackage({
+            stateRoot,
+            libraryId,
+            generation,
+            members: members.map((member) => ({
+              bookshelfId: member.bookshelfId,
+              generation: member.generation,
+              manifestSha256: member.manifestSha256,
+              memberCount: member.memberCount,
+            })),
+            maxSemanticUnits: 8,
+            maxInputTokens: 1000,
+            maxBookshelves: 4,
+            maxShelfCommunityRefs: 24,
+            artifactRows,
           });
+          const validation = await validateLibraryGraph({
+            graphVault: stateRoot,
+            libraryId,
+            bridgePath,
+          });
+          const query = await queryLibraryGraph({
+            graphVault: stateRoot,
+            libraryId,
+            bridgePath,
+            query: "architecture delivery practices",
+            maxReports: 3,
+            maxInputTokens: 1000,
+          });
+          const queryBudgetMetadata = query.evidence[0]?.metadata as {
+            reportCount?: number;
+            selectedReportCount?: number;
+            estimatedInputTokens?: number;
+          } | undefined;
           results.push({
             scale,
             semanticUnitCount:
-              inspection.artifacts["semantic_units.parquet"]?.rowCount ?? -1,
-            reportCount: query.reportCount,
-            selectedReportCount: query.selectedReportCount,
-            estimatedInputTokens: query.estimatedInputTokens,
+              validation.semanticUnitCount,
+            reportCount: queryBudgetMetadata?.reportCount ?? -1,
+            selectedReportCount:
+              queryBudgetMetadata?.selectedReportCount ?? -1,
+            estimatedInputTokens:
+              queryBudgetMetadata?.estimatedInputTokens ?? -1,
             evidenceCount: query.evidence.length,
+            representedBookCount: members.reduce(
+              (total, member) => total + member.memberCount,
+              0,
+            ),
+            validationOk: validation.ok,
+            validationDiagnostics: validation.diagnostics,
           });
-          const budgetFailure = await runBookshelfGraphQueryBridge({
-            pythonBin: "python3",
+          await expect(queryLibraryGraph({
+            graphVault: stateRoot,
+            libraryId,
             bridgePath,
-            payload: {
-              scopeKind: "library",
-              scopeId: libraryId,
-              libraryId,
-              generation,
-              outputRoot,
-              query: "architecture delivery practices",
-              maxReports: 3,
-              maxInputTokens: 1,
-            },
+            query: "architecture delivery practices",
+            maxReports: 3,
+            maxInputTokens: 1,
+          })).rejects.toMatchObject({
+            code: "budget_exceeded_narrow_scope_required",
           });
-          expect(budgetFailure.ok).toBe(false);
-          expect(budgetFailure.diagnostics).toContain(
-            "budget_exceeded_narrow_scope_required",
-          );
         }
 
         for (const result of results) {
+          expect(result.validationOk, String(result.scale)).toBe(true);
+          expect(result.validationDiagnostics, String(result.scale)).toEqual([]);
+          expect(result.representedBookCount, String(result.scale))
+            .toBe(result.scale);
           expect(result.semanticUnitCount, String(result.scale)).toBe(8);
-          expect(result.reportCount, String(result.scale)).toBeLessThanOrEqual(9);
+          expect(result.reportCount, String(result.scale)).toBeLessThanOrEqual(8);
           expect(result.selectedReportCount, String(result.scale)).toBe(3);
           expect(result.estimatedInputTokens, String(result.scale))
             .toBeGreaterThan(0);
@@ -745,6 +1360,92 @@ describe("GraphRAG library graph build", () => {
           result.evidenceCount,
         ].join(":"));
         expect(new Set(budgetFingerprints).size).toBe(1);
+      } finally {
+        await rm(tmpRoot, { recursive: true, force: true });
+      }
+    },
+    120000,
+  );
+
+  test("refuses query when actual library artifact rows exceed fixed budget",
+    async () => {
+      const tmpRoot = await mkProjectTmpDir("qmd-library-row-budget-");
+      try {
+        const stateRoot = join(tmpRoot, "graph_vault");
+        await writeReadyBookshelf({
+          stateRoot,
+          bookshelfId: "architecture-core",
+          bookIds: ["book-lr-a1", "book-lr-a2", "book-lr-a3"],
+          titlePrefix: "Library Row Budget A",
+          clockSecond: 52,
+        });
+        await writeReadyBookshelf({
+          stateRoot,
+          bookshelfId: "delivery-core",
+          bookIds: ["book-lr-b1", "book-lr-b2", "book-lr-b3"],
+          titlePrefix: "Library Row Budget B",
+          clockSecond: 54,
+        });
+        await resolveLibraryMembership({
+          graphVault: stateRoot,
+          libraryId: "software-engineering-library",
+          bookshelfIds: ["architecture-core", "delivery-core"],
+          now: () => "2026-06-06T00:00:56.000Z",
+        });
+        await buildLibraryGraph({
+          graphVault: stateRoot,
+          libraryId: "software-engineering-library",
+          maxReportsPerShelf: 2,
+          maxSemanticUnits: 4,
+          maxEdges: 16,
+          now: () => "2026-06-06T00:00:57.000Z",
+        });
+
+        const currentRoot = await readLibraryCurrentRoot(
+          stateRoot,
+          "software-engineering-library",
+        );
+        await duplicateParquetRows({
+          path: join(currentRoot, "community_reports.parquet"),
+          minRows: 8,
+        });
+        await refreshManifestFileRecord({
+          root: currentRoot,
+          manifestName: "LIBRARY_MANIFEST.json",
+          relativePath: "community_reports.parquet",
+        });
+        await updateUpperPublishPointers({
+          packageRoot: join(stateRoot, "library", "software-engineering-library"),
+          manifestName: "LIBRARY_MANIFEST.json",
+          generationManifestPath: join(currentRoot, "LIBRARY_MANIFEST.json"),
+        });
+
+        const validation = await validateLibraryGraph({
+          graphVault: stateRoot,
+          libraryId: "software-engineering-library",
+        });
+        expect(validation.ok).toBe(false);
+        expect(validation.diagnostics).toContain(
+          "artifact_row_count_mismatch:community_reports.parquet",
+        );
+        expect(validation.diagnostics).toEqual(expect.arrayContaining([
+          expect.stringContaining(
+            "budget_exceeded_narrow_scope_required:community_reports.parquet",
+          ),
+        ]));
+        await expect(queryLibraryGraph({
+          graphVault: stateRoot,
+          libraryId: "software-engineering-library",
+          query: "How do architecture and delivery practices relate?",
+          method: "global",
+        })).rejects.toMatchObject({
+          code: "budget_exceeded_narrow_scope_required",
+          diagnostics: expect.arrayContaining([
+            expect.stringContaining(
+              "budget_exceeded_narrow_scope_required:community_reports.parquet",
+            ),
+          ]),
+        });
       } finally {
         await rm(tmpRoot, { recursive: true, force: true });
       }

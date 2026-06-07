@@ -20,6 +20,19 @@ import {
 } from "../src/store.js";
 import { hashLanceDbDirectoryContents } from "../src/job-state/artifact-validation.js";
 import { hashFile } from "../src/job-state/fingerprint.js";
+import {
+  buildBookshelfGraph,
+} from "../src/graphrag/upper-index/bookshelf-graph.js";
+import {
+  resolveBookshelfMembership,
+} from "../src/graphrag/upper-index/bookshelf-membership.js";
+import {
+  buildLibraryGraph,
+} from "../src/graphrag/upper-index/library-graph.js";
+import {
+  resolveLibraryMembership,
+} from "../src/graphrag/upper-index/library-membership.js";
+import { writeReadyHotplugBook } from "./helpers/graphrag-hotplug-book-package.js";
 
 const MinimalParquetFixture = Buffer.from(
   "UEFSMRUEFRIVFkwVAhUAEgAACSAFAAAAcm93LTEVABUSFRYsFQIVEBUGFQYcNgAoBXJvdy0xGAVyb3ctMRERAAAACSACAAAAAgEBAgAVBBksNQAYBnNjaGVtYRUCABUMJQIYAmlkJQBMHAAAABYCGRwZHCYAHBUMGTUABhAZGAJpZBUCFgIWigEWkgEmOiYIHDYAKAVyb3ctMRgFcm93LTEREQAZLBUEFQAVAgAVABUQFQIAPBYKGQYZJgACAAAAFooBFgImCBaSAQAZHBgMQVJST1c6c2NoZW1hGKABLy8vLy8zQUFBQUFRQUFBQUFBQUtBQXdBQmdBRkFBZ0FDZ0FBQUFBQkJBQU1BQUFBQ0FBSUFBQUFCQUFJQUFBQUJBQUFBQUVBQUFBVUFBQUFFQUFVQUFnQUJnQUhBQXdBQUFBUUFCQUFBQUFBQUFFRkVBQUFBQmdBQUFBRUFBQUFBQUFBQUFJQUFBQnBaQUFBQkFBRUFBUUFBQUFBQUFBQQAYIHBhcnF1ZXQtY3BwLWFycm93IHZlcnNpb24gMjIuMC4wGRwcAAAAWgEAAFBBUjE=",
@@ -158,6 +171,18 @@ async function readLastBridgeRequest(
   if (lastLine == null) throw new Error("missing fake bridge request log");
   const entry = JSON.parse(lastLine) as { request?: Record<string, unknown> };
   return entry.request ?? {};
+}
+
+async function readBridgeRequests(
+  workspace: Workspace,
+): Promise<Array<Record<string, unknown>>> {
+  if (!existsSync(workspace.bridgeRequestLog)) return [];
+  const raw = await readFile(workspace.bridgeRequestLog, "utf8");
+  if (raw.trim() === "") return [];
+  return raw.trim().split(/\r?\n/u).map((line) => {
+    const entry = JSON.parse(line) as { request?: Record<string, unknown> };
+    return entry.request ?? {};
+  });
 }
 
 async function writeLanceDbFixture(root: string): Promise<void> {
@@ -768,6 +793,70 @@ async function writeUpperCurrentFixture(input: {
   });
 }
 
+async function writeReadyCliBookshelf(input: {
+  workspace: Workspace;
+  bookshelfId: string;
+  maxBooksForDeepening?: number;
+}): Promise<void> {
+  const bookIds = [
+    `${input.bookshelfId}-book-a`,
+    `${input.bookshelfId}-book-b`,
+    `${input.bookshelfId}-book-c`,
+  ];
+  for (const [index, bookId] of bookIds.entries()) {
+    await writeReadyHotplugBook({
+      stateRoot: input.workspace.graphVault,
+      bookId,
+      title: `CLI Upper Bookshelf ${index + 1}`,
+    });
+  }
+  await resolveBookshelfMembership({
+    graphVault: input.workspace.graphVault,
+    bookshelfId: input.bookshelfId,
+    bookIds,
+    now: () => "2026-06-06T00:00:20.000Z",
+  });
+  await buildBookshelfGraph({
+    graphVault: input.workspace.graphVault,
+    bookshelfId: input.bookshelfId,
+    maxReportsPerBook: 2,
+    maxSemanticUnits: 8,
+    maxEdges: 16,
+    maxBooksForDeepening: input.maxBooksForDeepening ?? 2,
+    now: () => "2026-06-06T00:00:21.000Z",
+  });
+}
+
+async function writeReadyCliLibrary(input: {
+  workspace: Workspace;
+  libraryId: string;
+  bookshelfIds: readonly string[];
+  maxBookshelves?: number;
+}): Promise<void> {
+  for (const bookshelfId of input.bookshelfIds) {
+    await writeReadyCliBookshelf({
+      workspace: input.workspace,
+      bookshelfId,
+      maxBooksForDeepening: 1,
+    });
+  }
+  await resolveLibraryMembership({
+    graphVault: input.workspace.graphVault,
+    libraryId: input.libraryId,
+    bookshelfIds: input.bookshelfIds,
+    now: () => "2026-06-06T00:00:22.000Z",
+  });
+  await buildLibraryGraph({
+    graphVault: input.workspace.graphVault,
+    libraryId: input.libraryId,
+    maxReportsPerShelf: 2,
+    maxSemanticUnits: 8,
+    maxEdges: 16,
+    maxBookshelves: input.maxBookshelves ?? 2,
+    now: () => "2026-06-06T00:00:23.000Z",
+  });
+}
+
 afterEach(async () => {
   while (workspaces.length > 0) {
     const workspace = workspaces.pop()!;
@@ -1157,6 +1246,238 @@ describe("CLI GraphRAG unified route", () => {
       expect(result.stdout).toBe("");
     },
     30000,
+  );
+
+  test("qmd query --bookshelf-id keeps upper deepening disabled by default",
+    async () => {
+      const workspace = await createWorkspace();
+      await writeReadyCliBookshelf({
+        workspace,
+        bookshelfId: "architecture-core",
+        maxBooksForDeepening: 1,
+      });
+
+      const result = await runQmd(workspace, [
+        "query",
+        "--bookshelf-id",
+        "architecture-core",
+        "--json",
+        "--no-rerank",
+        "How does architecture delivery relate?",
+      ]);
+
+      expect(result.exitCode, result.stderr).toBe(0);
+      const answer = JSON.parse(result.stdout);
+      expect(answer.answerText).toContain("fixed-budget GraphRAG report search");
+      expect(answer.answerText).not.toContain(
+        "Controlled deepening results from selected member books",
+      );
+      expect(answer.evidence.some(
+        (item: { metadata?: { upperDeepening?: unknown } }) =>
+          item.metadata?.upperDeepening === true,
+      )).toBe(false);
+      expect(await readBridgeRequests(workspace)).toHaveLength(0);
+    },
+    120000,
+  );
+
+  test("qmd query --bookshelf-id --upper-deepening calls bounded member books",
+    async () => {
+      const workspace = await createWorkspace();
+      await writeReadyCliBookshelf({
+        workspace,
+        bookshelfId: "architecture-core",
+        maxBooksForDeepening: 2,
+      });
+
+      const result = await runQmd(workspace, [
+        "query",
+        "--bookshelf-id",
+        "architecture-core",
+        "--upper-deepening",
+        "--max-deepening-targets",
+        "1",
+        "--json",
+        "--no-rerank",
+        "How does architecture delivery relate?",
+      ]);
+
+      expect(result.exitCode, result.stderr).toBe(0);
+      const answer = JSON.parse(result.stdout);
+      expect(answer.answerText).toContain(
+        "Controlled deepening results from selected member books",
+      );
+      expect(answer.answerText).toContain("GraphRAG CLI answer from fake bridge");
+      expect(answer.evidence.some(
+        (item: { metadata?: { upperDeepening?: unknown } }) =>
+          item.metadata?.upperDeepening === true,
+      )).toBe(true);
+      const bridgeRequests = await readBridgeRequests(workspace);
+      expect(bridgeRequests).toHaveLength(1);
+      const scope = bridgeRequests[0]?.capabilityScope as {
+        selectedBookIds?: string[];
+        graphCapabilityIds?: string[];
+      } | undefined;
+      expect(scope?.selectedBookIds).toHaveLength(1);
+      expect(scope?.selectedBookIds?.[0]).toMatch(/^architecture-core-book-/u);
+      expect(scope?.graphCapabilityIds).toHaveLength(1);
+      expect(JSON.stringify(answer)).not.toContain(workspace.graphVault);
+    },
+    120000,
+  );
+
+  test("qmd query --bookshelf-id --upper-deepening rejects over-budget targets",
+    async () => {
+      const workspace = await createWorkspace();
+      await writeReadyCliBookshelf({
+        workspace,
+        bookshelfId: "architecture-core",
+        maxBooksForDeepening: 1,
+      });
+
+      const result = await runQmd(workspace, [
+        "query",
+        "--bookshelf-id",
+        "architecture-core",
+        "--upper-deepening",
+        "--max-deepening-targets",
+        "2",
+        "--json",
+        "--timing",
+        "--no-rerank",
+        "How does architecture delivery relate?",
+      ]);
+
+      expect(result.exitCode).toBe(64);
+      const error = JSON.parse(result.stderr);
+      expect(error).toMatchObject({
+        route: "graphrag",
+        stage: "graphrag_query",
+        provider: "graphrag",
+        capability: "graph_query",
+        code: "budget_exceeded_narrow_scope_required",
+        exitCode: 64,
+        scopeKind: "bookshelf",
+        scopeId: "architecture-core",
+        retryable: false,
+        timingAvailable: true,
+      });
+      expect(error.metadata.diagnostics).toEqual(expect.arrayContaining([
+        "requested_deepening_targets:2",
+        "max_deepening_targets:1",
+      ]));
+      expect(result.stdout).toBe("");
+      expect(await readBridgeRequests(workspace)).toHaveLength(0);
+    },
+    120000,
+  );
+
+  test("qmd query --bookshelf-id --upper-deepening fails closed when a selected book capability is missing",
+    async () => {
+      const workspace = await createWorkspace();
+      await writeReadyCliBookshelf({
+        workspace,
+        bookshelfId: "architecture-core",
+        maxBooksForDeepening: 1,
+      });
+      for (const suffix of ["a", "b", "c"]) {
+        await rm(
+          join(
+            workspace.graphVault,
+            "books",
+            `architecture-core-book-${suffix}`,
+            "graphrag",
+            "output",
+            "community_reports.parquet",
+          ),
+          { force: true },
+        );
+      }
+
+      const result = await runQmd(workspace, [
+        "query",
+        "--bookshelf-id",
+        "architecture-core",
+        "--upper-deepening",
+        "--max-deepening-targets",
+        "1",
+        "--json",
+        "--timing",
+        "--no-rerank",
+        "How does architecture delivery relate?",
+      ]);
+
+      expect(result.exitCode).toBe(65);
+      const error = JSON.parse(result.stderr);
+      expect(error).toMatchObject({
+        route: "graphrag",
+        stage: "graph_capability",
+        provider: "graphrag",
+        capability: "graph_query",
+        code: "upper_index_stale",
+        exitCode: 65,
+        scopeKind: "bookshelf",
+        scopeId: "architecture-core",
+        retryable: false,
+        timingAvailable: true,
+      });
+      expect(error.metadata.diagnostics).toEqual(expect.arrayContaining([
+        expect.stringMatching(
+          /^controlled_deepening_book_capability_missing:architecture-core-book-/u,
+        ),
+      ]));
+      expect(result.stdout).toBe("");
+      expect(await readBridgeRequests(workspace)).toHaveLength(0);
+    },
+    120000,
+  );
+
+  test("qmd query --library-id --upper-deepening calls bounded member books",
+    async () => {
+      const workspace = await createWorkspace();
+      await writeReadyCliLibrary({
+        workspace,
+        libraryId: "software-engineering-library",
+        bookshelfIds: ["architecture-core", "delivery-core"],
+        maxBookshelves: 2,
+      });
+
+      const result = await runQmd(workspace, [
+        "query",
+        "--library-id",
+        "software-engineering-library",
+        "--upper-deepening",
+        "--max-deepening-targets",
+        "1",
+        "--json",
+        "--no-rerank",
+        "How do architecture and delivery practices relate?",
+      ]);
+
+      expect(result.exitCode, result.stderr).toBe(0);
+      const answer = JSON.parse(result.stdout);
+      expect(answer.answerText).toContain(
+        "Controlled deepening results from selected member books",
+      );
+      expect(answer.answerText).toContain("GraphRAG CLI answer from fake bridge");
+      expect(answer.evidence.some(
+        (item: { metadata?: { upperDeepening?: unknown } }) =>
+          item.metadata?.upperDeepening === true,
+      )).toBe(true);
+      const bridgeRequests = await readBridgeRequests(workspace);
+      expect(bridgeRequests).toHaveLength(1);
+      const scope = bridgeRequests[0]?.capabilityScope as {
+        selectedBookIds?: string[];
+        graphCapabilityIds?: string[];
+      } | undefined;
+      expect(scope?.selectedBookIds).toHaveLength(1);
+      expect(scope?.selectedBookIds?.[0]).toMatch(
+        /^(architecture-core|delivery-core)-book-/u,
+      );
+      expect(scope?.graphCapabilityIds).toHaveLength(1);
+      expect(JSON.stringify(answer)).not.toContain(workspace.graphVault);
+    },
+    120000,
   );
 
   test("qmd query --library-id returns upper typed error for missing index",

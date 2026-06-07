@@ -95,7 +95,7 @@ export const LibraryCatalogProjectionSchema = z.object({
   artifacts: ProjectionArtifactSchema,
   fixedQueryBudget: z.object({
     maxSemanticUnits: z.number().int().positive(),
-    maxBookshelvesForDeepening: z.number().int().nonnegative(),
+    maxBookshelves: z.number().int().nonnegative(),
     maxShelfCommunityRefs: z.number().int().positive(),
     maxInputTokens: z.number().int().positive(),
   }),
@@ -351,8 +351,7 @@ export async function rebuildLibraryCatalogProjection(input: {
     }),
     fixedQueryBudget: {
       maxSemanticUnits: manifest.fixedQueryBudget.maxSemanticUnits,
-      maxBookshelvesForDeepening:
-        manifest.fixedQueryBudget.maxBookshelvesForDeepening,
+      maxBookshelves: manifest.fixedQueryBudget.maxBookshelves,
       maxShelfCommunityRefs: manifest.fixedQueryBudget.maxShelfCommunityRefs,
       maxInputTokens: manifest.fixedQueryBudget.maxInputTokens,
     },

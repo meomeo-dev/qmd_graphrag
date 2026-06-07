@@ -298,6 +298,7 @@ def build_communities(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     communities: list[dict[str, Any]] = []
     reports: list[dict[str, Any]] = []
+    max_reports = max(1, int(payload.get("maxSemanticUnits") or 32))
     groups: dict[str, list[dict[str, Any]]] = {}
     for unit in semantic_units:
         groups.setdefault(unit["sourceBookshelfId"], []).append(unit)
@@ -315,7 +316,7 @@ def build_communities(
             evidence_rows,
             unit_meta,
         )
-    if len(semantic_units) > 1:
+    if len(semantic_units) > 1 and len(reports) < max_reports:
         append_library_overview(
             payload,
             semantic_units,
