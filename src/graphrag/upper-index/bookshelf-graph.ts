@@ -46,9 +46,17 @@ import {
   runBookshelfGraphParquetBridge,
 } from "./bookshelf-graph-parquet.js";
 import {
+  rebuildBookshelfCatalogProjection,
+} from "./upper-catalog-projection.js";
+import {
   validateBookshelfGraphAtRoot,
   validateBookshelfGraph,
 } from "./bookshelf-graph-validator.js";
+import {
+  bookshelfPackageRoot,
+  packageLocator,
+  readPackageCurrent,
+} from "./upper-package-paths.js";
 
 export { validateBookshelfGraph } from "./bookshelf-graph-validator.js";
 
@@ -235,13 +243,12 @@ async function readMembershipCurrent(input: {
   manifest: BookshelfMembershipManifest;
   membersFile: BookshelfMembersFile;
 }> {
-  const currentRoot = join(
-    input.graphVault,
-    "catalog",
-    "bookshelves",
-    input.bookshelfId,
-    "current",
-  );
+  const current = await readPackageCurrent({
+    graphVault: input.graphVault,
+    scopeKind: "bookshelf",
+    scopeId: input.bookshelfId,
+  });
+  const currentRoot = current.generationRoot;
   const membershipRoot = existsSync(
     join(currentRoot, "BOOKSHELF_MEMBERSHIP_MANIFEST.json"),
   )
@@ -481,9 +488,9 @@ export async function buildBookshelfGraph(
     maxMemberCommunityRefs,
   });
   const createdAt = input.now?.() ?? new Date().toISOString();
-  const root = join(graphVault, "catalog", "bookshelves", input.bookshelfId);
-  const stagingRoot = join(root, "staging", generation);
   const runId = bookshelfRunId(input.bookshelfId, generation);
+  const root = bookshelfPackageRoot(graphVault, input.bookshelfId);
+  const stagingRoot = join(root, "staging", runId);
   await rm(stagingRoot, { recursive: true, force: true });
   await mkdir(join(stagingRoot, "state"), { recursive: true });
   await mkdir(join(stagingRoot, "runs", runId, "checkpoints"), {
@@ -598,7 +605,7 @@ export async function buildBookshelfGraph(
     affectedArtifactDigest: graphDigest,
     expectedDigest: graphDigest,
     observedDigest: graphDigest,
-    redactedLocator: "current/BOOKSHELF_MANIFEST.json",
+    redactedLocator: `generations/${generation}/BOOKSHELF_MANIFEST.json`,
     remediationCommand: null,
     checkedAt: createdAt,
   });
@@ -803,22 +810,46 @@ export async function buildBookshelfGraph(
     );
   }
 
-  const currentRoot = join(root, "current");
-  const previousRoot = `${currentRoot}.previous-${process.pid}-${randomUUID()}`;
+  const generationRoot = join(root, "generations", generation);
+  const previousRoot = `${generationRoot}.previous-${process.pid}-${randomUUID()}`;
+  await mkdir(dirname(generationRoot), { recursive: true });
   await rm(previousRoot, { recursive: true, force: true });
-  if (existsSync(currentRoot)) await rename(currentRoot, previousRoot);
-  await rename(stagingRoot, currentRoot);
+  if (existsSync(generationRoot)) await rename(generationRoot, previousRoot);
+  await rename(stagingRoot, generationRoot);
   await rm(previousRoot, { recursive: true, force: true });
   await writeJson(join(root, "CURRENT.json"), {
     schemaVersion: BookshelfGraphSchemaVersion,
+    scopeKind: "bookshelf",
     bookshelfId: input.bookshelfId,
     generation,
-    current: "current",
-    manifestPath: "current/BOOKSHELF_MANIFEST.json",
+    current: `generations/${generation}`,
+    manifestPath: `generations/${generation}/BOOKSHELF_MANIFEST.json`,
     manifestSha256: writtenManifest.sha256,
     readyState: "bookshelf_query_ready",
     queryReady: true,
     publishedAt: createdAt,
+  });
+  await writeJson(join(root, "BOOKSHELF_MANIFEST.json"), manifest);
+  await writeJson(join(root, "state", "bookshelf-quality-gate.json"), qualityGate);
+  await writeJson(join(root, "state", "diagnostics.json"), diagnostics);
+  await writeJson(join(root, "PUBLISH_READY.json"), {
+    schemaVersion: BookshelfGraphSchemaVersion,
+    kind: "qmd_graphrag_upper_package_publish_ready",
+    scopeKind: "bookshelf",
+    scopeId: input.bookshelfId,
+    generation,
+    readyState: "bookshelf_query_ready",
+    queryReady: true,
+    manifestPath: "BOOKSHELF_MANIFEST.json",
+    manifestSha256: writtenManifest.sha256,
+    qualityGatePath: "state/bookshelf-quality-gate.json",
+    currentPath: "CURRENT.json",
+    publishedAt: createdAt,
+  });
+  await rebuildBookshelfCatalogProjection({
+    graphVault,
+    bookshelfId: input.bookshelfId,
+    now: () => createdAt,
   });
 
   return {

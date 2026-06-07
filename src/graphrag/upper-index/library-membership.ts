@@ -11,6 +11,12 @@ import {
   BookshelfQualityGateSchema,
   type BookshelfGraphManifest,
 } from "./bookshelf-graph-contracts.js";
+import {
+  libraryPackageRoot,
+  packageLocator,
+  readPackageCurrent,
+  readQueryReadyPackage,
+} from "./upper-package-paths.js";
 
 export const LibraryMembershipSchemaVersion = "1.0.0";
 
@@ -299,35 +305,39 @@ function libraryRunId(libraryId: string, generation: string): string {
   return `${libraryId}-${generation}`;
 }
 
-function bookshelfCurrentRoot(graphVault: string, bookshelfId: string): string {
-  return join(graphVault, "catalog", "bookshelves", bookshelfId, "current");
-}
-
-function bookshelfRelativePath(
-  bookshelfId: string,
-  relativePath: string,
-): string {
-  return `catalog/bookshelves/${bookshelfId}/current/${relativePath}`;
-}
-
 function requiredBookshelfArtifactPaths(
   bookshelfId: string,
   manifest: BookshelfGraphManifest,
 ): LibraryBookshelfMember["semanticArtifacts"] {
+  const generation = manifest.bookshelfIdentity.generation;
   return {
-    semanticUnits: bookshelfRelativePath(
-      bookshelfId,
-      manifest.graphArtifacts.semanticUnits,
-    ),
-    semanticEdges: bookshelfRelativePath(
-      bookshelfId,
-      manifest.graphArtifacts.semanticEdges,
-    ),
-    communityReports: bookshelfRelativePath(
-      bookshelfId,
-      manifest.graphArtifacts.communityReports,
-    ),
-    evidenceMap: bookshelfRelativePath(bookshelfId, manifest.evidenceMap.path),
+    semanticUnits: packageLocator({
+      scopeKind: "bookshelf",
+      scopeId: bookshelfId,
+      generation,
+      relativePath:
+        manifest.graphArtifacts.semanticUnits,
+    }),
+    semanticEdges: packageLocator({
+      scopeKind: "bookshelf",
+      scopeId: bookshelfId,
+      generation,
+      relativePath:
+        manifest.graphArtifacts.semanticEdges,
+    }),
+    communityReports: packageLocator({
+      scopeKind: "bookshelf",
+      scopeId: bookshelfId,
+      generation,
+      relativePath:
+        manifest.graphArtifacts.communityReports,
+    }),
+    evidenceMap: packageLocator({
+      scopeKind: "bookshelf",
+      scopeId: bookshelfId,
+      generation,
+      relativePath: manifest.evidenceMap.path,
+    }),
   };
 }
 
@@ -340,13 +350,12 @@ export async function readLibraryMembershipCurrent(input: {
   libraryId: string;
 }): Promise<LibraryMembershipCurrent> {
   const graphVault = resolve(input.graphVault);
-  const currentRoot = join(
+  const current = await readPackageCurrent({
     graphVault,
-    "catalog",
-    "library",
-    input.libraryId,
-    "current",
-  );
+    scopeKind: "library",
+    scopeId: input.libraryId,
+  });
+  const currentRoot = current.generationRoot;
   const membershipRoot = existsSync(
     join(currentRoot, "LIBRARY_MEMBERSHIP_MANIFEST.json"),
   )
@@ -402,24 +411,19 @@ async function readBookshelfManifest(input: {
   policy: Required<LibraryMembershipPolicy>;
 }): Promise<LibraryBookshelfMember> {
   assertSafeScopeId("bookshelf", input.bookshelfId);
-  const root = bookshelfCurrentRoot(input.graphVault, input.bookshelfId);
-  const manifestPath = join(root, "BOOKSHELF_MANIFEST.json");
-  const gatePath = join(root, "state", "bookshelf-quality-gate.json");
-  if (!existsSync(manifestPath)) {
+  const ready = await readQueryReadyPackage({
+    graphVault: input.graphVault,
+    scopeKind: "bookshelf",
+    scopeId: input.bookshelfId,
+  }).catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
     throw new Error(
-      `upper_quality_gate_failed:bookshelf_manifest_missing:${input.bookshelfId}`,
+      `upper_quality_gate_failed:bookshelf_package_not_query_ready:${input.bookshelfId}:${message}`,
     );
-  }
-  if (!existsSync(`${manifestPath}.sha256`)) {
-    throw new Error(
-      `upper_quality_gate_failed:bookshelf_manifest_checksum_missing:${input.bookshelfId}`,
-    );
-  }
-  if (!existsSync(gatePath)) {
-    throw new Error(
-      `upper_quality_gate_failed:bookshelf_gate_missing:${input.bookshelfId}`,
-    );
-  }
+  });
+  const root = ready.generationRoot;
+  const manifestPath = ready.manifestPath;
+  const gatePath = ready.gatePath;
   const manifestSha256 = sha256Buffer(await readFile(manifestPath));
   const sidecarSha256 = (await readFile(`${manifestPath}.sha256`, "utf8")).trim();
   if (sidecarSha256 !== manifestSha256) {
@@ -482,11 +486,18 @@ async function readBookshelfManifest(input: {
     evidenceMapRowCount: manifest.data.evidenceMap.rowCount,
     membershipSourceKind: input.policy.sourceKind,
     userLocked: input.policy.sourceKind === "user_explicit",
-    manifestPath: bookshelfRelativePath(input.bookshelfId, "BOOKSHELF_MANIFEST.json"),
-    qualityGatePath: bookshelfRelativePath(
-      input.bookshelfId,
-      "state/bookshelf-quality-gate.json",
-    ),
+    manifestPath: packageLocator({
+      scopeKind: "bookshelf",
+      scopeId: input.bookshelfId,
+      generation: manifest.data.bookshelfIdentity.generation,
+      relativePath: "BOOKSHELF_MANIFEST.json",
+    }),
+    qualityGatePath: packageLocator({
+      scopeKind: "bookshelf",
+      scopeId: input.bookshelfId,
+      generation: manifest.data.bookshelfIdentity.generation,
+      relativePath: "state/bookshelf-quality-gate.json",
+    }),
     semanticArtifacts: requiredBookshelfArtifactPaths(
       input.bookshelfId,
       manifest.data,
@@ -649,8 +660,8 @@ export async function resolveLibraryMembership(
     String(directBookLimit),
   ].join("\n")).slice(0, 16)}`;
   const runId = libraryRunId(input.libraryId, generation);
-  const root = join(graphVault, "catalog", "library", input.libraryId);
-  const stagingRoot = join(root, "staging", generation);
+  const root = libraryPackageRoot(graphVault, input.libraryId);
+  const stagingRoot = join(root, "staging", runId);
   await rm(stagingRoot, { recursive: true, force: true });
   await mkdir(join(stagingRoot, "state"), { recursive: true });
   await mkdir(join(stagingRoot, "runs", runId, "checkpoints"), {
@@ -725,7 +736,7 @@ export async function resolveLibraryMembership(
     affectedArtifactDigest: membersDigest,
     expectedDigest: membersDigest,
     observedDigest: membersDigest,
-    redactedLocator: "current/library_members.json",
+    redactedLocator: `generations/${generation}/library_members.json`,
     remediationCommand: null,
     checkedAt: createdAt,
   });
@@ -877,18 +888,20 @@ export async function resolveLibraryMembership(
     manifest,
   );
 
-  const currentRoot = join(root, "current");
-  const previousRoot = `${currentRoot}.previous-${process.pid}-${randomUUID()}`;
+  const generationRoot = join(root, "generations", generation);
+  const previousRoot = `${generationRoot}.previous-${process.pid}-${randomUUID()}`;
+  await mkdir(dirname(generationRoot), { recursive: true });
   await rm(previousRoot, { recursive: true, force: true });
-  if (existsSync(currentRoot)) await rename(currentRoot, previousRoot);
-  await rename(stagingRoot, currentRoot);
+  if (existsSync(generationRoot)) await rename(generationRoot, previousRoot);
+  await rename(stagingRoot, generationRoot);
   await rm(previousRoot, { recursive: true, force: true });
   await writeJson(join(root, "CURRENT.json"), {
     schemaVersion: LibraryMembershipSchemaVersion,
+    scopeKind: "library",
     libraryId: input.libraryId,
     generation,
-    current: "current",
-    manifestPath: "current/LIBRARY_MEMBERSHIP_MANIFEST.json",
+    current: `generations/${generation}`,
+    manifestPath: `generations/${generation}/LIBRARY_MEMBERSHIP_MANIFEST.json`,
     manifestSha256: writtenManifest.sha256,
     readyState: "library_membership_resolved",
     queryReady: false,
@@ -950,13 +963,20 @@ async function validateMemberBookshelf(input: {
   member: LibraryBookshelfMember;
   diagnostics: string[];
 }): Promise<void> {
-  const root = bookshelfCurrentRoot(input.graphVault, input.member.bookshelfId);
-  const manifestPath = join(root, "BOOKSHELF_MANIFEST.json");
-  const gatePath = join(root, "state", "bookshelf-quality-gate.json");
-  if (!existsSync(manifestPath)) {
+  let ready: Awaited<ReturnType<typeof readQueryReadyPackage>>;
+  try {
+    ready = await readQueryReadyPackage({
+      graphVault: input.graphVault,
+      scopeKind: "bookshelf",
+      scopeId: input.member.bookshelfId,
+    });
+  } catch {
     input.diagnostics.push(`member_bookshelf_manifest_missing:${input.member.bookshelfId}`);
     return;
   }
+  const root = ready.generationRoot;
+  const manifestPath = ready.manifestPath;
+  const gatePath = ready.gatePath;
   const actualManifestSha = sha256Buffer(await readFile(manifestPath));
   if (actualManifestSha !== input.member.manifestSha256) {
     input.diagnostics.push(`member_bookshelf_manifest_stale:${input.member.bookshelfId}`);
@@ -987,7 +1007,13 @@ async function validateMemberBookshelf(input: {
     input.diagnostics.push(`member_bookshelf_gate_failed:${input.member.bookshelfId}`);
   }
   for (const artifactPath of Object.values(input.member.semanticArtifacts)) {
-    const expectedPrefix = `catalog/bookshelves/${input.member.bookshelfId}/current/`;
+    const expectedPrefix = [
+      "bookshelves",
+      input.member.bookshelfId,
+      "generations",
+      input.member.generation,
+      "",
+    ].join("/");
     if (!artifactPath.startsWith(expectedPrefix)) {
       input.diagnostics.push(
         `member_bookshelf_artifact_locator_invalid:${input.member.bookshelfId}`,
@@ -1013,16 +1039,25 @@ export async function validateLibraryMembership(input: {
   directBookCount: number;
 }> {
   const graphVault = resolve(input.graphVault);
-  const currentRoot = join(
-    graphVault,
-    "catalog",
-    "library",
-    input.libraryId,
-    "current",
-  );
-  const root = existsSync(join(currentRoot, "LIBRARY_MEMBERSHIP_MANIFEST.json"))
-    ? currentRoot
-    : join(currentRoot, "membership");
+  let root: string;
+  try {
+    const current = await readPackageCurrent({
+      graphVault,
+      scopeKind: "library",
+      scopeId: input.libraryId,
+    });
+    root = existsSync(join(current.generationRoot, "LIBRARY_MEMBERSHIP_MANIFEST.json"))
+      ? current.generationRoot
+      : join(current.generationRoot, "membership");
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      diagnostics: [detail],
+      bookshelfCount: 0,
+      directBookCount: 0,
+    };
+  }
   const diagnostics: string[] = [];
   const manifestPath = join(root, "LIBRARY_MEMBERSHIP_MANIFEST.json");
   const membersPath = join(root, "library_members.json");

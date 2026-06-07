@@ -19,6 +19,7 @@ import {
   LibraryQualityGateSchema,
   RequiredParquetColumns,
 } from "./library-graph-contracts.js";
+import { readQueryReadyPackage } from "./upper-package-paths.js";
 
 function sha256Buffer(buffer: Buffer): string {
   return createHash("sha256").update(buffer).digest("hex");
@@ -104,19 +105,19 @@ async function validateMemberBookshelves(input: {
   diagnostics: string[];
 }): Promise<void> {
   for (const [bookshelfId, expectedSha] of Object.entries(input.members)) {
-    const root = join(
-      input.graphVault,
-      "catalog",
-      "bookshelves",
-      bookshelfId,
-      "current",
-    );
-    const manifestPath = join(root, "BOOKSHELF_MANIFEST.json");
-    const gatePath = join(root, "state", "bookshelf-quality-gate.json");
-    if (!existsSync(manifestPath)) {
+    let ready: Awaited<ReturnType<typeof readQueryReadyPackage>>;
+    try {
+      ready = await readQueryReadyPackage({
+        graphVault: input.graphVault,
+        scopeKind: "bookshelf",
+        scopeId: bookshelfId,
+      });
+    } catch {
       input.diagnostics.push(`member_bookshelf_manifest_missing:${bookshelfId}`);
       continue;
     }
+    const manifestPath = ready.manifestPath;
+    const gatePath = ready.gatePath;
     const actualSha = await sha256File(manifestPath);
     if (actualSha !== expectedSha) {
       input.diagnostics.push(`member_bookshelf_manifest_stale:${bookshelfId}`);
@@ -234,7 +235,22 @@ export async function validateLibraryGraph(input: {
   evidenceMapCount: number;
 }> {
   const graphVault = resolve(input.graphVault);
-  const root = join(graphVault, "catalog", "library", input.libraryId, "current");
+  let root: string;
+  try {
+    root = (await readQueryReadyPackage({
+      graphVault,
+      scopeKind: "library",
+      scopeId: input.libraryId,
+    })).generationRoot;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      diagnostics: [detail],
+      semanticUnitCount: 0,
+      evidenceMapCount: 0,
+    };
+  }
   const bridgePath = input.bridgePath ?? defaultBookshelfGraphBridgePath();
   const pythonBin = input.pythonBin ?? "python3";
   const validation = await validateLibraryGraphAtRoot({

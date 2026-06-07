@@ -22,6 +22,9 @@ import {
   runBookshelfGraphParquetBridge,
 } from "./bookshelf-graph-parquet.js";
 import {
+  rebuildLibraryCatalogProjection,
+} from "./upper-catalog-projection.js";
+import {
   LibraryGraphBuilderVersion,
   LibraryGraphChecks,
   LibraryGraphManifestSchema,
@@ -41,6 +44,9 @@ import {
   validateLibraryGraphAtRoot,
   validateLibraryGraph,
 } from "./library-graph-validator.js";
+import {
+  libraryPackageRoot,
+} from "./upper-package-paths.js";
 
 export { validateLibraryGraph } from "./library-graph-validator.js";
 
@@ -385,9 +391,9 @@ export async function buildLibraryGraph(
     maxShelfCommunityRefs,
   });
   const createdAt = input.now?.() ?? new Date().toISOString();
-  const root = join(graphVault, "catalog", "library", input.libraryId);
-  const stagingRoot = join(root, "staging", generation);
   const runId = libraryRunId(input.libraryId, generation);
+  const root = libraryPackageRoot(graphVault, input.libraryId);
+  const stagingRoot = join(root, "staging", runId);
   await rm(stagingRoot, { recursive: true, force: true });
   await mkdir(join(stagingRoot, "state"), { recursive: true });
   await mkdir(join(stagingRoot, "runs", runId, "checkpoints"), {
@@ -494,7 +500,7 @@ export async function buildLibraryGraph(
     affectedArtifactDigest: graphDigest,
     expectedDigest: graphDigest,
     observedDigest: graphDigest,
-    redactedLocator: "current/LIBRARY_MANIFEST.json",
+    redactedLocator: `generations/${generation}/LIBRARY_MANIFEST.json`,
     remediationCommand: null,
     checkedAt: createdAt,
   });
@@ -707,22 +713,46 @@ export async function buildLibraryGraph(
     );
   }
 
-  const currentRoot = join(root, "current");
-  const previousRoot = `${currentRoot}.previous-${process.pid}-${randomUUID()}`;
+  const generationRoot = join(root, "generations", generation);
+  const previousRoot = `${generationRoot}.previous-${process.pid}-${randomUUID()}`;
+  await mkdir(dirname(generationRoot), { recursive: true });
   await rm(previousRoot, { recursive: true, force: true });
-  if (existsSync(currentRoot)) await rename(currentRoot, previousRoot);
-  await rename(stagingRoot, currentRoot);
+  if (existsSync(generationRoot)) await rename(generationRoot, previousRoot);
+  await rename(stagingRoot, generationRoot);
   await rm(previousRoot, { recursive: true, force: true });
   await writeJson(join(root, "CURRENT.json"), {
     schemaVersion: LibraryGraphSchemaVersion,
+    scopeKind: "library",
     libraryId: input.libraryId,
     generation,
-    current: "current",
-    manifestPath: "current/LIBRARY_MANIFEST.json",
+    current: `generations/${generation}`,
+    manifestPath: `generations/${generation}/LIBRARY_MANIFEST.json`,
     manifestSha256: writtenManifest.sha256,
     readyState: "library_query_ready",
     queryReady: true,
     publishedAt: createdAt,
+  });
+  await writeJson(join(root, "LIBRARY_MANIFEST.json"), manifest);
+  await writeJson(join(root, "state", "library-quality-gate.json"), qualityGate);
+  await writeJson(join(root, "state", "diagnostics.json"), diagnostics);
+  await writeJson(join(root, "PUBLISH_READY.json"), {
+    schemaVersion: LibraryGraphSchemaVersion,
+    kind: "qmd_graphrag_upper_package_publish_ready",
+    scopeKind: "library",
+    scopeId: input.libraryId,
+    generation,
+    readyState: "library_query_ready",
+    queryReady: true,
+    manifestPath: "LIBRARY_MANIFEST.json",
+    manifestSha256: writtenManifest.sha256,
+    qualityGatePath: "state/library-quality-gate.json",
+    currentPath: "CURRENT.json",
+    publishedAt: createdAt,
+  });
+  await rebuildLibraryCatalogProjection({
+    graphVault,
+    libraryId: input.libraryId,
+    now: () => createdAt,
   });
 
   return {

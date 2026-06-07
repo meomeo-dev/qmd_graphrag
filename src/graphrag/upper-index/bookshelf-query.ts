@@ -1,7 +1,4 @@
-import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 
 import { SchemaVersion } from "../../contracts/common.js";
 import type { GraphCapability } from "../../contracts/graph-enhancement.js";
@@ -23,9 +20,14 @@ import {
   runBookshelfGraphQueryBridge,
 } from "./bookshelf-graph-parquet.js";
 import { validateBookshelfGraphAtRoot } from "./bookshelf-graph-validator.js";
+import {
+  packageLocator,
+  readQueryReadyPackage,
+} from "./upper-package-paths.js";
 
 export type BookshelfQueryScopeErrorCode =
   | "upper_index_missing"
+  | "upper_package_migration_required"
   | "upper_index_stale"
   | "upper_quality_gate_failed"
   | "budget_exceeded_narrow_scope_required"
@@ -67,14 +69,6 @@ export type QueryBookshelfGraphInput = {
   maxInputTokens?: number;
 };
 
-function sha256Buffer(buffer: Buffer): string {
-  return createHash("sha256").update(buffer).digest("hex");
-}
-
-async function sha256File(path: string): Promise<string> {
-  return sha256Buffer(await readFile(path));
-}
-
 async function readPublishedScope(input: {
   graphVault: string;
   bookshelfId: string;
@@ -82,22 +76,36 @@ async function readPublishedScope(input: {
   bridgePath: string;
 }): Promise<BookshelfQueryScope> {
   const graphVault = resolve(input.graphVault);
-  const root = join(
-    graphVault,
-    "catalog",
-    "bookshelves",
-    input.bookshelfId,
-    "current",
-  );
-  const manifestPath = join(root, "BOOKSHELF_MANIFEST.json");
-  const gatePath = join(root, "state", "bookshelf-quality-gate.json");
-  if (!existsSync(manifestPath) || !existsSync(gatePath)) {
+  let packageReady: Awaited<ReturnType<typeof readQueryReadyPackage>>;
+  try {
+    packageReady = await readQueryReadyPackage({
+      graphVault,
+      scopeKind: "bookshelf",
+      scopeId: input.bookshelfId,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.startsWith("upper_package_migration_required:")) {
+      throw new BookshelfQueryScopeError(
+        "upper_package_migration_required",
+        "Bookshelf upper package must be migrated out of catalog.",
+        ["legacy_catalog_bookshelf_package_requires_migration"],
+      );
+    }
+    if (message.startsWith("upper_quality_gate_failed:")) {
+      throw new BookshelfQueryScopeError(
+        "upper_quality_gate_failed",
+        "Bookshelf package-local publish gate is not query-ready.",
+        [message.replace(/^upper_quality_gate_failed:/u, "")],
+      );
+    }
     throw new BookshelfQueryScopeError(
       "upper_index_missing",
-      "Bookshelf upper index is missing or not published.",
-      ["missing_bookshelf_manifest_or_gate"],
+      "Bookshelf upper package is missing or not query-ready.",
+      [message.replace(/^upper_index_missing:/u, "")],
     );
   }
+  const root = packageReady.generationRoot;
   let validation: { ok: boolean; diagnostics: string[] };
   try {
     validation = await validateBookshelfGraphAtRoot({
@@ -142,10 +150,10 @@ async function readPublishedScope(input: {
     );
   }
   const manifest = BookshelfGraphManifestSchema.parse(
-    await readHotplugPackageUnknown(manifestPath),
+    await readHotplugPackageUnknown(packageReady.manifestPath),
   );
   const gate = BookshelfQualityGateSchema.parse(
-    await readHotplugPackageUnknown(gatePath),
+    await readHotplugPackageUnknown(packageReady.gatePath),
   );
   if (
     !manifest.bookshelfIdentity.queryReady ||
@@ -233,11 +241,14 @@ export async function queryBookshelfGraph(
     bridgePath,
   });
   const maxInputTokens = input.maxInputTokens ?? scope.maxInputTokens;
+  const bridgeStartedAt = Date.now();
   const bridge = await runBookshelfGraphQueryBridge({
     pythonBin,
     bridgePath,
     payload: {
       bookshelfId: scope.bookshelfId,
+      scopeKind: "bookshelf",
+      scopeId: scope.bookshelfId,
       generation: scope.manifest.bookshelfIdentity.generation,
       outputRoot: scope.root,
       query: input.query,
@@ -267,6 +278,7 @@ export async function queryBookshelfGraph(
       ["bookshelf_query_runtime_error"],
     );
   });
+  const bridgeDurationMs = Math.max(0, Date.now() - bridgeStartedAt);
   if (!bridge.ok) {
     const budgetExceeded = bridge.diagnostics.includes(
       "budget_exceeded_narrow_scope_required",
@@ -293,13 +305,12 @@ export async function queryBookshelfGraph(
       graphTextUnitId: item.targetTextUnitId,
       artifactId: item.targetCommunityReportId,
       locator: {
-        path: [
-          "catalog",
-          "bookshelves",
-          scope.bookshelfId,
-          "current",
-          "community_reports.parquet",
-        ].join("/"),
+        path: packageLocator({
+          scopeKind: "bookshelf",
+          scopeId: scope.bookshelfId,
+          generation: scope.manifest.bookshelfIdentity.generation,
+          relativePath: "community_reports.parquet",
+        }),
       },
       quote: item.quote,
       score: item.score,
@@ -323,11 +334,11 @@ export async function queryBookshelfGraph(
       runtimeMetrics: {
         kind: "graphrag_query_runtime_metrics",
         scope: "current_invocation",
-        totalDurationMs: 0,
+        totalDurationMs: bridgeDurationMs,
         stages: [
           {
             name: "bookshelf.fixed_budget_report_search",
-            durationMs: 0,
+            durationMs: bridgeDurationMs,
             status: "succeeded",
           },
         ],
@@ -340,7 +351,7 @@ export async function queryBookshelfGraph(
           requestsWithRetries: 0,
           retryCount: 0,
           streamingResponseCount: 0,
-          loggedComputeDurationMs: 0,
+          loggedComputeDurationMs: bridgeDurationMs,
           promptTokens: bridge.estimatedInputTokens,
           completionTokens: 0,
           totalTokens: bridge.estimatedInputTokens,

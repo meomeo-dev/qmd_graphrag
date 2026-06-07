@@ -1,5 +1,4 @@
-import { existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 
 import { SchemaVersion } from "../../contracts/common.js";
 import type { GraphCapability } from "../../contracts/graph-enhancement.js";
@@ -24,9 +23,14 @@ import {
   type LibraryGraphManifest,
 } from "./library-graph-contracts.js";
 import { validateLibraryGraphAtRoot } from "./library-graph-validator.js";
+import {
+  packageLocator,
+  readQueryReadyPackage,
+} from "./upper-package-paths.js";
 
 export type LibraryQueryScopeErrorCode =
   | "upper_index_missing"
+  | "upper_package_migration_required"
   | "upper_index_stale"
   | "upper_quality_gate_failed"
   | "budget_exceeded_narrow_scope_required"
@@ -75,16 +79,36 @@ async function readPublishedScope(input: {
   bridgePath: string;
 }): Promise<LibraryQueryScope> {
   const graphVault = resolve(input.graphVault);
-  const root = join(graphVault, "catalog", "library", input.libraryId, "current");
-  const manifestPath = join(root, "LIBRARY_MANIFEST.json");
-  const gatePath = join(root, "state", "library-quality-gate.json");
-  if (!existsSync(manifestPath) || !existsSync(gatePath)) {
+  let packageReady: Awaited<ReturnType<typeof readQueryReadyPackage>>;
+  try {
+    packageReady = await readQueryReadyPackage({
+      graphVault,
+      scopeKind: "library",
+      scopeId: input.libraryId,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.startsWith("upper_package_migration_required:")) {
+      throw new LibraryQueryScopeError(
+        "upper_package_migration_required",
+        "Library upper package must be migrated out of catalog.",
+        ["legacy_catalog_library_package_requires_migration"],
+      );
+    }
+    if (message.startsWith("upper_quality_gate_failed:")) {
+      throw new LibraryQueryScopeError(
+        "upper_quality_gate_failed",
+        "Library package-local publish gate is not query-ready.",
+        [message.replace(/^upper_quality_gate_failed:/u, "")],
+      );
+    }
     throw new LibraryQueryScopeError(
       "upper_index_missing",
-      "Library upper index is missing or not published.",
-      ["missing_library_manifest_or_gate"],
+      "Library upper package is missing or not query-ready.",
+      [message.replace(/^upper_index_missing:/u, "")],
     );
   }
+  const root = packageReady.generationRoot;
   let validation: { ok: boolean; diagnostics: string[] };
   try {
     validation = await validateLibraryGraphAtRoot({
@@ -129,10 +153,10 @@ async function readPublishedScope(input: {
     );
   }
   const manifest = LibraryGraphManifestSchema.parse(
-    await readHotplugPackageUnknown(manifestPath),
+    await readHotplugPackageUnknown(packageReady.manifestPath),
   );
   const gate = LibraryQualityGateSchema.parse(
-    await readHotplugPackageUnknown(gatePath),
+    await readHotplugPackageUnknown(packageReady.gatePath),
   );
   if (!manifest.libraryIdentity.queryReady || !gate.queryReady || gate.status !== "passed") {
     throw new LibraryQueryScopeError(
@@ -155,15 +179,19 @@ async function representativeBookForShelf(input: {
   graphVault: string;
   bookshelfId: string;
 }): Promise<{ bookId: string; contentHash: string }> {
+  const ready = await readQueryReadyPackage({
+    graphVault: input.graphVault,
+    scopeKind: "bookshelf",
+    scopeId: input.bookshelfId,
+  }).catch(() => {
+    throw new LibraryQueryScopeError(
+      "upper_quality_gate_failed",
+      "Library member bookshelf package is not query-ready.",
+      [`member_bookshelf_package_missing:${input.bookshelfId}`],
+    );
+  });
   const manifest = BookshelfGraphManifestSchema.parse(
-    await readHotplugPackageUnknown(join(
-      input.graphVault,
-      "catalog",
-      "bookshelves",
-      input.bookshelfId,
-      "current",
-      "BOOKSHELF_MANIFEST.json",
-    )),
+    await readHotplugPackageUnknown(ready.manifestPath),
   );
   const bookId = Object.keys(manifest.membership.memberManifestSha256).sort()[0];
   if (bookId == null) {
@@ -253,6 +281,7 @@ export async function queryLibraryGraph(
     bridgePath,
   });
   const maxInputTokens = input.maxInputTokens ?? scope.maxInputTokens;
+  const bridgeStartedAt = Date.now();
   const bridge = await runBookshelfGraphQueryBridge({
     pythonBin,
     bridgePath,
@@ -289,6 +318,7 @@ export async function queryLibraryGraph(
       ["library_query_runtime_error"],
     );
   });
+  const bridgeDurationMs = Math.max(0, Date.now() - bridgeStartedAt);
   if (!bridge.ok) {
     const budgetExceeded = bridge.diagnostics.includes(
       "budget_exceeded_narrow_scope_required",
@@ -315,13 +345,12 @@ export async function queryLibraryGraph(
       graphTextUnitId: item.targetTextUnitId,
       artifactId: item.targetCommunityReportId,
       locator: {
-        path: [
-          "catalog",
-          "library",
-          scope.libraryId,
-          "current",
-          "community_reports.parquet",
-        ].join("/"),
+        path: packageLocator({
+          scopeKind: "library",
+          scopeId: scope.libraryId,
+          generation: scope.manifest.libraryIdentity.generation,
+          relativePath: "community_reports.parquet",
+        }),
       },
       quote: item.quote,
       score: item.score,
@@ -346,11 +375,11 @@ export async function queryLibraryGraph(
       runtimeMetrics: {
         kind: "graphrag_query_runtime_metrics",
         scope: "current_invocation",
-        totalDurationMs: 0,
+        totalDurationMs: bridgeDurationMs,
         stages: [
           {
             name: "library.fixed_budget_report_search",
-            durationMs: 0,
+            durationMs: bridgeDurationMs,
             status: "succeeded",
           },
         ],
@@ -363,7 +392,7 @@ export async function queryLibraryGraph(
           requestsWithRetries: 0,
           retryCount: 0,
           streamingResponseCount: 0,
-          loggedComputeDurationMs: 0,
+          loggedComputeDurationMs: bridgeDurationMs,
           promptTokens: bridge.estimatedInputTokens,
           completionTokens: 0,
           totalTokens: bridge.estimatedInputTokens,

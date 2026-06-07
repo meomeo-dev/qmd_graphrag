@@ -17,7 +17,7 @@ function usage() {
     "",
     "Options:",
     "  --graph-vault <path>     graph_vault root, default graph_vault",
-    "  --bookshelf-id <id>      catalog bookshelf id to materialize",
+    "  --bookshelf-id <id>      bookshelf package id to materialize",
     "  --book-id <bookId>       repeat for each member book package",
     "  --policy-kind <kind>     user_explicit | deterministic_rule | taxonomy",
     "  --decided-by <actor>     bounded actor id, default local_cli_user",

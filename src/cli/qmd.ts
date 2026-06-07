@@ -202,6 +202,9 @@ import {
   resolveGraphRagQueryMethod,
   resolveUpperTypedQueryErrorDetails,
 } from "./graphrag-query-scope.js";
+import {
+  runUpperManagementCommand,
+} from "./graphrag-upper-management.js";
 import { createRunId } from "../job-state/fingerprint.js";
 
 // NOTE: enableProductionMode() is intentionally NOT called at module scope here.
@@ -4278,6 +4281,10 @@ function parseCLI() {
       "response-type": { type: "string" },
       "community-level": { type: "string" },
       "python-bin": { type: "string" },
+      "max-semantic-units": { type: "string" },
+      "max-edges": { type: "string" },
+      "max-reports-per-book": { type: "string" },
+      "max-reports-per-shelf": { type: "string" },
       intent: { type: "string" },
       trainset: { type: "string" },
       valset: { type: "string" },
@@ -4790,6 +4797,8 @@ function showHelp(): void {
   console.log("Primary commands:");
   console.log("  qmd query <query>             - Whole-corpus qmd search with expansion + reranking");
   console.log("  qmd query --graphrag <query>  - Graph-enhanced qmd query for graph-ready sources");
+  console.log("  qmd bookshelf <command>       - Manage bookshelf upper packages");
+  console.log("  qmd library <command>         - Manage library upper packages");
   console.log("  qmd dspy <command>            - Offline DSPy query expansion policy lifecycle");
   console.log("  qmd query 'lex:..\\nvec:...'   - Structured query document (you provide lex/vec/hyde lines)");
   console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM)");
@@ -5926,6 +5935,24 @@ if (isMain) {
     case "status":
       await showStatus();
       break;
+
+    case "bookshelf":
+    case "library": {
+      try {
+        const config = ensureRuntimeConfigForCli();
+        const graphVault = resolveGraphVaultForCli(cli.values, config);
+        await runUpperManagementCommand({
+          graphVault,
+          scopeKind: cli.command,
+          args: cli.args,
+          json: cli.opts.format === "json",
+          values: cli.values,
+        });
+      } catch (error) {
+        exitWithError(error);
+      }
+      break;
+    }
 
     case "doctor":
       await showDoctor(cli.opts.format === "json");

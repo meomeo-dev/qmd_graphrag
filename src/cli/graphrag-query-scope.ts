@@ -16,6 +16,7 @@ export type UpperTypedQueryErrorCode =
   | "missing_scope"
   | "ambiguous_scope"
   | "upper_index_missing"
+  | "upper_package_migration_required"
   | "upper_index_stale"
   | "upper_quality_gate_failed"
   | "budget_exceeded_narrow_scope_required"
@@ -53,6 +54,30 @@ function rebuildUpperIndexCommand(input: {
     ].join(" ");
   }
   return scopeSelectionCommand();
+}
+
+function migrateUpperPackageCommand(input: {
+  scopeKind?: GraphRagScopeKind;
+  scopeId: string;
+}): string {
+  if (input.scopeKind === "library") {
+    return [
+      "node scripts/graphrag/build-library-graph.mjs",
+      "--graph-vault <path>",
+      `--library-id ${input.scopeId}`,
+    ].join(" ");
+  }
+  if (input.scopeKind === "bookshelf") {
+    return [
+      "node scripts/graphrag/build-bookshelf-graph.mjs",
+      "--graph-vault <path>",
+      `--bookshelf-id ${input.scopeId}`,
+    ].join(" ");
+  }
+  return [
+    "rebuild or migrate the upper package under graph_vault/bookshelves/<id>",
+    "or graph_vault/library/<id>",
+  ].join(" ");
 }
 
 export function resolveGraphRagQueryMethod(
@@ -102,6 +127,16 @@ export function resolveUpperTypedQueryErrorDetails(input: {
         exitCode: 66,
         retryable: false,
         remediationCommand: rebuildUpperIndexCommand({
+          scopeKind: input.scopeKind,
+          scopeId: scopePlaceholder,
+        }),
+      };
+    case "upper_package_migration_required":
+      return {
+        ...shared,
+        exitCode: 65,
+        retryable: false,
+        remediationCommand: migrateUpperPackageCommand({
           scopeKind: input.scopeKind,
           scopeId: scopePlaceholder,
         }),

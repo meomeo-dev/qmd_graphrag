@@ -50,6 +50,16 @@ function sha256Text(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function stableJson(value: unknown): string {
+  return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+async function writeJsonWithSidecar(path: string, value: unknown): Promise<void> {
+  const text = stableJson(value);
+  await writeFile(path, text, "utf8");
+  await writeFile(`${path}.sha256`, `${sha256Text(text)}\n`, "utf8");
+}
+
 async function runQmd(
   workspace: Workspace,
   args: string[],
@@ -715,6 +725,49 @@ async function createWorkspace(options: {
   return workspace;
 }
 
+async function writeUpperCurrentFixture(input: {
+  graphVault: string;
+  scopeKind: "bookshelf" | "library";
+  scopeId: string;
+  readyState: string;
+}): Promise<void> {
+  const root = join(
+    input.graphVault,
+    input.scopeKind === "bookshelf" ? "bookshelves" : "library",
+    input.scopeId,
+  );
+  const generation = `${input.scopeKind}-nonready-generation`;
+  const generationRoot = join(root, "generations", generation);
+  const manifestName = input.scopeKind === "bookshelf"
+    ? "BOOKSHELF_MANIFEST.json"
+    : "LIBRARY_MANIFEST.json";
+  await mkdir(generationRoot, { recursive: true });
+  const manifest = {
+    schemaVersion: "1.0.0",
+    scopeKind: input.scopeKind,
+    scopeId: input.scopeId,
+    generation,
+    materializationStatus: input.readyState,
+  };
+  const manifestPath = join(generationRoot, manifestName);
+  await writeJsonWithSidecar(manifestPath, manifest);
+  const manifestSha256 = sha256Text(stableJson(manifest));
+  await writeJsonWithSidecar(join(root, "CURRENT.json"), {
+    schemaVersion: "1.0.0",
+    scopeKind: input.scopeKind,
+    ...(input.scopeKind === "bookshelf"
+      ? { bookshelfId: input.scopeId }
+      : { libraryId: input.scopeId }),
+    generation,
+    current: `generations/${generation}`,
+    manifestPath: `generations/${generation}/${manifestName}`,
+    manifestSha256,
+    readyState: input.readyState,
+    queryReady: true,
+    publishedAt: "2026-06-06T00:00:00.000Z",
+  });
+}
+
 afterEach(async () => {
   while (workspaces.length > 0) {
     const workspace = workspaces.pop()!;
@@ -989,7 +1042,117 @@ describe("CLI GraphRAG unified route", () => {
         timingAvailable: true,
       });
       expect(error.metadata.diagnostics).toContain(
-        "missing_bookshelf_manifest_or_gate",
+        "package_root_missing",
+      );
+      expect(result.stdout).toBe("");
+    },
+    30000,
+  );
+
+  test("qmd query --bookshelf-id returns migration error for legacy catalog-only index",
+    async () => {
+      const workspace = await createWorkspace();
+      await mkdir(
+        join(
+          workspace.graphVault,
+          "catalog",
+          "bookshelves",
+          "legacy-bookshelf",
+          "current",
+        ),
+        { recursive: true },
+      );
+      await writeFile(
+        join(
+          workspace.graphVault,
+          "catalog",
+          "bookshelves",
+          "legacy-bookshelf",
+          "current",
+          "BOOKSHELF_MANIFEST.json",
+        ),
+        "{}\n",
+        "utf8",
+      );
+      const result = await runQmd(workspace, [
+        "query",
+        "--bookshelf-id",
+        "legacy-bookshelf",
+        "--json",
+        "--timing",
+        "--no-rerank",
+        "How does test driven development work?",
+      ]);
+
+      expect(result.exitCode).toBe(65);
+      const error = JSON.parse(result.stderr);
+      expect(error).toMatchObject({
+        route: "graphrag",
+        stage: "graph_capability",
+        provider: "graphrag",
+        capability: "graph_query",
+        code: "upper_package_migration_required",
+        exitCode: 65,
+        scopeKind: "bookshelf",
+        scopeId: "legacy-bookshelf",
+        retryable: false,
+        remediationCommand:
+          "node scripts/graphrag/build-bookshelf-graph.mjs --graph-vault <path> --bookshelf-id legacy-bookshelf",
+        timingAvailable: true,
+      });
+      expect(error.metadata.diagnostics).toContain(
+        "legacy_catalog_bookshelf_package_requires_migration",
+      );
+      expect(result.stdout).toBe("");
+    },
+    30000,
+  );
+
+  test.each([
+    ["bookshelf", "failed"],
+    ["bookshelf", "staging"],
+    ["library", "failed"],
+    ["library", "staging"],
+  ] as const)(
+    "qmd query --%s-id refuses %s upper CURRENT as query-ready",
+    async (scopeKind, readyState) => {
+      const workspace = await createWorkspace();
+      const scopeId = `${readyState}-${scopeKind}`;
+      await writeUpperCurrentFixture({
+        graphVault: workspace.graphVault,
+        scopeKind,
+        scopeId,
+        readyState,
+      });
+
+      const result = await runQmd(workspace, [
+        "query",
+        scopeKind === "bookshelf" ? "--bookshelf-id" : "--library-id",
+        scopeId,
+        "--json",
+        "--timing",
+        "--no-rerank",
+        scopeKind === "bookshelf"
+          ? "How does test driven development work?"
+          : "How do architecture and delivery practices relate?",
+      ]);
+
+      expect(result.exitCode).toBe(65);
+      const error = JSON.parse(result.stderr);
+      expect(error).toMatchObject({
+        route: "graphrag",
+        stage: "graph_capability",
+        provider: "graphrag",
+        capability: "graph_query",
+        code: "upper_quality_gate_failed",
+        exitCode: 65,
+        scopeKind,
+        scopeId,
+        retryable: false,
+        timingAvailable: true,
+      });
+      expect(error.metadata.diagnostics).toContain(
+        "current_ready_state_mismatch",
       );
       expect(result.stdout).toBe("");
     },
@@ -1026,7 +1189,66 @@ describe("CLI GraphRAG unified route", () => {
         timingAvailable: true,
       });
       expect(error.metadata.diagnostics).toContain(
-        "missing_library_manifest_or_gate",
+        "package_root_missing",
+      );
+      expect(result.stdout).toBe("");
+    },
+    30000,
+  );
+
+  test("qmd query --library-id returns migration error for legacy catalog-only index",
+    async () => {
+      const workspace = await createWorkspace();
+      await mkdir(
+        join(
+          workspace.graphVault,
+          "catalog",
+          "library",
+          "legacy-library",
+          "current",
+        ),
+        { recursive: true },
+      );
+      await writeFile(
+        join(
+          workspace.graphVault,
+          "catalog",
+          "library",
+          "legacy-library",
+          "current",
+          "LIBRARY_MANIFEST.json",
+        ),
+        "{}\n",
+        "utf8",
+      );
+      const result = await runQmd(workspace, [
+        "query",
+        "--library-id",
+        "legacy-library",
+        "--json",
+        "--timing",
+        "--no-rerank",
+        "How do architecture and delivery practices relate?",
+      ]);
+
+      expect(result.exitCode).toBe(65);
+      const error = JSON.parse(result.stderr);
+      expect(error).toMatchObject({
+        route: "graphrag",
+        stage: "graph_capability",
+        provider: "graphrag",
+        capability: "graph_query",
+        code: "upper_package_migration_required",
+        exitCode: 65,
+        scopeKind: "library",
+        scopeId: "legacy-library",
+        retryable: false,
+        remediationCommand:
+          "node scripts/graphrag/build-library-graph.mjs --graph-vault <path> --library-id legacy-library",
+        timingAvailable: true,
+      });
+      expect(error.metadata.diagnostics).toContain(
+        "legacy_catalog_library_package_requires_migration",
       );
       expect(result.stdout).toBe("");
     },

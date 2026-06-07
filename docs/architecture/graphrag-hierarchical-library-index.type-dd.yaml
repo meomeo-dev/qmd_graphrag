@@ -2,28 +2,36 @@ schemaVersion: 1.0.0
 title: GraphRAG 书-书架-Library 层级索引统一设计
 status: design_audit_passed
 owner: qmd_graphrag
-lastReviewed: 2026-06-05
+lastReviewed: 2026-06-06
 purpose: >
-  定义在现有单书热插拔包之上构建书架 (bookshelf) 与 library 层级 GraphRAG 索引的设计，使跨书查询在书籍数量增长时保持固定查询预算，
-  同时把全库语义整合、聚类与摘要成本前移到构建阶段。
+  定义在现有单书热插拔包之上构建书架 (bookshelf) 与 library 层级 GraphRAG
+  索引的设计，使跨书查询在书籍数量增长时保持固定查询预算，同时把
+  全库语义整合、聚类与摘要成本前移到构建阶段。design-turn_011 后，
+  bookshelf 与 library 被定义为 graph_vault/bookshelves/** 和
+  graph_vault/library/** 下可复制传播的上层包，catalog 只承担 projection
+  与路由索引职责。design-turn_014 已按固定 D01-D10 基准复审通过。
 designAudit:
   auditDirectory: docs/architecture/graphrag-hierarchical-library-index-audits
   baselineDirectory: |
     docs/architecture/graphrag-hierarchical-library-index-audits/base
   currentRunDirectory: |
-    docs/architecture/graphrag-hierarchical-library-index-audits/design-turn_007
+    docs/architecture/graphrag-hierarchical-library-index-audits/design-turn_014
   finalReport: >
     docs/architecture/graphrag-hierarchical-library-index-audits/reports/final-summary.md
   baselinePolicy: |
     所有设计审计轮次必须复用 base 目录中的固定 10 个评估维度。 后续轮次不得新增、删除、重命名、重排或改写基准维度，除非开启新的 设计任务。
   status: design_audit_passed
   finalAuditSummary:
-    run: design-turn_007
+    run: design-turn_014
     baseline: |
       docs/architecture/graphrag-hierarchical-library-index-audits/base/evaluation-dimensions.yaml
-    result: 3_agents_all_d01_to_d10_passed_unified_contract
-    conclusion: 第七轮复审中 3 个 agent 均按固定 D01-D10 基准判定通过。pipeline I/O
-      与接地性审计内容已合并回本文档，本文档为书-书架-library 层级 GraphRAG 设计唯一规范性 Type DD。
+    result: 3_agents_all_d01_to_d10_passed_catalog_projection_update
+    conclusion: >
+      第十四轮设计审计中 3 个 agent 均按固定 D01-D10 基准判定通过。
+      本文档继续保持上层包目录权威修订：bookshelf 与 library 包根分别为
+      graph_vault/bookshelves/{bookshelfId} 与 graph_vault/library/{libraryId}。
+      最新复审确认 query-ready 上层包发布后生成的 catalog projection 仍是
+      非权威派生视图，不拥有上层包闭包，也不能证明 query-ready。
 documentAuthority:
   canonicalDocument: docs/architecture/graphrag-hierarchical-library-index.type-dd.yaml
   rule: 本文档是书-书架-library 层级 GraphRAG 索引设计的唯一规范性 Type DD。pipeline I/O、实现接地性、书架组织策略、library
@@ -35,8 +43,10 @@ documentAuthority:
 scope:
   included:
     - graph_vault/books/{bookId} 仍作为单书包权威根目录。
-    - graph_vault/catalog/bookshelves/{bookshelfId} 作为书架层级派生索引根。
-    - graph_vault/catalog/library/{libraryId} 作为 library 层级派生索引根。
+    - graph_vault/bookshelves/{bookshelfId} 作为书架上层包权威根目录。
+    - graph_vault/library/{libraryId} 作为 library 上层包权威根目录。
+    - graph_vault/catalog/** 作为 book、bookshelf 与 library 的 projection、
+      capability、默认 scope 和路由索引目录。
     - 书、书架、library 三层 GraphRAG 查询能力、构建状态、质量门与 成本上限。
     - 基于单书 GraphRAG community_reports、entities、relationships 与 qmd 索引派生上层索引。
     - 查询时固定 top-K、固定 LLM 调用、固定 token 上限的交互路径。
@@ -45,6 +55,7 @@ scope:
     - 修改 Microsoft GraphRAG vendor 内部索引算法。
     - 查询时全量扫描所有单书 community_reports 的交互路径。
     - 把书架或 library 索引写入单书可复制包文件闭包。
+    - 把 bookshelf 或 library 包闭包写入 graph_vault/catalog/**。
     - 以全局 catalog 替代单书 BOOK_MANIFEST.json 的包权威。
 implementationGrounding:
   existingFoundation:
@@ -56,21 +67,34 @@ implementationGrounding:
       capability 投影。
     - qmd query --graphrag --graph-book-id 的单书 GraphRAG 查询、runtime bridge、timing 和
       provider metrics。
-  implementedCapabilities:
-    - bookshelf_members.json、membership_decisions.jsonl 和书架成员决策引擎。
-    - BOOKSHELF_MANIFEST、书架 semantic_units、semantic_edges、
+  packageRootImplementedCapabilities:
+    - package-root bookshelf_members.json、membership_decisions.jsonl 和书架成员决策引擎。
+    - package-root BOOKSHELF_MANIFEST、书架 semantic_units、semantic_edges、
       community_reports、evidence_map 和书架质量门。
-    - LIBRARY_MANIFEST、library_members、library semantic artifacts、 library 质量门和分区策略。
-    - --bookshelf-id、--library-id 和 upper_index_* typed errors 的 CLI 实现。
+    - package-root LIBRARY_MANIFEST、library_members、library semantic artifacts、
+      library 质量门和分区策略。
+    - package-root --bookshelf-id、--library-id 和 upper_index_* typed errors 的 CLI 实现。
+    - explicit upper package query without catalog projection。
+    - upper_package_migration_required fail-closed query path for legacy
+      catalog-only upper artifacts。
+    - catalog projection generated from query-ready bookshelf/library packages
+      under graph_vault/catalog/**/projection.yaml, with package-local
+      readiness proof retained as authority。
+    - package-root qmd bookshelf/library status/list/build/rebuild 管理命令；
+      status/list 仅读取上层包权威状态，build/rebuild 仅从 package-root
+      membership 调用现有上层 builder/validator 并发布 query-ready 包。
   remainingCapabilities:
-    - qmd library list/build/status/rebuild 管理命令。
     - LLM synthesis over selected upper semantic units。
     - bounded deepening into selected single-book GraphRAG。
   implementationRule: >
     已实现的书架/library 查询仅覆盖固定预算 community_reports report
-    search、证据回链、typed error 和 timing。后续实现必须继续以现有单书包和
-    catalog projection 为输入边界，新增独立 upper-index 模块，不得把 runner
-    ledger 当作语义输入，也不得把书架/library 索引写回单书包。
+    search、证据回链、typed error 和 timing，权威读取已迁移到
+    graph_vault/bookshelves/** 与 graph_vault/library/** 上层包闭包。
+    catalog projection 只能作为派生发现和路由视图；显式上层查询必须先校验
+    package-local CURRENT、manifest、PUBLISH_READY、quality gate 和 checksum
+    sidecar。后续实现必须继续以现有单书包和上层包 manifest 为权威边界，
+    新增独立 upper-index 模块，不得把 runner ledger 当作语义输入，也不得把
+    书架/library 索引写回单书包或 catalog 包闭包。
 terms:
   book:
     meaning: >
@@ -78,8 +102,11 @@ terms:
       graph_vault/books/{bookId}/BOOK_MANIFEST.json 与包内质量门。
   bookshelf:
     meaning: >
-      一组书的稳定语义集合。书架可以按主题、课程、项目、用户集合或 操作策略创建。书架索引是从成员书包派生的可重建 catalog 产物。 书架可以是物化书架
-      (materialized bookshelf) 或虚拟书架 (virtual bookshelf)。只有物化书架生成独立 GraphRAG 索引。
+      一组书的稳定语义集合。书架可以按主题、课程、项目、用户集合或
+      操作策略创建。书架是 graph_vault/bookshelves/{bookshelfId} 下
+      可复制传播的上层包；其 GraphRAG 索引从成员书包派生并可重建。
+      书架可以是物化书架 (materialized bookshelf) 或虚拟书架
+      (virtual bookshelf)。只有物化书架生成独立 GraphRAG 索引。
   virtualBookshelf:
     meaning: >
       一个用于导航、继承和聚合的上层书架节点。虚拟书架不直接生成 GraphRAG 索引，不承载交互查询语义单元；查询必须路由到其子物化 书架、library 索引或显式
@@ -88,8 +115,10 @@ terms:
     meaning: |
       决定哪些书进入某个书架的可审计规则。它记录来源类型、权威等级、 输入证据、版本、人工确认状态和成员生成结果。
   library:
-    meaning: |
-      一个或多个书架的上层集合。library 索引用于跨书架查询、全局主题 导航和固定预算综合回答。
+    meaning: >
+      一个或多个书架的上层集合。library 是
+      graph_vault/library/{libraryId} 下可复制传播的上层包；其索引用于
+      跨书架查询、全局主题导航和固定预算综合回答。
   semanticUnit:
     meaning: >
       上层索引查询时消费的预计算语义单元。来源可以是单书 community report、书架级 community report、library 级
@@ -109,6 +138,19 @@ hardInvariants:
   - id: derived_upper_indexes_only
     rule: |
       书架与 library 索引都是可重建派生物。缺失、损坏或过期的上层索引 不得使有效单书包变成 not_query_ready。
+  - id: upper_package_authority_roots
+    rule: >
+      bookshelf 与 library 的包权威根分别只能位于
+      graph_vault/bookshelves/{bookshelfId} 和 graph_vault/library/{libraryId}。
+      BOOKSHELF_MANIFEST、LIBRARY_MANIFEST、PUBLISH_READY、CURRENT、
+      package-local quality gates、generations、staging 和 runs 都必须位于
+      各自上层包闭包内。
+  - id: catalog_projection_only
+    rule: >
+      graph_vault/catalog/** 只保存 book、bookshelf 与 library 的 projection、
+      capability、默认 scope 指针、路由索引和观测状态。catalog 不拥有
+      bookshelf/library 包闭包，不得作为上层包 manifest、quality gate 或
+      publish marker 的权威来源。
   - id: fixed_interactive_query_cost
     rule: >
       交互查询不得把全部成员书的 community_reports 作为 prompt 输入， 不得按成员书数量创建不受限的 map 调用。查询必须先从上层预计算
@@ -159,8 +201,8 @@ hierarchyModel:
         - existing single-book GraphRAG outputs
         - optional book semantic projection for upper-level builders
     - level: bookshelf
-      authorityRoot: graph_vault/catalog/bookshelves/{bookshelfId}
-      graphRoot: graph_vault/catalog/bookshelves/{bookshelfId}/graphrag
+      authorityRoot: graph_vault/bookshelves/{bookshelfId}
+      graphRoot: graph_vault/bookshelves/{bookshelfId}/generations/{generationId}
       queryModes:
         - graphrag_bookshelf_global
         - graphrag_bookshelf_routed_deepening
@@ -172,6 +214,10 @@ hierarchyModel:
         - member relationships.parquet
       outputs:
         - BOOKSHELF_MANIFEST.json
+        - BOOKSHELF_MANIFEST.json.sha256
+        - PUBLISH_READY.json
+        - PUBLISH_READY.json.sha256
+        - CURRENT.json
         - bookshelf_members.json
         - semantic_units.parquet
         - semantic_edges.parquet
@@ -179,10 +225,12 @@ hierarchyModel:
         - community_reports.parquet
         - semantic_unit_embeddings.lance
         - evidence_map.parquet
+        - state/membership-quality-gate.json
         - state/bookshelf-quality-gate.json
+        - runs/{runId}
     - level: library
-      authorityRoot: graph_vault/catalog/library/{libraryId}
-      graphRoot: graph_vault/catalog/library/{libraryId}/graphrag
+      authorityRoot: graph_vault/library/{libraryId}
+      graphRoot: graph_vault/library/{libraryId}/generations/{generationId}
       queryModes:
         - graphrag_library_global
         - graphrag_library_bookshelf_routed_deepening
@@ -193,6 +241,10 @@ hierarchyModel:
         - selected direct book semantic units for freshness repair
       outputs:
         - LIBRARY_MANIFEST.json
+        - LIBRARY_MANIFEST.json.sha256
+        - PUBLISH_READY.json
+        - PUBLISH_READY.json.sha256
+        - CURRENT.json
         - library_members.json
         - semantic_units.parquet
         - semantic_edges.parquet
@@ -200,7 +252,9 @@ hierarchyModel:
         - community_reports.parquet
         - semantic_unit_embeddings.lance
         - evidence_map.parquet
+        - state/library-membership-gate.json
         - state/library-quality-gate.json
+        - runs/{runId}
 upperGraphArtifactSchemas:
   semanticUnits:
     path: semantic_units.parquet
@@ -561,6 +615,22 @@ queryContract:
       A query without explicit scope may read a current projection manifest or default
       scope pointer. It must not rebuild all books, shelves, or library indexes inside
       the query path.
+    packageAuthorityValidation: >
+      Explicit --bookshelf-id and --library-id queries must resolve the package root
+      under graph_vault/bookshelves/{bookshelfId} or graph_vault/library/{libraryId}
+      first, then validate package-local CURRENT, manifest, PUBLISH_READY and quality
+      gate files. Catalog projections may help discovery and default scope routing,
+      but they are never sufficient authority for query readiness.
+    catalogOptionalForExplicitScope: >
+      If a valid bookshelf or library package is present and its package-local quality
+      gate passes, explicit scope query may run even when catalog projection files are
+      missing or stale. The query may schedule or recommend projection rebuild, but it
+      must not fail solely because catalog projection is absent.
+    legacyCatalogArtifactRule: >
+      If only legacy graph_vault/catalog/bookshelves/** or graph_vault/catalog/library/**
+      artifacts exist and the package root is missing, the query must fail closed with
+      upper_package_migration_required. It must not treat legacy catalog artifacts as a
+      copyable package or current query-ready authority.
   typedErrors:
     schema: typed_query_error_v1
     commonFields:
@@ -601,6 +671,16 @@ queryContract:
         meaning: >
           The requested bookshelf or library manifest, vector index, semantic units,
           semantic edges, evidence map, or quality gate is missing.
+      - code: upper_package_migration_required
+        exitCode: 65
+        retryable: false
+        remediationCommand: >
+          rebuild or migrate the upper package under graph_vault/bookshelves/<id> or
+          graph_vault/library/<id>, then regenerate catalog projection
+        meaning: >
+          Legacy catalog-based upper artifacts exist, but the required copyable
+          bookshelf or library package root is missing or lacks package-local
+          PUBLISH_READY/CURRENT authority.
       - code: upper_index_stale
         exitCode: 65
         retryable: false
@@ -660,6 +740,14 @@ queryContract:
         - cli.prepare
         - route.resolve_scope
         - route.validate_upper_index
+    - case: legacy_catalog_upper_artifact_only
+      outcome: typed_error
+      code: upper_package_migration_required
+      fallbackAllowed: no_legacy_catalog_authority
+      timingFields:
+        - cli.prepare
+        - route.resolve_scope
+        - route.validate_upper_package_root
     - case: explicit_scope_stale
       outcome: typed_error
       code: upper_index_stale
@@ -715,7 +803,7 @@ queryContract:
         is not an interactive query path.
 qualityGates:
   bookshelfGate:
-    path: graph_vault/catalog/bookshelves/{bookshelfId}/state/bookshelf-quality-gate.json
+    path: graph_vault/bookshelves/{bookshelfId}/state/bookshelf-quality-gate.json
     checkIds:
       - member_manifest_sha256_matches
       - member_package_gates_passed
@@ -752,7 +840,7 @@ qualityGates:
       - sensitive payload scan passes
       - stale marker absent
   libraryGate:
-    path: graph_vault/catalog/library/{libraryId}/state/library-quality-gate.json
+    path: graph_vault/library/{libraryId}/state/library-quality-gate.json
     checkIds:
       - member_bookshelf_manifest_sha256_matches
       - member_bookshelf_gates_passed
@@ -802,8 +890,8 @@ qualityGates:
       when available.
   failureDiagnostics:
     pathPattern:
-      bookshelf: graph_vault/catalog/bookshelves/{bookshelfId}/state/diagnostics.json
-      library: graph_vault/catalog/library/{libraryId}/state/diagnostics.json
+      bookshelf: graph_vault/bookshelves/{bookshelfId}/state/diagnostics.json
+      library: graph_vault/library/{libraryId}/state/diagnostics.json
     requiredFields:
       - schemaVersion
       - scopeKind
@@ -826,8 +914,18 @@ qualityGates:
       locators, never by absolute local path.
 stateAndRecovery:
   ledgerRoots:
-    bookshelfBuild: graph_vault/catalog/bookshelves/{bookshelfId}/runs/{runId}
-    libraryBuild: graph_vault/catalog/library/{libraryId}/runs/{runId}
+    bookshelfBuild: graph_vault/bookshelves/{bookshelfId}/runs/{runId}
+    libraryBuild: graph_vault/library/{libraryId}/runs/{runId}
+  packageStateRoots:
+    bookshelf: graph_vault/bookshelves/{bookshelfId}
+    library: graph_vault/library/{libraryId}
+  catalogProjectionRoots:
+    bookshelf: graph_vault/catalog/bookshelves/{bookshelfId}
+    library: graph_vault/catalog/library/{libraryId}
+    rule: >
+      Catalog projection roots are rebuildable routing views derived from package-local
+      manifests and quality gates. They do not contain package authority, publish
+      markers, or query-ready gates.
   durableState:
     - manifest.json derived from checkpoints
     - status.json derived from checkpoints and events
@@ -840,12 +938,16 @@ stateAndRecovery:
     - interrupted builds resume from validated checkpoints
     - stale member manifests mark upper index stale before query use
     - repair operations write bounded diagnostics and never mutate book packages
+    - catalog projections can be deleted and rebuilt from package-local authority
+    - legacy catalog-only upper artifacts remain not query-ready until migrated
   publishProtocol:
-    - write artifacts under staging/{runId}
+    - write artifacts under package-local staging/{runId}
     - validate staged artifacts and checksum sidecars
     - write quality gate and diagnostics in staging
-    - atomically promote staged manifest and artifacts to current generation
-    - write publish marker last
+    - atomically promote staged artifacts to generations/{generationId}
+    - update CURRENT.json to the promoted generation
+    - write package-root manifest and PUBLISH_READY marker last
+    - rebuild catalog projection from package-root manifest and CURRENT.json
     - remove or quarantine failed staging directories through explicit repair
   diagnosticRedactionPolicy:
     allowedFields:
@@ -875,7 +977,7 @@ stateAndRecovery:
       payloads, reversible request material or user-local paths.
 manifestSchemas:
   bookshelfManifest:
-    path: BOOKSHELF_MANIFEST.json
+    path: graph_vault/bookshelves/{bookshelfId}/BOOKSHELF_MANIFEST.json
     authority: graph_build_query_ready_manifest
     rule: >
       BOOKSHELF_MANIFEST.json 只能由 materialized_bookshelf_graph_build 在
@@ -893,8 +995,17 @@ manifestSchemas:
       - qualityGate
       - files
       - sensitivityPolicy
+    packageRootRequiredFiles:
+      - BOOKSHELF_MANIFEST.json
+      - BOOKSHELF_MANIFEST.json.sha256
+      - PUBLISH_READY.json
+      - PUBLISH_READY.json.sha256
+      - CURRENT.json
+      - state/bookshelf-quality-gate.json
+      - state/diagnostics.json
   bookshelfMembershipManifest:
-    path: BOOKSHELF_MEMBERSHIP_MANIFEST.json
+    path: >
+      graph_vault/bookshelves/{bookshelfId}/generations/{generationId}/membership/BOOKSHELF_MEMBERSHIP_MANIFEST.json
     authority: membership_only_handoff_manifest
     rule: >
       membership 阶段可以发布 BOOKSHELF_MEMBERSHIP_MANIFEST.json，证明
@@ -911,7 +1022,7 @@ manifestSchemas:
       - files
       - sensitivityPolicy
   libraryManifest:
-    path: LIBRARY_MANIFEST.json
+    path: graph_vault/library/{libraryId}/LIBRARY_MANIFEST.json
     authority: graph_build_query_ready_manifest
     rule: >
       LIBRARY_MANIFEST.json 只能由 library_graph_build 在 library 级
@@ -929,8 +1040,17 @@ manifestSchemas:
       - qualityGate
       - files
       - sensitivityPolicy
+    packageRootRequiredFiles:
+      - LIBRARY_MANIFEST.json
+      - LIBRARY_MANIFEST.json.sha256
+      - PUBLISH_READY.json
+      - PUBLISH_READY.json.sha256
+      - CURRENT.json
+      - state/library-quality-gate.json
+      - state/diagnostics.json
   libraryMembershipManifest:
-    path: LIBRARY_MEMBERSHIP_MANIFEST.json
+    path: >
+      graph_vault/library/{libraryId}/generations/{generationId}/membership/LIBRARY_MEMBERSHIP_MANIFEST.json
     authority: library_membership_only_handoff_manifest
     rule: >
       library_membership_resolution 可以发布 LIBRARY_MEMBERSHIP_MANIFEST.json，
@@ -960,10 +1080,12 @@ compatibilityWithHotplugPackages:
     - default query refuses stale upper index and offers rebuild/status commands
   exportBehavior:
     - book export excludes bookshelf and library indexes
-    - shelf export may include shelf manifest and graph artifacts but not member book
-      packages
-    - library export may include library manifest and graph artifacts but not
-      shelves/books
+    - bookshelf export copies graph_vault/bookshelves/{bookshelfId} as an upper
+      package closure, but does not copy member book packages
+    - library export copies graph_vault/library/{libraryId} as an upper package
+      closure, but does not copy member bookshelf or book packages
+    - catalog projections are excluded from upper package export and can be rebuilt
+      after mount
 implementationPlan:
   phase1:
     title: fixed-budget library global over precomputed semantic units
@@ -993,6 +1115,14 @@ implementationPlan:
       - stale index repair workflow
 testContracts:
   requiredCases:
+    - copied graph_vault/bookshelves/{bookshelfId} package can be queried by explicit
+      --bookshelf-id in a fresh vault after package-local gate validation
+    - copied graph_vault/library/{libraryId} package can be queried by explicit
+      --library-id in a fresh vault after package-local gate validation
+    - deleting catalog bookshelf/library projections does not break explicit
+      package-root upper queries
+    - legacy catalog upper artifacts without package roots fail closed with
+      upper_package_migration_required
     - single-book query still succeeds with catalog upper indexes deleted
     - user explicit bookshelf membership overrides taxonomy and LLM suggestions
     - membership_decisions fixture validates user lock, accepted suggestion, LLM rerun
@@ -1041,7 +1171,7 @@ pipelineIoContract:
       - 修改单书 hotplug package 的既有文件闭包合同。
       - 修改 GraphRAG vendor 内部索引算法。
       - 查询阶段全量扫描所有单书或所有书架的交互路径。
-      - 把 catalog 派生索引写回单书包。
+      - 把 catalog projection 当作 bookshelf/library 包闭包或写回单书包。
   hardInvariants:
     - id: stage_gate_handoff
       rule: >
@@ -1050,12 +1180,16 @@ pipelineIoContract:
     - id: package_first_authority
       rule: >
         单书包权威来自 graph_vault/books/{bookId}/BOOK_MANIFEST.json、 PUBLISH_READY.json、包内
-        qmd/index、包内 GraphRAG output 和包内 state gates。书架与 library 只能读取这些已验证包产物或由其派生的
-        catalog projection。
+        qmd/index、包内 GraphRAG output 和包内 state gates。书架与 library
+        包权威分别来自 graph_vault/bookshelves/{bookshelfId} 与
+        graph_vault/library/{libraryId} 的 package-local manifest、CURRENT、
+        PUBLISH_READY、generations 和 state gates。
     - id: catalog_is_derivative
       rule: >
-        graph_vault/catalog/** 下的书架、library、qmd projection 和 runner ledger
-        均为派生状态。它们不得改变单书包身份、文件闭包或直接单书 查询的 query_ready 判定。
+        graph_vault/catalog/** 下的 book、bookshelf、library、qmd projection
+        和 runner ledger 均为派生状态。catalog 不拥有 bookshelf/library
+        package authority，不得改变单书包身份、文件闭包、上层包闭包或
+        任何 scope 的 query_ready 判定。
     - id: no_runner_ledger_as_semantic_input
       rule: >
         graph_vault/catalog/batch-runs/**、runs/**、events.jsonl 和 recovery summaries
@@ -1073,23 +1207,35 @@ pipelineIoContract:
       - book_package_publish
       - book_mount_projection
       - single-book scoped_query_execution through --graph-book-id
-    implementedStageTargets:
+    packageRootImplementedStageTargets:
       - bookshelf_membership_resolution
       - materialized_bookshelf_graph_build
       - bookshelf scoped_query_execution fixed-budget report search
       - library_membership_resolution
       - library_graph_build
       - library scoped_query_execution fixed-budget report search
+      - catalog projection generated from query-ready bookshelf/library packages
+      - qmd bookshelf/library status/list/build/rebuild management commands
+        over package roots
     remainingNewCapabilities:
       - bounded deepening into single-book GraphRAG
       - LLM synthesis over selected upper semantic units
     rule: >
       alreadySupported 表示当前代码已有对应单书或 catalog 基础；
-      implementedStageTargets 表示已有真实运行目标和测试覆盖的阶段能力；
-      remainingNewCapabilities 表示设计已定义合同但尚无实现。实现和测试不得把
-      remainingNewCapabilities 当成当前功能。bookshelf/library scoped_query_execution
-      当前只覆盖固定预算 community_reports 检索、证据回链和 timing 观测，
-      不包含 LLM synthesis 或跨 scope 下钻。
+      packageRootImplementedStageTargets 表示已有真实运行目标和测试覆盖，并以
+      graph_vault/bookshelves/{bookshelfId} 与 graph_vault/library/{libraryId}
+      作为上层包权威根。remainingNewCapabilities 表示设计已定义合同但
+      尚未完成实现。bookshelf/library scoped_query_execution 当前覆盖
+      package-root 固定预算 community_reports 检索、证据回链、timing 观测、
+      legacy catalog-only migration typed error，以及无 catalog projection 的显式
+      上层包查询。catalog projection 生成已限定为从 query-ready 上层包派生的
+      非权威 projection。bookshelf/library status/list 管理命令只读取
+      package-root `CURRENT.json`、manifest、PUBLISH_READY、quality gate 和
+      catalog projection 存在性，不触发构建，也不把 catalog projection 当作
+      query-ready 权威。bookshelf/library build/rebuild 管理命令只消费既有
+      package-root membership，调用已实现的上层 builder/validator 并重新发布
+      query-ready 包；仍不包含 LLM synthesis、跨 scope 下钻、membership 创建、
+      自动 repair 或增量 refresh 管理生命周期。
   stageFieldContract:
     requiredFields:
       - stageId
@@ -1102,8 +1248,10 @@ pipelineIoContract:
       - failureOutputs
       - nextStageInputs
     publishSemantics: >
-      每个写产物阶段必须先写 staging/{runId}，完成 schema、checksum、敏感 扫描、质量门和固定预算模拟后，再原子提升为 current
-      generation。 publish marker 是阶段完成的最后写入。
+      每个写产物阶段必须先写 package-local staging/{runId}，完成 schema、
+      checksum、敏感扫描、质量门和固定预算模拟后，再原子提升为
+      generations/{generationId} 并更新 CURRENT.json。PUBLISH_READY 是阶段完成的
+      最后写入，catalog projection 只能在此之后由包内权威重建。
   pipelineStages:
     - stageId: book_package_publish
       responsibility: |
@@ -1205,7 +1353,7 @@ pipelineIoContract:
       responsibility: >
         把用户显式选择、规则、图书馆分类法和 LLM 建议解析为一个可审计的 书架成员 generation。该阶段决定哪些书进入物化书架，哪些分类需要
         拆成虚拟父书架和多个物化子书架。
-      authorityRoot: graph_vault/catalog/bookshelves/{bookshelfId}
+      authorityRoot: graph_vault/bookshelves/{bookshelfId}
       requiredInputs:
         - mounted book inventory
         - user explicit include, exclude or lock decisions
@@ -1263,7 +1411,7 @@ pipelineIoContract:
     - stageId: materialized_bookshelf_graph_build
       responsibility: |
         从成员单书包的已验证 qmd/GraphRAG 产物派生书架级 GraphRAG 索引。 只有物化书架执行该阶段。
-      authorityRoot: graph_vault/catalog/bookshelves/{bookshelfId}
+      authorityRoot: graph_vault/bookshelves/{bookshelfId}
       requiredInputs:
         - BOOKSHELF_MEMBERSHIP_MANIFEST.json with queryReady false
         - BOOKSHELF_MEMBERSHIP_MANIFEST.json.sha256
@@ -1284,6 +1432,9 @@ pipelineIoContract:
       emittedOutputs:
         - BOOKSHELF_MANIFEST.json
         - BOOKSHELF_MANIFEST.json.sha256
+        - PUBLISH_READY.json
+        - PUBLISH_READY.json.sha256
+        - CURRENT.json
         - semantic_units.parquet
         - semantic_edges.parquet
         - communities.parquet
@@ -1323,7 +1474,7 @@ pipelineIoContract:
     - stageId: library_membership_resolution
       responsibility: |
         把一个 library 的成员解析为物化书架、虚拟父书架或小规模 direct book 成员。大规模 library 必须通过书架组织，不能直接吞入全部单书。
-      authorityRoot: graph_vault/catalog/library/{libraryId}
+      authorityRoot: graph_vault/library/{libraryId}
       requiredInputs:
         - materialized BOOKSHELF_MANIFEST.json files
         - virtual parent bookshelf manifests
@@ -1370,7 +1521,7 @@ pipelineIoContract:
     - stageId: library_graph_build
       responsibility: |
         从物化书架的已发布语义单元、社区报告和证据图派生 library 级 GraphRAG 索引。该阶段服务跨书架全局查询。
-      authorityRoot: graph_vault/catalog/library/{libraryId}
+      authorityRoot: graph_vault/library/{libraryId}
       requiredInputs:
         - library_members.json
         - member BOOKSHELF_MANIFEST.json files
@@ -1388,6 +1539,9 @@ pipelineIoContract:
       emittedOutputs:
         - LIBRARY_MANIFEST.json
         - LIBRARY_MANIFEST.json.sha256
+        - PUBLISH_READY.json
+        - PUBLISH_READY.json.sha256
+        - CURRENT.json
         - semantic_units.parquet
         - semantic_edges.parquet
         - communities.parquet
@@ -1429,8 +1583,9 @@ pipelineIoContract:
       authorityRoot: selected query scope
       requiredInputs:
         - explicit bookId, bookshelfId, libraryId or configured default scope
-        - selected scope manifest
-        - selected scope quality gate
+        - selected package-root manifest
+        - selected package-root PUBLISH_READY and CURRENT marker
+        - selected package-local quality gate
         - selected scope semantic units or existing single-book query artifacts
         - fixed query budget
       forbiddenInputs:
@@ -1438,6 +1593,8 @@ pipelineIoContract:
         - stale scope unless stale reads are explicitly allowed
         - exhaustive all-books scan in interactive mode
         - failed or running staging generations
+        - legacy catalog-only upper artifacts as query-ready authority
+        - catalog projection as package readiness proof
       emittedOutputs:
         - answer text or structured response
         - evidence lineage with bookId and lower artifact references
@@ -1457,6 +1614,7 @@ pipelineIoContract:
         - upper_index_missing
         - upper_index_stale
         - upper_quality_gate_failed
+        - upper_package_migration_required
         - budget_exceeded_narrow_scope_required
         - missing_scope
         - ambiguous_scope
@@ -1563,10 +1721,17 @@ pipelineIoContract:
       - bookshelf build publishes only after quality gate and publish marker
       - library membership rejects direct book members above directBookLimit
       - library build rejects stale member bookshelf generation
+      - copied bookshelf package validates from graph_vault/bookshelves/{bookshelfId}
+        without catalog projection
+      - copied library package validates from graph_vault/library/{libraryId}
+        without catalog projection
+      - deleting catalog bookshelf/library projections does not break explicit upper
+        package query
+      - legacy catalog-only upper artifacts fail with upper_package_migration_required
       - scoped query refuses missing upper index without building it
       - scoped query failure codes match the main typed query error contract
       - scoped query reports budget_exceeded_narrow_scope_required when over budget
-      - deleting catalog bookshelf/library artifacts does not break single-book query
+      - deleting catalog bookshelf/library projections does not break single-book query
       - diagnostics contain redacted locators and no provider payloads
 implementationGroundingReview:
   sourceDocument: merged from
@@ -1598,19 +1763,169 @@ implementationGroundingReview:
     already_supported、direct_extension、new_capability 和 risk_gap， 防止把待实现设计误读为现有能力。
   summary:
     conclusion: >
-      当前层级设计以已实现的单书 hotplug package、包内 qmd index、包内 GraphRAG output、catalog
-      projection、GraphRAG 单书查询和 runner ledger 为基础，没有脱离既有领域模型。书架和
-      library 的 membership、builder、上层 semantic artifacts、CLI scope 和 typed
-      error fixed-budget report search 已作为独立 upper-index 能力交付；LLM
-      synthesis、受控下钻和 library 管理命令仍是后续能力。
+      当前层级设计以已实现的单书 hotplug package、包内 qmd index、包内
+      GraphRAG output、catalog projection、GraphRAG 单书查询和 runner
+      ledger 为基础，没有脱离既有领域模型。design-turn_011 和
+      design-turn_012 将上层包权威根修订为
+      graph_vault/bookshelves/{bookshelfId} 与 graph_vault/library/{libraryId}；
+      implementation-turn_009 已完成该 package-root 迁移的主要可运行闭环。
+      本 review 下方的 groundingMatrix 已更新为当前 package-root 实现状态。
+      legacy catalog-only 记录仅保留在迁移诊断、typed error 和 catalog
+      projection 语境中；当前状态以 implementationGrounding 和
+      pipelineIoContract.currentImplementationStatus 为准。
     highestRisk: >
-      设计最容易脱节的位置不是单书包输入，而是 upper-level builder 与 CLI 查询 scope 的状态判定。当前代码已支持
+      设计最容易脱节的位置不是单书包输入，而是 upper-level builder 与
+      CLI 查询 scope 的状态判定。当前实现已支持 package-root
       `--bookshelf-id`、`--library-id`、upper semantic unit index、
-      BOOKSHELF_MANIFEST 和 LIBRARY_MANIFEST 的固定预算 report search；不得把这些
-      能力误读为已包含 LLM synthesis、跨 scope 下钻或完整 library 管理命令。
+      BOOKSHELF_MANIFEST、LIBRARY_MANIFEST、CURRENT、PUBLISH_READY、
+      package-local quality gate、legacy catalog-only migration typed error
+      和无 catalog projection 的显式查询；不得把这些能力继续扩展误写成
+      LLM synthesis、跨 scope 下钻或完整 library 管理命令已完成。
     requiredImplementationPosture: >
-      实现必须优先新增独立模块，复用现有 hotplug validator、catalog projection、 qmd index 和 GraphRAG query
-      contracts；不得把 bookshelf/library 逻辑塞入 已经较长的 CLI 主文件，也不得把 runner ledger 当作语义输入。
+      实现必须优先在独立 upper-index 模块中迁移 package-root 读写边界，
+      复用现有 hotplug validator、catalog projection、qmd index 和 GraphRAG
+      query contracts；不得把 bookshelf/library 逻辑塞入已经较长的 CLI
+      主文件，也不得把 runner ledger 当作语义输入。
+    postImplementationTurn009:
+      status: package_root_minimum_closure_implemented_with_risk
+      report: >
+        docs/architecture/graphrag-hierarchical-library-index-audits/reports/implementation-turn-009-summary.md
+      completed:
+        - graph_vault/bookshelves/{bookshelfId} package-root membership
+        - graph_vault/bookshelves/{bookshelfId} package-root graph build
+        - graph_vault/library/{libraryId} package-root membership
+        - graph_vault/library/{libraryId} package-root graph build
+        - explicit --bookshelf-id and --library-id package-root query
+        - legacy catalog-only upper_package_migration_required typed error
+        - no-catalog-projection explicit package query tests
+        - package-local CURRENT, PUBLISH_READY, manifest and quality gate checks
+      retainedRisks:
+        - implementation-turn_010 completed with PASS_WITH_RISK
+        - implementation-turn_011 confirmed post-F-001/F-002/runtimeMetrics fixes
+          with PASS_WITH_RISK
+        - single-book --graph-book-id true provider success remains externally blocked
+        - implementation-turn_012 confirmed failed/staging CLI fixture coverage
+          with PASS_WITH_RISK
+        - LLM synthesis, controlled deepening and library management commands remain future
+    postImplementationTurn010:
+      status: package_root_hardening_reaudited_with_risk
+      report: >
+        docs/architecture/graphrag-hierarchical-library-index-audits/reports/implementation-turn-010-summary.md
+      auditResult: 3_agents_pass_with_risk
+      postAuditFixes:
+        - unified unsafe upper scope id rejection in upper-package-paths.ts
+        - library evidence bridge rejects missing or unknown-* lower lineage
+        - evidence_map inspect rejects missing or unknown-* lineage fields
+        - bookshelf/library query runtime metrics use measured bridge elapsed time
+      reAudit: implementation-turn_011
+    postImplementationTurn011:
+      status: pass_with_risk_fixture_fix_reaudited
+      report: >
+        docs/architecture/graphrag-hierarchical-library-index-audits/reports/implementation-turn-011-summary.md
+      auditResult: 3_agents_pass_with_risk
+      closedItems:
+        - F-001 unsafe upper scope id rejection confirmed
+        - F-002 missing or unknown-* lower lineage fail-closed confirmed
+        - bookshelf/library query runtime metrics measured duration confirmed
+      postAuditFixes:
+        - failed/staging CLI fixture coverage added for explicit bookshelf and
+          library scopes in test/cli-graphrag-route.test.ts
+      retainedRisks:
+        - real external provider single-book --graph-book-id success not executed
+        - catalog projection generation remains future
+        - LLM synthesis, controlled deepening and library management commands remain future
+      reAudit: implementation-turn_012
+    postImplementationTurn012:
+      status: pass_with_risk_no_new_blockers
+      report: >
+        docs/architecture/graphrag-hierarchical-library-index-audits/reports/implementation-turn-012-summary.md
+      auditResult: 3_agents_pass_with_risk
+      closedItems:
+        - failed/staging CLI fixture coverage confirmed for explicit bookshelf
+          and library scopes
+        - package-root readiness rejects non-query-ready readyState before
+          semantic query bridge
+      retainedRisks:
+        - real external provider single-book --graph-book-id success not executed
+        - catalog projection generation remains future
+        - LLM synthesis, controlled deepening and library management commands remain future
+    postImplementationTurn013:
+      status: pass_with_risk_catalog_projection_minimum
+      report: >
+        docs/architecture/graphrag-hierarchical-library-index-audits/reports/implementation-turn-013-summary.md
+      auditResult: 3_agents_pass_with_risk
+      completed:
+        - src/graphrag/upper-index/upper-catalog-projection.ts generates
+          non-authoritative bookshelf/library projection.yaml files from
+          query-ready upper packages
+        - bookshelf and library graph builders regenerate projection after
+          package-local PUBLISH_READY.json is written
+        - durable writer maps graph_vault/catalog/bookshelves/*/projection.yaml
+          and graph_vault/catalog/library/*/projection.yaml to catalogWriterLane
+        - graph tests prove catalog projection exists, contains
+          catalogIsAuthority=false, and omits upper manifest files from catalog
+        - graph tests still prove explicit package-root queries survive deleted
+          catalog projection roots
+      postAuditHardening:
+        - loadUpperCatalogProjection rejects catalog projection files whose
+          stored scopeKind or scopeId does not match the requested upper scope
+      validation:
+        - TypeScript build check passed after post-audit hardening
+        - test/graphrag-bookshelf-graph.test.ts passed with catalog projection
+          scope mismatch coverage
+        - test/graphrag-library-graph.test.ts passed after post-audit hardening
+        - test/cli-graphrag-route.test.ts passed
+        - test/cli-graphrag-query-scope.test.ts passed
+        - test/cli-graphrag-upper-index-failclosed.test.ts passed
+      retainedRisks:
+        - real external provider single-book --graph-book-id success not executed
+        - LLM synthesis, controlled deepening and build/rebuild management
+          commands remain future
+      reAudit: implementation-turn_013
+    postImplementationTurn013LocalAdditions:
+      status: upper_management_status_list_build_rebuild_minimum_reaudited_with_risk
+      completed:
+        - src/graphrag/upper-index/upper-management.ts reports bookshelf/library
+          package-root status without treating catalog projection as authority
+        - getUpperPackageStatus parses graph manifest and graph quality gate
+          schemas before reporting query_ready, so checksum/marker self-consistent
+          but invalid upper packages fail closed as not_query_ready
+        - src/cli/graphrag-upper-management.ts adds qmd bookshelf/library
+          status/list/build/rebuild CLI helpers
+        - src/cli/qmd.ts dispatches qmd bookshelf and qmd library management
+          commands through a narrow CLI adapter and parses upper build budget
+          options as strings
+        - build/rebuild commands consume existing package-root membership,
+          run the existing upper builder and validator, and report package-root
+          query-ready status without treating catalog projection as authority
+      validation:
+        - TypeScript build check passed
+        - test/cli-graphrag-upper-management.test.ts passed with status/list
+          and build/rebuild smoke coverage, including corrupt-but-checksummed
+          manifest/gate status fail-closed regression
+        - test/cli-graphrag-route.test.ts, test/cli-graphrag-query-scope.test.ts
+          and test/cli-graphrag-upper-index-failclosed.test.ts passed after
+          qmd option parser update
+        - test/graphrag-bookshelf-graph.test.ts, test/graphrag-library-graph.test.ts,
+          membership tests, hotplug catalog/qmd projection tests and targeted
+          qmd vsearch regression passed after management status hardening
+      reAudit:
+        implementationTurn014:
+          result: fail
+          requiredFixClosedBy: implementation-turn_015
+          finding: >
+            status/list could report query_ready for checksum/marker
+            self-consistent but graph manifest or quality gate schema-invalid
+            upper packages.
+        implementationTurn015:
+          result: 3_agents_pass_with_risk
+          report: >
+            docs/architecture/graphrag-hierarchical-library-index-audits/reports/implementation-turn-015-summary.md
+      retainedRisks:
+        - membership creation, automatic repair and incremental refresh
+          management lifecycle remains future
+        - real external provider single-book --graph-book-id success not executed
+        - LLM synthesis and controlled deepening remain future
   groundingMatrix:
     - designStage: book_package_publish
       groundingStatus: already_supported
@@ -1659,7 +1974,7 @@ implementationGroundingReview:
         单书 GraphRAG 查询、capability route、runtime bridge retry、runtime metrics 和 query
         timing 已存在。层级查询设计应复用这些 contracts，但不能假设 已有跨书 scope。
     - designStage: bookshelf_membership_resolution
-      groundingStatus: implemented_stage_target
+      groundingStatus: package_root_membership_implemented
       existingBasis:
         - catalog projected book inventory
         - manifestSha256 and packageGeneration in BOOK_MANIFEST
@@ -1670,24 +1985,31 @@ implementationGroundingReview:
         - scripts/graphrag/build-bookshelf-membership.mjs
         - test/graphrag-bookshelf-membership.test.ts
       implementedArtifacts:
-        - graph_vault/catalog/bookshelves/{bookshelfId}/current/membership/BOOKSHELF_MEMBERSHIP_MANIFEST.json
-        - graph_vault/catalog/bookshelves/{bookshelfId}/current/membership/bookshelf_members.json
-        - graph_vault/catalog/bookshelves/{bookshelfId}/current/membership/membership_decisions.jsonl
-        - graph_vault/catalog/bookshelves/{bookshelfId}/current/membership/bookshelf_split_plan.json
-        - graph_vault/catalog/bookshelves/{bookshelfId}/current/state/membership-quality-gate.json
+        - graph_vault/bookshelves/{bookshelfId}/generations/{generation}/BOOKSHELF_MEMBERSHIP_MANIFEST.json
+        - graph_vault/bookshelves/{bookshelfId}/generations/{generation}/bookshelf_members.json
+        - graph_vault/bookshelves/{bookshelfId}/generations/{generation}/membership_decisions.jsonl
+        - graph_vault/bookshelves/{bookshelfId}/generations/{generation}/bookshelf_split_plan.json
+        - graph_vault/bookshelves/{bookshelfId}/generations/{generation}/state/membership-quality-gate.json
+        - graph_vault/bookshelves/{bookshelfId}/CURRENT.json
+        - graph_vault/bookshelves/{bookshelfId}/staging/{runId}
+        - graph_vault/bookshelves/{bookshelfId}/runs/{runId}
       remainingImplementation:
+        - optional membership-only catalog projection from package-local
+          membership state
         - BOOKSHELF_MEMBERSHIP_MANIFEST schema
           extension for taxonomy and LLM proposal provenance
         - interactive user lock editing commands
         - accepted LLM suggestion promotion workflow
       assessment: |
-        该阶段已作为第一阶段真实目标实现：从已通过单书质量门的 mounted
-        book inventory 生成 membership manifest、members、decisions、split
-        plan 和 membership quality gate。BOOKSHELF_MEMBERSHIP_MANIFEST 仍只
-        证明成员闭环，不授予 bookshelf query_ready；BOOKSHELF_MANIFEST 仍由
+        该阶段已按 package-root 规范实现：从已通过单书质量门的 mounted book
+        inventory 生成 membership manifest、members、decisions、split plan 和
+        membership quality gate，并写入
+        graph_vault/bookshelves/{bookshelfId} 上层包闭包。该阶段写入
+        CURRENT.json 以交接 membership generation，但不写 PUBLISH_READY，也不授予
+        bookshelf query_ready；BOOKSHELF_MANIFEST 和 PUBLISH_READY 仍由
         materialized_bookshelf_graph_build 发布。
     - designStage: materialized_bookshelf_graph_build
-      groundingStatus: implemented_stage_target
+      groundingStatus: package_root_implemented_with_catalog_projection
       existingBasis:
         - member community_reports.parquet
         - member entities.parquet
@@ -1700,6 +2022,7 @@ implementationGroundingReview:
         - src/graphrag/upper-index/bookshelf-graph-parquet.ts
         - src/graphrag/upper-index/bookshelf-graph-validator.ts
         - src/graphrag/upper-index/bookshelf-graph.ts
+        - src/graphrag/upper-index/upper-catalog-projection.ts
         - scripts/graphrag/build-bookshelf-graph.mjs
         - scripts/graphrag/bookshelf-graph-parquet-bridge.py
         - scripts/graphrag/bookshelf_graph_bridge_build.py
@@ -1709,56 +2032,70 @@ implementationGroundingReview:
         - scripts/graphrag/bookshelf_graph_bridge_query.py
         - test/graphrag-bookshelf-graph.test.ts
       implementedArtifacts:
-        - graph_vault/catalog/bookshelves/{bookshelfId}/current/BOOKSHELF_MANIFEST.json
-        - graph_vault/catalog/bookshelves/{bookshelfId}/current/semantic_units.parquet
-        - graph_vault/catalog/bookshelves/{bookshelfId}/current/semantic_edges.parquet
-        - graph_vault/catalog/bookshelves/{bookshelfId}/current/communities.parquet
-        - graph_vault/catalog/bookshelves/{bookshelfId}/current/community_reports.parquet
-        - graph_vault/catalog/bookshelves/{bookshelfId}/current/evidence_map.parquet
-        - graph_vault/catalog/bookshelves/{bookshelfId}/current/semantic_unit_embeddings.lance/
-        - graph_vault/catalog/bookshelves/{bookshelfId}/current/state/bookshelf-quality-gate.json
+        - graph_vault/bookshelves/{bookshelfId}/generations/{generation}/BOOKSHELF_MANIFEST.json
+        - graph_vault/bookshelves/{bookshelfId}/generations/{generation}/semantic_units.parquet
+        - graph_vault/bookshelves/{bookshelfId}/generations/{generation}/semantic_edges.parquet
+        - graph_vault/bookshelves/{bookshelfId}/generations/{generation}/communities.parquet
+        - graph_vault/bookshelves/{bookshelfId}/generations/{generation}/community_reports.parquet
+        - graph_vault/bookshelves/{bookshelfId}/generations/{generation}/evidence_map.parquet
+        - graph_vault/bookshelves/{bookshelfId}/generations/{generation}/semantic_unit_embeddings.lance/
+        - graph_vault/bookshelves/{bookshelfId}/generations/{generation}/state/bookshelf-quality-gate.json
+        - graph_vault/bookshelves/{bookshelfId}/BOOKSHELF_MANIFEST.json
+        - graph_vault/bookshelves/{bookshelfId}/CURRENT.json
+        - graph_vault/bookshelves/{bookshelfId}/PUBLISH_READY.json
+        - graph_vault/catalog/bookshelves/{bookshelfId}/projection.yaml
       remainingImplementation:
         - richer bookshelf community clustering and summarization
         - LLM-authored bookshelf community report synthesis
         - incremental rebuild planner beyond conservative generation rebuild
       assessment: >
-        该阶段已作为第二阶段真实目标实现，产物位于 catalog/bookshelves
-        下，不写回单书包。第一版 builder 生成上层 semantic_units、
-        semantic_edges、communities、community_reports、evidence_map 和
-        bookshelf quality gate，并执行固定预算模拟。当前版本偏向可验证的
-        派生 report search 结构，后续可在相同合同内增强社区聚类和 LLM
-        synthesis。
+        该阶段已按 package-root 规范实现，不写回单书包，也不把 catalog 当作
+        包闭包。第一版 builder 生成上层 semantic_units、semantic_edges、
+        communities、community_reports、evidence_map、embedding manifest 和
+        bookshelf quality gate，执行固定预算模拟，并通过 package-local
+        staging -> quality gate -> generations/{generation} -> CURRENT.json ->
+        PUBLISH_READY.json 发布。publish 后从 query-ready 上层包生成
+        graph_vault/catalog/bookshelves/{bookshelfId}/projection.yaml；该
+        projection 只包含非权威发现和路由信息，query-ready 证明仍来自
+        package-local CURRENT、PUBLISH_READY、manifest 和 quality gate。
+        后续仍需更丰富的聚类/摘要和 LLM-authored synthesis。
     - designStage: library_membership_resolution
-      groundingStatus: implemented_stage_target
+      groundingStatus: package_root_membership_implemented
       existingBasis:
         - published BOOKSHELF_MANIFEST outputs
-        - current catalog root convention
-        - graph_vault/catalog/library/{libraryId}/current/membership/
-        - graph_vault/catalog/library/{libraryId}/current/state/library-membership-gate.json
+        - package-root bookshelf CURRENT and PUBLISH_READY
+        - package-root bookshelf quality gates
+        - package-root bookshelf semantic artifacts
       implementedCode:
         - src/graphrag/upper-index/library-membership.ts
         - scripts/graphrag/build-library-membership.mjs
         - test/graphrag-library-membership.test.ts
       implementedArtifacts:
-        - LIBRARY_MEMBERSHIP_MANIFEST.json
-        - library_members.json
-        - library_partition_plan.json
-        - library_membership_quality_gate
+        - graph_vault/library/{libraryId}/generations/{generation}/LIBRARY_MEMBERSHIP_MANIFEST.json
+        - graph_vault/library/{libraryId}/generations/{generation}/library_members.json
+        - graph_vault/library/{libraryId}/generations/{generation}/library_partition_plan.json
+        - graph_vault/library/{libraryId}/generations/{generation}/state/library-membership-gate.json
+        - graph_vault/library/{libraryId}/CURRENT.json
+        - graph_vault/library/{libraryId}/staging/{runId}
+        - graph_vault/library/{libraryId}/runs/{runId}
       implementedBehavior:
         - directBookLimit enforcement
         - conservative library partition planning
         - membership-only queryReady false handoff
         - membership archive fallback after library graph publish
       remainingImplementation:
+        - optional membership-only catalog projection from package-local
+          library membership state
         - richer virtual parent expansion policies
         - incremental membership refresh beyond conservative generation publish
       assessment: |
-        library membership 已作为真实目标实现。该阶段发布 queryReady=false 的
-        membership-only 产物，只能作为 library_graph_build 输入，不能授权
-        `--library-id` 查询。实现支持 membership-only current 和 graph current
-        archive 的读取与校验，防止 library graph 发布后复验 membership 失败。
+        library membership 已按 package-root 规范实现。该阶段读取已发布
+        bookshelf package，而不是读取 catalog package 闭包；发布 queryReady=false
+        的 membership-only 产物，只能作为 library_graph_build 输入，不能授权
+        `--library-id` 查询。query-ready catalog projection 由 library graph
+        publish 后从 package-local authority 派生。
     - designStage: library_graph_build
-      groundingStatus: implemented_stage_target
+      groundingStatus: package_root_implemented_with_catalog_projection
       existingBasis:
         - published bookshelf semantic_units and community_reports
         - existing GraphRAG community report concepts
@@ -1767,27 +2104,36 @@ implementationGroundingReview:
         - src/graphrag/upper-index/library-graph.ts
         - src/graphrag/upper-index/library-graph-contracts.ts
         - src/graphrag/upper-index/library-graph-validator.ts
+        - src/graphrag/upper-index/upper-catalog-projection.ts
         - scripts/graphrag/build-library-graph.mjs
         - scripts/graphrag/library_graph_bridge_build.py
         - test/graphrag-library-graph.test.ts
       implementedArtifacts:
-        - graph_vault/catalog/library/{libraryId}/current/LIBRARY_MANIFEST.json
-        - graph_vault/catalog/library/{libraryId}/current/semantic_units.parquet
-        - graph_vault/catalog/library/{libraryId}/current/semantic_edges.parquet
-        - graph_vault/catalog/library/{libraryId}/current/community_reports.parquet
-        - graph_vault/catalog/library/{libraryId}/current/evidence_map.parquet
-        - graph_vault/catalog/library/{libraryId}/current/state/library-quality-gate.json
+        - graph_vault/library/{libraryId}/generations/{generation}/LIBRARY_MANIFEST.json
+        - graph_vault/library/{libraryId}/generations/{generation}/semantic_units.parquet
+        - graph_vault/library/{libraryId}/generations/{generation}/semantic_edges.parquet
+        - graph_vault/library/{libraryId}/generations/{generation}/community_reports.parquet
+        - graph_vault/library/{libraryId}/generations/{generation}/evidence_map.parquet
+        - graph_vault/library/{libraryId}/generations/{generation}/state/library-quality-gate.json
+        - graph_vault/library/{libraryId}/LIBRARY_MANIFEST.json
+        - graph_vault/library/{libraryId}/CURRENT.json
+        - graph_vault/library/{libraryId}/PUBLISH_READY.json
+        - graph_vault/catalog/library/{libraryId}/projection.yaml
       remainingImplementation:
         - LLM-authored library community report synthesis
         - richer cross-shelf clustering
         - incremental refresh planner beyond conservative generation rebuild
       assessment: >
-        library graph build 已作为真实目标实现。第一版 builder 以已发布
-        bookshelf current 为输入，生成 library 级 semantic_units、
+        library graph build 已按 package-root 规范实现。第一版 builder 以已发布
+        bookshelf package current 为输入，生成 library 级 semantic_units、
         semantic_edges、community_reports、evidence_map 和 quality gate，并以
-        staging -> quality gate -> current generation 发布。当前版本偏向可验证的
-        固定预算 report search，后续可在相同合同内增强跨书架聚类与 LLM
-        synthesis。
+        package-local staging -> quality gate -> generations/{generation} ->
+        CURRENT.json -> PUBLISH_READY.json 发布。审计后已强化下层 evidence
+        lineage，缺失或 `unknown-*` lineage 会 fail closed。publish 后从
+        query-ready library package 生成
+        graph_vault/catalog/library/{libraryId}/projection.yaml；catalog 仍不是
+        manifest、quality gate 或 publish marker 的权威。后续仍需
+        LLM-authored synthesis、更丰富的跨书架聚类和增量刷新 planner。
     - designStage: scoped_query_execution
       groundingStatus: partial_support
       existingCode:
@@ -1824,12 +2170,15 @@ implementationGroundingReview:
         - bounded timing stage cli.query_library_upper_index
       assessment: >
         scoped_query_execution 目前是部分实现：单书 `--graph-book-id` 保持既有
-        GraphRAG 查询，`--bookshelf-id` 与 `--library-id` 已支持只读取已发布
-        upper index current 的固定预算 report search，并返回 typed error、
-        timing 和 evidence lineage。LLM synthesis 和受控下钻仍未实现。
+        GraphRAG 查询，package-root `--bookshelf-id` 与 `--library-id` 已支持
+        只读取已发布 upper package current 的固定预算 report search，并返回
+        typed error、timing 和 evidence lineage。显式查询不依赖 catalog
+        projection；query-ready 上层包发布后会重建非权威 catalog projection。
+        LLM synthesis 和受控下钻仍未实现。
       firstRunnableTarget: >
-        第一版 --bookshelf-id 与 --library-id 查询以已发布 upper index current
-        为唯一输入，执行固定预算的 upper-level community_reports 检索，并通过
+        新一版 --bookshelf-id 与 --library-id 查询必须以已发布 package-root
+        upper index current 为唯一输入，执行固定预算的 upper-level
+        community_reports 检索，并通过
         evidence_map 把证据回链到 bookshelfId、bookId、sourceId、documentId、
         contentHash、community report 或 text_unit。该目标不在交互路径构建索引，
         不扫描全部单书 community_reports，不调用未受限 LLM synthesis；默认
@@ -1874,27 +2223,48 @@ implementationGroundingReview:
         - single-book GraphRAG query
         - timing and runtime metrics
     phase1_groundedMinimum:
-      status: next_implementation_slice
+      status: implemented_with_risk_after_implementation_turn_012
       includes:
-        - BOOKSHELF_MANIFEST and LIBRARY_MANIFEST schema validators
-        - bookshelf_members.json and membership_decisions.jsonl fixtures
-        - qmd library list/status commands that read only catalog state
-        - upper typed error code mapping without building upper indexes
-        - tests proving single-book query survives deleted upper catalog
+        - bookshelf writes under graph_vault/bookshelves/{bookshelfId}
+        - library writes under graph_vault/library/{libraryId}
+        - package-root BOOKSHELF_MANIFEST, LIBRARY_MANIFEST, CURRENT and PUBLISH_READY
+          validators
+        - explicit upper package query without catalog projection
+        - upper_package_migration_required typed error for legacy catalog-only artifacts
+        - tests proving explicit upper package query survives deleted catalog projections
+        - unsafe upper scope id rejection
+        - library evidence bridge fail-closed for missing or unknown lower lineage
+        - measured bookshelf/library upper query runtime metrics
+        - failed/staging CLI fixture coverage for explicit bookshelf/library scopes
+        - catalog projection generated from query-ready upper packages without
+          making catalog an authority root
+      remaining:
+        - real external provider single-book --graph-book-id success validation
     phase2_bookshelfBuild:
-      status: future
+      status: package_root_minimum_implemented
       includes:
         - materialized bookshelf builder
         - semantic_units, semantic_edges and evidence_map writers
         - bookshelf quality gate and fixed-budget simulation
+        - catalog projection generated from query-ready bookshelf package
         - no LLM suggestion promotion without user acceptance record
+      remaining:
+        - LLM synthesis over selected bookshelf semantic units
+        - controlled deepening into selected member books
     phase3_libraryBuild:
-      status: future
+      status: package_root_minimum_implemented
       includes:
         - library membership and partition planner
         - library upper index builder
         - library quality gate
         - fixed-budget library query
+        - catalog projection generated from query-ready library package
+        - bookshelf/library status/list/build/rebuild management commands over
+          package roots
+      remaining:
+        - LLM synthesis over selected library semantic units
+        - membership creation, automatic repair and incremental refresh
+          management command lifecycle
   designAdjustment:
     required: true
     completed: true

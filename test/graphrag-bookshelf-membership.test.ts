@@ -128,6 +128,19 @@ async function writeReadyHotplugBook(input: {
   );
 }
 
+async function readBookshelfCurrentRoot(
+  stateRoot: string,
+  bookshelfId: string,
+): Promise<string> {
+  const current = JSON.parse(
+    await readFile(
+      join(stateRoot, "bookshelves", bookshelfId, "CURRENT.json"),
+      "utf8",
+    ),
+  );
+  return join(stateRoot, "bookshelves", bookshelfId, current.current);
+}
+
 describe("GraphRAG bookshelf membership", () => {
   test("materializes a membership generation from three query-ready book packages",
     async () => {
@@ -153,12 +166,9 @@ describe("GraphRAG bookshelf membership", () => {
           graphVault: stateRoot,
           bookshelfId: "architecture-core",
         });
-        const currentRoot = join(
+        const currentRoot = await readBookshelfCurrentRoot(
           stateRoot,
-          "catalog",
-          "bookshelves",
           "architecture-core",
-          "current",
         );
         const manifest = JSON.parse(
           await readFile(
@@ -228,17 +238,26 @@ describe("GraphRAG bookshelf membership", () => {
           bookIds,
           now: () => "2026-06-06T00:00:02.000Z",
         });
-        const manifestPath = join(
+        const currentRoot = await readBookshelfCurrentRoot(
           stateRoot,
-          "catalog",
-          "bookshelves",
           "architecture-core",
-          "current",
+        );
+        const manifestPath = join(
+          currentRoot,
           "BOOKSHELF_MEMBERSHIP_MANIFEST.json",
         );
         const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-        manifest.files[0].sha256 = "bad-sha256";
-        await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+        const tamperedFile = manifest.files.find(
+          (file: { path: string }) => file.path === "bookshelf_members.json",
+        ) as { path: string };
+        const members = JSON.parse(
+          await readFile(join(currentRoot, tamperedFile.path), "utf8"),
+        );
+        members.members[0].title = "Tampered Architecture";
+        await writeFile(
+          join(currentRoot, tamperedFile.path),
+          `${JSON.stringify(members, null, 2)}\n`,
+        );
 
         const validation = await validateBookshelfMembership({
           graphVault: stateRoot,
@@ -246,10 +265,13 @@ describe("GraphRAG bookshelf membership", () => {
         });
 
         expect(validation.ok).toBe(false);
-        expect(validation.diagnostics).toContain("manifest_sidecar_mismatch");
         expect(validation.diagnostics).toContain(
-          `manifest_file_sha256_mismatch:${manifest.files[0].path}`,
+          `manifest_file_sha256_mismatch:${tamperedFile.path}`,
         );
+        expect(validation.diagnostics).toContain(
+          `manifest_file_sidecar_mismatch:${tamperedFile.path}`,
+        );
+        expect(validation.diagnostics).toContain("members_digest_mismatch");
       } finally {
         await rm(tmpRoot, { recursive: true, force: true });
       }
@@ -291,10 +313,9 @@ describe("GraphRAG bookshelf membership", () => {
       expect(existsSync(
         join(
           stateRoot,
-          "catalog",
           "bookshelves",
           "architecture-core",
-          "current",
+          "CURRENT.json",
         ),
       )).toBe(false);
     } finally {

@@ -15,6 +15,10 @@ import {
   resolveBookPublishReadyPath,
   resolveBookRoot,
 } from "../book-package-layout.js";
+import {
+  bookshelfPackageRoot,
+  readPackageCurrent,
+} from "./upper-package-paths.js";
 
 export const BookshelfMembershipSchemaVersion = "1.0.0";
 
@@ -543,8 +547,8 @@ export async function resolveBookshelfMembership(
     policy.taxonomyVersion ?? "",
   ].join("\n")).slice(0, 16)}`;
   const runId = membershipRunId(input.bookshelfId, generation);
-  const root = join(graphVault, "catalog", "bookshelves", input.bookshelfId);
-  const stagingRoot = join(root, "staging", generation);
+  const root = bookshelfPackageRoot(graphVault, input.bookshelfId);
+  const stagingRoot = join(root, "staging", runId);
   await rm(stagingRoot, { recursive: true, force: true });
   await mkdir(join(stagingRoot, "state"), { recursive: true });
   await mkdir(join(stagingRoot, "runs", runId, "checkpoints"), {
@@ -608,7 +612,7 @@ export async function resolveBookshelfMembership(
     affectedArtifactDigest: membershipDigest,
     expectedDigest: membershipDigest,
     observedDigest: membershipDigest,
-    redactedLocator: "current/bookshelf_members.json",
+    redactedLocator: `generations/${generation}/bookshelf_members.json`,
     remediationCommand: null,
     checkedAt: createdAt,
   });
@@ -756,18 +760,20 @@ export async function resolveBookshelfMembership(
   );
   void writtenManifest;
 
-  const currentRoot = join(root, "current");
-  const previousRoot = `${currentRoot}.previous-${process.pid}-${randomUUID()}`;
+  const generationRoot = join(root, "generations", generation);
+  const previousRoot = `${generationRoot}.previous-${process.pid}-${randomUUID()}`;
+  await mkdir(dirname(generationRoot), { recursive: true });
   await rm(previousRoot, { recursive: true, force: true });
-  if (existsSync(currentRoot)) await rename(currentRoot, previousRoot);
-  await rename(stagingRoot, currentRoot);
+  if (existsSync(generationRoot)) await rename(generationRoot, previousRoot);
+  await rename(stagingRoot, generationRoot);
   await rm(previousRoot, { recursive: true, force: true });
   await writeJson(join(root, "CURRENT.json"), {
     schemaVersion: BookshelfMembershipSchemaVersion,
+    scopeKind: "bookshelf",
     bookshelfId: input.bookshelfId,
     generation,
-    current: "current",
-    manifestPath: "current/BOOKSHELF_MEMBERSHIP_MANIFEST.json",
+    current: `generations/${generation}`,
+    manifestPath: `generations/${generation}/BOOKSHELF_MEMBERSHIP_MANIFEST.json`,
     manifestSha256: writtenManifest.sha256,
     readyState: "membership_resolved",
     queryReady: false,
@@ -788,13 +794,22 @@ export async function validateBookshelfMembership(input: {
   graphVault: string;
   bookshelfId: string;
 }): Promise<{ ok: boolean; diagnostics: string[]; memberCount: number }> {
-  const root = join(
-    resolve(input.graphVault),
-    "catalog",
-    "bookshelves",
-    input.bookshelfId,
-    "current",
-  );
+  let root: string;
+  try {
+    const resolved = await readPackageCurrent({
+      graphVault: input.graphVault,
+      scopeKind: "bookshelf",
+      scopeId: input.bookshelfId,
+    });
+    root = existsSync(
+      join(resolved.generationRoot, "BOOKSHELF_MEMBERSHIP_MANIFEST.json"),
+    )
+      ? resolved.generationRoot
+      : join(resolved.generationRoot, "membership");
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return { ok: false, diagnostics: [detail], memberCount: 0 };
+  }
   const diagnostics: string[] = [];
   const manifestPath = join(root, "BOOKSHELF_MEMBERSHIP_MANIFEST.json");
   const membersPath = join(root, "bookshelf_members.json");

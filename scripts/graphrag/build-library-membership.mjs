@@ -17,7 +17,7 @@ function usage() {
     "",
     "Options:",
     "  --graph-vault <path>      graph_vault root, default graph_vault",
-    "  --library-id <id>         catalog library id to materialize",
+    "  --library-id <id>         library package id to materialize",
     "  --bookshelf-id <id>       repeat for each materialized bookshelf",
     "  --shelf-limit <n>         partition limit, default 32",
     "  --direct-book-limit <n>   direct book limit, default 0",

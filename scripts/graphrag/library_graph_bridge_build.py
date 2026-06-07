@@ -42,7 +42,7 @@ def _evidence_for_report(
     report: dict[str, Any],
     evidence_rows: list[dict[str, Any]],
     by_id: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     evidence_ids = _list_value(report.get("evidenceMapIds"))
     for evidence_id in evidence_ids:
         if evidence_id in by_id:
@@ -51,7 +51,32 @@ def _evidence_for_report(
     for row in evidence_rows:
         if str(row.get("upperArtifactId") or "") == report_id:
             return row
-    return {}
+    return None
+
+
+def _required_lower_lineage(
+    lower: dict[str, Any] | None,
+    *,
+    report_id: str,
+) -> dict[str, str]:
+    if lower is None:
+        raise ValueError(f"missing_lower_evidence:{report_id}")
+    fields = {
+        "targetBookId": lower.get("targetBookId"),
+        "targetSourceId": lower.get("targetSourceId"),
+        "targetDocumentId": lower.get("targetDocumentId"),
+        "targetContentHash": lower.get("targetContentHash"),
+        "targetCommunityReportId": lower.get("targetCommunityReportId"),
+        "targetTextUnitId": lower.get("targetTextUnitId"),
+        "targetArtifactDigest": lower.get("targetArtifactDigest"),
+    }
+    result: dict[str, str] = {}
+    for field, value in fields.items():
+        text = str(value or "")
+        if not text or text.startswith("unknown-"):
+            raise ValueError(f"invalid_lower_evidence:{report_id}:{field}")
+        result[field] = text
+    return result
 
 
 def _add_library_evidence(
@@ -68,6 +93,7 @@ def _add_library_evidence(
     artifact_digest: str,
     rank: float,
 ) -> str:
+    lineage = _required_lower_lineage(lower, report_id=report_id)
     evidence_rows.append({
         "evidenceMapId": evidence_id,
         "ownerLevel": "library",
@@ -75,18 +101,14 @@ def _add_library_evidence(
         "upperArtifactKind": upper_kind,
         "upperArtifactId": upper_id,
         "targetLevel": "book",
-        "targetBookId": str(lower.get("targetBookId") or "unknown-book"),
+        "targetBookId": lineage["targetBookId"],
         "targetBookshelfId": bookshelf_id,
-        "targetSourceId": str(lower.get("targetSourceId") or "unknown-source"),
-        "targetDocumentId": str(lower.get("targetDocumentId") or "unknown-document"),
-        "targetContentHash": str(lower.get("targetContentHash") or "unknown-content"),
-        "targetCommunityReportId": str(
-            lower.get("targetCommunityReportId") or report_id
-        ),
-        "targetTextUnitId": str(lower.get("targetTextUnitId") or "unknown-text-unit"),
-        "targetArtifactDigest": str(
-            lower.get("targetArtifactDigest") or artifact_digest
-        ),
+        "targetSourceId": lineage["targetSourceId"],
+        "targetDocumentId": lineage["targetDocumentId"],
+        "targetContentHash": lineage["targetContentHash"],
+        "targetCommunityReportId": lineage["targetCommunityReportId"],
+        "targetTextUnitId": lineage["targetTextUnitId"],
+        "targetArtifactDigest": lineage["targetArtifactDigest"],
         "rank": rank,
         "generation": generation,
     })
@@ -443,20 +465,27 @@ def build_library(payload: dict[str, Any]) -> dict[str, Any]:
     semantic_units: list[dict[str, Any]] = []
     evidence_rows: list[dict[str, Any]] = []
     unit_meta: dict[str, dict[str, Any]] = {}
-    append_semantic_units(payload, semantic_units, evidence_rows, unit_meta)
-    semantic_units = limit_semantic_units(
-        payload,
-        semantic_units,
-        evidence_rows,
-        unit_meta,
-    )
-    edges = build_edges(payload, semantic_units, evidence_rows, unit_meta)
-    communities, reports = build_communities(
-        payload,
-        semantic_units,
-        evidence_rows,
-        unit_meta,
-    )
+    try:
+        append_semantic_units(payload, semantic_units, evidence_rows, unit_meta)
+        semantic_units = limit_semantic_units(
+            payload,
+            semantic_units,
+            evidence_rows,
+            unit_meta,
+        )
+        edges = build_edges(payload, semantic_units, evidence_rows, unit_meta)
+        communities, reports = build_communities(
+            payload,
+            semantic_units,
+            evidence_rows,
+            unit_meta,
+        )
+    except ValueError as error:
+        return {
+            "ok": False,
+            "diagnostics": [str(error)],
+            "artifacts": {},
+        }
     for name, rows in [
         ("semantic_units.parquet", semantic_units),
         ("semantic_edges.parquet", edges),

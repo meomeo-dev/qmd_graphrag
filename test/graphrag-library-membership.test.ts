@@ -47,6 +47,16 @@ async function writeReadyBookshelf(input: {
   });
 }
 
+async function readLibraryCurrentRoot(
+  stateRoot: string,
+  libraryId: string,
+): Promise<string> {
+  const current = JSON.parse(
+    await readFile(join(stateRoot, "library", libraryId, "CURRENT.json"), "utf8"),
+  );
+  return join(stateRoot, "library", libraryId, current.current);
+}
+
 describe("GraphRAG library membership", () => {
   test("materializes library membership from two query-ready bookshelves",
     async () => {
@@ -80,12 +90,9 @@ describe("GraphRAG library membership", () => {
           graphVault: stateRoot,
           libraryId: "software-engineering-library",
         });
-        const currentRoot = join(
+        const currentRoot = await readLibraryCurrentRoot(
           stateRoot,
-          "catalog",
-          "library",
           "software-engineering-library",
-          "current",
         );
         const manifest = JSON.parse(
           await readFile(
@@ -119,12 +126,16 @@ describe("GraphRAG library membership", () => {
         expect(existsSync(join(currentRoot, "LIBRARY_MANIFEST.json"))).toBe(false);
         expect(existsSync(join(
           stateRoot,
-          "catalog",
           "bookshelves",
           "architecture-core",
-          "current",
           "BOOKSHELF_MANIFEST.json",
         ))).toBe(true);
+        expect(existsSync(join(
+          stateRoot,
+          "catalog",
+          "library",
+          "software-engineering-library",
+        ))).toBe(false);
         for (const member of members.members.bookshelves) {
           const checkpoint = join(
             currentRoot,

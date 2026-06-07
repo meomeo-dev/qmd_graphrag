@@ -99,6 +99,18 @@ const DurableTargetMappingTable = [
     targetMappingOwner: "qmdProjectionCatalog",
   },
   {
+    pattern: /\/graph_vault\/catalog\/bookshelves\/[^/]+\/projection\.yaml$/,
+    lane: "catalogWriterLane",
+    durableKind: "yaml",
+    targetMappingOwner: "upperCatalogProjection",
+  },
+  {
+    pattern: /\/graph_vault\/catalog\/library\/[^/]+\/projection\.yaml$/,
+    lane: "catalogWriterLane",
+    durableKind: "yaml",
+    targetMappingOwner: "upperCatalogProjection",
+  },
+  {
     pattern: /\/graph_vault\/books\/[^/]+\/(?:job|artifacts|checkpoints)\.yaml$/,
     lane: "checkpointWriterLane",
     durableKind: "yaml",

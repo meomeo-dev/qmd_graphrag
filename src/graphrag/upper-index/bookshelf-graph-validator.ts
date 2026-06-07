@@ -16,6 +16,7 @@ import {
   defaultBookshelfGraphBridgePath,
   runBookshelfGraphParquetBridge,
 } from "./bookshelf-graph-parquet.js";
+import { readQueryReadyPackage } from "./upper-package-paths.js";
 
 function sha256Buffer(buffer: Buffer): string {
   return createHash("sha256").update(buffer).digest("hex");
@@ -170,17 +171,27 @@ export async function validateBookshelfGraph(input: {
   semanticUnitCount: number;
   evidenceMapCount: number;
 }> {
-  const root = join(
-    resolve(input.graphVault),
-    "catalog",
-    "bookshelves",
-    input.bookshelfId,
-    "current",
-  );
+  const graphVault = resolve(input.graphVault);
+  let root: string;
+  try {
+    root = (await readQueryReadyPackage({
+      graphVault,
+      scopeKind: "bookshelf",
+      scopeId: input.bookshelfId,
+    })).generationRoot;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      diagnostics: [detail],
+      semanticUnitCount: 0,
+      evidenceMapCount: 0,
+    };
+  }
   const bridgePath = input.bridgePath ?? defaultBookshelfGraphBridgePath();
   const pythonBin = input.pythonBin ?? "python3";
   const validation = await validateBookshelfGraphAtRoot({
-    graphVault: resolve(input.graphVault),
+    graphVault,
     bookshelfId: input.bookshelfId,
     root,
     pythonBin,
