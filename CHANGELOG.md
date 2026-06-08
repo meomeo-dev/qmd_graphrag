@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Changes
+
+- GraphRAG: add package-root bookshelf and library upper index workflows,
+  including membership refresh, repair, query-ready publication, explicit
+  `--bookshelf-id` / `--library-id` query scopes, bounded evidence lineage, and
+  optional `--upper-synthesis` provider synthesis.
+
+### Fixes
+
+- GraphRAG: load `graph_vault/.env` provider configuration for qmd query,
+  vector search, Python bridge, and upper synthesis paths so stale shell
+  provider env no longer breaks real queries.
+- GraphRAG: resolve single-book hotplug query scope from package-local
+  manifests, publish markers, GraphRAG output, and text-unit identity when
+  catalog projections are absent.
+
+### Validation
+
+- GraphRAG: verified real qmd, qmd vsearch, single-book GraphRAG, bookshelf
+  GraphRAG, library GraphRAG, and bookshelf/library `--upper-synthesis`
+  provider queries against package-local ready gates.
+- Audit: completed implementation-turn_020 and implementation-turn_021
+  three-agent implementation audits with final `PASS` verdicts.
+
 ## [2.5.1] - 2026-05-20
 
 ### Changes
