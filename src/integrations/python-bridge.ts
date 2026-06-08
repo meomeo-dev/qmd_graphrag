@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { hostname } from "node:os";
@@ -46,6 +46,12 @@ const GRAPH_RAG_PROVIDER_PAYLOAD_ASSIGNMENT_PATTERN =
   /\b(?:raw|payload|body|provider[_-]?request|provider[_-]?response|provider[_-]?request[_-]?body|provider[_-]?response[_-]?body|provider[_-]?request[_-]?payload|provider[_-]?response[_-]?payload|raw[_-]?request|raw[_-]?response|request[_-]?body|response[_-]?body|request[_-]?payload|response[_-]?payload)\b\s*[:=]\s*(?:"[^"]*"|'[^']*'|\{[^}]*\}|\[[^\]]*\]|[^,\s}]+)/giu;
 const PYTHON_BRIDGE_INHERIT_PARENT_PROCESS_GROUP =
   "QMD_GRAPHRAG_INHERIT_PARENT_PROCESS_GROUP";
+const PROVIDER_ENV_KEYS = [
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+  "JINA_API_KEY",
+  "JINA_API_BASE",
+] as const;
 
 type EarlyStopWatcher = {
   stop(): void;
@@ -133,6 +139,67 @@ function optionalProvider(
     return value;
   }
   return undefined;
+}
+
+function parseDotenvLine(line: string): { key: string; value: string } | null {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith("#")) return null;
+  const body = trimmed.startsWith("export ")
+    ? trimmed.slice("export ".length).trim()
+    : trimmed;
+  const separatorIndex = body.indexOf("=");
+  if (separatorIndex <= 0) return null;
+  const key = body.slice(0, separatorIndex).trim();
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key)) return null;
+
+  let value = body.slice(separatorIndex + 1).trim();
+  const quote = value[0];
+  if (
+    (quote === "\"" || quote === "'") &&
+    value.endsWith(quote) &&
+    value.length >= 2
+  ) {
+    value = value.slice(1, -1);
+    if (quote === "\"") {
+      value = value
+        .replace(/\\n/gu, "\n")
+        .replace(/\\r/gu, "\r")
+        .replace(/\\t/gu, "\t")
+        .replace(/\\"/gu, "\"")
+        .replace(/\\\\/gu, "\\");
+    }
+  } else {
+    const commentIndex = value.search(/\s#/u);
+    if (commentIndex >= 0) value = value.slice(0, commentIndex).trimEnd();
+  }
+
+  return { key, value };
+}
+
+function graphVaultRootDirFromRequest(request: unknown): string | undefined {
+  if (request == null || typeof request !== "object") return undefined;
+  const value = (request as { rootDir?: unknown }).rootDir;
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function graphVaultDotenvEnvOverlay(
+  request: unknown,
+): Partial<Record<(typeof PROVIDER_ENV_KEYS)[number], string>> {
+  const rootDir = graphVaultRootDirFromRequest(request);
+  if (rootDir == null) return {};
+  const dotenvPath = join(rootDir, ".env");
+  if (!existsSync(dotenvPath)) return {};
+  const parsed: Record<string, string> = {};
+  for (const line of readFileSync(dotenvPath, "utf-8").split(/\r?\n/u)) {
+    const entry = parseDotenvLine(line);
+    if (entry == null) continue;
+    parsed[entry.key] = entry.value;
+  }
+  return Object.fromEntries(
+    PROVIDER_ENV_KEYS
+      .filter((key) => parsed[key] != null)
+      .map((key) => [key, parsed[key]!]),
+  );
 }
 
 function bridgeSubprocessRecordPath(subprocessId: string): string | null {
@@ -388,13 +455,9 @@ export async function callPythonBridge<TRequest, TResponse>(
     "python3";
   const dotenvOverlay = projectDotenvEnvOverlay(
     options.workingDirectory ?? process.cwd(),
-    [
-      "OPENAI_API_KEY",
-      "OPENAI_BASE_URL",
-      "JINA_API_KEY",
-      "JINA_API_BASE",
-    ],
+    PROVIDER_ENV_KEYS,
   );
+  const vaultDotenvOverlay = graphVaultDotenvEnvOverlay(options.request);
 
   return new Promise<TResponse>((resolve, reject) => {
     const subprocessId = `python-bridge-${randomUUID()}`;
@@ -405,6 +468,7 @@ export async function callPythonBridge<TRequest, TResponse>(
       env: {
         ...process.env,
         ...dotenvOverlay,
+        ...vaultDotenvOverlay,
       },
       stdio: ["pipe", "pipe", "pipe"],
       detached: processGroup,

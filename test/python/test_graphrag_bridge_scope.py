@@ -162,6 +162,8 @@ def _write_books(root: Path) -> None:
     )
     _write_query_ready_state(root, "book-1", "artifact-1")
     _write_query_ready_state(root, "book-2", "artifact-2")
+    _write_hotplug_projection(root, "book-1")
+    _write_hotplug_projection(root, "book-2")
 
 
 def _stage_fingerprints() -> dict[str, str]:
@@ -173,6 +175,86 @@ def _stage_fingerprints() -> dict[str, str]:
         "embed": "stage-embed",
         "query_ready": "stage-query-ready",
     }
+
+
+def _write_hotplug_projection(root: Path, book_id: str) -> None:
+    suffix = book_id.rsplit("-", 1)[-1]
+    book_dir = root / "books" / book_id
+    graph_output = book_dir / "graphrag" / "output"
+    graph_output.mkdir(parents=True, exist_ok=True)
+    (book_dir / "BOOK_MANIFEST.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": "1.0.0",
+                "kind": "qmd_graphrag_book_package",
+                "identity": {
+                    "bookId": book_id,
+                    "sourceHash": f"source-{suffix}",
+                    "canonicalTitle": f"Book {suffix}",
+                    "titleSlug": f"book-{suffix}",
+                    "createdAt": "2026-05-21T00:00:00.000Z",
+                    "packageGeneration": f"pkg-{suffix}",
+                },
+                "source": {
+                    "sourcePath": "source/source.epub",
+                    "sourceHash": f"source-{suffix}",
+                },
+                "input": {
+                    "canonicalNormalizedPath": f"input/book-{suffix}.md",
+                    "normalizedHash": f"content-{suffix}",
+                },
+                "qmd": {"qmdReadyState": "included_index_valid"},
+                "graphrag": {
+                    "queryReady": True,
+                    "graphRagReadyState": "query_ready",
+                    "artifactSchema": "graphrag-output-v1",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (book_dir / "PUBLISH_READY.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": "1.0.0",
+                "kind": "qmd_graphrag_book_publish_ready",
+                "bookId": book_id,
+                "packageGeneration": f"pkg-{suffix}",
+                "manifestSha256": f"manifest-{suffix}",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (graph_output / "qmd_output_manifest.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": "1.0.0",
+                "bookId": book_id,
+                "sourceHash": f"source-{suffix}",
+                "documentId": f"doc-{suffix}",
+                "contentHash": f"content-{suffix}",
+                "stageFingerprints": _stage_fingerprints(),
+                "providerFingerprint": "provider-openai-responses-jina",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (graph_output / "qmd_graph_text_unit_identity.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": "1.0.0",
+                "bookId": book_id,
+                "sourceId": f"sha256:source-{suffix}",
+                "sourceHash": f"source-{suffix}",
+                "documentId": f"doc-{suffix}",
+                "contentHash": f"content-{suffix}",
+                "normalizedPath": f"input/book-{suffix}.md",
+                "graphDocumentId": f"doc-{suffix}",
+                "graphTextUnitIds": [f"tu-{suffix}"],
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _write_query_ready_state(root: Path, book_id: str, artifact_prefix: str) -> None:
@@ -1153,6 +1235,103 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                 capabilities,
             )
 
+    def test_capability_scope_derives_from_hotplug_package_without_catalog_book(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmd-bridge-scope-") as tmp:
+            root = Path(tmp)
+            _write_books(root)
+            (root / "catalog" / "graph-capabilities.yaml").unlink()
+
+            books_path = root / "catalog" / "books.yaml"
+            books_catalog = yaml.safe_load(books_path.read_text(encoding="utf-8"))
+            books_catalog["items"] = [
+                item
+                for item in books_catalog["items"]
+                if item["bookId"] != "book-1"
+            ]
+            books_path.write_text(yaml.safe_dump(books_catalog), encoding="utf-8")
+
+            identity_path = root / "catalog" / "document-identity-map.yaml"
+            identity_catalog = yaml.safe_load(identity_path.read_text(encoding="utf-8"))
+            identity_catalog["items"] = [
+                item
+                for item in identity_catalog["items"]
+                if item["canonicalBookId"] != "book-1"
+            ]
+            identity_path.write_text(
+                yaml.safe_dump(identity_catalog),
+                encoding="utf-8",
+            )
+
+            book_ids, capabilities = _resolve_capability_scoped_book_ids(
+                root,
+                ["book-1"],
+                ["book-1:graph_query"],
+            )
+
+            self.assertEqual(book_ids, ["book-1"])
+            self.assertEqual(capabilities[0]["capabilityId"], "book-1:graph_query")
+            self.assertEqual(capabilities[0]["sourceId"], "sha256:source-1")
+            self.assertEqual(capabilities[0]["documentId"], "doc-1")
+            self.assertEqual(capabilities[0]["contentHash"], "content-1")
+            self.assertEqual(
+                capabilities[0]["artifactIds"],
+                _lineage_artifact_ids("artifact-1"),
+            )
+            _validate_capabilities_against_request_scope(
+                root,
+                {
+                    "selectedBookIds": ["book-1"],
+                    "graphCapabilityIds": ["book-1:graph_query"],
+                    "sourceIds": ["sha256:source-1"],
+                    "documentIds": ["doc-1"],
+                    "contentHashes": ["content-1"],
+                    "artifactIds": _lineage_artifact_ids("artifact-1"),
+                },
+                capabilities,
+            )
+
+    def test_capability_scope_rejects_hotplug_package_without_graph_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="qmd-bridge-scope-") as tmp:
+            root = Path(tmp)
+            _write_books(root)
+            (root / "catalog" / "graph-capabilities.yaml").unlink()
+
+            books_path = root / "catalog" / "books.yaml"
+            books_catalog = yaml.safe_load(books_path.read_text(encoding="utf-8"))
+            books_catalog["items"] = [
+                item
+                for item in books_catalog["items"]
+                if item["bookId"] != "book-1"
+            ]
+            books_path.write_text(yaml.safe_dump(books_catalog), encoding="utf-8")
+
+            identity_path = root / "catalog" / "document-identity-map.yaml"
+            identity_catalog = yaml.safe_load(identity_path.read_text(encoding="utf-8"))
+            identity_catalog["items"] = [
+                item
+                for item in identity_catalog["items"]
+                if item["canonicalBookId"] != "book-1"
+            ]
+            identity_path.write_text(
+                yaml.safe_dump(identity_catalog),
+                encoding="utf-8",
+            )
+            (
+                root / "books" / "book-1" / "graphrag" / "output" /
+                "qmd_graph_text_unit_identity.json"
+            ).unlink()
+
+            with self.assertRaisesRegex(ValueError, "missing document identity"):
+                _resolve_capability_scoped_book_ids(
+                    root,
+                    ["book-1"],
+                    ["book-1:graph_query"],
+                )
+
     def test_capability_scope_derives_from_current_manifest_when_checkpoint_stats_id_is_stale(
         self,
     ) -> None:
@@ -1373,6 +1552,7 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                 item for item in catalog["items"] if item["bookId"] != "book-1"
             ]
             books_path.write_text(yaml.safe_dump(catalog), encoding="utf-8")
+            (root / "books" / "book-1" / "BOOK_MANIFEST.json").unlink()
 
             with self.assertRaisesRegex(ValueError, "unknown or not-ready"):
                 _resolve_capability_scoped_book_ids(
@@ -1407,6 +1587,10 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
             _write_books(root)
             (root / "catalog" / "graph-capabilities.yaml").unlink()
             (root / "catalog" / "document-identity-map.yaml").unlink()
+            (
+                root / "books" / "book-1" / "graphrag" / "output" /
+                "qmd_graph_text_unit_identity.json"
+            ).unlink()
 
             with self.assertRaisesRegex(ValueError, "missing document identity"):
                 _resolve_capability_scoped_book_ids(
@@ -1426,6 +1610,10 @@ class GraphRagBridgeScopeTest(unittest.TestCase):
                 if item["canonicalBookId"] != "book-1"
             ]
             identity_path.write_text(yaml.safe_dump(catalog), encoding="utf-8")
+            (
+                root / "books" / "book-1" / "graphrag" / "output" /
+                "qmd_graph_text_unit_identity.json"
+            ).unlink()
 
             with self.assertRaisesRegex(ValueError, "missing document identity"):
                 _filter_graphrag_frames_for_scope(root, _frames(), ["book-1"])

@@ -577,7 +577,9 @@ function defaultProjectProvidersConfig(): CollectionConfig["providers"] {
 function parseDotenvLine(line: string): { key: string; value: string } | null {
   const trimmed = line.trim();
   if (!trimmed || trimmed.startsWith("#")) return null;
-  const body = trimmed.startsWith("export ") ? trimmed.slice("export ".length).trim() : trimmed;
+  const body = trimmed.startsWith("export ")
+    ? trimmed.slice("export ".length).trim()
+    : trimmed;
   const separatorIndex = body.indexOf("=");
   if (separatorIndex <= 0) return null;
   const key = body.slice(0, separatorIndex).trim();
@@ -2178,7 +2180,70 @@ function parsePositiveIntegerOption(name: string, value: unknown): number | unde
   return parsed;
 }
 
-function createCliUpperSynthesisRunner(): UpperSynthesisRunner {
+const GraphVaultProviderEnvKeys = [
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+  "JINA_API_KEY",
+  "JINA_API_BASE",
+] as const;
+
+type EnvPatch = {
+  key: string;
+  previous: string | undefined;
+  applied: boolean;
+};
+
+export function applyGraphVaultDotenvForCli(
+  graphVault: string,
+  env: NodeJS.ProcessEnv = process.env,
+): EnvPatch[] {
+  const dotenvPath = pathJoin(graphVault, ".env");
+  if (!existsSync(dotenvPath)) return [];
+
+  const parsedEnv = new Map<string, string>();
+  const body = readFileSync(dotenvPath, "utf-8");
+  for (const line of body.split(/\r?\n/u)) {
+    const parsed = parseDotenvLine(line);
+    if (parsed == null) continue;
+    parsedEnv.set(parsed.key, parsed.value);
+  }
+
+  const patches: EnvPatch[] = [];
+  for (const key of GraphVaultProviderEnvKeys) {
+    const value = parsedEnv.get(key);
+    if (value == null) {
+      patches.push({ key, previous: env[key], applied: false });
+      continue;
+    }
+    const previous = env[key];
+    env[key] = value;
+    patches.push({ key, previous, applied: true });
+  }
+  return patches;
+}
+
+function restoreEnvPatches(
+  patches: readonly EnvPatch[],
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  for (let index = patches.length - 1; index >= 0; index -= 1) {
+    const patch = patches[index]!;
+    if (!patch.applied) continue;
+    if (patch.previous === undefined) delete env[patch.key];
+    else env[patch.key] = patch.previous;
+  }
+}
+
+export function applyGraphVaultDotenvForCliValues(
+  values: Record<string, unknown>,
+  config: CollectionConfig = ensureRuntimeConfigForCli(),
+  env: NodeJS.ProcessEnv = process.env,
+): EnvPatch[] {
+  const graphVault = resolveGraphVaultForCli(values, config);
+  return applyGraphVaultDotenvForCli(graphVault, env);
+}
+
+function createCliUpperSynthesisRunner(graphVault: string): UpperSynthesisRunner {
   return async (input) => {
     const startedAt = Date.now();
     const result = await withLLMSession(
@@ -3213,7 +3278,11 @@ function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): voi
   for (const line of lines) process.stderr.write(line + '\n');
 }
 
-async function vectorSearch(query: string, opts: OutputOptions, _model: string = DEFAULT_EMBED_MODEL): Promise<void> {
+async function vectorSearch(
+  query: string,
+  opts: OutputOptions,
+  _model: string = DEFAULT_EMBED_MODEL,
+): Promise<void> {
   const store = getStore();
 
   // Validate collection filter (supports multiple -c flags)
@@ -3312,7 +3381,12 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
 }
 
-async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
+async function querySearch(
+  query: string,
+  opts: OutputOptions,
+  _embedModel: string = DEFAULT_EMBED_MODEL,
+  _rerankModel: string = DEFAULT_RERANK_MODEL,
+): Promise<void> {
   await withLLMSession(async () => {
     const timing = createQueryTimingRecorder(opts, {
       route: "qmd",
@@ -3611,7 +3685,7 @@ async function graphRagQuerySearch(
     );
   }
   const upperSynthesisRunner = upperSynthesis
-    ? createCliUpperSynthesisRunner()
+    ? createCliUpperSynthesisRunner(graphVault)
     : undefined;
 
   const answer = await routeQuery({
@@ -6198,7 +6272,18 @@ if (isMain) {
       if (!cli.values["min-score"]) {
         cli.opts.minScore = 0.3;
       }
-      await vectorSearch(cli.query, cli.opts);
+      {
+        const config = ensureRuntimeConfigForCli();
+        const envPatches = applyGraphVaultDotenvForCliValues(
+          cli.values,
+          config,
+        );
+        try {
+          await vectorSearch(cli.query, cli.opts);
+        } finally {
+          restoreEnvPatches(envPatches);
+        }
+      }
       break;
 
     case "query":
@@ -6217,14 +6302,20 @@ if (isMain) {
             redactedMessage: "--mode must be qmd or auto.",
           }));
         }
-        if (
-          cli.values.graphrag ||
-          cli.values["bookshelf-id"] != null ||
-          cli.values["library-id"] != null
-        ) {
-          await graphRagQuerySearch(cli.query, cli.opts, cli.values);
-        } else {
-          const config = ensureRuntimeConfigForCli();
+        const config = ensureRuntimeConfigForCli();
+        const envPatches = applyGraphVaultDotenvForCliValues(
+          cli.values,
+          config,
+        );
+        try {
+          if (
+            cli.values.graphrag ||
+            cli.values["bookshelf-id"] != null ||
+            cli.values["library-id"] != null
+          ) {
+            await graphRagQuerySearch(cli.query, cli.opts, cli.values);
+            break;
+          }
           const configuredRoute = config.query?.default_route ?? "qmd";
           const explicitMode = cli.values.mode == null
             ? null
@@ -6235,6 +6326,8 @@ if (isMain) {
           } else {
             await querySearch(cli.query, cli.opts);
           }
+        } finally {
+          restoreEnvPatches(envPatches);
         }
       } catch (error) {
         exitWithError(error);

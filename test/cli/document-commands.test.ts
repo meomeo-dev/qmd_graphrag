@@ -9,7 +9,12 @@ import {
 import { tmpdir } from "os";
 import { join, sep } from "path";
 import YAML from "yaml";
-import { buildEditorUri, termLink } from "../../src/cli/qmd.ts";
+import {
+  applyGraphVaultDotenvForCli,
+  applyGraphVaultDotenvForCliValues,
+  buildEditorUri,
+  termLink,
+} from "../../src/cli/qmd.ts";
 import { SchemaVersion } from "../../src/contracts/common.ts";
 import { createCliTestHarness } from "../helpers/cli-harness.ts";
 
@@ -1068,6 +1073,106 @@ describe("editor URI templates", () => {
 
     expect(linked).toBe("\x1b]8;;vscode://file//tmp/docs/api.md:12:1\x07docs/api.md:12\x1b]8;;\x07");
   });
+});
+
+describe("graph vault dotenv overlay", () => {
+  test(
+    "overlays provider env from graph vault dotenv for GraphRAG calls",
+    async () => {
+      const tmpRoot = await mkdtemp(join(tmpdir(), "qmd-vault-dotenv-"));
+      try {
+        const graphVault = join(tmpRoot, "graph_vault");
+        await mkdir(graphVault, { recursive: true });
+        await writeFile(
+          join(graphVault, ".env"),
+          [
+            "OPENAI_API_KEY=vault-openai-key",
+            "OPENAI_BASE_URL=https://vault-openai.example",
+            "JINA_API_KEY=vault-jina-key",
+            "JINA_API_BASE=https://vault-jina.example",
+          ].join("\n") + "\n",
+          "utf8",
+        );
+        const env: NodeJS.ProcessEnv = {
+          OPENAI_API_KEY: "shell-openai-key",
+        };
+
+        const patches = applyGraphVaultDotenvForCli(graphVault, env);
+
+        expect(env.OPENAI_API_KEY).toBe("vault-openai-key");
+        expect(env.OPENAI_BASE_URL).toBe("https://vault-openai.example");
+        expect(env.JINA_API_KEY).toBe("vault-jina-key");
+        expect(env.JINA_API_BASE).toBe("https://vault-jina.example");
+        expect(patches).toEqual([
+          {
+            key: "OPENAI_API_KEY",
+            previous: "shell-openai-key",
+            applied: true,
+          },
+          { key: "OPENAI_BASE_URL", previous: undefined, applied: true },
+          { key: "JINA_API_KEY", previous: undefined, applied: true },
+          { key: "JINA_API_BASE", previous: undefined, applied: true },
+        ]);
+      } finally {
+        await rm(tmpRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test(
+    "resolves graph vault dotenv from CLI values for query providers",
+    async () => {
+      const tmpRoot = await mkdtemp(join(tmpdir(), "qmd-vault-query-env-"));
+      try {
+        const graphVault = join(tmpRoot, "runtime_vault");
+        await mkdir(graphVault, { recursive: true });
+        await writeFile(
+          join(graphVault, ".env"),
+          [
+            "OPENAI_API_KEY=vault-query-openai-key",
+            "OPENAI_BASE_URL=https://vault-query-openai.example",
+            "JINA_API_KEY=vault-query-jina-key",
+            "JINA_API_BASE=https://vault-query-jina.example",
+          ].join("\n") + "\n",
+          "utf8",
+        );
+        const env: NodeJS.ProcessEnv = {
+          OPENAI_API_KEY: "stale-shell-openai-key",
+          OPENAI_BASE_URL: "https://stale-shell-openai.example",
+        };
+
+        const patches = applyGraphVaultDotenvForCliValues(
+          { "graph-vault": graphVault },
+          {
+            collections: {},
+            graphrag: { vault: "unused_graph_vault" },
+          },
+          env,
+        );
+
+        expect(env.OPENAI_API_KEY).toBe("vault-query-openai-key");
+        expect(env.OPENAI_BASE_URL).toBe("https://vault-query-openai.example");
+        expect(env.JINA_API_KEY).toBe("vault-query-jina-key");
+        expect(env.JINA_API_BASE).toBe("https://vault-query-jina.example");
+        expect(patches).toEqual([
+          {
+            key: "OPENAI_API_KEY",
+            previous: "stale-shell-openai-key",
+            applied: true,
+          },
+          {
+            key: "OPENAI_BASE_URL",
+            previous: "https://stale-shell-openai.example",
+            applied: true,
+          },
+          { key: "JINA_API_KEY", previous: undefined, applied: true },
+          { key: "JINA_API_BASE", previous: undefined, applied: true },
+        ]);
+      } finally {
+        await rm(tmpRoot, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 // =============================================================================

@@ -561,22 +561,44 @@ def _load_document_identity_map(root_dir: Path) -> dict[str, dict[str, Any]]:
         raise RuntimeError("PyYAML is required to enforce GraphRAG capability scope") from error
 
     identity_path = root_dir / "catalog" / "document-identity-map.yaml"
-    if not identity_path.exists():
-        return {}
-    catalog = yaml.safe_load(identity_path.read_text(encoding="utf-8")) or {}
-    return {
+    catalog = (
+        yaml.safe_load(identity_path.read_text(encoding="utf-8")) or {}
+        if identity_path.exists()
+        else {}
+    )
+    identities = {
         str(item.get("documentId")): item
         for item in catalog.get("items", [])
         if isinstance(item, dict) and item.get("documentId")
     }
+    books_dir = root_dir / "books"
+    if not books_dir.is_dir():
+        return identities
+    for book_root in sorted(item for item in books_dir.iterdir() if item.is_dir()):
+        identity = _load_hotplug_document_identity(root_dir, book_root.name)
+        if identity is None or not identity.get("documentId"):
+            continue
+        identities.setdefault(str(identity["documentId"]), identity)
+    return identities
 
 
 def _load_document_identity_map_by_book(root_dir: Path) -> dict[str, dict[str, Any]]:
-    return {
+    identities = {
         str(item.get("canonicalBookId")): item
         for item in _load_document_identity_map(root_dir).values()
         if item.get("canonicalBookId")
     }
+    books_dir = root_dir / "books"
+    if not books_dir.is_dir():
+        return identities
+    for book_root in sorted(item for item in books_dir.iterdir() if item.is_dir()):
+        book_id = book_root.name
+        if book_id in identities:
+            continue
+        identity = _load_hotplug_document_identity(root_dir, book_id)
+        if identity is not None:
+            identities[book_id] = identity
+    return identities
 
 
 def _load_books_by_id(root_dir: Path) -> dict[str, dict[str, Any]]:
@@ -586,13 +608,167 @@ def _load_books_by_id(root_dir: Path) -> dict[str, dict[str, Any]]:
         raise RuntimeError("PyYAML is required to enforce GraphRAG capability scope") from error
 
     catalog_path = root_dir / "catalog" / "books.yaml"
-    if not catalog_path.exists():
-        return {}
-    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8")) or {}
-    return {
+    catalog = (
+        yaml.safe_load(catalog_path.read_text(encoding="utf-8")) or {}
+        if catalog_path.exists()
+        else {}
+    )
+    books = {
         str(item.get("bookId")): item
         for item in catalog.get("items", [])
         if isinstance(item, dict) and item.get("bookId")
+    }
+    books_dir = root_dir / "books"
+    if not books_dir.is_dir():
+        return books
+    for book_root in sorted(item for item in books_dir.iterdir() if item.is_dir()):
+        book_id = book_root.name
+        if book_id in books:
+            continue
+        book = _load_hotplug_book_job(root_dir, book_id)
+        if book is not None:
+            books[book_id] = book
+    return books
+
+
+def _read_json_file(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _load_hotplug_book_job(root_dir: Path, book_id: str) -> dict[str, Any] | None:
+    try:
+        import yaml  # type: ignore
+    except Exception as error:  # noqa: BLE001
+        raise RuntimeError("PyYAML is required to enforce GraphRAG capability scope") from error
+
+    book_root = root_dir / "books" / book_id
+    manifest = _read_json_file(book_root / "BOOK_MANIFEST.json")
+    publish_ready = _read_json_file(book_root / "PUBLISH_READY.json")
+    graph_output = _read_json_file(book_root / "graphrag" / "output" / "qmd_output_manifest.json")
+    if manifest is None or publish_ready is None or graph_output is None:
+        return None
+    if manifest.get("kind") != "qmd_graphrag_book_package":
+        return None
+    if publish_ready.get("kind") != "qmd_graphrag_book_publish_ready":
+        return None
+    if str(publish_ready.get("bookId") or "") != book_id:
+        return None
+
+    identity = manifest.get("identity") if isinstance(manifest.get("identity"), dict) else {}
+    source = manifest.get("source") if isinstance(manifest.get("source"), dict) else {}
+    input_info = manifest.get("input") if isinstance(manifest.get("input"), dict) else {}
+    graphrag = manifest.get("graphrag") if isinstance(manifest.get("graphrag"), dict) else {}
+    qmd = manifest.get("qmd") if isinstance(manifest.get("qmd"), dict) else {}
+    if identity.get("bookId") != book_id or graphrag.get("queryReady") is not True:
+        return None
+
+    state_path = _book_state_yaml_path(root_dir, book_id, "job.yaml")
+    state = yaml.safe_load(state_path.read_text(encoding="utf-8")) or {} if state_path.exists() else {}
+    state_metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
+    manifest_metadata = (
+        manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else {}
+    )
+    stage_fingerprints = graph_output.get("stageFingerprints")
+    provider_fingerprint = graph_output.get("providerFingerprint")
+    if not isinstance(stage_fingerprints, dict) or not isinstance(provider_fingerprint, str):
+        return None
+
+    source_hash = str(graph_output.get("sourceHash") or identity.get("sourceHash") or source.get("sourceHash") or "")
+    normalized_path = str(
+        input_info.get("canonicalNormalizedPath")
+        or state.get("normalizedPath")
+        or state_metadata.get("normalizedPath")
+        or ""
+    )
+    content_hash = str(graph_output.get("contentHash") or input_info.get("normalizedHash") or "")
+    document_id = str(graph_output.get("documentId") or state.get("documentId") or "")
+    if not source_hash or not normalized_path or not content_hash or not document_id:
+        return None
+
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "bookId": book_id,
+        "documentId": document_id,
+        "sourcePath": source.get("sourcePath") or f"books/{book_id}/source/source.epub",
+        "sourceHash": source_hash,
+        "normalizedContentHash": content_hash,
+        "normalizedPath": normalized_path,
+        "normalizationPolicyVersion": state.get(
+            "normalizationPolicyVersion",
+            "graphrag-normalized-markdown-v1",
+        ),
+        "configFingerprint": state.get(
+            "configFingerprint",
+            qmd.get("qmdIndexSchema", "qmd-book-index-v1"),
+        ),
+        "promptFingerprint": state.get("promptFingerprint", "book-hotplug-manifest"),
+        "modelFingerprint": state.get(
+            "modelFingerprint",
+            graphrag.get("artifactSchema")
+            or graphrag.get("graphRagArtifactSchema")
+            or "graphrag-output-v1",
+        ),
+        "stageFingerprints": stage_fingerprints,
+        "providerFingerprint": provider_fingerprint,
+        "overallStatus": "succeeded",
+        "createdAt": identity.get("createdAt") or publish_ready.get("createdAt"),
+        "updatedAt": publish_ready.get("createdAt") or identity.get("createdAt"),
+        "metadata": {
+            **state_metadata,
+            "canonicalTitle": identity.get("canonicalTitle")
+            or manifest_metadata.get("title"),
+            "packageGeneration": identity.get("packageGeneration")
+            or publish_ready.get("packageGeneration"),
+            "projectionSource": "book_hotplug_manifest",
+        },
+    }
+
+
+def _load_hotplug_document_identity(
+    root_dir: Path,
+    book_id: str,
+) -> dict[str, Any] | None:
+    book_root = root_dir / "books" / book_id
+    manifest = _read_json_file(book_root / "BOOK_MANIFEST.json")
+    graph_identity = _read_json_file(
+        book_root / "graphrag" / "output" / "qmd_graph_text_unit_identity.json"
+    )
+    if manifest is None or graph_identity is None:
+        return None
+    identity = manifest.get("identity") if isinstance(manifest.get("identity"), dict) else {}
+    input_info = manifest.get("input") if isinstance(manifest.get("input"), dict) else {}
+    if identity.get("bookId") != book_id or graph_identity.get("bookId") != book_id:
+        return None
+    graph_text_unit_ids = graph_identity.get("graphTextUnitIds")
+    if not isinstance(graph_text_unit_ids, list) or not graph_text_unit_ids:
+        return None
+    normalized_path = (
+        f"books/{book_id}/{input_info.get('canonicalNormalizedPath')}"
+        if input_info.get("canonicalNormalizedPath")
+        else graph_identity.get("normalizedPath")
+    )
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "sourceId": graph_identity.get("sourceId"),
+        "sourceHash": graph_identity.get("sourceHash"),
+        "canonicalBookId": book_id,
+        "documentId": graph_identity.get("documentId"),
+        "contentHash": graph_identity.get("contentHash"),
+        "normalizationPolicyVersion": "graphrag-normalized-markdown-v1",
+        "normalizedPath": normalized_path,
+        "chunkIds": [],
+        "graphDocumentId": graph_identity.get("graphDocumentId"),
+        "graphTextUnitIds": graph_text_unit_ids,
+        "metadata": {
+            "qmdCorpusRegistered": True,
+            "projectionSource": "book_hotplug_manifest",
+        },
     }
 
 
