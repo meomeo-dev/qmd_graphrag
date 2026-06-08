@@ -236,6 +236,14 @@ export type ResolveBookshelfMembershipResult = {
   memberCount: number;
 };
 
+export type BookshelfMembershipCurrent = {
+  currentRoot: string;
+  manifestSha256: string;
+  manifest: BookshelfMembershipManifest;
+  membersFile: z.infer<typeof BookshelfMembersFileSchema>;
+  qualityGate: MembershipQualityGate;
+};
+
 const ForbiddenManifestFields = [
   "providerRequestPayload",
   "providerResponsePayload",
@@ -787,6 +795,63 @@ export async function resolveBookshelfMembership(
     manifest,
     qualityGate,
     memberCount: collected.members.length,
+  };
+}
+
+export async function readBookshelfMembershipCurrent(input: {
+  graphVault: string;
+  bookshelfId: string;
+}): Promise<BookshelfMembershipCurrent> {
+  const resolved = await readPackageCurrent({
+    graphVault: input.graphVault,
+    scopeKind: "bookshelf",
+    scopeId: input.bookshelfId,
+  });
+  const currentRoot = existsSync(
+    join(resolved.generationRoot, "BOOKSHELF_MEMBERSHIP_MANIFEST.json"),
+  )
+    ? resolved.generationRoot
+    : join(resolved.generationRoot, "membership");
+  const manifestPath = join(currentRoot, "BOOKSHELF_MEMBERSHIP_MANIFEST.json");
+  const membersPath = join(currentRoot, "bookshelf_members.json");
+  const gatePath = join(currentRoot, "state", "membership-quality-gate.json");
+  const manifest = BookshelfMembershipManifestSchema.safeParse(
+    await readHotplugPackageUnknown(manifestPath),
+  );
+  const members = BookshelfMembersFileSchema.safeParse(
+    await readHotplugPackageUnknown(membersPath),
+  );
+  const gate = MembershipQualityGateSchema.safeParse(
+    await readHotplugPackageUnknown(gatePath),
+  );
+  if (!manifest.success) {
+    throw new Error("upper_quality_gate_failed:bookshelf_membership_manifest_invalid");
+  }
+  if (!members.success) {
+    throw new Error("upper_quality_gate_failed:bookshelf_members_invalid");
+  }
+  if (!gate.success || gate.data.status !== "passed") {
+    throw new Error("upper_quality_gate_failed:bookshelf_membership_gate_not_passed");
+  }
+  if (manifest.data.bookshelfIdentity.bookshelfId !== input.bookshelfId) {
+    throw new Error("upper_quality_gate_failed:bookshelf_membership_scope_mismatch");
+  }
+  if (members.data.bookshelfId !== input.bookshelfId) {
+    throw new Error("upper_quality_gate_failed:bookshelf_members_scope_mismatch");
+  }
+  const manifestSha256 = sha256Buffer(await readFile(manifestPath));
+  const sidecar = existsSync(`${manifestPath}.sha256`)
+    ? (await readFile(`${manifestPath}.sha256`, "utf8")).trim()
+    : "";
+  if (sidecar !== manifestSha256) {
+    throw new Error("upper_quality_gate_failed:bookshelf_membership_checksum_mismatch");
+  }
+  return {
+    currentRoot,
+    manifestSha256,
+    manifest: manifest.data,
+    membersFile: members.data,
+    qualityGate: gate.data,
   };
 }
 

@@ -216,6 +216,80 @@ describe("GraphRAG upper package management CLI", () => {
     120000,
   );
 
+  test("refreshes and repairs bookshelf membership through package-root CLI",
+    async () => {
+      const tmpRoot = await mkProjectTmpDir("qmd-upper-bookshelf-repair-cli-");
+      try {
+        const graphVault = join(tmpRoot, "graph_vault");
+        const bookshelfId = "architecture-repair";
+        const bookIds = ["book-ubr-a", "book-ubr-b", "book-ubr-c"];
+        for (const [index, bookId] of bookIds.entries()) {
+          await writeReadyHotplugBook({
+            stateRoot: graphVault,
+            bookId,
+            title: `Upper Repair Bookshelf ${index + 1}`,
+          });
+        }
+
+        const refreshed = await harness.runQmd([
+          "bookshelf",
+          "refresh-membership",
+          bookshelfId,
+          "--graph-vault",
+          graphVault,
+          "--json",
+          "--book-id",
+          "book-ubr-a",
+          "--book-id",
+          "book-ubr-b",
+          "--book-id",
+          "book-ubr-c",
+        ], { timeoutMs: 120000 });
+        expect(refreshed.exitCode, refreshed.stderr).toBe(0);
+        const refreshResult = JSON.parse(refreshed.stdout);
+        expect(refreshResult.command).toBe("refresh-membership");
+        expect(refreshResult.scopeKind).toBe("bookshelf");
+        expect(refreshResult.ok).toBe(true);
+        expect(refreshResult.queryReady).toBe(false);
+        expect(refreshResult.readyState).toBe("membership_resolved");
+        expect(refreshResult.validation.memberCount).toBe(3);
+        expect(refreshResult.packageStatus.status).toBe("not_query_ready");
+        expect(refreshResult.packageStatus.readyState).toBe("membership_resolved");
+        expect(JSON.stringify(refreshResult)).not.toContain(graphVault);
+
+        const repaired = await harness.runQmd([
+          "bookshelf",
+          "repair",
+          bookshelfId,
+          "--graph-vault",
+          graphVault,
+          "--json",
+          "--max-reports-per-book",
+          "2",
+          "--max-semantic-units",
+          "16",
+          "--max-edges",
+          "32",
+        ], { timeoutMs: 120000 });
+        expect(repaired.exitCode, repaired.stderr).toBe(0);
+        const repairResult = JSON.parse(repaired.stdout);
+        expect(repairResult.command).toBe("repair");
+        expect(repairResult.scopeKind).toBe("bookshelf");
+        expect(repairResult.ok).toBe(true);
+        expect(repairResult.packageStatus.status).toBe("query_ready");
+        expect(repairResult.packageStatus.readyState)
+          .toBe("bookshelf_query_ready");
+        expect(repairResult.membershipValidation.memberCount).toBe(3);
+        expect(repairResult.graphValidation.semanticUnitCount).toBeGreaterThan(0);
+        expect(repairResult.graphValidation.evidenceMapCount).toBeGreaterThan(0);
+        expect(JSON.stringify(repairResult)).not.toContain(graphVault);
+      } finally {
+        await rm(tmpRoot, { recursive: true, force: true });
+      }
+    },
+    120000,
+  );
+
   test("reports bookshelf package-root status without using catalog as authority",
     async () => {
       const tmpRoot = await mkProjectTmpDir("qmd-upper-management-cli-");
@@ -609,6 +683,84 @@ describe("GraphRAG upper package management CLI", () => {
         expect(rebuildResult.status).toBe("query_ready");
         expect(rebuildResult.packageStatus.readyState).toBe("library_query_ready");
         expect(JSON.stringify(rebuildResult)).not.toContain(graphVault);
+      } finally {
+        await rm(tmpRoot, { recursive: true, force: true });
+      }
+    },
+    120000,
+  );
+
+  test("refreshes and repairs library membership through package-root CLI",
+    async () => {
+      const tmpRoot = await mkProjectTmpDir("qmd-upper-library-repair-cli-");
+      try {
+        const graphVault = join(tmpRoot, "graph_vault");
+        await writeBookshelfFixture({
+          graphVault,
+          bookshelfId: "architecture-core",
+          bookIds: ["book-ulr-a", "book-ulr-b", "book-ulr-c"],
+          queryReady: true,
+        });
+        await writeBookshelfFixture({
+          graphVault,
+          bookshelfId: "delivery-core",
+          bookIds: ["book-ulr-d", "book-ulr-e", "book-ulr-f"],
+          queryReady: true,
+        });
+
+        const refreshed = await harness.runQmd([
+          "library",
+          "refresh-membership",
+          "software-repair-library",
+          "--graph-vault",
+          graphVault,
+          "--json",
+          "--member-bookshelf-id",
+          "architecture-core",
+          "--member-bookshelf-id",
+          "delivery-core",
+        ], { timeoutMs: 120000 });
+        expect(refreshed.exitCode, refreshed.stderr).toBe(0);
+        const refreshResult = JSON.parse(refreshed.stdout);
+        expect(refreshResult.command).toBe("refresh-membership");
+        expect(refreshResult.scopeKind).toBe("library");
+        expect(refreshResult.ok).toBe(true);
+        expect(refreshResult.queryReady).toBe(false);
+        expect(refreshResult.readyState).toBe("library_membership_resolved");
+        expect(refreshResult.validation.bookshelfCount).toBe(2);
+        expect(refreshResult.packageStatus.status).toBe("not_query_ready");
+        expect(refreshResult.packageStatus.readyState)
+          .toBe("library_membership_resolved");
+        expect(JSON.stringify(refreshResult)).not.toContain(graphVault);
+
+        const repaired = await harness.runQmd([
+          "library",
+          "repair",
+          "software-repair-library",
+          "--graph-vault",
+          graphVault,
+          "--json",
+          "--max-reports-per-shelf",
+          "2",
+          "--max-semantic-units",
+          "16",
+          "--max-edges",
+          "32",
+        ], { timeoutMs: 120000 });
+        expect(repaired.exitCode, repaired.stderr).toBe(0);
+        const repairResult = JSON.parse(repaired.stdout);
+        expect(repairResult.command).toBe("repair");
+        expect(repairResult.scopeKind).toBe("library");
+        expect(repairResult.ok).toBe(true);
+        expect(repairResult.refreshedMembershipGeneration).toMatch(
+          /^library-membership-/u,
+        );
+        expect(repairResult.packageStatus.status).toBe("query_ready");
+        expect(repairResult.packageStatus.readyState).toBe("library_query_ready");
+        expect(repairResult.membershipValidation.bookshelfCount).toBe(2);
+        expect(repairResult.graphValidation.semanticUnitCount).toBeGreaterThan(0);
+        expect(repairResult.graphValidation.evidenceMapCount).toBeGreaterThan(0);
+        expect(JSON.stringify(repairResult)).not.toContain(graphVault);
       } finally {
         await rm(tmpRoot, { recursive: true, force: true });
       }

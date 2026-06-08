@@ -260,6 +260,7 @@ export type LLMSessionOptions = {
 export interface ILLMSession {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
   embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
+  generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
   expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]>;
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
   /** Whether this session is still valid (not released or aborted) */
@@ -2097,6 +2098,7 @@ export class LlamaCpp implements LLM {
       model: modelName,
       input,
       stream: true,
+      ...(options.maxTokens ? { max_output_tokens: options.maxTokens } : {}),
       ...(provider.reasoningEffort
         ? { reasoning: { effort: provider.reasoningEffort } }
         : {}),
@@ -2832,6 +2834,15 @@ class LLMSession implements ILLMSession {
 
   async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
     return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts, options));
+  }
+
+  async generate(
+    prompt: string,
+    options?: GenerateOptions,
+  ): Promise<GenerateResult | null> {
+    return this.withOperation(() =>
+      this.manager.getLlamaCpp().generate(prompt, options)
+    );
   }
 
   async expandQuery(

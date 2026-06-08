@@ -1032,6 +1032,40 @@ describe("GraphRAG library graph build", () => {
           "library/software-engineering-library/generations/" +
             `${manifest.libraryIdentity.generation}/community_reports.parquet`,
         );
+        const synthesized = await queryLibraryGraph({
+          graphVault: stateRoot,
+          libraryId: "software-engineering-library",
+          query: "How do architecture and delivery practices relate?",
+          method: "global",
+          synthesis: {
+            enabled: true,
+            maxInputTokens: manifest.fixedQueryBudget.maxInputTokens,
+            maxOutputTokens: 128,
+            runner: async (input) => {
+              expect(input.scopeKind).toBe("library");
+              expect(input.scopeId).toBe("software-engineering-library");
+              expect(input.evidence.length).toBeGreaterThan(0);
+              expect(input.evidence.length).toBeLessThanOrEqual(
+                manifest.fixedQueryBudget.maxSemanticUnits,
+              );
+              return {
+                text: `Synthesized library answer ${input.evidence[0]?.evidenceId}`,
+                model: "deterministic-upper-synthesis",
+                promptTokens: input.estimatedInputTokens,
+                completionTokens: 13,
+                durationMs: 6,
+              };
+            },
+          },
+        });
+        expect(synthesized.responseText).toContain("Synthesized library answer");
+        expect(synthesized.providerDetail?.runtimeMetrics?.aggregate
+          .attemptedRequestCount).toBe(1);
+        expect(synthesized.providerDetail?.runtimeMetrics?.stages.map(
+          (stage) => stage.name,
+        )).toContain("upper.llm_synthesis");
+        expect(synthesized.evidence[0]?.metadata?.upperSynthesis).toBe(true);
+        expect(JSON.stringify(synthesized)).not.toContain("Answer the user query");
 
         const catalogProjectionRoot = join(
           stateRoot,

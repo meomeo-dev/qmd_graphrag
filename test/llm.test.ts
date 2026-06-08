@@ -653,6 +653,58 @@ describe("LlamaCpp Jina rerank", () => {
     }
   });
 
+  test("passes generation maxTokens to OpenAI Responses output budget", async () => {
+    const previousApiKey = process.env.OPENAI_API_KEY;
+    const previousBaseUrl = process.env.OPENAI_BASE_URL;
+    const previousFetch = globalThis.fetch;
+    process.env.OPENAI_API_KEY = "redaction-sentinel";
+    process.env.OPENAI_BASE_URL = "http://gateway.local";
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body));
+      expect(request.model).toBe("gpt-5.4");
+      expect(request.stream).toBe(true);
+      expect(request.max_output_tokens).toBe(123);
+      expect(request.metadata.max_completion_tokens).toBe(123);
+      return new Response([
+        "event: response.output_text.delta",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"bounded answer\"}",
+        "",
+        "event: response.completed",
+        "data: {\"type\":\"response.completed\"}",
+        "",
+      ].join("\n"));
+    });
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    try {
+      const llm = new LlamaCpp({ generateModel: "openai:gpt-5.4" }) as any;
+      llm._ciMode = false;
+      const result = await llm.generate("short answer", { maxTokens: 123 });
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://gateway.local/responses",
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({
+            Authorization: "Bearer redaction-sentinel",
+            Accept: "text/event-stream",
+          }),
+        }),
+      );
+      expect(result).toMatchObject({
+        text: "bounded answer",
+        model: "openai:gpt-5.4",
+        done: true,
+      });
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousApiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousApiKey;
+      if (previousBaseUrl === undefined) delete process.env.OPENAI_BASE_URL;
+      else process.env.OPENAI_BASE_URL = previousBaseUrl;
+    }
+  });
+
   test("retries retryable OpenAI Responses stream errors", async () => {
     const previousApiKey = process.env.OPENAI_API_KEY;
     const previousBaseUrl = process.env.OPENAI_BASE_URL;

@@ -131,7 +131,10 @@ import {
   type ModelsConfig,
 } from "../collections.js";
 import { createQmdGraphRagRuntime } from "../runtime.js";
-import { GraphRagSearchMethodSchema } from "../contracts/graphrag.js";
+import {
+  GraphRagSearchMethodSchema,
+  type GraphRagSearchMethod,
+} from "../contracts/graphrag.js";
 import { SchemaVersion, type JsonValue } from "../contracts/common.js";
 import {
   buildDspyRuntimeFingerprints,
@@ -205,6 +208,9 @@ import {
 import {
   runUpperManagementCommand,
 } from "./graphrag-upper-management.js";
+import type {
+  UpperSynthesisRunner,
+} from "../graphrag/upper-index/upper-synthesis.js";
 import { createRunId } from "../job-state/fingerprint.js";
 
 // NOTE: enableProductionMode() is intentionally NOT called at module scope here.
@@ -2172,6 +2178,27 @@ function parsePositiveIntegerOption(name: string, value: unknown): number | unde
   return parsed;
 }
 
+function createCliUpperSynthesisRunner(): UpperSynthesisRunner {
+  return async (input) => {
+    const startedAt = Date.now();
+    const result = await withLLMSession(
+      (session) => session.generate(input.prompt, {
+        maxTokens: input.maxOutputTokens,
+        temperature: 0.2,
+      }),
+      { maxDuration: 10 * 60 * 1000, name: "upperSynthesis" },
+    );
+    if (result == null) {
+      throw new Error("upper_synthesis_llm_returned_null");
+    }
+    return {
+      text: result.text,
+      model: result.model,
+      durationMs: Math.max(0, Date.now() - startedAt),
+    };
+  };
+}
+
 function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
   if (value === undefined) return undefined;
   const s = String(value);
@@ -3565,6 +3592,27 @@ async function graphRagQuerySearch(
   if (maxDeepeningTargets != null && !upperDeepening) {
     throw new Error("--max-deepening-targets requires --upper-deepening");
   }
+  const upperSynthesis = values["upper-synthesis"] === true;
+  const maxSynthesisInputTokens = parsePositiveIntegerOption(
+    "--max-synthesis-input-tokens",
+    values["max-synthesis-input-tokens"],
+  );
+  const maxSynthesisOutputTokens = parsePositiveIntegerOption(
+    "--max-synthesis-output-tokens",
+    values["max-synthesis-output-tokens"],
+  );
+  if (
+    (maxSynthesisInputTokens != null || maxSynthesisOutputTokens != null) &&
+    !upperSynthesis
+  ) {
+    throw new Error(
+      "--max-synthesis-input-tokens and --max-synthesis-output-tokens " +
+        "require --upper-synthesis",
+    );
+  }
+  const upperSynthesisRunner = upperSynthesis
+    ? createCliUpperSynthesisRunner()
+    : undefined;
 
   const answer = await routeQuery({
     schemaVersion: SchemaVersion,
@@ -3715,6 +3763,12 @@ async function graphRagQuerySearch(
                   }
                   : undefined,
               },
+              synthesis: {
+                enabled: upperSynthesis,
+                maxInputTokens: maxSynthesisInputTokens,
+                maxOutputTokens: maxSynthesisOutputTokens,
+                runner: upperSynthesisRunner,
+              },
             }),
           );
         } catch (error) {
@@ -3795,6 +3849,12 @@ async function graphRagQuerySearch(
                     );
                   }
                   : undefined,
+              },
+              synthesis: {
+                enabled: upperSynthesis,
+                maxInputTokens: maxSynthesisInputTokens,
+                maxOutputTokens: maxSynthesisOutputTokens,
+                runner: upperSynthesisRunner,
               },
             }),
           );
@@ -4374,6 +4434,15 @@ function parseCLI() {
       "python-bin": { type: "string" },
       "upper-deepening": { type: "boolean", default: false },
       "max-deepening-targets": { type: "string" },
+      "upper-synthesis": { type: "boolean", default: false },
+      "max-synthesis-input-tokens": { type: "string" },
+      "max-synthesis-output-tokens": { type: "string" },
+      "book-id": { type: "string", multiple: true },
+      "member-bookshelf-id": { type: "string", multiple: true },
+      "policy-kind": { type: "string" },
+      "decided-by": { type: "string" },
+      "shelf-limit": { type: "string" },
+      "direct-book-limit": { type: "string" },
       "max-semantic-units": { type: "string" },
       "max-edges": { type: "string" },
       "max-reports-per-book": { type: "string" },
@@ -5000,6 +5069,9 @@ function showHelp(): void {
   console.log("  --python-bin <path>           - Python executable for GraphRAG bridge");
   console.log("  --upper-deepening             - Deepen selected upper-index evidence into member books");
   console.log("  --max-deepening-targets <n>   - Narrow upper deepening below package budget");
+  console.log("  --upper-synthesis             - Synthesize selected upper-index evidence with one LLM call");
+  console.log("  --max-synthesis-input-tokens <n>  - Narrow synthesis input below package budget");
+  console.log("  --max-synthesis-output-tokens <n> - Narrow synthesis output below package budget");
   console.log("");
   console.log("Multi-get options:");
   console.log("  -l <num>                   - Maximum lines per file");

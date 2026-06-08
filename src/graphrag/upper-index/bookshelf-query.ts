@@ -31,6 +31,12 @@ import {
   applyControlledDeepening,
   type ControlledDeepeningBookQuery,
 } from "./controlled-deepening.js";
+import {
+  UpperSynthesisDefaultMaxOutputTokens,
+  UpperSynthesisError,
+  applyUpperSynthesis,
+  type UpperSynthesisRunner,
+} from "./upper-synthesis.js";
 
 export type BookshelfQueryScopeErrorCode =
   | "upper_index_missing"
@@ -84,6 +90,12 @@ export type QueryBookshelfGraphInput = {
       bookIds: readonly string[],
     ) => Promise<GraphCapability[]>;
     runBookQuery?: ControlledDeepeningBookQuery;
+  };
+  synthesis?: {
+    enabled?: boolean;
+    maxInputTokens?: number;
+    maxOutputTokens?: number;
+    runner?: UpperSynthesisRunner;
   };
 };
 
@@ -418,6 +430,32 @@ export async function queryBookshelfGraph(
       },
     },
   });
+  let synthesizedResponse: GraphRagQueryResponse;
+  try {
+    synthesizedResponse = await applyUpperSynthesis({
+      enabled: input.synthesis?.enabled,
+      scopeKind: "bookshelf",
+      scopeId: scope.bookshelfId,
+      generation: scope.manifest.bookshelfIdentity.generation,
+      query: input.query,
+      method: input.method ?? "global",
+      upperResponse,
+      maxInputTokens: scope.manifest.fixedQueryBudget.maxInputTokens,
+      requestedMaxInputTokens: input.synthesis?.maxInputTokens,
+      maxOutputTokens: UpperSynthesisDefaultMaxOutputTokens,
+      requestedMaxOutputTokens: input.synthesis?.maxOutputTokens,
+      runner: input.synthesis?.runner,
+    });
+  } catch (error) {
+    if (error instanceof UpperSynthesisError) {
+      throw new BookshelfQueryScopeError(
+        error.code,
+        error.message,
+        error.diagnostics,
+      );
+    }
+    throw error;
+  }
   try {
     return await applyControlledDeepening({
       enabled: input.controlledDeepening?.enabled,
@@ -429,7 +467,7 @@ export async function queryBookshelfGraph(
       method: input.method ?? "global",
       responseType: input.responseType ?? "multiple paragraphs",
       communityLevel: input.communityLevel,
-      upperResponse,
+      upperResponse: synthesizedResponse,
       maxDeepeningTargets: scope.manifest.fixedQueryBudget.maxBooksForDeepening,
       requestedMaxDeepeningTargets: input.controlledDeepening?.maxTargets,
       loadBookCapabilities: input.controlledDeepening?.loadBookCapabilities,

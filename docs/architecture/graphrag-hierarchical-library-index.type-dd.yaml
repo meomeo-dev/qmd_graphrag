@@ -81,21 +81,34 @@ implementationGrounding:
     - catalog projection generated from query-ready bookshelf/library packages
       under graph_vault/catalog/**/projection.yaml, with package-local
       readiness proof retained as authority。
-    - package-root qmd bookshelf/library status/list/build/rebuild 管理命令；
-      status/list 仅读取上层包权威状态，build/rebuild 仅从 package-root
-      membership 调用现有上层 builder/validator 并发布 query-ready 包。
+    - package-root qmd bookshelf/library
+      status/list/build/rebuild/refresh-membership/repair 管理命令；
+      status/list 仅读取上层包权威状态，build/rebuild/repair 仅从
+      package-root membership 调用现有上层 builder/validator 并发布
+      query-ready 包，refresh-membership 只发布 queryReady=false 的
+      membership generation。
     - explicit --upper-deepening controlled deepening from selected upper
       evidence into bounded member single-book GraphRAG calls, with
       --max-deepening-targets only allowed to narrow the package budget。
+    - explicit --upper-synthesis LLM synthesis over selected upper semantic
+      units, with one bounded LLM call, package-local maxInputTokens,
+      fixed output cap, timing, evidence lineage and fail-closed budget errors。
   remainingCapabilities:
-    - LLM synthesis over selected upper semantic units。
+    - LLM-authored build-time community report synthesis remains future for
+      richer bookshelf/library derived reports.
+    - automatic scheduled repair and incremental rebuild planners remain future
+      beyond explicit refresh-membership and repair commands.
   implementationRule: >
-    已实现的书架/library 查询仅覆盖固定预算 community_reports report
-    search、显式受控单书下钻、证据回链、typed error 和 timing，权威读取已迁移到
-    graph_vault/bookshelves/** 与 graph_vault/library/** 上层包闭包。受控下钻默认关闭；
+    已实现的书架/library 查询覆盖固定预算 community_reports report
+    search、显式受控单书下钻、显式上层 LLM synthesis、证据回链、typed
+    error 和 timing，权威读取已迁移到 graph_vault/bookshelves/** 与
+    graph_vault/library/** 上层包闭包。受控下钻和 LLM synthesis 默认关闭；
     只有显式 `--upper-deepening` 才能从上层已选 evidence 中按
     maxBooksForDeepening 或 maxBookshelves 选择固定数量目标，并且
-    `--max-deepening-targets` 只能收窄不能放宽 package-local 固定预算。
+    `--max-deepening-targets` 只能收窄不能放宽 package-local 固定预算；
+    只有显式 `--upper-synthesis` 才能对已选上层 evidence 执行一次受限
+    LLM 调用，且 `--max-synthesis-input-tokens` 与
+    `--max-synthesis-output-tokens` 只能收窄不能放宽 package-local 固定预算。
     catalog projection 只能作为派生发现和路由视图；显式上层查询必须先校验
     package-local CURRENT、manifest、PUBLISH_READY、quality gate 和 checksum
     sidecar。后续实现必须继续以现有单书包和上层包 manifest 为权威边界，
@@ -1222,11 +1235,15 @@ pipelineIoContract:
       - library_graph_build
       - library scoped_query_execution fixed-budget report search
       - library scoped_query_execution explicit controlled deepening
+      - bookshelf scoped_query_execution explicit upper LLM synthesis
+      - library scoped_query_execution explicit upper LLM synthesis
       - catalog projection generated from query-ready bookshelf/library packages
-      - qmd bookshelf/library status/list/build/rebuild management commands
+      - qmd bookshelf/library
+        status/list/build/rebuild/refresh-membership/repair management commands
         over package roots
     remainingNewCapabilities:
-      - LLM synthesis over selected upper semantic units
+      - build-time LLM-authored bookshelf/library community report synthesis
+      - automatic scheduled repair and incremental rebuild planner
     rule: >
       alreadySupported 表示当前代码已有对应单书或 catalog 基础；
       packageRootImplementedStageTargets 表示已有真实运行目标和测试覆盖，并以
@@ -1235,17 +1252,23 @@ pipelineIoContract:
       尚未完成实现。bookshelf/library scoped_query_execution 当前覆盖
       package-root 固定预算 community_reports 检索、证据回链、timing 观测、
       显式 `--upper-deepening` 受控单书下钻、legacy catalog-only migration
-      typed error，以及无 catalog projection 的显式
+      typed error、显式 `--upper-synthesis` 上层 evidence LLM synthesis，
+      以及无 catalog projection 的显式
       上层包查询。catalog projection 生成已限定为从 query-ready 上层包派生的
       非权威 projection。bookshelf/library status/list 管理命令只读取
       package-root `CURRENT.json`、manifest、PUBLISH_READY、quality gate 和
       catalog projection 存在性，不触发构建，也不把 catalog projection 当作
       query-ready 权威。bookshelf/library build/rebuild 管理命令只消费既有
       package-root membership，调用已实现的上层 builder/validator 并重新发布
-      query-ready 包；显式上层下钻只使用上层 query 已选 evidence 和固定数量
-      member book GraphRAG 调用，默认关闭，不扫描全库。当前仍不包含
-      LLM synthesis、membership 创建、
-      自动 repair 或增量 refresh 管理生命周期。
+      query-ready 包；refresh-membership 只发布 queryReady=false 的 membership
+      generation；repair 读取当前 package-root membership，重新解析成员并
+      重建 query-ready 上层包。显式上层下钻只使用上层 query 已选 evidence
+      和固定数量 member book GraphRAG 调用，默认关闭，不扫描全库。显式
+      上层 synthesis 只消费已选上层 evidence，执行一次受限 LLM 调用，输出
+      budget 由请求体 max_output_tokens、prompt 指令和事后 typed budget
+      校验共同约束；prompt/completion/provider payload 不进入可发布索引。
+      当前仍不包含自动调度 repair、增量 rebuild planner 或 build-time
+      LLM-authored community report synthesis。
   stageFieldContract:
     requiredFields:
       - stageId
@@ -1789,8 +1812,10 @@ implementationGroundingReview:
       `--bookshelf-id`、`--library-id`、upper semantic unit index、
       BOOKSHELF_MANIFEST、LIBRARY_MANIFEST、CURRENT、PUBLISH_READY、
       package-local quality gate、legacy catalog-only migration typed error
-      和无 catalog projection 的显式查询；不得把这些能力继续扩展误写成
-      LLM synthesis、跨 scope 下钻或完整 library 管理命令已完成。
+      和无 catalog projection 的显式查询。implementation-turn_020 已补齐
+      显式 `--upper-synthesis`、refresh-membership 和 repair 管理命令；
+      仍不得把 build-time LLM-authored community report synthesis、自动调度
+      repair 或增量 rebuild planner 误写成已完成。
     requiredImplementationPosture: >
       实现必须优先在独立 upper-index 模块中迁移 package-root 读写边界，
       复用现有 hotplug validator、catalog projection、qmd index 和 GraphRAG
@@ -2001,9 +2026,66 @@ implementationGroundingReview:
         - real external provider single-book --graph-book-id success not executed
         - --upper-deepening uses fixture-tested and injectable provider paths in
           this turn; real external provider success remains separately blocked
-        - LLM synthesis remains future
-        - membership creation, automatic repair and incremental refresh
-          management lifecycle remains future
+    postImplementationTurn020LocalAdditions:
+      status: explicit_upper_synthesis_and_management_lifecycle_passed
+      report: >
+        docs/architecture/graphrag-hierarchical-library-index-audits/reports/implementation-turn-020-summary.md
+      auditResult: 3_agents_pass
+      completed:
+        - src/graphrag/upper-index/upper-synthesis.ts adds explicit default-off
+          upper LLM synthesis over selected upper evidence only.
+        - src/cli/qmd.ts adds --upper-synthesis,
+          --max-synthesis-input-tokens and --max-synthesis-output-tokens;
+          max options only narrow package-local fixed budgets.
+        - OpenAI Responses generate requests carry max_output_tokens, and the
+          synthesis prompt also states the active output token budget.
+        - synthesis output is sanitized; raw prompt, raw completion and
+          provider payload are not exposed in query response metadata or
+          publishable upper artifacts.
+        - runtime metrics include upper.llm_synthesis and one attempted LLM
+          request for successful synthesis.
+        - qmd bookshelf/library refresh-membership writes package-root
+          membership generations with queryReady=false.
+        - qmd bookshelf/library repair reads current package-root membership,
+          revalidates members and rebuilds query-ready packages without using
+          catalog projection as authority.
+      validation:
+        - npm run test:types passed after OpenAI Responses max_output_tokens
+          and upper synthesis prompt-budget hardening.
+        - test/graphrag-upper-synthesis.test.ts passed with bounded runner,
+          budget-exceeded, missing-runner and prompt redaction coverage.
+        - test/llm.test.ts OpenAI Responses focused tests passed, including
+          generate maxTokens to max_output_tokens request coverage.
+        - test/integrations/contracts.test.ts Provider contracts passed with
+          max_output_tokens schema coverage.
+        - real package smoke built audit-shelf-a from 3 published book
+          packages and audit-shelf-b from 3 published book packages under
+          graph_vault/bookshelves/**.
+        - real package smoke built audit-library from two published bookshelf
+          packages under graph_vault/library/**.
+        - explicit --bookshelf-id and --library-id queries succeeded with
+          catalog projection temporarily removed, proving package-root
+          authority.
+        - real provider --upper-synthesis smoke succeeded against
+          audit-library with --max-synthesis-output-tokens 512, timing and
+          upper.llm_synthesis present, and no prompt/provider payload in
+          stdout.
+        - deliberate --max-synthesis-output-tokens 200 provider smoke failed
+          closed with budget_exceeded_narrow_scope_required, proving narrowed
+          output budgets are enforced rather than silently widened.
+      implementationAudit:
+        run: implementation-turn_020
+        agentReports:
+          - docs/architecture/graphrag-hierarchical-library-index-audits/implementation-turn_020/agent-1/report.md
+          - docs/architecture/graphrag-hierarchical-library-index-audits/implementation-turn_020/agent-2/report.md
+          - docs/architecture/graphrag-hierarchical-library-index-audits/implementation-turn_020/agent-3/report.md
+        result: 3_agents_all_d01_to_d10_passed
+        verdict: PASS
+      futureCapabilities:
+        - build-time LLM-authored bookshelf/library community report synthesis
+          remains future.
+        - automatic scheduled repair and incremental rebuild planner remain
+          future beyond explicit refresh-membership and repair commands.
   groundingMatrix:
     - designStage: book_package_publish
       groundingStatus: already_supported
@@ -2227,14 +2309,17 @@ implementationGroundingReview:
         - --query-method
         - --timing
       missingImplementation:
-        - LLM synthesis over selected upper semantic units
+        - build-time LLM-authored bookshelf/library community report synthesis
+        - automatic scheduled repair and incremental rebuild planner
       implementedCode:
         - src/graphrag/upper-index/bookshelf-query.ts
         - src/graphrag/upper-index/library-query.ts
         - src/graphrag/upper-index/upper-query-capability.ts
         - src/graphrag/upper-index/controlled-deepening.ts
+        - src/graphrag/upper-index/upper-synthesis.ts
         - src/cli/qmd.ts
         - test/graphrag-controlled-deepening.test.ts
+        - test/graphrag-upper-synthesis.test.ts
         - test/graphrag-bookshelf-graph.test.ts
         - test/graphrag-library-graph.test.ts
       implementedQueryBehavior:
@@ -2247,6 +2332,12 @@ implementationGroundingReview:
         - evidence lineage through evidence_map
         - explicit --upper-deepening routes selected upper evidence into
           bounded member book GraphRAG calls
+        - explicit --upper-synthesis runs one bounded LLM call over selected
+          upper evidence only
+        - --max-synthesis-input-tokens and --max-synthesis-output-tokens
+          reject attempts to exceed package fixed budget
+        - upper synthesis records upper.llm_synthesis timing/runtime metrics
+          without exposing raw prompt, raw completion or provider payload
         - --max-deepening-targets rejects attempts to exceed package fixed budget
         - controlled deepening fails closed when a selected member book
           graph_query capability is missing
@@ -2257,10 +2348,12 @@ implementationGroundingReview:
         GraphRAG 查询，package-root `--bookshelf-id` 与 `--library-id` 已支持
         只读取已发布 upper package current 的固定预算 report search，并可通过
         显式 `--upper-deepening` 对已选 evidence 中的固定数量 member books
-        调用单书 GraphRAG；查询返回 typed error、timing 和 evidence lineage。
+        调用单书 GraphRAG；也可通过显式 `--upper-synthesis` 对已选上层
+        evidence 执行一次受限 LLM synthesis。查询返回 typed error、timing 和
+        evidence lineage。
         显式查询不依赖 catalog
         projection；query-ready 上层包发布后会重建非权威 catalog projection。
-        LLM synthesis 仍未实现。
+        build-time LLM-authored community report synthesis 仍未实现。
       firstRunnableTarget: >
         新一版 --bookshelf-id 与 --library-id 查询必须以已发布 package-root
         upper index current 为唯一输入，执行固定预算的 upper-level
@@ -2269,8 +2362,10 @@ implementationGroundingReview:
         contentHash、community report 或 text_unit。该目标不在交互路径构建索引，
         不扫描全部单书 community_reports。显式 `--upper-deepening` 只在该
         upper query 已选 evidence 上按 fixed budget 调用单书 GraphRAG；
-        默认 synthesisLlMCallCap 为 0，不调用未受限 LLM synthesis，输出标准
-        UnifiedAnswer 与 bounded timing。
+        默认 synthesisLlMCallCap 为 0，不调用未受限 LLM synthesis。显式
+        `--upper-synthesis` 的 LLM call cap 为 1，且输入和输出 token 预算只能
+        收窄 package-local fixedQueryBudget。输出标准 UnifiedAnswer 与 bounded
+        timing。
   riskAssessment:
     - id: risk_upper_scope_assumed_existing
       severity: high
@@ -2338,8 +2433,11 @@ implementationGroundingReview:
         - no LLM suggestion promotion without user acceptance record
         - explicit --upper-deepening controlled deepening into selected
           member books under maxBooksForDeepening
+        - explicit --upper-synthesis over selected bookshelf semantic evidence
+          with one bounded LLM call
       remaining:
-        - LLM synthesis over selected bookshelf semantic units
+        - build-time LLM-authored bookshelf community report synthesis
+        - automatic scheduled repair and incremental rebuild planner
     phase3_libraryBuild:
       status: package_root_minimum_implemented
       includes:
@@ -2348,14 +2446,16 @@ implementationGroundingReview:
         - library quality gate
         - fixed-budget library query
         - catalog projection generated from query-ready library package
-        - bookshelf/library status/list/build/rebuild management commands over
-          package roots
+        - bookshelf/library
+          status/list/build/rebuild/refresh-membership/repair management
+          commands over package roots
         - explicit --upper-deepening controlled deepening from selected
           library evidence into member books under maxBookshelves
+        - explicit --upper-synthesis over selected library semantic evidence
+          with one bounded LLM call
       remaining:
-        - LLM synthesis over selected library semantic units
-        - membership creation, automatic repair and incremental refresh
-          management command lifecycle
+        - build-time LLM-authored library community report synthesis
+        - automatic scheduled repair and incremental rebuild planner
   designAdjustment:
     required: true
     completed: true

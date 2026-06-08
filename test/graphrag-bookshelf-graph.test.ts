@@ -753,6 +753,42 @@ describe("GraphRAG bookshelf graph build", () => {
           "bookshelves/architecture-core/generations/" +
             `${manifest.bookshelfIdentity.generation}/community_reports.parquet`,
         );
+        const synthesized = await queryBookshelfGraph({
+          graphVault: stateRoot,
+          bookshelfId: "architecture-core",
+          query: "What is architecture testing?",
+          method: "global",
+          synthesis: {
+            enabled: true,
+            maxInputTokens: manifest.fixedQueryBudget.maxInputTokens,
+            maxOutputTokens: 128,
+            runner: async (input) => {
+              expect(input.scopeKind).toBe("bookshelf");
+              expect(input.scopeId).toBe("architecture-core");
+              expect(input.evidence.length).toBeGreaterThan(0);
+              expect(input.evidence.length).toBeLessThanOrEqual(
+                manifest.fixedQueryBudget.maxSemanticUnits,
+              );
+              return {
+                text: `Synthesized bookshelf answer ${input.evidence[0]?.evidenceId}`,
+                model: "deterministic-upper-synthesis",
+                promptTokens: input.estimatedInputTokens,
+                completionTokens: 11,
+                durationMs: 5,
+              };
+            },
+          },
+        });
+        expect(synthesized.responseText).toContain(
+          "Synthesized bookshelf answer",
+        );
+        expect(synthesized.providerDetail?.runtimeMetrics?.aggregate
+          .attemptedRequestCount).toBe(1);
+        expect(synthesized.providerDetail?.runtimeMetrics?.stages.map(
+          (stage) => stage.name,
+        )).toContain("upper.llm_synthesis");
+        expect(synthesized.evidence[0]?.metadata?.upperSynthesis).toBe(true);
+        expect(JSON.stringify(synthesized)).not.toContain("Answer the user query");
 
         const catalogProjectionRoot = join(
           stateRoot,

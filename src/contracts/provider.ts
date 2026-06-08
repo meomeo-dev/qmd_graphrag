@@ -85,6 +85,7 @@ export const OpenAIResponsesRequestSchema = z.object({
     JsonValueSchema,
   ]),
   stream: z.literal(true),
+  max_output_tokens: z.number().int().positive().optional(),
   reasoning: OpenAIResponsesReasoningSchema.optional(),
   text: z.object({
     format: OpenAIStructuredOutputSchemaSchema,

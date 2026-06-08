@@ -1333,6 +1333,7 @@ describe("Provider contracts", () => {
       model: "gpt-5.4",
       input: "answer with JSON",
       stream: true,
+      max_output_tokens: 256,
       reasoning: { effort: "medium" },
       text: {
         format: {
@@ -1356,6 +1357,7 @@ describe("Provider contracts", () => {
     });
 
     expect(request.stream).toBe(true);
+    expect(request.max_output_tokens).toBe(256);
     expect(response.outputText).toContain("ok");
   });
 
