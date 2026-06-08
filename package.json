@@ -1,6 +1,6 @@
 {
   "name": "qmd_graphrag",
-  "version": "2.5.1",
+  "version": "2.5.2",
   "description": "A typed QMD fork with GraphRAG and DSPy integration scaffolding",
   "type": "module",
   "main": "dist/index.js",

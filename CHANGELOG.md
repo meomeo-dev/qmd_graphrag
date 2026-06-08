@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.5.2] - 2026-06-08
+
 ### Changes
 
 - GraphRAG: add package-root bookshelf and library upper index workflows,
