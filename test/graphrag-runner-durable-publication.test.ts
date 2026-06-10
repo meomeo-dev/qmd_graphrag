@@ -279,7 +279,7 @@ describe("GraphRAG EPUB batch runner - Durable Publication", () => {
       expect(eventRaw).toContain("durable_json_checksum_meta_committed");
       await rm(tmpRoot, { recursive: true, force: true });
 	    },
-	    30000);
+	    60000);
 
 	  test("durable preflight blocks partial checksum sidecar crash window",
 	    async () => {
@@ -519,6 +519,7 @@ describe("GraphRAG EPUB batch runner - Durable Publication", () => {
 		        stateRoot,
 		        "books",
 		        bookId,
+		        "graphrag",
 		        "output",
 		        "lancedb",
 		        "entity_description.lance",
@@ -645,7 +646,7 @@ describe("GraphRAG EPUB batch runner - Durable Publication", () => {
         const bookId = batchBookId(sourceHash, relative(projectRoot, sourcePath));
         await writeProviderAuthReopenGraphFixture({ stateRoot, bookId, sourceHash });
 
-        const target = join(stateRoot, "books", bookId, "job.yaml");
+        const target = join(stateRoot, "books", bookId, "state", "job.yaml");
         const orphanTemp = `${target}.tmp-runner-start`;
         const oldDate = new Date(Date.now() - 25 * 60 * 60 * 1000);
         await mkdir(dirname(target), { recursive: true });

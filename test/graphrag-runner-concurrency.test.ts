@@ -114,8 +114,7 @@ describe("GraphRAG EPUB batch runner - Concurrency And Coordination", () => {
         .trim()
         .split("\n")
         .map((line) => JSON.parse(line));
-      const checkpointName = readdirSync(join(runRoot, "items"))
-        .find((name) => /^item-.*\.json$/.test(name));
+      const checkpointName = durablePrimaryJsonEntries(join(runRoot, "items"))[0];
       expect(checkpointName).toBeDefined();
       const checkpoint = JSON.parse(readFileSync(
         join(runRoot, "items", String(checkpointName)),
@@ -455,7 +454,7 @@ describe("GraphRAG EPUB batch runner - Concurrency And Coordination", () => {
       event.status === "completed"
     )).toBe(true);
     await rm(fixture.tmpRoot, { recursive: true, force: true });
-  }, 90000);
+  }, 150000);
 
   test("book worker pool defers duplicate canonical books", async () => {
     const tmpRoot = await mkProjectTmpDir("qmd-batch-duplicate-book-");

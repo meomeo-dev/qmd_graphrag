@@ -1,7 +1,7 @@
 import { expect } from "vitest";
 import { mkdir, mkdtemp, rm, writeFile } from "fs/promises";
 import { existsSync, readFileSync, readdirSync } from "fs";
-import { dirname, join, relative } from "path";
+import { delimiter, dirname, join, relative } from "path";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
 import { createHash } from "crypto";
@@ -99,6 +99,20 @@ export function isDurableAuxiliaryJsonEntry(entry: string): boolean {
 export function durablePrimaryJsonEntries(path: string): string[] {
   return readdirSync(path)
     .filter((name) => name.endsWith(".json") && !isDurableAuxiliaryJsonEntry(name));
+}
+
+export function nodeScriptBin(): string {
+  if (!process.versions.bun) return process.execPath;
+  const names = process.platform === "win32"
+    ? ["node.exe", "node.cmd", "node"]
+    : ["node"];
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    for (const name of names) {
+      const candidate = join(dir, name);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return "node";
 }
 
 export async function writeDurableTextFixture(
@@ -203,6 +217,16 @@ export async function writeQmdBuildFixture(input: {
       createdAt: "2026-05-23T00:00:00.000Z",
     },
   );
+  await ensureBookScopedQmdIndex({
+    stateRoot: input.stateRoot,
+    bookId: input.bookId,
+    normalizedPath: input.normalizedPath,
+    normalizedContentHash,
+    sourceQmdIndexPath: qmdIndexPath,
+    rootPath: projectRoot,
+    now: () => "2026-05-23T00:00:00.000Z",
+    toolVersion: "test-qmd-build-fixture",
+  });
 }
 
 export async function writeBookScopedQmdIndexFixture(input: {
@@ -340,6 +364,20 @@ export async function writeProviderAuthReopenGraphFixture(input: {
         community_report: "run-community-report",
         embed: "run-embed",
       },
+    },
+  );
+  await writeDurableJsonFixture(
+    join(outputDir, "qmd_graph_text_unit_identity.json"),
+    {
+      schemaVersion: SchemaVersion,
+      bookId: input.bookId,
+      sourceId: `sha256:${input.sourceHash}`,
+      sourceHash: input.sourceHash,
+      documentId,
+      contentHash,
+      normalizedPath: `books/${input.bookId}/input/book.md`,
+      graphDocumentId: `graph-doc-${input.bookId}`,
+      graphTextUnitIds: [`tu-${input.bookId}`],
     },
   );
   await mkdir(join(input.stateRoot, "catalog"), { recursive: true });
@@ -632,7 +670,7 @@ export async function runBatchStatusJson(input: {
   args?: string[];
 }): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   return new Promise((resolveResult) => {
-    const proc = spawn(process.execPath, [
+    const proc = spawn(nodeScriptBin(), [
       join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
       "--source-dir",
       input.sourceDir,
@@ -674,7 +712,7 @@ export async function runBatchMigrateOnly(input: {
   env?: Record<string, string>;
 }): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   return new Promise((resolveResult) => {
-    const proc = spawn(process.execPath, [
+    const proc = spawn(nodeScriptBin(), [
       join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
       "--source-dir",
       input.sourceDir,
@@ -1136,7 +1174,7 @@ export async function runParallelRunnerFixture(input: {
     stderr: string;
     exitCode: number | null;
   }>((resolveResult) => {
-    const proc = spawn(process.execPath, [
+    const proc = spawn(nodeScriptBin(), [
       join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
       "--source-dir",
       sourceDir,
@@ -1247,7 +1285,7 @@ export function runBatchWorkflow(input: {
   return new Promise((resolveResult) => {
     let settled = false;
     const workflowTimeoutMs = input.timeoutMs ?? 60_000;
-    const proc = spawn(process.execPath, [
+    const proc = spawn(nodeScriptBin(), [
       join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
       "--source-dir", input.sourceDir,
       "--state-root", input.stateRoot,

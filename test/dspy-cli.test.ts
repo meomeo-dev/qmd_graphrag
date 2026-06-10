@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -9,18 +9,15 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 
 import YAML from "yaml";
 import { afterEach, describe, expect, test } from "vitest";
 
 function qmdCommandArgs(args: string[]): { bin: string; args: string[] } {
   const cliPath = join(process.cwd(), "src/cli/qmd.ts");
-  if (process.versions.bun) {
-    return { bin: process.execPath, args: [cliPath, ...args] };
-  }
   return {
-    bin: process.execPath,
+    bin: nodeScriptBin(),
     args: [
       join(process.cwd(), "node_modules/tsx/dist/cli.mjs"),
       cliPath,
@@ -29,7 +26,22 @@ function qmdCommandArgs(args: string[]): { bin: string; args: string[] } {
   };
 }
 
+function nodeScriptBin(): string {
+  if (!process.versions.bun) return process.execPath;
+  const names = process.platform === "win32"
+    ? ["node.exe", "node.cmd", "node"]
+    : ["node"];
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    for (const name of names) {
+      const candidate = join(dir, name);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return "node";
+}
+
 const roots: string[] = [];
+const QMD_PROCESS_TIMEOUT_MS = 45_000;
 
 function tempProject(): string {
   const root = mkdtempSync(join(tmpdir(), "qmd-dspy-cli-"));
@@ -43,7 +55,14 @@ function qmdProcess(
   root: string,
   args: string[],
   env: Record<string, string | undefined> = {},
-) {
+): Promise<{
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  error?: Error;
+  signal?: NodeJS.Signals | null;
+  timedOut?: boolean;
+}> {
   const { bin, args: commandArgs } = qmdCommandArgs(args);
   const childEnv: NodeJS.ProcessEnv = {
     ...process.env,
@@ -55,22 +74,76 @@ function qmdProcess(
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined) delete childEnv[key];
   }
-  return spawnSync(bin, commandArgs, {
-    cwd: root,
-    encoding: "utf-8",
-    env: childEnv,
+
+  return new Promise((resolve) => {
+    const child = spawn(bin, commandArgs, {
+      cwd: root,
+      env: childEnv,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    let spawnError: Error | undefined;
+
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+
+    const killTimer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      const forceKillTimer = setTimeout(() => {
+        if (!settled) child.kill("SIGKILL");
+      }, 2_000);
+      if (typeof forceKillTimer.unref === "function") forceKillTimer.unref();
+    }, QMD_PROCESS_TIMEOUT_MS);
+    if (typeof killTimer.unref === "function") killTimer.unref();
+
+    child.on("error", (error) => {
+      spawnError = error;
+    });
+    child.on("close", (status, signal) => {
+      settled = true;
+      clearTimeout(killTimer);
+      resolve({
+        status,
+        stdout,
+        stderr,
+        error: spawnError,
+        signal,
+        timedOut,
+      });
+    });
   });
 }
 
-function runQmd(
+async function runQmd(
   root: string,
   args: string[],
   env: Record<string, string | undefined> = {},
-): string {
-  const result = qmdProcess(root, args, env);
+): Promise<string> {
+  const result = await qmdProcess(root, args, env);
   if (result.status !== 0) {
+    const command = ["qmd", ...args].join(" ");
+    let failure = `exit status ${result.status}`;
+    if (result.signal) failure += ` signal ${result.signal}`;
+    if (result.timedOut) {
+      failure = `timed out after ${QMD_PROCESS_TIMEOUT_MS}ms`;
+      if (result.signal) failure += ` signal ${result.signal}`;
+    }
+    if (result.error != null) {
+      failure = `${result.error.name}: ${result.error.message}`;
+    }
     throw new Error(
-      `qmd failed (${result.status})\nSTDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}`,
+      `qmd failed (${failure}) for ${command}\n` +
+        `STDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}`,
     );
   }
   return result.stdout;
@@ -92,9 +165,9 @@ function writeExpansionRecords(root: string): string {
   return recordsPath;
 }
 
-function promoteImportedPolicy(root: string, graphVault = "graph_vault") {
+async function promoteImportedPolicy(root: string, graphVault = "graph_vault") {
   const recordsPath = writeExpansionRecords(root);
-  const imported = JSON.parse(runQmd(root, [
+  const imported = JSON.parse(await runQmd(root, [
     "dspy",
     "import-expansion-records",
     "--records",
@@ -102,7 +175,7 @@ function promoteImportedPolicy(root: string, graphVault = "graph_vault") {
     "--graph-vault",
     graphVault,
   ]));
-  const report = JSON.parse(runQmd(root, [
+  const report = JSON.parse(await runQmd(root, [
     "dspy",
     "evaluate-expansion-policy",
     "--artifact",
@@ -110,7 +183,7 @@ function promoteImportedPolicy(root: string, graphVault = "graph_vault") {
     "--graph-vault",
     graphVault,
   ]));
-  runQmd(root, [
+  await runQmd(root, [
     "dspy",
     "promote-expansion-policy",
     "--artifact",
@@ -130,7 +203,7 @@ afterEach(() => {
 });
 
 describe("qmd dspy CLI", () => {
-  test("loads project .env before running CLI commands", () => {
+  test("loads project .env before running CLI commands", async () => {
     const root = tempProject();
     writeFileSync(join(root, ".env"), "QMD_DSPY_DOTENV_TEST=loaded-from-dotenv\n");
     const trainsetPath = join(root, "train.jsonl");
@@ -160,7 +233,7 @@ process.stdout.write(JSON.stringify({
 `);
     chmodSync(fakePython, 0o755);
 
-    const output = JSON.parse(runQmd(root, [
+    const output = JSON.parse(await runQmd(root, [
       "dspy",
       "optimize-query-prompt",
       "--trainset",
@@ -174,7 +247,8 @@ process.stdout.write(JSON.stringify({
     expect(output.runPath).toMatch(/^dspy\/runs\/.*\/run.yaml$/);
   });
 
-  test("runs optimize-query-prompt through the CLI bridge with a fake python", () => {
+  test("runs optimize-query-prompt through the CLI bridge with a fake python",
+    async () => {
     const root = tempProject();
     const trainsetPath = join(root, "train.jsonl");
     writeFileSync(trainsetPath, JSON.stringify({
@@ -216,7 +290,7 @@ process.stdout.write(JSON.stringify({
 `);
     chmodSync(fakePython, 0o755);
 
-    const output = JSON.parse(runQmd(root, [
+    const output = JSON.parse(await runQmd(root, [
       "dspy",
       "optimize-query-prompt",
       "--trainset",
@@ -233,7 +307,8 @@ process.stdout.write(JSON.stringify({
     expect(existsSync(join(root, "graph_vault", output.artifactPath))).toBe(true);
   });
 
-  test("registers metric and dataset registries used by optimize and evaluate", () => {
+  test("registers metric and dataset registries used by optimize and evaluate",
+    async () => {
     const root = tempProject();
     const trainsetPath = join(root, "train.jsonl");
     const valsetPath = join(root, "val.jsonl");
@@ -267,7 +342,7 @@ process.stdout.write(JSON.stringify({
 `);
     chmodSync(fakePython, 0o755);
 
-    const metric = JSON.parse(runQmd(root, [
+    const metric = JSON.parse(await runQmd(root, [
       "dspy",
       "register-metric-spec",
       "--metric",
@@ -279,7 +354,7 @@ process.stdout.write(JSON.stringify({
       "--graph-vault",
       "graph_vault",
     ]));
-    const dataset = JSON.parse(runQmd(root, [
+    const dataset = JSON.parse(await runQmd(root, [
       "dspy",
       "register-evaluation-dataset",
       "--dataset",
@@ -291,7 +366,7 @@ process.stdout.write(JSON.stringify({
       "--graph-vault",
       "graph_vault",
     ]));
-    const output = JSON.parse(runQmd(root, [
+    const output = JSON.parse(await runQmd(root, [
       "dspy",
       "optimize-query-prompt",
       "--dataset",
@@ -303,7 +378,7 @@ process.stdout.write(JSON.stringify({
       "--graph-vault",
       "graph_vault",
     ]));
-    const report = JSON.parse(runQmd(root, [
+    const report = JSON.parse(await runQmd(root, [
       "dspy",
       "evaluate-expansion-policy",
       "--artifact",
@@ -325,7 +400,7 @@ process.stdout.write(JSON.stringify({
     expect(report.metrics.metric_max_expansion_items).toBe(3);
   });
 
-  test("imports, evaluates, promotes, disables, and rollbacks a policy", () => {
+  test("imports, evaluates, promotes, disables, and rollbacks a policy", async () => {
     const root = tempProject();
     const recordsPath = join(root, "records.jsonl");
     writeFileSync(
@@ -340,7 +415,7 @@ process.stdout.write(JSON.stringify({
     );
 
     const graphVault = "graph_vault";
-    const importOutput = JSON.parse(runQmd(root, [
+    const importOutput = JSON.parse(await runQmd(root, [
       "dspy",
       "import-expansion-records",
       "--records",
@@ -351,7 +426,7 @@ process.stdout.write(JSON.stringify({
     expect(importOutput.artifactPath).toMatch(/^dspy\/artifacts\//);
     expect(existsSync(join(root, graphVault, importOutput.artifactPath))).toBe(true);
 
-    const report = JSON.parse(runQmd(root, [
+    const report = JSON.parse(await runQmd(root, [
       "dspy",
       "evaluate-expansion-policy",
       "--artifact",
@@ -363,7 +438,7 @@ process.stdout.write(JSON.stringify({
     expect(report.promotability).toBe("promotable");
 
     const reportPath = `dspy/reports/${report.reportId}.yaml`;
-    const decision = JSON.parse(runQmd(root, [
+    const decision = JSON.parse(await runQmd(root, [
       "dspy",
       "promote-expansion-policy",
       "--artifact",
@@ -385,7 +460,7 @@ process.stdout.write(JSON.stringify({
       strict_schema: true,
     });
 
-    const status = JSON.parse(runQmd(root, [
+    const status = JSON.parse(await runQmd(root, [
       "dspy",
       "status",
       "--graph-vault",
@@ -394,7 +469,7 @@ process.stdout.write(JSON.stringify({
     expect(status.pointer.provider).toBe("dspy");
     expect(status.pointer.active).toBe(true);
 
-    const disabled = JSON.parse(runQmd(root, [
+    const disabled = JSON.parse(await runQmd(root, [
       "dspy",
       "disable-expansion-policy",
       "--graph-vault",
@@ -403,7 +478,7 @@ process.stdout.write(JSON.stringify({
     expect(disabled.active).toBe(false);
     expect(readLocalConfig(root).query.expansion_policy.provider).toBe("builtin");
 
-    const rolledBack = JSON.parse(runQmd(root, [
+    const rolledBack = JSON.parse(await runQmd(root, [
       "dspy",
       "rollback-expansion-policy",
       "--graph-vault",
@@ -418,7 +493,7 @@ process.stdout.write(JSON.stringify({
     });
   });
 
-  test("writes portable policy_ref for nested graph_vault override", () => {
+  test("writes portable policy_ref for nested graph_vault override", async () => {
     const root = tempProject();
     const recordsPath = join(root, "records.jsonl");
     writeFileSync(
@@ -429,7 +504,7 @@ process.stdout.write(JSON.stringify({
       }) + "\n",
     );
     const graphVault = join("vaults", "graph_vault");
-    const imported = JSON.parse(runQmd(root, [
+    const imported = JSON.parse(await runQmd(root, [
       "dspy",
       "import-expansion-records",
       "--records",
@@ -437,7 +512,7 @@ process.stdout.write(JSON.stringify({
       "--graph-vault",
       graphVault,
     ]));
-    const report = JSON.parse(runQmd(root, [
+    const report = JSON.parse(await runQmd(root, [
       "dspy",
       "evaluate-expansion-policy",
       "--artifact",
@@ -446,7 +521,7 @@ process.stdout.write(JSON.stringify({
       graphVault,
     ]));
 
-    runQmd(root, [
+    await runQmd(root, [
       "dspy",
       "promote-expansion-policy",
       "--artifact",
@@ -462,7 +537,7 @@ process.stdout.write(JSON.stringify({
       "graph_vault/dspy/policies/query-expansion/current.yaml",
     );
 
-    const status = JSON.parse(runQmd(root, [
+    const status = JSON.parse(await runQmd(root, [
       "dspy",
       "status",
       "--graph-vault",
@@ -471,10 +546,10 @@ process.stdout.write(JSON.stringify({
     expect(status.pointer.active).toBe(true);
   });
 
-  test("restores pointer when promote config write fails", () => {
+  test("restores pointer when promote config write fails", async () => {
     const root = tempProject();
     const recordsPath = writeExpansionRecords(root);
-    const imported = JSON.parse(runQmd(root, [
+    const imported = JSON.parse(await runQmd(root, [
       "dspy",
       "import-expansion-records",
       "--records",
@@ -482,7 +557,7 @@ process.stdout.write(JSON.stringify({
       "--graph-vault",
       "graph_vault",
     ]));
-    const report = JSON.parse(runQmd(root, [
+    const report = JSON.parse(await runQmd(root, [
       "dspy",
       "evaluate-expansion-policy",
       "--artifact",
@@ -491,7 +566,7 @@ process.stdout.write(JSON.stringify({
       "graph_vault",
     ]));
 
-    const failed = qmdProcess(root, [
+    const failed = await qmdProcess(root, [
       "dspy",
       "promote-expansion-policy",
       "--artifact",
@@ -503,7 +578,7 @@ process.stdout.write(JSON.stringify({
     ], { QMD_TEST_FAIL_DSPY_CONFIG_WRITE: "1" });
 
     expect(failed.status).not.toBe(0);
-    const status = JSON.parse(runQmd(root, [
+    const status = JSON.parse(await runQmd(root, [
       "dspy",
       "status",
       "--graph-vault",
@@ -512,11 +587,11 @@ process.stdout.write(JSON.stringify({
     expect(status.pointer).toBeNull();
   });
 
-  test("restores pointer when disable config write fails", () => {
+  test("restores pointer when disable config write fails", async () => {
     const root = tempProject();
-    promoteImportedPolicy(root);
+    await promoteImportedPolicy(root);
 
-    const failed = qmdProcess(root, [
+    const failed = await qmdProcess(root, [
       "dspy",
       "disable-expansion-policy",
       "--graph-vault",
@@ -524,7 +599,7 @@ process.stdout.write(JSON.stringify({
     ], { QMD_TEST_FAIL_DSPY_CONFIG_WRITE: "1" });
 
     expect(failed.status).not.toBe(0);
-    const status = JSON.parse(runQmd(root, [
+    const status = JSON.parse(await runQmd(root, [
       "dspy",
       "status",
       "--graph-vault",
@@ -535,10 +610,10 @@ process.stdout.write(JSON.stringify({
     expect(readLocalConfig(root).query.expansion_policy.provider).toBe("dspy");
   });
 
-  test("restores pointer when rollback config write fails", () => {
+  test("restores pointer when rollback config write fails", async () => {
     const root = tempProject();
-    promoteImportedPolicy(root);
-    runQmd(root, [
+    await promoteImportedPolicy(root);
+    await runQmd(root, [
       "dspy",
       "disable-expansion-policy",
       "--graph-vault",
@@ -546,7 +621,7 @@ process.stdout.write(JSON.stringify({
     ]);
     expect(readLocalConfig(root).query.expansion_policy.provider).toBe("builtin");
 
-    const failed = qmdProcess(root, [
+    const failed = await qmdProcess(root, [
       "dspy",
       "rollback-expansion-policy",
       "--graph-vault",
@@ -554,7 +629,7 @@ process.stdout.write(JSON.stringify({
     ], { QMD_TEST_FAIL_DSPY_CONFIG_WRITE: "1" });
 
     expect(failed.status).not.toBe(0);
-    const status = JSON.parse(runQmd(root, [
+    const status = JSON.parse(await runQmd(root, [
       "dspy",
       "status",
       "--graph-vault",

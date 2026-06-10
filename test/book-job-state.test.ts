@@ -59,6 +59,10 @@ async function createFixtureDir(): Promise<string> {
   return mkdtemp(join(tmpdir(), "qmd-graphrag-book-state-"));
 }
 
+async function expectPathAccessible(path: string): Promise<void> {
+  await expect(access(path).then(() => true)).resolves.toBe(true);
+}
+
 async function writeCompleteLanceDbFixture(root: string): Promise<void> {
   for (const tableName of [
     "entity_description.lance",
@@ -309,7 +313,8 @@ describe("FileBookJobStateRepository", () => {
   test("registers a book and persists catalog entry", async () => {
     const root = await createFixtureDir();
     try {
-      const repo = new FileBookJobStateRepository(join(root, "graph_vault"));
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
       const sourcePath = join(root, "book.epub");
       await writeFile(sourcePath, "fixture epub content", "utf8");
 
@@ -371,7 +376,12 @@ describe("FileBookJobStateRepository", () => {
         "graphrag-normalized-markdown-v1",
       );
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await rm(root, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 50,
+      });
     }
   });
 
@@ -424,7 +434,12 @@ describe("FileBookJobStateRepository", () => {
       expect(identityCatalog.items.map((item) => item.canonicalBookId).sort())
         .toEqual(expectedBookIds);
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await rm(root, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 50,
+      });
     }
   });
 
@@ -524,7 +539,7 @@ describe("FileBookJobStateRepository", () => {
       await expect(readJsonFileDurable(targetPath)).resolves.toMatchObject({
         value: 2,
       });
-      await expect(access(targetPath)).resolves.toBeUndefined();
+      await expectPathAccessible(targetPath);
       const staleMetaEntries = await readdir(dirname(targetPath));
       expect(staleMetaEntries.filter((entry) =>
         entry.startsWith("checkpoint.json.corrupt-")
@@ -614,7 +629,7 @@ describe("FileBookJobStateRepository", () => {
           repairAllowed: true,
         }),
       } satisfies Partial<DurableStateError>);
-      await expect(access(targetPath)).resolves.toBeUndefined();
+      await expectPathAccessible(targetPath);
     } finally {
       if (previousHooks == null) delete process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS;
       else process.env.QMD_GRAPHRAG_ENABLE_TEST_HOOKS = previousHooks;
@@ -884,13 +899,11 @@ describe("FileBookJobStateRepository", () => {
       await expect(readJsonFileDurable(targetPath)).resolves.toMatchObject({
         value: 1,
       });
-      await expect(access(ownerlessTemp)).resolves.toBeUndefined();
-      await expect(access(missingCreatedAtTemp)).resolves.toBeUndefined();
-      await expect(access(`${missingCreatedAtTemp}.owner.json`))
-        .resolves.toBeUndefined();
-      await expect(access(remoteOwnerTemp)).resolves.toBeUndefined();
-      await expect(access(`${remoteOwnerTemp}.owner.json`))
-        .resolves.toBeUndefined();
+      await expectPathAccessible(ownerlessTemp);
+      await expectPathAccessible(missingCreatedAtTemp);
+      await expectPathAccessible(`${missingCreatedAtTemp}.owner.json`);
+      await expectPathAccessible(remoteOwnerTemp);
+      await expectPathAccessible(`${remoteOwnerTemp}.owner.json`);
       await expect(access(expiredLeaseTemp)).rejects.toThrow();
       await expect(access(`${expiredLeaseTemp}.owner.json`)).rejects.toThrow();
       const recoveryLog = await readFile(
@@ -2058,7 +2071,7 @@ describe("FileBookJobStateRepository", () => {
       await expect(repo.getBookJob(job.bookId)).resolves.toMatchObject({
         bookId: job.bookId,
       });
-      await expect(access(checksumPath)).resolves.toBeUndefined();
+      await expectPathAccessible(checksumPath);
 
       await writeFile(checksumPath, `${"0".repeat(64)}\n`, "utf8");
       await writeFile(
@@ -2102,7 +2115,7 @@ describe("FileBookJobStateRepository", () => {
       await expect(validateLanceDbDirectory(lancedbPath)).resolves.toMatchObject({
         valid: true,
       });
-      await expect(access(checksumPath)).resolves.toBeUndefined();
+      await expectPathAccessible(checksumPath);
 
       await writeFile(checksumPath, `${"0".repeat(64)}\n`, "utf8");
       await writeFile(
@@ -2267,7 +2280,8 @@ describe("FileBookJobStateRepository", () => {
   test("deduplicates high-cost artifacts without path or run locators", async () => {
     const root = await createFixtureDir();
     try {
-      const repo = new FileBookJobStateRepository(join(root, "graph_vault"));
+      const graphVault = join(root, "graph_vault");
+      const repo = new FileBookJobStateRepository(graphVault);
       const sourcePath = join(root, "book.epub");
       await writeFile(sourcePath, "fixture epub content", "utf8");
 
@@ -2278,10 +2292,11 @@ describe("FileBookJobStateRepository", () => {
         modelFingerprint: "model-1",
       });
 
-      const firstPath = join(root, "graph_vault", "output-a", "entities.parquet");
-      const secondPath = join(root, "graph_vault", "output-b", "entities.parquet");
-      await mkdir(join(root, "graph_vault", "output-a"), { recursive: true });
-      await mkdir(join(root, "graph_vault", "output-b"), { recursive: true });
+      const outputDir = bookScopedOutputDir(graphVault, job.bookId);
+      const firstPath = join(outputDir, "run-a", "entities.parquet");
+      const secondPath = join(outputDir, "run-b", "entities.parquet");
+      await mkdir(join(outputDir, "run-a"), { recursive: true });
+      await mkdir(join(outputDir, "run-b"), { recursive: true });
       await writeMinimalParquetFixture(firstPath);
       await writeMinimalParquetFixture(secondPath);
       const contentHash = await hashFile(firstPath);
@@ -3668,7 +3683,7 @@ describe("FileBookJobStateRepository", () => {
           ...queryReadyArtifactIds,
         ]),
       );
-      await expect(access(`${catalogPath}.sha256`)).resolves.toBeUndefined();
+      await expectPathAccessible(`${catalogPath}.sha256`);
       await expect(readFile(`${catalogPath}.sha256`, "utf8")).resolves.toBe(
         `${await hashFile(catalogPath)}\n`,
       );
@@ -3780,9 +3795,9 @@ describe("FileBookJobStateRepository", () => {
           stage: "query_ready",
           status: "succeeded",
         });
-        await expect(access(
+        await expectPathAccessible(
           join(graphVault, "catalog", "graph-capabilities.yaml.sha256"),
-        )).resolves.toBeUndefined();
+        );
       } finally {
         if (previousEnv.runId == null) delete process.env.QMD_GRAPHRAG_RUN_ID;
         else process.env.QMD_GRAPHRAG_RUN_ID = previousEnv.runId;
@@ -3837,8 +3852,8 @@ describe("FileBookJobStateRepository", () => {
             throw new Error("lease rejected after commit");
           },
         })).rejects.toThrow("lease rejected after commit");
-        await expect(access(catalogPath)).resolves.toBeUndefined();
-        await expect(access(`${catalogPath}.sha256`)).resolves.toBeUndefined();
+        await expectPathAccessible(catalogPath);
+        await expectPathAccessible(`${catalogPath}.sha256`);
       } finally {
         await rm(root, { recursive: true, force: true });
       }
@@ -4032,6 +4047,7 @@ describe("FileBookJobStateRepository", () => {
         graphVault,
         "books",
         job.bookId,
+        "state",
         "checkpoints.yaml",
       );
       const checkpoints = YAML.parse(await readFile(checkpointsPath, "utf8")) as {

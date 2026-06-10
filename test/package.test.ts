@@ -18,8 +18,11 @@ describe("package test task", () => {
 
     const testAllScript = readFileSync(new URL("scripts/test-all.mjs", root), "utf8");
     expect(testAllScript).toContain("TypeScript build typecheck");
-    expect(testAllScript).toContain("Vitest suite under Node");
-    expect(testAllScript).toContain("Bun test suite");
+    expect(testAllScript).toContain("listVitestTestFiles");
+    expect(testAllScript).toContain("Vitest file");
+    expect(testAllScript).toContain("--no-file-parallelism");
+    expect(testAllScript).toContain("Bun test file");
+    expect(testAllScript).toContain("--max-concurrency");
     expect(testAllScript).toContain("Package smoke");
     expect(testAllScript).toContain("GraphRAG vendor subtree unchanged");
     expect(testAllScript).toContain("vendor/graphrag");

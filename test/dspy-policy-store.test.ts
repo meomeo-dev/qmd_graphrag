@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, test } from "vitest";
+import YAML from "yaml";
 
 import { SchemaVersion } from "../src/contracts/common.js";
 import { buildDspyRuntimeFingerprints } from "../src/dspy/fingerprints.js";
@@ -11,6 +12,7 @@ import {
   DspyPointerLockError,
   DspyPolicyStore,
 } from "../src/dspy/policy-store.js";
+import { writeDurableYamlFixture } from "./helpers/graphrag-runner-harness.ts";
 
 async function makeVault(): Promise<string> {
   return mkdtemp(join(tmpdir(), "qmd-dspy-policy-"));
@@ -552,9 +554,10 @@ describe("DSPy policy store", () => {
       reason: "test promotion",
     });
     const decisionPath = join(vault, "dspy", "promotions", `${decision.decisionId}.yaml`);
-    const demotedDecision = readFileSync(decisionPath, "utf8")
-      .replace("promotionStatus: promoted", "promotionStatus: rejected");
-    writeFileSync(decisionPath, demotedDecision, "utf8");
+    await writeDurableYamlFixture(decisionPath, {
+      ...YAML.parse(readFileSync(decisionPath, "utf8")),
+      promotionStatus: "rejected",
+    });
 
     const unavailable = store.expandQuery("hexagonal architecture");
     expect(unavailable.status).toBe("fallback");
@@ -589,9 +592,10 @@ describe("DSPy policy store", () => {
       reason: "test promotion",
     });
     const pointerPath = join(vault, store.pointerRelativePath());
-    const mismatchedPointer = readFileSync(pointerPath, "utf8")
-      .replace(/currentDecisionId: .+\n/, "currentDecisionId: dspy-decision-mismatch\n");
-    writeFileSync(pointerPath, mismatchedPointer, "utf8");
+    await writeDurableYamlFixture(pointerPath, {
+      ...YAML.parse(readFileSync(pointerPath, "utf8")),
+      currentDecisionId: "dspy-decision-mismatch",
+    });
 
     const unavailable = store.expandQuery("hexagonal architecture");
     expect(unavailable.status).toBe("fallback");
@@ -626,9 +630,10 @@ describe("DSPy policy store", () => {
       reason: "test promotion",
     });
     const decisionPath = join(vault, "dspy", "promotions", `${decision.decisionId}.yaml`);
-    const mismatchedDecision = readFileSync(decisionPath, "utf8")
-      .replace(/artifactHash: .+\n/, "artifactHash: mismatched-artifact-hash\n");
-    writeFileSync(decisionPath, mismatchedDecision, "utf8");
+    await writeDurableYamlFixture(decisionPath, {
+      ...YAML.parse(readFileSync(decisionPath, "utf8")),
+      artifactHash: "mismatched-artifact-hash",
+    });
 
     const refused = store.expandQuery("hexagonal architecture");
     expect(refused.status).toBe("strict_refuse");
@@ -859,9 +864,9 @@ describe("DSPy policy store", () => {
       fingerprints: {},
     });
     const artifactPath = join(vault, result.artifactPath);
-    const artifact = readFileSync(artifactPath, "utf8")
-      .replace(/generatedExpansionHash: .+\n/, "");
-    writeFileSync(artifactPath, artifact, "utf8");
+    const artifact = YAML.parse(readFileSync(artifactPath, "utf8"));
+    delete artifact.generatedExpansionHash;
+    await writeDurableYamlFixture(artifactPath, artifact);
     const report = store.evaluateExpansionPolicy({ artifactPath: result.artifactPath });
     store.promoteExpansionPolicy({
       artifactPath: result.artifactPath,
@@ -903,10 +908,10 @@ describe("DSPy policy store", () => {
       reason: "test promotion",
     });
     const artifactPath = join(vault, result.artifactPath);
-    const artifact = readFileSync(artifactPath, "utf8")
-      .replace(/generatedExpansionPath: .+\n/, "")
-      .replace(/generatedExpansionHash: .+\n/, "");
-    writeFileSync(artifactPath, artifact, "utf8");
+    const artifact = YAML.parse(readFileSync(artifactPath, "utf8"));
+    delete artifact.generatedExpansionPath;
+    delete artifact.generatedExpansionHash;
+    await writeDurableYamlFixture(artifactPath, artifact);
 
     const expanded = store.expandQuery("hexagonal architecture");
     expect(expanded.status).toBe("fallback");
@@ -935,9 +940,9 @@ describe("DSPy policy store", () => {
       fingerprints: {},
     });
     const artifactPath = join(vault, result.artifactPath);
-    const artifact = readFileSync(artifactPath, "utf8")
-      .replace(/generatedExpansionHash: .+\n/, "");
-    writeFileSync(artifactPath, artifact, "utf8");
+    const artifact = YAML.parse(readFileSync(artifactPath, "utf8"));
+    delete artifact.generatedExpansionHash;
+    await writeDurableYamlFixture(artifactPath, artifact);
     const report = store.evaluateExpansionPolicy({ artifactPath: result.artifactPath });
     store.promoteExpansionPolicy({
       artifactPath: result.artifactPath,
@@ -973,9 +978,9 @@ describe("DSPy policy store", () => {
       fingerprints: {},
     });
     const artifactPath = join(vault, result.artifactPath);
-    const artifact = readFileSync(artifactPath, "utf8")
-      .replace(/generatedExpansionHash: .+\n/, "");
-    writeFileSync(artifactPath, artifact, "utf8");
+    const artifact = YAML.parse(readFileSync(artifactPath, "utf8"));
+    delete artifact.generatedExpansionHash;
+    await writeDurableYamlFixture(artifactPath, artifact);
     const report = store.evaluateExpansionPolicy({ artifactPath: result.artifactPath });
     store.promoteExpansionPolicy({
       artifactPath: result.artifactPath,

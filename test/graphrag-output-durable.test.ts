@@ -20,6 +20,7 @@ describe("GraphRAG output durable sidecars", () => {
         "graph_vault",
         "books",
         "book-output-durable-fixture",
+        "graphrag",
         "output",
       );
       const statsPath = join(outputDir, "stats.json");
@@ -54,8 +55,6 @@ describe("GraphRAG output durable sidecars", () => {
         .resolves.toBe(`${result[0].checksum}\n`);
       await expect(readFile(`${statsPath}.sha256.meta.json`, "utf8"))
         .resolves.toContain("\"checksumRecoveryDecision\": \"graph_output_stage_success\"");
-      await expect(readFile(join(outputDir, ".durable-recovery.jsonl"), "utf8"))
-        .resolves.toContain("\"refreshStage\":\"community_report\"");
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }

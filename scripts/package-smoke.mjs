@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -35,6 +35,21 @@ function assertPath(path, label = path) {
   return full;
 }
 
+function listMjsFiles(dir) {
+  const files = [];
+  for (const entry of readdirSync(join(root, dir), { withFileTypes: true })) {
+    const path = normalize(join(dir, entry.name));
+    if (entry.isDirectory()) {
+      files.push(...listMjsFiles(path));
+      continue;
+    }
+    if (entry.isFile() && entry.name.endsWith(".mjs")) {
+      files.push(path);
+    }
+  }
+  return files;
+}
+
 run("build compiled package", process.execPath, ["scripts/build.mjs"]);
 run("AST grammar runtime packages", process.execPath, ["scripts/check-package-grammars.mjs"]);
 
@@ -42,14 +57,28 @@ for (const entry of pkg.files ?? []) {
   assertPath(entry.replace(/\/$/, ""), `package.json files[] entry ${entry}`);
 }
 
-const packageFiles = new Set(pkg.files ?? []);
-for (const entry of pkg.files ?? []) {
-  if (!entry.endsWith(".mjs")) continue;
+const packageEntries = pkg.files ?? [];
+const packageFiles = new Set(packageEntries.filter((entry) => !entry.endsWith("/")));
+const packageDirs = packageEntries
+  .filter((entry) => entry.endsWith("/"))
+  .map((entry) => normalize(entry));
+const packagedMjsFiles = [
+  ...packageFiles,
+  ...packageDirs.flatMap((entry) => listMjsFiles(entry.replace(/\/$/, ""))),
+].filter((entry) => entry.endsWith(".mjs"));
+
+function isPackagedPath(path) {
+  const normalizedPath = normalize(path);
+  if (packageFiles.has(normalizedPath)) return true;
+  return packageDirs.some((entry) => normalizedPath.startsWith(entry));
+}
+
+for (const entry of packagedMjsFiles) {
   const source = readFileSync(join(root, entry), "utf8");
   const imports = [...source.matchAll(/\bimport\s+(?:[^"']+\s+from\s+)?["'](\.[^"']+)["']/g)]
     .map((match) => normalize(join(dirname(entry), match[1])));
   for (const imported of imports) {
-    if (!packageFiles.has(imported)) {
+    if (!isPackagedPath(imported)) {
       console.error(
         `Package smoke failed: ${entry} imports ${imported} outside files[]`,
       );

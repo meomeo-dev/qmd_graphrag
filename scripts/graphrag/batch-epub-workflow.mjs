@@ -572,6 +572,20 @@ const durableTargetMappingTable = [
     preflightScopes: [{ path: "graph_vault/dspy", recursive: true }],
   },
   {
+    pattern: /^graph_vault\/dspy\/.+\.jsonl$/,
+    lane: "catalogWriterLane",
+    durableKind: "jsonl",
+    targetMappingOwner: "dspyPolicyStore",
+    preflightScopes: [{ path: "graph_vault/dspy", recursive: true }],
+  },
+  {
+    pattern: /^graph_vault\/dspy\/.+\.txt$/,
+    lane: "catalogWriterLane",
+    durableKind: "file",
+    targetMappingOwner: "dspyPolicyStore",
+    preflightScopes: [{ path: "graph_vault/dspy", recursive: true }],
+  },
+  {
     pattern: /^graph_vault\/books\/[^/]+\/qmd\/qmd_build_manifest\.json$/,
     lane: "checkpointWriterLane",
     durableKind: "json",
@@ -8842,6 +8856,16 @@ function maybeDowngradeCompletedOnLoad(item, checkpoint) {
   return checkpoint;
 }
 
+function loadStartupPreflightCheckpoint(item) {
+  const path = itemPath(item);
+  if (!existsSync(path)) return undefined;
+  const raw = readJson(path);
+  const hydrated = hydrateCheckpoint(item, raw);
+  return evidenceItemForCheckpoint(item, hydrated).itemId === item.itemId
+    ? hydrated
+    : undefined;
+}
+
 function finalizeLoadedCheckpoint(path, item, checkpoint, shouldPersist) {
   const checkpointEvidenceItem = evidenceItemForCheckpoint(item, checkpoint);
   const finalized = withCheckpointPersistenceInvariants(
@@ -10620,6 +10644,7 @@ function graphQueryEvidence(checkpoint) {
       stage: failed.name,
       reason: "graph_query_command_check_failed",
       artifactIds: [],
+      commandChecks: checkpoint.commandChecks ?? [],
     };
   }
   const missing = graphQueryCommandCheckNames.find((name) => !names.has(name));
@@ -13846,11 +13871,10 @@ async function main() {
   if (!statusJson) {
     acquireCoordinatorLock();
     manifest = loadManifest(items);
-    const completedSeed = loadCompletedSeed();
     const startupCheckpoints = new Map(items.map((item) => [
       item.itemId,
-      loadCheckpoint(item, completedSeed),
-    ]));
+      loadStartupPreflightCheckpoint(item),
+    ]).filter(([, checkpoint]) => checkpoint != null));
     const runnerStartTargets = durablePreflightTargetsForStartupItems(
       items,
       startupCheckpoints,

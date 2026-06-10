@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   closeSync,
   existsSync,
@@ -35,7 +36,11 @@ import {
 import { hashText } from "./fingerprint.js";
 
 const DurableLockStaleMs = 120_000;
-const DurableLockWaitMs = 300_000;
+const DurableLockWaitMs = Math.max(
+  1,
+  Number.parseInt(process.env.QMD_GRAPHRAG_TEST_DURABLE_LOCK_WAIT_MS ?? "", 10) ||
+    300_000,
+);
 const DurableDefaultLaneTimeoutMs = 120_000;
 const DurableTempStaleMs = 24 * 60 * 60 * 1000;
 const DurableReleaseOn = ["commit", "error", "cancellation", "lease_loss", "timeout"];
@@ -57,9 +62,27 @@ const DurableAdapterContract = Object.freeze({
 const Host = hostname();
 const SessionId = process.env.QMD_GRAPHRAG_RUNNER_SESSION_ID ??
   `process-${process.pid}`;
+const DurableFileLockContext =
+  new AsyncLocalStorage<Map<string, number>>();
 let testRenameEnoentInjected = false;
 let testDirectoryFsyncFailureInjected = false;
 let testDirectoryFsyncFailureMatchCount = 0;
+
+function shouldSkipRealFsyncForTests(): boolean {
+  return process.env.QMD_GRAPHRAG_TEST_SKIP_REAL_FSYNC === "1";
+}
+
+async function syncFileHandleDurably(
+  handle: Awaited<ReturnType<typeof open>>,
+): Promise<void> {
+  if (shouldSkipRealFsyncForTests()) return;
+  await handle.sync();
+}
+
+function fsyncFdDurably(fd: number): void {
+  if (shouldSkipRealFsyncForTests()) return;
+  fsyncSync(fd);
+}
 
 const DurableTargetMappingTable = [
   {
@@ -229,6 +252,18 @@ const DurableTargetMappingTable = [
     pattern: /\/graph_vault\/dspy\/.+\.json$/,
     lane: "catalogWriterLane",
     durableKind: "json",
+    targetMappingOwner: "dspyPolicyStore",
+  },
+  {
+    pattern: /\/graph_vault\/dspy\/.+\.jsonl$/,
+    lane: "catalogWriterLane",
+    durableKind: "jsonl",
+    targetMappingOwner: "dspyPolicyStore",
+  },
+  {
+    pattern: /\/graph_vault\/dspy\/.+\.txt$/,
+    lane: "catalogWriterLane",
+    durableKind: "file",
     targetMappingOwner: "dspyPolicyStore",
   },
   {
@@ -955,6 +990,10 @@ async function withDurableFileLock<T>(
   callback: () => Promise<T>,
 ): Promise<T> {
   const lockPath = `${path}.lock`;
+  const heldLocks = DurableFileLockContext.getStore();
+  if ((heldLocks?.get(lockPath) ?? 0) > 0) {
+    return callback();
+  }
   const startedAt = Date.now();
   await mkdir(dirname(path), { recursive: true });
   for (;;) {
@@ -963,7 +1002,7 @@ async function withDurableFileLock<T>(
     try {
       handle = await open(lockPath, "wx");
       await handle.writeFile(`${JSON.stringify(owner)}\n`, "utf8");
-      await handle.sync();
+      await syncFileHandleDurably(handle);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       await removeStaleDurableLock(lockPath);
@@ -994,7 +1033,10 @@ async function withDurableFileLock<T>(
 
     try {
       assertDurableLockStillOwned(lockPath, owner);
-      const result = await callback();
+      const result = await DurableFileLockContext.run(
+        incrementHeldDurableFileLock(heldLocks, lockPath),
+        callback,
+      );
       assertDurableLockStillOwned(lockPath, owner);
       return result;
     } finally {
@@ -1013,6 +1055,10 @@ function withDurableFileLockSync<T>(
   callback: () => T,
 ): T {
   const lockPath = `${path}.lock`;
+  const heldLocks = DurableFileLockContext.getStore();
+  if ((heldLocks?.get(lockPath) ?? 0) > 0) {
+    return callback();
+  }
   const startedAt = Date.now();
   mkdirSyncRecursive(dirname(path));
   for (;;) {
@@ -1021,7 +1067,7 @@ function withDurableFileLockSync<T>(
     try {
       fd = openSync(lockPath, "wx");
       writeSync(fd, `${JSON.stringify(owner)}\n`, undefined, "utf8");
-      fsyncSync(fd);
+      fsyncFdDurably(fd);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       removeStaleDurableLockSync(lockPath);
@@ -1054,13 +1100,25 @@ function withDurableFileLockSync<T>(
 
     try {
       assertDurableLockStillOwned(lockPath, owner);
-      const result = callback();
+      const result = DurableFileLockContext.run(
+        incrementHeldDurableFileLock(heldLocks, lockPath),
+        callback,
+      );
       assertDurableLockStillOwned(lockPath, owner);
       return result;
     } finally {
       releaseDurableFileLockSync(lockPath, owner);
     }
   }
+}
+
+function incrementHeldDurableFileLock(
+  heldLocks: Map<string, number> | undefined,
+  lockPath: string,
+): Map<string, number> {
+  const next = new Map(heldLocks ?? []);
+  next.set(lockPath, (next.get(lockPath) ?? 0) + 1);
+  return next;
 }
 
 async function releaseDurableFileLock(
@@ -1521,7 +1579,7 @@ async function writeFileDurable(
   try {
     handle = await open(path, flag);
     await handle.writeFile(text, "utf8");
-    await handle.sync();
+    await syncFileHandleDurably(handle);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") throw error;
     throw durableFileFsyncError(path, error, operation);
@@ -1531,7 +1589,7 @@ async function writeFileDurable(
   let fd: number | null = null;
   try {
     fd = openSync(path, "r");
-    fsyncSync(fd);
+    fsyncFdDurably(fd);
   } catch (error) {
     throw durableFileFsyncError(path, error, operation);
   } finally {
@@ -1554,7 +1612,7 @@ function writeFileDurableSync(
     } else {
       writeSync(fd, text, undefined, "utf8");
     }
-    fsyncSync(fd);
+    fsyncFdDurably(fd);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") throw error;
     throw durableFileFsyncError(path, error, operation);
@@ -1564,7 +1622,7 @@ function writeFileDurableSync(
   let readFd: number | null = null;
   try {
     readFd = openSync(path, "r");
-    fsyncSync(readFd);
+    fsyncFdDurably(readFd);
   } catch (error) {
     throw durableFileFsyncError(path, error, operation);
   } finally {
@@ -1839,6 +1897,7 @@ async function fsyncDirectoryStrict(
   const fsyncOperation = directoryFsyncEvidence(path, operation);
   try {
     maybeInjectDirectoryFsyncFailure(path, fsyncOperation);
+    if (shouldSkipRealFsyncForTests()) return;
     fd = openSync(path, "r");
     fsyncSync(fd);
   } catch (error) {
@@ -1871,6 +1930,7 @@ function fsyncDirectoryStrictSync(
   const fsyncOperation = directoryFsyncEvidence(path, operation);
   try {
     maybeInjectDirectoryFsyncFailure(path, fsyncOperation);
+    if (shouldSkipRealFsyncForTests()) return;
     fd = openSync(path, "r");
     fsyncSync(fd);
   } catch (error) {

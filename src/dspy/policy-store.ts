@@ -73,6 +73,10 @@ const NativeFallbackReasons = new Set<QueryExpansionFailureReason>([
   "pointer_missing",
   "decision_missing",
   "policy_unavailable",
+  "artifact_missing",
+  "generated_expansion_missing",
+  "runtime_error",
+  "runtime_output_schema_invalid",
 ]);
 
 export type DspyPolicyStoreOptions = {
@@ -188,7 +192,13 @@ function nowIso(now: () => Date): string {
 }
 
 function loadYamlFile(path: string): unknown {
-  return readYamlUnknownDurableSync(path);
+  const value = readYamlUnknownDurableSync(path);
+  if (value == null) {
+    const error = new Error(`ENOENT: no such file or directory, open '${path}'`);
+    Object.assign(error, { code: "ENOENT" });
+    throw error;
+  }
+  return value;
 }
 
 function writeYamlFile(path: string, value: unknown): void {
@@ -517,7 +527,7 @@ export class DspyPolicyStore {
   }
 
   pointerLockRelativePath(): string {
-    return normalizeVaultRelative(`${this.pointerRelativePath()}.lock`);
+    return normalizeVaultRelative(`${this.pointerRelativePath()}.writer-lock`);
   }
 
   pointerLockPath(): string {

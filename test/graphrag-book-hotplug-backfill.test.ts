@@ -8,6 +8,7 @@ import { describe, expect, test } from "vitest";
 
 import {
   mkProjectTmpDir,
+  nodeScriptBin,
   writeDurableJsonFixture,
   writeProviderAuthReopenGraphFixture,
 } from "./helpers/graphrag-runner-harness.js";
@@ -22,7 +23,7 @@ async function runBackfill(input: {
   env?: Record<string, string>;
 }): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   return new Promise((resolveResult) => {
-    const proc = spawn(process.execPath, [
+    const proc = spawn(nodeScriptBin(), [
       "scripts/graphrag/backfill-hotplug-packages.mjs",
       "--state-root",
       input.stateRoot,

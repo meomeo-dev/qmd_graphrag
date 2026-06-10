@@ -6470,6 +6470,10 @@ if (isMain) {
         case "install": {
           try {
             await installSkill(Boolean(cli.values.global), Boolean(cli.values.force), Boolean(cli.values.yes));
+            await finishSuccessfulCliCommand({
+              command: "skill-install",
+              cleanup: async () => {},
+            });
           } catch (error) {
             exitWithError(error);
           }
@@ -6540,6 +6544,7 @@ if (isMain) {
     await finishSuccessfulCliCommand({
       command: cli.command,
       format: cli.opts.format,
+      cleanup: cli.command === "doctor" ? async () => {} : undefined,
     });
   }
 

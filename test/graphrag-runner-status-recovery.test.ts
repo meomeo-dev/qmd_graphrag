@@ -49,12 +49,11 @@ describe("GraphRAG EPUB batch runner - Status Recovery", () => {
     const logRoot = join(tmpRoot, "logs");
     const configDir = join(tmpRoot, "config");
     const runId = "fail-fast-transient-fixture";
-    const sourceBytes = "fail fast transient";
-    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
     const sourcePath = join(sourceDir, "Book.epub");
     await mkdir(sourceDir, { recursive: true });
+    await writeMinimalEpubFixture(sourcePath, "Fail Fast Transient");
+    const sourceHash = createHash("sha256").update(readFileSync(sourcePath)).digest("hex");
     await mkdir(configDir, { recursive: true });
-    await writeFile(sourcePath, sourceBytes);
     await writeFile(join(configDir, "index.yml"), "collections: {}\n");
     const sourceRelativePath = relative(projectRoot, sourcePath);
     const itemId = `item-${sourceHash.slice(0, 12)}-${

@@ -78,8 +78,20 @@ const QMD_INDEX_LOCK_STALE_MS = 120000;
 const QMD_INDEX_LOCK_WAIT_MS = Math.max(QMD_INDEX_LOCK_STALE_MS * 2, 300000);
 const QMD_SQLITE_BUSY_RETRY_LIMIT = 8;
 const QMD_SQLITE_BUSY_RETRY_BASE_MS = 25;
+
+function shouldSkipRealFsyncForTests(): boolean {
+  return process.env.QMD_GRAPHRAG_TEST_SKIP_REAL_FSYNC === "1";
+}
+
+function fsyncFdDurably(fd: number): void {
+  if (shouldSkipRealFsyncForTests()) return;
+  fsyncSync(fd);
+}
 const QMD_SQLITE_BUSY_RETRY_MAX_MS = 500;
 const QMD_INDEX_RELEASE_ON = ["commit", "error", "cancellation", "lease_loss", "timeout"];
+const PYTHON_HELPER_TIMEOUT_MS =
+  Number.parseInt(process.env.QMD_GRAPHRAG_PYTHON_HELPER_TIMEOUT_MS ?? "", 10) ||
+  120000;
 
 const GRAPH_RAG_STAGE_ARTIFACT_REQUIREMENTS: StageArtifactRequirementMap = {
   ingest: ["source_epub"],
@@ -819,6 +831,29 @@ function selectPythonBin(): string {
   return process.env.PYTHON || "python3";
 }
 
+function pythonHelperEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    OMP_NUM_THREADS: process.env.OMP_NUM_THREADS ?? "1",
+    OPENBLAS_NUM_THREADS: process.env.OPENBLAS_NUM_THREADS ?? "1",
+    PYARROW_NUM_THREADS: process.env.PYARROW_NUM_THREADS ?? "1",
+    VECLIB_MAXIMUM_THREADS: process.env.VECLIB_MAXIMUM_THREADS ?? "1",
+  };
+}
+
+function pythonHelperFailureMessage(
+  action: string,
+  result: ReturnType<typeof spawnSync>,
+): string {
+  if (result.error != null) {
+    return `${action}: ${result.error.message}`;
+  }
+  const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
+  if (stderr.length > 0) return `${action}: ${stderr}`;
+  if (result.signal != null) return `${action}: terminated by ${result.signal}`;
+  return `${action}: exit status ${result.status ?? "unknown"}`;
+}
+
 export async function readGraphTextUnitIdentity(input: {
   bookId: string;
   sourceId: string;
@@ -854,15 +889,19 @@ async function readValidatedGraphTextUnitIdentity(
   }
 
   const helper = [
-    "import json, sys",
+    "import json, os, sys",
     "import pandas as pd",
+    "def finish(payload):",
+    "    sys.stdout.write(str(payload) + '\\n')",
+    "    sys.stdout.flush()",
+    "    os._exit(0)",
     "documents_path, text_units_path, document_id, graph_document_id, expected_json, normalized_path = sys.argv[1:7]",
     "documents = pd.read_parquet(documents_path)",
     "text_units = pd.read_parquet(text_units_path)",
     "required_doc_cols = {'id', 'text_unit_ids'}",
     "required_text_unit_cols = {'id', 'document_id'}",
     "if not required_doc_cols.issubset(set(documents.columns)) or not required_text_unit_cols.issubset(set(text_units.columns)):",
-    "    print('null')",
+    "    finish('null')",
     "    raise SystemExit(0)",
     "normalized_title = str(normalized_path).replace('\\\\', '/').split('/')[-1]",
     "def title_basename(value):",
@@ -876,13 +915,13 @@ async function readValidatedGraphTextUnitIdentity(
     "    if matched.empty and len(documents.index) == 1:",
     "        matched = documents.iloc[[0]]",
     "if matched.empty:",
-    "    print('null')",
+    "    finish('null')",
     "    raise SystemExit(0)",
     "document = matched.iloc[0]",
     "graph_document_id = str(document['id'])",
     "if len(documents.index) > 1:",
     "    if 'title' not in documents.columns or title_basename(document.get('title')) != normalized_title:",
-    "        print('null')",
+    "        finish('null')",
     "        raise SystemExit(0)",
     "def normalize_ids(value):",
     "    if value is None:",
@@ -899,13 +938,13 @@ async function readValidatedGraphTextUnitIdentity(
     "scoped_ids = set(str(item) for item in filtered['id'].tolist() if item is not None and str(item))",
     "expected_ids = set(str(item) for item in json.loads(expected_json)) if expected_json else set()",
     "if not document_ids or document_ids != scoped_ids:",
-    "    print('null')",
+    "    finish('null')",
     "    raise SystemExit(0)",
     "if expected_ids and expected_ids != document_ids:",
-    "    print('null')",
+    "    finish('null')",
     "    raise SystemExit(0)",
     "ids = sorted(document_ids)",
-    "print(json.dumps({'graphDocumentId': graph_document_id, 'graphTextUnitIds': ids}))",
+    "finish(json.dumps({'graphDocumentId': graph_document_id, 'graphTextUnitIds': ids}))",
   ].join("\n");
   const result = spawnSync(selectPythonBin(), [
     "-c",
@@ -920,10 +959,13 @@ async function readValidatedGraphTextUnitIdentity(
     input.normalizedPath,
   ], {
     encoding: "utf8",
+    env: pythonHelperEnv(),
+    killSignal: "SIGKILL",
+    timeout: PYTHON_HELPER_TIMEOUT_MS,
   });
-  if (result.status !== 0) {
+  if (result.error != null || result.status !== 0) {
     throw new Error(
-      result.stderr.trim() || "failed to read GraphRAG text unit identity",
+      pythonHelperFailureMessage("failed to read GraphRAG text unit identity", result),
     );
   }
   const parsed = JSON.parse(result.stdout.trim()) as null | {
@@ -1381,7 +1423,7 @@ async function withQmdIndexFileLock<T>(
     try {
       fd = openSync(lockPath, "wx");
       writeFileSync(fd, `${JSON.stringify(owner)}\n`, "utf8");
-      fsyncSync(fd);
+      fsyncFdDurably(fd);
       if (!qmdIndexLockOwnedBy(lockPath, owner)) {
         throw qmdIndexLockTimeoutError(qmdIndexPath, lockPath, {
           expected: owner,
@@ -1450,8 +1492,16 @@ async function writeLanceDbRowCountSidecars(root: string): Promise<void> {
 
 async function readLanceDbRowCount(tableDir: string): Promise<number | null> {
   const helper = [
-    "import json, sys",
+    "import json, os, sys",
     "import lancedb",
+    "def finish(payload, status=0):",
+    "    sys.stdout.write(str(payload) + '\\n')",
+    "    sys.stdout.flush()",
+    "    os._exit(status)",
+    "def fail(payload):",
+    "    sys.stderr.write(str(payload) + '\\n')",
+    "    sys.stderr.flush()",
+    "    os._exit(1)",
     "table_dir = sys.argv[1]",
     "db_uri, table_name = table_dir.rsplit('/', 1)",
     "db = lancedb.connect(db_uri)",
@@ -1464,13 +1514,16 @@ async function readLanceDbRowCount(tableDir: string): Promise<number | null> {
     "    except Exception:",
     "        pass",
     "if table is None:",
-    "    raise ValueError(f'LanceDB table not found: {table_name}')",
-    "print(json.dumps({'rowCount': int(table.count_rows())}))",
+    "    fail(f'LanceDB table not found: {table_name}')",
+    "finish(json.dumps({'rowCount': int(table.count_rows())}))",
   ].join("\n");
   const result = spawnSync(selectPythonBin(), ["-c", helper, tableDir], {
     encoding: "utf8",
+    env: pythonHelperEnv(),
+    killSignal: "SIGKILL",
+    timeout: PYTHON_HELPER_TIMEOUT_MS,
   });
-  if (result.status !== 0) return null;
+  if (result.error != null || result.status !== 0) return null;
   try {
     const parsed = JSON.parse(result.stdout.trim()) as { rowCount?: unknown };
     return typeof parsed.rowCount === "number" ? parsed.rowCount : null;
@@ -1777,6 +1830,7 @@ function fsyncQmdIndexLockDirectory(
   let fd: number | null = null;
   try {
     maybeInjectQmdIndexDirectoryFsyncFailure(path, lockPath);
+    if (shouldSkipRealFsyncForTests()) return;
     fd = openSync(path, "r");
     fsyncSync(fd);
   } catch (error) {

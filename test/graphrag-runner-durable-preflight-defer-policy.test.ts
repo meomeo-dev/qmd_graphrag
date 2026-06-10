@@ -1,10 +1,15 @@
-import { mkdir, rm, writeFile } from "fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "fs/promises";
 import { join, relative } from "path";
 import { describe, expect, test } from "vitest";
 import {
   durablePreflightDeferReopenDecision,
 } from "../scripts/graphrag/durable-preflight-defer-policy.mjs";
-import { mkProjectTmpDir } from "./helpers/graphrag-runner-harness.ts";
+
+async function mkProjectTmpDir(prefix: string): Promise<string> {
+  const root = join(process.cwd(), ".tmp-tests");
+  await mkdir(root, { recursive: true });
+  return mkdtemp(join(root, prefix));
+}
 
 describe("GraphRAG runner durable preflight defer policy", () => {
   test("reopens before-resume live lock failures only after the lock clears", async () => {

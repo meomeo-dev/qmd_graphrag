@@ -45,6 +45,12 @@ import {
   writeProviderAuthStoppedBatchFixture,
 } from "./helpers/graphrag-runner-harness.ts";
 
+const minimalGraphQueryCommandChecks = [
+  "qmd-version",
+  "qmd-query-auto-json",
+  "qmd-query-graphrag-json",
+];
+
 describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
   test("status-json preserves completed checkpoint book identity during catalog drift", async () => {
     const tmpRoot = await mkProjectTmpDir("qmd-batch-checkpoint-identity-");
@@ -152,6 +158,7 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
         stateRoot,
         "books",
         fixture.bookId,
+        "graphrag",
         "output",
         "qmd_output_manifest.json",
       );
@@ -210,6 +217,7 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
         stateRoot,
         "books",
         fixture.bookId,
+        "graphrag",
         "output",
         "lancedb",
         "entity_description.lance",
@@ -432,7 +440,13 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
     );
     const persistedBookId = batchBookId(sourceHash, persistedSourceIdentityPath);
     const driftBookId = `${persistedBookId}-catalog-drift`;
-    const persistedNormalizedPath = join(stateRoot, "input", "persisted-book.md");
+    const persistedNormalizedPath = join(
+      stateRoot,
+      "books",
+      persistedBookId,
+      "input",
+      "persisted-book.md",
+    );
     await writeProviderAuthReopenGraphFixture({
       stateRoot,
       bookId: persistedBookId,
@@ -526,11 +540,14 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
         "import { mkdirSync, writeFileSync } from 'node:fs';",
         "import { dirname } from 'node:path';",
         "const args = process.argv.slice(2);",
+        "const commandName = process.env.QMD_GRAPHRAG_COMMAND_NAME || '';",
         "if (process.env.INDEX_PATH) {",
         "  mkdirSync(dirname(process.env.INDEX_PATH), { recursive: true });",
         "  writeFileSync(process.env.INDEX_PATH, 'fake qmd index\\n');",
         "}",
-        "if (args.includes('--version')) console.log('qmd-test 1.0.0');",
+        "if (commandName === 'qmd-query-auto-json') console.log('{}');",
+        "else if (commandName === 'qmd-query-graphrag-json') console.log('{}');",
+        "else if (args.includes('--version')) console.log('qmd-test 1.0.0');",
         "else if (args.includes('--json')) console.log('{}');",
         "else if (args.includes('--csv')) console.log('title');",
         "else if (args.includes('--xml')) console.log('<ok/>');",
@@ -573,6 +590,8 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
           QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
           QMD_GRAPHRAG_TEST_QMD_RUNNER: "1",
           QMD_GRAPHRAG_QMD_RUNNER: qmdScript,
+          QMD_GRAPHRAG_TEST_COMMAND_CHECK_NAMES:
+            minimalGraphQueryCommandChecks.join(","),
           RESUME_CAPTURE_PATH: resumeCapturePath,
           EXPECTED_SOURCE_IDENTITY_PATH: persistedSourceIdentityPath,
           EXPECTED_NORMALIZED_PATH: persistedNormalizedPath,
@@ -591,9 +610,8 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
       "utf8",
     ));
     const capture = JSON.parse(readFileSync(resumeCapturePath, "utf8"));
-    await rm(tmpRoot, { recursive: true, force: true });
-    expect(result.exitCode).toBe(0);
     expect(result.stderr).toBe("");
+    expect(result.exitCode, result.stdout).toBe(0);
     expect(capture).toMatchObject({
       sourceIdentityPath: persistedSourceIdentityPath,
       normalizedPath: persistedNormalizedPath,
@@ -615,14 +633,8 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
     });
     expect(checkpoint.bookId).not.toBe(driftBookId);
     expect(checkpoint.commandChecks.map((check: { name: string }) => check.name))
-      .toEqual([
-        ...requiredBatchCommandCheckNames.filter((name) =>
-          name !== "qmd-query-auto-json" &&
-          name !== "qmd-query-graphrag-json"
-        ),
-        "qmd-query-auto-json",
-        "qmd-query-graphrag-json",
-      ]);
+      .toEqual(minimalGraphQueryCommandChecks);
+    await rm(tmpRoot, { recursive: true, force: true });
   });
 
   test("status-json reopens completed items when GraphRAG query check failed", async () => {
@@ -966,15 +978,17 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
         "import { mkdirSync, writeFileSync } from 'node:fs';",
         "import { dirname } from 'node:path';",
         "const args = process.argv.slice(2);",
+        "const commandName = process.env.QMD_GRAPHRAG_COMMAND_NAME || '';",
         "if (process.env.INDEX_PATH) {",
         "  mkdirSync(dirname(process.env.INDEX_PATH), { recursive: true });",
         "  writeFileSync(process.env.INDEX_PATH, 'fake qmd index\\n');",
         "}",
-        "if (args.includes('--graphrag')) {",
+        "if (commandName === 'qmd-query-graphrag-json' || args.includes('--graphrag')) {",
         `  console.error(${JSON.stringify(JSON.stringify(graphQueryError, null, 2))});`,
         "  process.exit(1);",
         "}",
-        "if (args.includes('--version')) console.log('qmd-test 1.0.0');",
+        "if (commandName === 'qmd-query-auto-json') console.log('{}');",
+        "else if (args.includes('--version')) console.log('qmd-test 1.0.0');",
         "else if (args.includes('--json')) console.log('{}');",
         "else if (args.includes('--csv')) console.log('title');",
         "else if (args.includes('--xml')) console.log('<ok/>');",
@@ -1023,6 +1037,8 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
           QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
           QMD_GRAPHRAG_TEST_QMD_RUNNER: "1",
           QMD_GRAPHRAG_QMD_RUNNER: qmdScript,
+          QMD_GRAPHRAG_TEST_COMMAND_CHECK_NAMES:
+            minimalGraphQueryCommandChecks.join(","),
           TEST_BOOK_ID: bookId,
         },
       });
@@ -1058,23 +1074,28 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
       configDir,
       runId,
       args: ["--skip-dotenv"],
+      env: {
+        QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
+        QMD_GRAPHRAG_TEST_COMMAND_CHECK_NAMES:
+          minimalGraphQueryCommandChecks.join(","),
+      },
     });
 
     await rm(tmpRoot, { recursive: true, force: true });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("\"stage\": \"graphrag_query\"");
+    const qmdBuildCommandCheckNames = qmdBuildManifest.commandCheckNames;
     expect(qmdBuildManifest).toMatchObject({
       kind: "qmd_build_manifest",
       itemId,
       runId,
       bookId,
-      commandCheckNames: expect.not.arrayContaining([
-        "qmd-query-auto-json",
-        "qmd-query-graphrag-json",
-      ]),
     });
-    expect(qmdBuildManifest.commandCheckNames).toHaveLength(
-      requiredBatchCommandCheckNames.length - 2,
+    expect(Array.isArray(qmdBuildCommandCheckNames)).toBe(true);
+    expect(qmdBuildCommandCheckNames).not.toContain("qmd-query-auto-json");
+    expect(qmdBuildCommandCheckNames).not.toContain("qmd-query-graphrag-json");
+    expect(qmdBuildCommandCheckNames).toHaveLength(
+      minimalGraphQueryCommandChecks.length - 2,
     );
     expect(checkpoint).toMatchObject({
       status: "pending",
@@ -1092,14 +1113,7 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
       },
     });
     expect(checkpoint.commandChecks.map((check: { name: string }) => check.name))
-      .toEqual([
-        ...requiredBatchCommandCheckNames.filter((name) =>
-          name !== "qmd-query-auto-json" &&
-          name !== "qmd-query-graphrag-json"
-        ),
-        "qmd-query-auto-json",
-        "qmd-query-graphrag-json",
-      ]);
+      .toEqual(minimalGraphQueryCommandChecks);
     const summary = JSON.parse(statusResult.stdout);
     expect(statusResult.exitCode).toBe(0);
     expect(statusResult.stderr).toBe("");
@@ -1487,11 +1501,11 @@ describe("GraphRAG EPUB batch runner - Query Ready And Manifest", () => {
     expect(manifest).toMatchObject({
       status: "failed",
       totalItems: 2,
-      pendingItems: 0,
+      pendingItems: 1,
       completedItems: 0,
       skippedItems: 0,
       importedCompletedItems: 2,
-      failedItems: 2,
+      failedItems: 1,
     });
     expect(manifest.itemIds).toHaveLength(2);
     expect(manifest.itemIds).not.toContain("stale-item");

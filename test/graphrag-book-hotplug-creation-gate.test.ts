@@ -100,12 +100,10 @@ describe("GraphRAG hotplug creation quality gate", () => {
         expect(runtimeGate).toMatchObject({
           bookId,
           copyDistributionAllowed: true,
-          currentState: "visible_not_query_ready",
-          queryReady: false,
+          currentState: "query_ready",
+          queryReady: true,
         });
-        expect(runtimeGate.diagnostics).toContain(
-          "graph_visible_not_query_ready",
-        );
+        expect(runtimeGate.diagnostics).toEqual([]);
 
         const graphIdentity = JSON.parse(readFileSync(
           join(bookRoot, "graphrag", "output", "qmd_graph_text_unit_identity.json"),

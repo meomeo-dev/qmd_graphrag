@@ -20,9 +20,9 @@ import {
   durablePrimaryJsonEntries,
   expectDurableSubprocessEnvelopeIncomplete,
   mkProjectTmpDir,
+  nodeScriptBin,
   passedBatchCommandChecks,
   projectRoot,
-  requiredBatchCommandCheckNames,
   runBatchMigrateOnly,
   runBatchStatusJson,
   runBatchWorkflow,
@@ -41,6 +41,12 @@ import {
   writeProviderAuthReopenGraphFixture,
   writeProviderAuthStoppedBatchFixture,
 } from "./helpers/graphrag-runner-harness.ts";
+
+const minimalGraphQueryCommandChecks = [
+  "qmd-version",
+  "qmd-query-auto-json",
+  "qmd-query-graphrag-json",
+];
 
 describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
   test("non-transient GraphRAG data compatibility failure stops before next book", async () => {
@@ -175,7 +181,7 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
       stderr: string;
       exitCode: number | null;
     }>((resolveResult) => {
-      const proc = spawn(process.execPath, [
+      const proc = spawn(nodeScriptBin(), [
         join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
         "--source-dir",
         sourceDir,
@@ -353,7 +359,7 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
 
     const result = await new Promise<{ stderr: string; exitCode: number | null }>(
       (resolveResult) => {
-        const proc = spawn(process.execPath, [
+        const proc = spawn(nodeScriptBin(), [
           join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
           "--source-dir",
           sourceDir,
@@ -538,7 +544,7 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
       stderr: string;
       exitCode: number | null;
     }>((resolveResult) => {
-      const proc = spawn(process.execPath, [
+      const proc = spawn(nodeScriptBin(), [
         join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
         "--source-dir",
         sourceDir,
@@ -646,6 +652,19 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
       createHash("sha256").update(sourceRelativePath).digest("hex").slice(0, 8)
     }`;
     const bookId = batchBookId(sourceHash, sourceRelativePath);
+    const normalizedPath = join(stateRoot, "books", bookId, "input", "a-auth.md");
+    await writeQmdBuildFixture({
+      tmpRoot,
+      stateRoot,
+      configDir,
+      runId,
+      itemId,
+      bookId,
+      sourceName: "A-Auth.epub",
+      sourceRelativePath,
+      sourceHash,
+      normalizedPath,
+    });
     await writeProviderAuthReopenGraphFixture({ stateRoot, bookId, sourceHash });
     await writeDurableJsonFixture(
       join(stateRoot, "catalog", "batch-runs", runId, "manifest.json"),
@@ -683,7 +702,7 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
         sourceRelativePath,
         sourceIdentityPath: sourceRelativePath,
         sourceHash,
-        normalizedPath: join(".tmp-tests", "graph_vault", "input", "a-auth.md"),
+        normalizedPath: relative(projectRoot, normalizedPath),
         bookId,
         attempts: 1,
         failedAt: "2026-05-23T00:10:00.000Z",
@@ -728,11 +747,14 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
         "import { mkdirSync, writeFileSync } from 'node:fs';",
         "import { dirname } from 'node:path';",
         "const args = process.argv.slice(2);",
+        "const commandName = process.env.QMD_GRAPHRAG_COMMAND_NAME || '';",
         "if (process.env.INDEX_PATH) {",
         "  mkdirSync(dirname(process.env.INDEX_PATH), { recursive: true });",
         "  writeFileSync(process.env.INDEX_PATH, 'fake qmd index\\n');",
         "}",
-        "if (args.includes('--version')) console.log('qmd-test 1.0.0');",
+        "if (commandName === 'qmd-query-auto-json') console.log('{}');",
+        "else if (commandName === 'qmd-query-graphrag-json') console.log('{}');",
+        "else if (args.includes('--version')) console.log('qmd-test 1.0.0');",
         "else if (args.includes('--json')) console.log('{}');",
         "else if (args.includes('--csv')) console.log('title');",
         "else if (args.includes('--xml')) console.log('<ok/>');",
@@ -746,7 +768,7 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
       stderr: string;
       exitCode: number | null;
     }>((resolveResult) => {
-      const proc = spawn(process.execPath, [
+      const proc = spawn(nodeScriptBin(), [
         join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
         "--source-dir",
         sourceDir,
@@ -771,10 +793,12 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
           PATH: process.env.PATH ?? "",
           HOME: process.env.HOME ?? "",
           QMD_GRAPHRAG_ENABLE_TEST_HOOKS: "1",
-            QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
+          QMD_GRAPHRAG_TEST_RESUME_RUNNER: "1",
           QMD_GRAPHRAG_RESUME_RUNNER: resumeScript,
           QMD_GRAPHRAG_TEST_QMD_RUNNER: "1",
           QMD_GRAPHRAG_QMD_RUNNER: qmdScript,
+          QMD_GRAPHRAG_TEST_COMMAND_CHECK_NAMES:
+            minimalGraphQueryCommandChecks.join(","),
           TEST_BOOK_ID: bookId,
           OPENAI_API_KEY: "repaired-openai-key",
           OPENAI_BASE_URL: "https://api.openai.example",
@@ -801,20 +825,11 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
       join(stateRoot, "catalog", "batch-runs", runId, "recovery-summary.json"),
       "utf8",
     ));
-    await rm(tmpRoot, { recursive: true, force: true });
-
-    expect(result.exitCode).toBe(0);
     expect(result.stderr).toBe("");
+    expect(result.exitCode, result.stdout).toBe(0);
     expect(checkpoint.status).toBe("completed");
     expect(checkpoint.commandChecks.map((check: { name: string }) => check.name))
-      .toEqual([
-        ...requiredBatchCommandCheckNames.filter((name) =>
-          name !== "qmd-query-auto-json" &&
-          name !== "qmd-query-graphrag-json"
-        ),
-        "qmd-query-auto-json",
-        "qmd-query-graphrag-json",
-      ]);
+      .toEqual(minimalGraphQueryCommandChecks);
     expect(checkpoint.metadata).toMatchObject({
       providerAuthReopenDecision: "reopen_legacy_provider_auth_key_present",
       providerAuthReopenEligible: true,
@@ -836,6 +851,7 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
     const serializedState = JSON.stringify({ checkpoint, events, summary });
     expect(serializedState).not.toContain("repaired-openai-key");
     expect(serializedState).not.toContain("repaired-jina-key");
+    await rm(tmpRoot, { recursive: true, force: true });
   });
 
   test("provider auth reopen preserves checkpoint identity during catalog drift", async () => {
@@ -1026,7 +1042,7 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
 
     const result = await new Promise<{ stderr: string; exitCode: number | null }>(
       (resolveResult) => {
-        const proc = spawn(process.execPath, [
+        const proc = spawn(nodeScriptBin(), [
           join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
           "--source-dir",
           sourceDir,
@@ -1117,7 +1133,7 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
       stderr: string;
       exitCode: number | null;
     }>((resolveResult) => {
-      const proc = spawn(process.execPath, [
+      const proc = spawn(nodeScriptBin(), [
         join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
         "--source-dir",
         sourceDir,
@@ -1192,7 +1208,7 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
       stderr: string;
       exitCode: number | null;
     }>((resolveResult) => {
-      const proc = spawn(process.execPath, [
+      const proc = spawn(nodeScriptBin(), [
         join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
         "--source-dir",
         sourceDir,
@@ -1355,7 +1371,7 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
       stderr: string;
       exitCode: number | null;
     }>((resolveResult) => {
-      const proc = spawn(process.execPath, [
+      const proc = spawn(nodeScriptBin(), [
         join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
         "--source-dir",
         sourceDir,
@@ -1444,7 +1460,7 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
       stderr: string;
       exitCode: number | null;
     }>((resolveResult) => {
-      const proc = spawn(process.execPath, [
+      const proc = spawn(nodeScriptBin(), [
         join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
         "--source-dir",
         sourceDir,
@@ -1539,7 +1555,7 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
       stderr: string;
       exitCode: number | null;
     }>((resolveResult) => {
-      const proc = spawn(process.execPath, [
+      const proc = spawn(nodeScriptBin(), [
         join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
         "--source-dir",
         sourceDir,
@@ -1609,7 +1625,7 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
       stderr: string;
       exitCode: number | null;
     }>((resolveResult) => {
-      const proc = spawn(process.execPath, [
+      const proc = spawn(nodeScriptBin(), [
         join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
         "--source-dir",
         sourceDir,
@@ -1727,7 +1743,7 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
       stderr: string;
       exitCode: number | null;
     }>((resolveResult) => {
-      const proc = spawn(process.execPath, [
+      const proc = spawn(nodeScriptBin(), [
         join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
         "--source-dir",
         sourceDir,
@@ -1797,7 +1813,7 @@ describe("GraphRAG EPUB batch runner - Provider Auth Reopen", () => {
       stderr: string;
       exitCode: number | null;
     }>((resolveResult) => {
-      const proc = spawn(process.execPath, [
+      const proc = spawn(nodeScriptBin(), [
         join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
         "--source-dir",
         sourceDir,

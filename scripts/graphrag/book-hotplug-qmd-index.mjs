@@ -31,6 +31,12 @@ function safeUnlink(path) {
   rmSync(path, { force: true });
 }
 
+function cleanupSqliteTransientFiles(indexPath) {
+  for (const path of [`${indexPath}-shm`, `${indexPath}-wal`]) {
+    safeUnlink(path);
+  }
+}
+
 function withOptionalSqliteVecWarningSuppressed(fn) {
   const originalWarn = console.warn;
   console.warn = (...args) => {
@@ -215,9 +221,14 @@ export async function ensureBookScopedQmdIndex(input) {
   const contentHash = await hashContent(content);
 
   mkdirSync(dirname(indexPath), { recursive: true });
-  for (const path of [indexPath, `${indexPath}.sha256`, `${indexPath}.sha256.meta.json`]) {
+  for (const path of [
+    indexPath,
+    `${indexPath}.sha256`,
+    `${indexPath}.sha256.meta.json`,
+  ]) {
     safeUnlink(path);
   }
+  cleanupSqliteTransientFiles(indexPath);
 
   const target = withOptionalSqliteVecWarningSuppressed(() => createStore(indexPath));
   let vectorCopy;
@@ -238,9 +249,11 @@ export async function ensureBookScopedQmdIndex(input) {
     );
     vectorCopy = copyVectorRows({ ...input, rootPath, stateRoot, target, contentHash });
     target.db.exec("PRAGMA optimize");
+    target.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
   } finally {
     target.close();
   }
+  cleanupSqliteTransientFiles(indexPath);
 
   const stats = statSync(indexPath);
   const indexSha256 = sha256File(indexPath);

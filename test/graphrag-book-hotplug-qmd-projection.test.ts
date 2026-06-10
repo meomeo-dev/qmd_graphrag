@@ -14,13 +14,63 @@ import {
 } from "../src/graphrag/book-hotplug-catalog.js";
 import {
   mkProjectTmpDir,
-  writeBookScopedQmdIndexFixture,
   writeDurableJsonFixture,
   writeProviderAuthReopenGraphFixture,
 } from "./helpers/graphrag-runner-harness.js";
 
 function sha256Text(text: string): string {
   return createHash("sha256").update(text).digest("hex");
+}
+
+async function writeMinimalQmdIndexFixture(input: {
+  bookRoot: string;
+  bookId: string;
+  normalizedHash: string;
+}): Promise<void> {
+  const indexDir = join(input.bookRoot, "qmd", "index");
+  const indexPath = join(indexDir, "qmd_book_index.sqlite");
+  const indexContent = `minimal qmd index fixture for ${input.bookId}\n`;
+  const indexHash = sha256Text(indexContent);
+  await mkdir(indexDir, { recursive: true });
+  await writeFile(indexPath, indexContent, "utf8");
+  await writeFile(`${indexPath}.sha256`, `${indexHash}\n`, "utf8");
+  await writeFile(
+    `${indexPath}.sha256.meta.json`,
+    `${JSON.stringify({
+      checksum: indexHash,
+      targetLocator: "qmd/index/qmd_book_index.sqlite",
+      checksumPath: "qmd/index/qmd_book_index.sqlite.sha256",
+      checksumRecoveryDecision: "committed",
+      commitState: "committed",
+      operationId: `fixture-qmd-index-${input.bookId}`,
+      runnerSessionId: "qmd-projection-fixture",
+      committedAt: "2026-06-02T00:00:00.000Z",
+    }, null, 2)}\n`,
+    "utf8",
+  );
+  await writeFile(
+    join(indexDir, "qmd_book_index.meta.json"),
+    `${JSON.stringify({
+      schemaVersion: "1.0.0",
+      kind: "qmd_graphrag_book_qmd_index_metadata",
+      bookId: input.bookId,
+      qmdIndexSchema: "qmd-book-index-v1",
+      indexPath: "qmd/index/qmd_book_index.sqlite",
+      documentPath: "input/book.md",
+      normalizedPath: "input/book.md",
+      normalizedContentHash: input.normalizedHash,
+      qmdContentHash: input.normalizedHash,
+      indexSha256: indexHash,
+      indexBytes: Buffer.byteLength(indexContent),
+      collection: "books",
+      vectorRowsCopied: 0,
+      vectorModelCount: 0,
+      vectorCompleteness: "not_available",
+      createdAt: "2026-06-02T00:00:00.000Z",
+      toolVersion: "qmd-projection-fixture",
+    }, null, 2)}\n`,
+    "utf8",
+  );
 }
 
 async function writeHotplugProjectionFixture(input: {
@@ -75,11 +125,10 @@ async function writeHotplugProjectionFixture(input: {
       graphTextUnitIds: [`tu-${input.bookId}`],
     },
   );
-  await writeBookScopedQmdIndexFixture({
-    stateRoot: input.stateRoot,
+  await writeMinimalQmdIndexFixture({
+    bookRoot,
     bookId: input.bookId,
-    normalizedPath: join(bookRoot, "input", "book.md"),
-    normalizedContentHash: normalizedHash,
+    normalizedHash,
   });
 
   const { manifest, publishReady } = buildBookHotplugPackage({

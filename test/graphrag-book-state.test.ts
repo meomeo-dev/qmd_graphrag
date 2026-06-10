@@ -97,6 +97,10 @@ async function createWorkspace(): Promise<string> {
   return mkdtemp(join(tmpdir(), "qmd-graphrag-workspace-"));
 }
 
+async function expectPathAccessible(path: string): Promise<void> {
+  await expect(access(path).then(() => true)).resolves.toBe(true);
+}
+
 async function writeMinimalGraphOutput(outputDir: string): Promise<void> {
   await mkdir(outputDir, { recursive: true });
   const parquetScript = [
@@ -2319,7 +2323,7 @@ describe("syncGraphRagBookWorkspace", () => {
           FROM documents d
           WHERE d.collection = 'books' AND d.active = 1
         `).get() as { path: string; hash: string } | undefined;
-        expect(row?.path).toBe("book.md");
+        expect(row?.path).toBe(`${state.job.bookId}/input/book.md`);
         expect(row?.hash).toBe(state.job.normalizedContentHash);
       } finally {
         qmdStore.close();
@@ -2537,7 +2541,9 @@ describe("syncGraphRagBookWorkspace", () => {
       expect(sources.items[0]?.metadata?.bookId).toBe(stableBookId);
       expect(identities.items[0]?.canonicalBookId).toBe(stableBookId);
       expect(identities.items[0]?.metadata?.bookId).toBe(stableBookId);
-      expect(await repo.getBookJob(legacyBookId)).toBeNull();
+      expect((await repo.listBookJobs()).map((job) => job.bookId))
+        .toEqual([stableBookId]);
+      expect(books.items.some((item) => item.bookId === legacyBookId)).toBe(false);
       expect(await repo.getBookJob(stableBookId)).not.toBeNull();
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -3257,7 +3263,7 @@ describe("syncGraphRagBookWorkspace", () => {
         projectConfig,
         recordRecoveredStages: false,
       })).rejects.toThrow("GraphRAG document identity sidecar evidence is invalid");
-      await expect(access(checksumPath)).resolves.toBeUndefined();
+      await expectPathAccessible(checksumPath);
 
       await writeFile(checksumPath, `${"0".repeat(64)}\n`, "utf8");
       await expect(syncGraphRagBookWorkspace({

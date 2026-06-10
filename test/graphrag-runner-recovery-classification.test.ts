@@ -3,7 +3,6 @@ import { copyFile, mkdir, mkdtemp, rm, utimes, writeFile } from "fs/promises";
 import {
   existsSync,
   readFileSync,
-  readdirSync,
   symlinkSync,
   writeFileSync,
 } from "fs";
@@ -231,7 +230,7 @@ describe("GraphRAG EPUB batch runner - Recovery Classification", () => {
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line));
-    const [checkpointName] = readdirSync(join(batchRoot, "items"));
+    const [checkpointName] = durablePrimaryJsonEntries(join(batchRoot, "items"));
     const checkpoint = JSON.parse(
       readFileSync(join(batchRoot, "items", checkpointName), "utf8"),
     );

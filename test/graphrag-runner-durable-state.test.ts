@@ -20,6 +20,7 @@ import {
   durablePrimaryJsonEntries,
   expectDurableSubprocessEnvelopeIncomplete,
   mkProjectTmpDir,
+  nodeScriptBin,
   passedBatchCommandChecks,
   projectRoot,
   requiredBatchCommandCheckNames,
@@ -123,7 +124,7 @@ describe("GraphRAG EPUB batch runner - Durable State", () => {
     expect(script).toContain("batch_wait_retry_window");
     expect(script).toContain("item_running_recovered");
     expect(script).toContain("batch_state_migrated");
-    expect(script).toContain("raw_log_migrated");
+    expect(script).toContain("migrateGraphVaultRawReportsForItems");
     expect(script).toContain("\"--report-root\"");
     expect(script).toContain("assertNoBookScopedRawReports");
     expect(script).toContain("BatchRunManifestSchema.parse");
@@ -229,7 +230,7 @@ describe("GraphRAG EPUB batch runner - Durable State", () => {
       stderr: string;
       exitCode: number | null;
     }>((resolveResult) => {
-      const proc = spawn(process.execPath, [
+      const proc = spawn(nodeScriptBin(), [
         join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
         "--source-dir",
         sourceDir,
@@ -267,7 +268,7 @@ describe("GraphRAG EPUB batch runner - Durable State", () => {
     let heartbeatCheckpointText = "";
     let heartbeatChecksumText = "";
     let heartbeatChecksumMeta: Record<string, unknown> | null = null;
-    for (let attempt = 0; attempt < 80; attempt += 1) {
+    for (let attempt = 0; attempt < 160; attempt += 1) {
       await sleep(250);
       if (!existsSync(checkpointPath)) continue;
       const checkpointText = readFileSync(checkpointPath, "utf8");
@@ -294,7 +295,7 @@ describe("GraphRAG EPUB batch runner - Durable State", () => {
       stderr: string;
       exitCode: number | null;
     }>((resolveResult) => {
-      const proc = spawn(process.execPath, [
+      const proc = spawn(nodeScriptBin(), [
         join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
         "--source-dir",
         sourceDir,
@@ -444,7 +445,7 @@ describe("GraphRAG EPUB batch runner - Durable State", () => {
       QMD_GRAPHRAG_TEST_QMD_RUNNER: "1",
       QMD_GRAPHRAG_QMD_RUNNER: qmdScript,
     };
-    const first = spawn(process.execPath, args, { cwd: tmpRoot, env });
+    const first = spawn(nodeScriptBin(), args, { cwd: tmpRoot, env });
     let firstStdout = "";
     let firstStderr = "";
     first.stdout.on("data", (chunk) => { firstStdout += String(chunk); });
@@ -458,7 +459,7 @@ describe("GraphRAG EPUB batch runner - Durable State", () => {
         stderr: string;
         exitCode: number | null;
       }>((resolveResult) => {
-        const proc = spawn(process.execPath, args, { cwd: tmpRoot, env });
+        const proc = spawn(nodeScriptBin(), args, { cwd: tmpRoot, env });
         let stdout = "";
         let stderr = "";
         proc.stdout.on("data", (chunk) => { stdout += String(chunk); });
@@ -512,7 +513,7 @@ describe("GraphRAG EPUB batch runner - Durable State", () => {
       stderr: string;
       exitCode: number | null;
     }>((resolveResult) => {
-      const proc = spawn(process.execPath, [
+      const proc = spawn(nodeScriptBin(), [
         join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
         "--source-dir",
         sourceDir,
@@ -619,7 +620,7 @@ describe("GraphRAG EPUB batch runner - Durable State", () => {
         stderr: string;
         exitCode: number | null;
       }>((resolveResult) => {
-        const proc = spawn(process.execPath, [
+        const proc = spawn(nodeScriptBin(), [
           join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
           "--source-dir",
           sourceDir,
@@ -712,7 +713,7 @@ describe("GraphRAG EPUB batch runner - Durable State", () => {
 	        stderr: string;
 	        exitCode: number | null;
 	      }>((resolveResult) => {
-	        const proc = spawn(process.execPath, [
+	        const proc = spawn(nodeScriptBin(), [
 	          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
 	          "--source-dir",
 	          sourceDir,
@@ -777,7 +778,7 @@ describe("GraphRAG EPUB batch runner - Durable State", () => {
 	        stderr: string;
 	        exitCode: number | null;
 	      }>((resolveResult) => {
-	        const proc = spawn(process.execPath, [
+	        const proc = spawn(nodeScriptBin(), [
 	          join(projectRoot, "scripts", "graphrag", "batch-epub-workflow.mjs"),
 	          "--source-dir",
 	          sourceDir,

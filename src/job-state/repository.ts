@@ -1,6 +1,8 @@
 import {
   copyFile,
   mkdir,
+  readdir,
+  rm,
   stat,
   writeFile,
 } from "node:fs/promises";
@@ -512,6 +514,21 @@ function mergeStringLists(
   return values.length > 0 ? [...new Set(values)] : undefined;
 }
 
+function sameDocumentContentIdentity(
+  item: DocumentIdentityCatalog["items"][number],
+  input: {
+    sourceId: string;
+    sourceHash: string;
+    documentId: string;
+    contentHash: string;
+  },
+): boolean {
+  return item.sourceId === input.sourceId &&
+    item.sourceHash === input.sourceHash &&
+    item.documentId === input.documentId &&
+    item.contentHash === input.contentHash;
+}
+
 function mergeDocumentIdentityMaps(
   left: DocumentIdentityCatalog["items"][number],
   right: DocumentIdentityCatalog["items"][number],
@@ -534,7 +551,7 @@ function mergeDocumentIdentityMaps(
   );
   return DocumentIdentityMapSchema.parse({
     ...left,
-    normalizedPath: right.normalizedPath ?? left.normalizedPath,
+    normalizedPath: left.normalizedPath ?? right.normalizedPath,
     chunkIds: mergeStringLists(left.chunkIds, right.chunkIds) ?? [],
     ...(graphSource.graphDocumentId
       ? { graphDocumentId: graphSource.graphDocumentId }
@@ -545,6 +562,7 @@ function mergeDocumentIdentityMaps(
     aliases: mergeStringLists(left.aliases, [
       ...(right.aliases ?? []),
       right.normalizedPath ?? "",
+      left.normalizedPath ?? "",
     ].filter((item) => item.length > 0)),
     metadata: preservedMetadata,
   });
@@ -1112,6 +1130,7 @@ export class FileBookJobStateRepository {
       now,
     );
     await this.upsertDocumentIdentityMap(job);
+    await this.removeMatchingLegacyBookRoots(job);
     return job;
   }
 
@@ -1200,6 +1219,10 @@ export class FileBookJobStateRepository {
       EMPTY_SOURCE_DOCUMENT_CATALOG,
       (catalog) => {
         const items = catalog.items.filter((item) =>
+          item.metadata?.bookId === job.bookId ||
+          item.sourceId !== sourceId ||
+          item.sourceHash !== job.sourceHash
+        ).filter((item) =>
           item.metadata?.bookId !== job.bookId
         );
         items.push(source);
@@ -1218,10 +1241,17 @@ export class FileBookJobStateRepository {
       DocumentIdentityCatalogSchema,
       EMPTY_DOCUMENT_IDENTITY_CATALOG,
       (catalog) => {
-        const existingIdentity = catalog.items.find((item) =>
-          item.canonicalBookId === job.bookId &&
-          item.documentId === job.documentId
+        const matchingIdentities = catalog.items.filter((item) =>
+          sameDocumentContentIdentity(item, {
+            sourceId,
+            sourceHash: job.sourceHash,
+            documentId: job.documentId,
+            contentHash,
+          })
         );
+        const existingIdentity = matchingIdentities.find((item) =>
+          item.canonicalBookId === job.bookId
+        ) ?? matchingIdentities[0];
         const preservesContentIdentity =
           existingIdentity?.sourceId === sourceId &&
           existingIdentity.sourceHash === job.sourceHash &&
@@ -1276,9 +1306,29 @@ export class FileBookJobStateRepository {
           metadata: preservedProjectionMetadata,
         });
         const items = catalog.items.filter((item) =>
-          item.canonicalBookId !== job.bookId
+          !sameDocumentContentIdentity(item, {
+            sourceId,
+            sourceHash: job.sourceHash,
+            documentId: job.documentId,
+            contentHash,
+          })
         );
-        items.push(identity);
+        const mergedIdentity = matchingIdentities.reduce(
+          (current, item) => mergeDocumentIdentityMaps(current, {
+            ...item,
+            canonicalBookId: job.bookId,
+          }),
+          identity,
+        );
+        items.push(DocumentIdentityMapSchema.parse({
+          ...mergedIdentity,
+          canonicalBookId: job.bookId,
+          metadata: mergeJobMetadata(mergedIdentity.metadata, {
+            bookId: job.bookId,
+            sourceIdentityPath: job.sourceIdentityPath,
+            normalizedPath: normalizedPath ?? null,
+          }),
+        }));
         items.sort((left, right) =>
           left.documentId.localeCompare(right.documentId)
         );
@@ -1434,7 +1484,13 @@ export class FileBookJobStateRepository {
     await writeYamlFile(this.bookJobPath(parsed.bookId), parsed);
 
     await updateBookJobCatalogFile(this.bookCatalogPath(), (catalog) => {
-      const items = catalog.items.filter((item) => item.bookId !== parsed.bookId);
+      const items = catalog.items.filter((item) =>
+        item.bookId === parsed.bookId ||
+        item.sourceHash !== parsed.sourceHash ||
+        item.documentId !== parsed.documentId ||
+        (item.normalizedContentHash ?? item.sourceHash) !==
+          (parsed.normalizedContentHash ?? parsed.sourceHash)
+      ).filter((item) => item.bookId !== parsed.bookId);
       items.push(parsed);
       items.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
       return { schemaVersion: SchemaVersion, items };
@@ -1449,6 +1505,37 @@ export class FileBookJobStateRepository {
       BookJobSchema,
       null,
     );
+  }
+
+  private async removeMatchingLegacyBookRoots(job: BookJob): Promise<void> {
+    let entries: string[];
+    try {
+      entries = await readdir(this.booksDir);
+    } catch {
+      return;
+    }
+    const catalog = await readBookJobCatalogFile(this.bookCatalogPath());
+    const catalogBookIds = new Set(catalog.items.map((item) => item.bookId));
+    const contentHash = job.normalizedContentHash ?? job.sourceHash;
+    for (const entry of entries) {
+      if (entry === job.bookId) continue;
+      if (!entry.startsWith("book-")) continue;
+      if (catalogBookIds.has(entry)) continue;
+      const legacyJob = await readYamlFile(
+        this.bookJobPath(entry),
+        BookJobSchema,
+        null,
+      );
+      if (
+        legacyJob == null ||
+        legacyJob.sourceHash !== job.sourceHash ||
+        legacyJob.documentId !== job.documentId ||
+        (legacyJob.normalizedContentHash ?? legacyJob.sourceHash) !== contentHash
+      ) {
+        continue;
+      }
+      await rm(this.bookDir(entry), { recursive: true, force: true });
+    }
   }
 
   async buildGraphEnhancementRequest(

@@ -386,15 +386,12 @@ describe("GraphRAG EPUB batch runner - Remote Running Recovery", () => {
     await mkdir(sourceDir, { recursive: true });
     await mkdir(configDir, { recursive: true });
     await writeFile(join(configDir, "index.yml"), "collections: {}\n");
-    const firstBytes = "runtime provider auth";
-    const secondBytes = "pending should not run after runtime auth";
-    await writeFile(join(sourceDir, "A-Auth.epub"), firstBytes);
-    await writeFile(join(sourceDir, "B-Pending.epub"), secondBytes);
-
     const firstPath = join(sourceDir, "A-Auth.epub");
     const secondPath = join(sourceDir, "B-Pending.epub");
-    const firstHash = createHash("sha256").update(firstBytes).digest("hex");
-    const secondHash = createHash("sha256").update(secondBytes).digest("hex");
+    await writeMinimalEpubFixture(firstPath, "Runtime Provider Auth");
+    await writeMinimalEpubFixture(secondPath, "Pending Should Not Run");
+    const firstHash = createHash("sha256").update(readFileSync(firstPath)).digest("hex");
+    const secondHash = createHash("sha256").update(readFileSync(secondPath)).digest("hex");
     const firstRelativePath = relative(projectRoot, firstPath);
     const secondRelativePath = relative(projectRoot, secondPath);
     const firstItemId = `item-${firstHash.slice(0, 12)}-${

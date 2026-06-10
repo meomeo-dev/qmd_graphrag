@@ -11,6 +11,7 @@ import {
 } from "../scripts/graphrag/book-hotplug-package.mjs";
 import {
   mkProjectTmpDir,
+  nodeScriptBin,
   writeBookScopedQmdIndexFixture,
   writeDurableJsonFixture,
   writeProviderAuthReopenGraphFixture,
@@ -25,7 +26,7 @@ function runBackfill(input: {
   args?: string[];
 }): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   return new Promise((resolveResult) => {
-    const proc = spawn(process.execPath, [
+    const proc = spawn(nodeScriptBin(), [
       "scripts/graphrag/backfill-hotplug-packages.mjs",
       "--state-root",
       input.stateRoot,

@@ -156,254 +156,258 @@ describe("BM25 Search (FTS)", () => {
 // Vector Search Tests - Requires embedding model
 // =============================================================================
 
-describe.skipIf(!!process.env.CI)("Vector Search", () => {
-  let store: ReturnType<typeof createStore>;
-  let db: Database;
-  let hasEmbeddings = false;
+if (!process.env.CI) {
+  describe("Vector Search", () => {
+    let store: ReturnType<typeof createStore>;
+    let db: Database;
+    let hasEmbeddings = false;
 
-  beforeAll(async () => {
-    store = createStore();
-    db = store.db;
+    beforeAll(async () => {
+      store = createStore();
+      db = store.db;
 
-    // Check if embeddings already exist (from previous test run)
-    const vecTable = db.prepare(
-      `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
-    ).get();
+      // Check if embeddings already exist (from previous test run)
+      const vecTable = db.prepare(
+        `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
+      ).get();
 
-    if (vecTable) {
-      const count = db.prepare(`SELECT COUNT(*) as cnt FROM vectors_vec`).get() as { cnt: number };
-      if (count.cnt > 0) {
-        hasEmbeddings = true;
-        return;
-      }
-    }
-
-    // Generate embeddings for test documents
-    const llm = getDefaultLlamaCpp();
-    store.ensureVecTable(768); // embeddinggemma uses 768 dimensions
-
-    const evalDocsDir = join(dirname(fileURLToPath(import.meta.url)), "eval-docs");
-    const files = readdirSync(evalDocsDir).filter(f => f.endsWith(".md"));
-
-    for (const file of files) {
-      const content = readFileSync(join(evalDocsDir, file), "utf-8");
-      const hash = createHash("sha256").update(content).digest("hex").slice(0, 12);
-      const title = content.split("\n")[0]?.replace(/^#\s*/, "") || file;
-
-      // Chunk and embed
-      const chunks = await chunkDocumentByTokens(content);
-      for (let seq = 0; seq < chunks.length; seq++) {
-        const chunk = chunks[seq];
-        if (!chunk) continue;
-        const formatted = formatDocForEmbedding(chunk.text, title);
-        const result = await llm.embed(formatted, { model: DEFAULT_EMBED_MODEL, isQuery: false });
-        if (result?.embedding) {
-          // Convert to Float32Array for sqlite-vec
-          const embedding = new Float32Array(result.embedding);
-          const now = new Date().toISOString();
-          insertEmbedding(db, hash, seq, chunk.pos, embedding, DEFAULT_EMBED_MODEL, now);
+      if (vecTable) {
+        const count = db.prepare(`SELECT COUNT(*) as cnt FROM vectors_vec`).get() as { cnt: number };
+        if (count.cnt > 0) {
+          hasEmbeddings = true;
+          return;
         }
       }
-    }
-    hasEmbeddings = true;
-  }, 120000); // 2 minute timeout for embedding generation
 
-  afterAll(() => {
-    store.close();
+      // Generate embeddings for test documents
+      const llm = getDefaultLlamaCpp();
+      store.ensureVecTable(768); // embeddinggemma uses 768 dimensions
+
+      const evalDocsDir = join(dirname(fileURLToPath(import.meta.url)), "eval-docs");
+      const files = readdirSync(evalDocsDir).filter(f => f.endsWith(".md"));
+
+      for (const file of files) {
+        const content = readFileSync(join(evalDocsDir, file), "utf-8");
+        const hash = createHash("sha256").update(content).digest("hex").slice(0, 12);
+        const title = content.split("\n")[0]?.replace(/^#\s*/, "") || file;
+
+        // Chunk and embed
+        const chunks = await chunkDocumentByTokens(content);
+        for (let seq = 0; seq < chunks.length; seq++) {
+          const chunk = chunks[seq];
+          if (!chunk) continue;
+          const formatted = formatDocForEmbedding(chunk.text, title);
+          const result = await llm.embed(formatted, { model: DEFAULT_EMBED_MODEL, isQuery: false });
+          if (result?.embedding) {
+            // Convert to Float32Array for sqlite-vec
+            const embedding = new Float32Array(result.embedding);
+            const now = new Date().toISOString();
+            insertEmbedding(db, hash, seq, chunk.pos, embedding, DEFAULT_EMBED_MODEL, now);
+          }
+        }
+      }
+      hasEmbeddings = true;
+    }, 120000); // 2 minute timeout for embedding generation
+
+    afterAll(() => {
+      store.close();
+    });
+
+    // Note: Don't dispose here - Hybrid tests also use llama.
+    // Dispose happens in the global afterAll.
+
+    test("easy queries: ≥60% Hit@3 (vector should match keywords too)", async () => {
+      if (!hasEmbeddings) return; // Skip if embedding failed
+
+      const easyQueries = evalQueries.filter(q => q.difficulty === "easy");
+      let hits = 0;
+      for (const { query, expectedDoc } of easyQueries) {
+        const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+        if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
+      }
+      expect(hits / easyQueries.length).toBeGreaterThanOrEqual(0.6);
+    }, 60000);
+
+    test("medium queries: ≥40% Hit@3 (vector excels at semantic)", async () => {
+      if (!hasEmbeddings) return;
+
+      const mediumQueries = evalQueries.filter(q => q.difficulty === "medium");
+      let hits = 0;
+      for (const { query, expectedDoc } of mediumQueries) {
+        const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+        if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
+      }
+      // Vector search should do better on semantic queries than BM25
+      expect(hits / mediumQueries.length).toBeGreaterThanOrEqual(0.4);
+    }, 60000);
+
+    test("hard queries: ≥30% Hit@5 (vector helps with vague queries)", async () => {
+      if (!hasEmbeddings) return;
+
+      const hardQueries = evalQueries.filter(q => q.difficulty === "hard");
+      let hits = 0;
+      for (const { query, expectedDoc } of hardQueries) {
+        const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+        if (results.some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
+      }
+      expect(hits / hardQueries.length).toBeGreaterThanOrEqual(0.3);
+    }, 60000);
+
+    test("overall Hit@3 ≥50% (vector baseline)", async () => {
+      if (!hasEmbeddings) return;
+
+      let hits = 0;
+      for (const { query, expectedDoc } of evalQueries) {
+        const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+        if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
+      }
+      expect(hits / evalQueries.length).toBeGreaterThanOrEqual(0.5);
+    }, 60000);
   });
-
-  // Note: Don't dispose here - Hybrid tests also use llama.
-  // Dispose happens in the global afterAll.
-
-  test("easy queries: ≥60% Hit@3 (vector should match keywords too)", async () => {
-    if (!hasEmbeddings) return; // Skip if embedding failed
-
-    const easyQueries = evalQueries.filter(q => q.difficulty === "easy");
-    let hits = 0;
-    for (const { query, expectedDoc } of easyQueries) {
-      const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
-      if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
-    }
-    expect(hits / easyQueries.length).toBeGreaterThanOrEqual(0.6);
-  }, 60000);
-
-  test("medium queries: ≥40% Hit@3 (vector excels at semantic)", async () => {
-    if (!hasEmbeddings) return;
-
-    const mediumQueries = evalQueries.filter(q => q.difficulty === "medium");
-    let hits = 0;
-    for (const { query, expectedDoc } of mediumQueries) {
-      const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
-      if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
-    }
-    // Vector search should do better on semantic queries than BM25
-    expect(hits / mediumQueries.length).toBeGreaterThanOrEqual(0.4);
-  }, 60000);
-
-  test("hard queries: ≥30% Hit@5 (vector helps with vague queries)", async () => {
-    if (!hasEmbeddings) return;
-
-    const hardQueries = evalQueries.filter(q => q.difficulty === "hard");
-    let hits = 0;
-    for (const { query, expectedDoc } of hardQueries) {
-      const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
-      if (results.some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
-    }
-    expect(hits / hardQueries.length).toBeGreaterThanOrEqual(0.3);
-  }, 60000);
-
-  test("overall Hit@3 ≥50% (vector baseline)", async () => {
-    if (!hasEmbeddings) return;
-
-    let hits = 0;
-    for (const { query, expectedDoc } of evalQueries) {
-      const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
-      if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
-    }
-    expect(hits / evalQueries.length).toBeGreaterThanOrEqual(0.5);
-  }, 60000);
-});
+}
 
 // =============================================================================
 // Hybrid Search (RRF) Tests - Combines BM25 + Vector
 // =============================================================================
 
-describe.skipIf(!!process.env.CI)("Hybrid Search (RRF)", () => {
-  let store: ReturnType<typeof createStore>;
-  let db: Database;
-  let hasVectors = false;
+if (!process.env.CI) {
+  describe("Hybrid Search (RRF)", () => {
+    let store: ReturnType<typeof createStore>;
+    let db: Database;
+    let hasVectors = false;
 
-  beforeAll(() => {
-    store = createStore();
-    db = store.db;
-    // Check if vectors exist
-    const vecTable = db.prepare(
-      `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
-    ).get();
-    if (vecTable) {
-      const count = db.prepare(`SELECT COUNT(*) as cnt FROM vectors_vec`).get() as { cnt: number };
-      hasVectors = count.cnt > 0;
+    beforeAll(() => {
+      store = createStore();
+      db = store.db;
+      // Check if vectors exist
+      const vecTable = db.prepare(
+        `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
+      ).get();
+      if (vecTable) {
+        const count = db.prepare(`SELECT COUNT(*) as cnt FROM vectors_vec`).get() as { cnt: number };
+        hasVectors = count.cnt > 0;
+      }
+    });
+
+    afterAll(() => {
+      store.close();
+    });
+
+    // Helper: run hybrid search with RRF fusion
+    async function hybridSearch(query: string, limit: number = 10): Promise<RankedResult[]> {
+      const rankedLists: RankedResult[][] = [];
+
+      // FTS results
+      const ftsResults = searchFTS(db, query, 20);
+      if (ftsResults.length > 0) {
+        rankedLists.push(ftsResults.map(r => ({
+          file: r.filepath,
+          displayPath: r.displayPath,
+          title: r.title,
+          body: r.body || "",
+          score: r.score
+        })));
+      }
+
+      // Vector results
+      const vecResults = await searchVec(db, query, DEFAULT_EMBED_MODEL, 20);
+      if (vecResults.length > 0) {
+        rankedLists.push(vecResults.map(r => ({
+          file: r.filepath,
+          displayPath: r.displayPath,
+          title: r.title,
+          body: r.body || "",
+          score: r.score
+        })));
+      }
+
+      if (rankedLists.length === 0) return [];
+
+      // Apply RRF fusion
+      const fused = reciprocalRankFusion(rankedLists);
+      return fused.slice(0, limit);
     }
+
+    test("easy queries: ≥80% Hit@3 (hybrid should match BM25)", async () => {
+      const easyQueries = evalQueries.filter(q => q.difficulty === "easy");
+      let hits = 0;
+      for (const { query, expectedDoc } of easyQueries) {
+        const results = await hybridSearch(query);
+        if (results.slice(0, 3).some(r => matchesExpected(r.file, expectedDoc))) hits++;
+      }
+      expect(hits / easyQueries.length).toBeGreaterThanOrEqual(0.8);
+    }, 60000);
+
+    test("medium queries: ≥50% Hit@3 with vectors, ≥15% without", async () => {
+      const mediumQueries = evalQueries.filter(q => q.difficulty === "medium");
+      let hits = 0;
+      for (const { query, expectedDoc } of mediumQueries) {
+        const results = await hybridSearch(query);
+        if (results.slice(0, 3).some(r => matchesExpected(r.file, expectedDoc))) hits++;
+      }
+      // With vectors: hybrid should outperform both BM25 (15%) and vector (40%)
+      // Without vectors: hybrid is just BM25, so use BM25 threshold
+      const threshold = hasVectors ? 0.5 : 0.15;
+      expect(hits / mediumQueries.length).toBeGreaterThanOrEqual(threshold);
+    }, 60000);
+
+    test("hard queries: ≥35% Hit@5 with vectors, ≥15% without", async () => {
+      const hardQueries = evalQueries.filter(q => q.difficulty === "hard");
+      let hits = 0;
+      for (const { query, expectedDoc } of hardQueries) {
+        const results = await hybridSearch(query);
+        if (results.some(r => matchesExpected(r.file, expectedDoc))) hits++;
+      }
+      const threshold = hasVectors ? 0.35 : 0.15;
+      expect(hits / hardQueries.length).toBeGreaterThanOrEqual(threshold);
+    }, 60000);
+
+    test("fusion queries: ≥50% Hit@3 (RRF combines weak signals)", async () => {
+      if (!hasVectors) return; // Fusion requires both methods
+
+      const fusionQueries = evalQueries.filter(q => q.difficulty === "fusion");
+      let hybridHits = 0;
+      let bm25Hits = 0;
+      let vecHits = 0;
+
+      for (const { query, expectedDoc } of fusionQueries) {
+        // Hybrid results
+        const hybridResults = await hybridSearch(query);
+        if (hybridResults.slice(0, 3).some(r => matchesExpected(r.file, expectedDoc))) hybridHits++;
+
+        // BM25 results for comparison
+        const bm25Results = searchFTS(db, query, 5);
+        if (bm25Results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) bm25Hits++;
+
+        // Vector results for comparison
+        const vecResults = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+        if (vecResults.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) vecHits++;
+      }
+
+      const hybridRate = hybridHits / fusionQueries.length;
+      const bm25Rate = bm25Hits / fusionQueries.length;
+      const vecRate = vecHits / fusionQueries.length;
+
+      // Fusion should achieve at least 50% on these multi-signal queries
+      expect(hybridRate).toBeGreaterThanOrEqual(0.5);
+
+      // Fusion should outperform or match the best individual method
+      expect(hybridRate).toBeGreaterThanOrEqual(Math.max(bm25Rate, vecRate));
+    }, 60000);
+
+    test("overall Hit@3 ≥60% with vectors, ≥40% without", async () => {
+      // Filter out fusion queries for overall score (they're tested separately)
+      const standardQueries = evalQueries.filter(q => q.difficulty !== "fusion");
+      let hits = 0;
+      for (const { query, expectedDoc } of standardQueries) {
+        const results = await hybridSearch(query);
+        if (results.slice(0, 3).some(r => matchesExpected(r.file, expectedDoc))) hits++;
+      }
+      const threshold = hasVectors ? 0.6 : 0.4;
+      expect(hits / standardQueries.length).toBeGreaterThanOrEqual(threshold);
+    }, 60000);
   });
-
-  afterAll(() => {
-    store.close();
-  });
-
-  // Helper: run hybrid search with RRF fusion
-  async function hybridSearch(query: string, limit: number = 10): Promise<RankedResult[]> {
-    const rankedLists: RankedResult[][] = [];
-
-    // FTS results
-    const ftsResults = searchFTS(db, query, 20);
-    if (ftsResults.length > 0) {
-      rankedLists.push(ftsResults.map(r => ({
-        file: r.filepath,
-        displayPath: r.displayPath,
-        title: r.title,
-        body: r.body || "",
-        score: r.score
-      })));
-    }
-
-    // Vector results
-    const vecResults = await searchVec(db, query, DEFAULT_EMBED_MODEL, 20);
-    if (vecResults.length > 0) {
-      rankedLists.push(vecResults.map(r => ({
-        file: r.filepath,
-        displayPath: r.displayPath,
-        title: r.title,
-        body: r.body || "",
-        score: r.score
-      })));
-    }
-
-    if (rankedLists.length === 0) return [];
-
-    // Apply RRF fusion
-    const fused = reciprocalRankFusion(rankedLists);
-    return fused.slice(0, limit);
-  }
-
-  test("easy queries: ≥80% Hit@3 (hybrid should match BM25)", async () => {
-    const easyQueries = evalQueries.filter(q => q.difficulty === "easy");
-    let hits = 0;
-    for (const { query, expectedDoc } of easyQueries) {
-      const results = await hybridSearch(query);
-      if (results.slice(0, 3).some(r => matchesExpected(r.file, expectedDoc))) hits++;
-    }
-    expect(hits / easyQueries.length).toBeGreaterThanOrEqual(0.8);
-  }, 60000);
-
-  test("medium queries: ≥50% Hit@3 with vectors, ≥15% without", async () => {
-    const mediumQueries = evalQueries.filter(q => q.difficulty === "medium");
-    let hits = 0;
-    for (const { query, expectedDoc } of mediumQueries) {
-      const results = await hybridSearch(query);
-      if (results.slice(0, 3).some(r => matchesExpected(r.file, expectedDoc))) hits++;
-    }
-    // With vectors: hybrid should outperform both BM25 (15%) and vector (40%)
-    // Without vectors: hybrid is just BM25, so use BM25 threshold
-    const threshold = hasVectors ? 0.5 : 0.15;
-    expect(hits / mediumQueries.length).toBeGreaterThanOrEqual(threshold);
-  }, 60000);
-
-  test("hard queries: ≥35% Hit@5 with vectors, ≥15% without", async () => {
-    const hardQueries = evalQueries.filter(q => q.difficulty === "hard");
-    let hits = 0;
-    for (const { query, expectedDoc } of hardQueries) {
-      const results = await hybridSearch(query);
-      if (results.some(r => matchesExpected(r.file, expectedDoc))) hits++;
-    }
-    const threshold = hasVectors ? 0.35 : 0.15;
-    expect(hits / hardQueries.length).toBeGreaterThanOrEqual(threshold);
-  }, 60000);
-
-  test("fusion queries: ≥50% Hit@3 (RRF combines weak signals)", async () => {
-    if (!hasVectors) return; // Fusion requires both methods
-
-    const fusionQueries = evalQueries.filter(q => q.difficulty === "fusion");
-    let hybridHits = 0;
-    let bm25Hits = 0;
-    let vecHits = 0;
-
-    for (const { query, expectedDoc } of fusionQueries) {
-      // Hybrid results
-      const hybridResults = await hybridSearch(query);
-      if (hybridResults.slice(0, 3).some(r => matchesExpected(r.file, expectedDoc))) hybridHits++;
-
-      // BM25 results for comparison
-      const bm25Results = searchFTS(db, query, 5);
-      if (bm25Results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) bm25Hits++;
-
-      // Vector results for comparison
-      const vecResults = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
-      if (vecResults.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) vecHits++;
-    }
-
-    const hybridRate = hybridHits / fusionQueries.length;
-    const bm25Rate = bm25Hits / fusionQueries.length;
-    const vecRate = vecHits / fusionQueries.length;
-
-    // Fusion should achieve at least 50% on these multi-signal queries
-    expect(hybridRate).toBeGreaterThanOrEqual(0.5);
-
-    // Fusion should outperform or match the best individual method
-    expect(hybridRate).toBeGreaterThanOrEqual(Math.max(bm25Rate, vecRate));
-  }, 60000);
-
-  test("overall Hit@3 ≥60% with vectors, ≥40% without", async () => {
-    // Filter out fusion queries for overall score (they're tested separately)
-    const standardQueries = evalQueries.filter(q => q.difficulty !== "fusion");
-    let hits = 0;
-    for (const { query, expectedDoc } of standardQueries) {
-      const results = await hybridSearch(query);
-      if (results.slice(0, 3).some(r => matchesExpected(r.file, expectedDoc))) hits++;
-    }
-    const threshold = hasVectors ? 0.6 : 0.4;
-    expect(hits / standardQueries.length).toBeGreaterThanOrEqual(threshold);
-  }, 60000);
-});
+}
 
 // =============================================================================
 // Cleanup

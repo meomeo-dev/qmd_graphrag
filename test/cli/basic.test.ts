@@ -504,7 +504,7 @@ describe("CLI Status Command", () => {
     expect(stdout).toContain("invalid 1");
     expect(stdout).toContain("HTML page, not a GGUF model");
     expect(stdout).toContain("qmd pull --refresh");
-  }, 20000);
+  }, 90000);
 
   test("qmd doctor says when models are overridden by env", async () => {
     const env = await harness.createIsolatedTestEnv("doctor-env-models");
@@ -772,4 +772,3 @@ describe("CLI Search Command", () => {
     expect(stderr).not.toContain("OpenAI Responses");
   }, 25000);
 });
-

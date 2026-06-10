@@ -49,18 +49,17 @@ describe("GraphRAG EPUB batch runner - Provider Auth Stop Decisions", () => {
     const logRoot = join(tmpRoot, "logs");
     const configDir = join(tmpRoot, "config");
     const runId = "settings-projection-reject";
-    const sourceBytes = "settings projection rejection";
-    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
     const sourcePath = join(sourceDir, "Book.epub");
+    await mkdir(sourceDir, { recursive: true });
+    await writeMinimalEpubFixture(sourcePath, "Settings Projection Rejection");
+    const sourceHash = createHash("sha256").update(readFileSync(sourcePath)).digest("hex");
     const normalizedPath = join(
       stateRoot,
       "input",
       `book-${sourceHash.slice(0, 10)}.md`,
     );
-    await mkdir(sourceDir, { recursive: true });
     await mkdir(configDir, { recursive: true });
     await mkdir(dirname(normalizedPath), { recursive: true });
-    await writeFile(sourcePath, sourceBytes);
     await writeFile(normalizedPath, "# Book\n\nSettings rejection fixture.\n");
     await writeFile(join(configDir, "index.yml"), "collections: {}\n");
     const sourceRelativePath = relative(projectRoot, sourcePath);
@@ -197,18 +196,17 @@ describe("GraphRAG EPUB batch runner - Provider Auth Stop Decisions", () => {
     const logRoot = join(tmpRoot, "logs");
     const configDir = join(tmpRoot, "config");
     const runId = "settings-projection-invalid-source";
-    const sourceBytes = "settings projection invalid source";
-    const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
     const sourcePath = join(sourceDir, "Book.epub");
+    await mkdir(sourceDir, { recursive: true });
+    await writeMinimalEpubFixture(sourcePath, "Settings Projection Invalid Source");
+    const sourceHash = createHash("sha256").update(readFileSync(sourcePath)).digest("hex");
     const normalizedPath = join(
       stateRoot,
       "input",
       `book-${sourceHash.slice(0, 10)}.md`,
     );
-    await mkdir(sourceDir, { recursive: true });
     await mkdir(configDir, { recursive: true });
     await mkdir(dirname(normalizedPath), { recursive: true });
-    await writeFile(sourcePath, sourceBytes);
     await writeFile(normalizedPath, "# Book\n\nInvalid source fixture.\n");
     await writeFile(
       join(configDir, "index.yml"),
